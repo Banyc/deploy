@@ -1304,7 +1304,10 @@ mod tests_ssh {
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let root = dir.path().join("remote");
         let rel = Path::new("state/operation.lock");
-        let payload = "{\"owner\":\"a\",\"token\":1,\"expires_at_ms\":1700000000000}";
+        // The mutation-lock record: owner + persisted monotonic epoch (no
+        // time anywhere in the protocol — create-once ownership with no
+        // lease/expiry).
+        let payload = "{\"owner\":\"a\",\"epoch\":1}";
 
         // Genuinely absent: the Absent frame.
         let cmd = SshTransport::remove_file_if_cmd(&root, rel, payload.as_bytes());
@@ -1327,7 +1330,7 @@ mod tests_ssh {
         // Reinstall, then compare against a DIFFERENT expected record: the
         // Mismatch frame and the entry is restored byte-for-byte.
         std::fs::write(root.join(rel), payload).unwrap();
-        let cmd2 = SshTransport::remove_file_if_cmd(&root, rel, b"{\"owner\":\"b\",\"token\":2}");
+        let cmd2 = SshTransport::remove_file_if_cmd(&root, rel, b"{\"owner\":\"b\",\"epoch\":2}");
         let out = run_sh_stdin(&cmd2, &[]);
         assert!(out.status.success(), "script must exit 0: {out:?}");
         assert_eq!(String::from_utf8_lossy(&out.stdout), "M");

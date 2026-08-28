@@ -16,6 +16,82 @@
 //!   (`transactions`) records.
 //! * `protocol` — the protocol handshake.
 //! * `observed` — the observed-state re-exports.
+//!
+//! # The server mutation lock: create-once ownership, no automatic takeover
+//!
+//! The per-slot mutation lock is a CREATE-ONCE OWNERSHIP record
+//! ([`LockRecord`]: owner + a persisted monotonic epoch) installed by atomic
+//! create-if-absent and removed only by atomic compare-and-delete. The
+//! record is created exactly once — a different holder's record FAILS a
+//! contender — and is removed either by its OWNER's release or by EXPLICIT
+//! RECOVERY ([`RemoteHelper::recover_lock`]) after the controller's death is
+//! CONFIRMED. There is NO automatic takeover and NO time anywhere in the
+//! protocol: no lease, no expiry, no clock is consulted (the protocol is
+//! immune to clock skew by construction), and a held lock never becomes
+//! breakable on its own.
+//!
+//! ## Why no automatic takeover (the two rejected designs)
+//!
+//! The previous protocol (automatic lease takeover with client-side expiry)
+//! was neither linearizable nor genuinely fenced:
+//!
+//! * **Not linearizable**: the expiry decision was made by the CONTENDER'S
+//!   clock. With independent skewable clocks, a contender whose clock runs
+//!   fast could break a lease the owner believed was still valid — TWO
+//!   controllers could both hold the lock at once and both mutate.
+//! * **Not genuinely fenced**: the fencing token was only used for
+//!   compare-and-delete on release/break — the actual slot MUTATIONS never
+//!   presented or validated the token, so a superseded owner could still
+//!   mutate.
+//!
+//! The "server-side serialized transitions + persisted epoch + server time"
+//! alternative (every mutation presents and validates the epoch against a
+//! server authority) is NOT implemented here: this codebase's substrate is a
+//! FILESYSTEM with no genuine server — a "server-side" check for the local
+//! transport is just another process's clock, so automatic takeover cannot
+//! be made linearizable on this substrate. Design one is chosen: time
+//! disappears from the protocol entirely (the skew surface vanishes), the
+//! lock is created once and only its owner releases it, and a held lock
+//! changes hands ONLY via explicit recovery under the authoritative local
+//! lock.
+//!
+//! ## The fencing guarantee (precisely)
+//!
+//! What the protocol GUARANTEES:
+//!
+//! * **Create-once mutual exclusion**: the lock is installed by atomic
+//!   create-if-absent; at most ONE claim ever succeeds for a given slot
+//!   generation, so two controllers never both hold the same record. Every
+//!   slot mutation happens only while the mutating controller holds the
+//!   create-once lock.
+//! * **A stale release never displaces a live holder**: release is a
+//!   compare-and-delete against the EXACT record acquired — a release whose
+//!   record no longer matches the on-disk lock (a successor recovered the
+//!   slot) FAILS explicitly and NEVER deletes the successor's lock.
+//! * **Recovery is explicit, evidence-requiring, and epoch-advancing**:
+//!   recovery ([`RemoteHelper::recover_lock`]) is a named operation invoked
+//!   ONLY after the operator CONFIRMS the holding controller died, performed
+//!   WHILE HOLDING the authoritative local application-store lock (a live
+//!   controller always holds it while operating, so recovery under it cannot
+//!   race a live controller). It takes the observed record as its premise
+//!   (read → verify → remove — never a blind overwrite), removes it via
+//!   compare-and-delete (a lock that changed between the read and the remove
+//!   is NEVER removed), and installs the successor with epoch + 1.
+//! * **The epoch never repeats**: the epoch is persisted in the record
+//!   (starts at 1); EVERY recovery writes the broken record's epoch + 1 —
+//!   monotonically increasing per slot — and because the record is
+//!   persisted, a fresh process reading the lock sees the current epoch.
+//!
+//! What the protocol does NOT guarantee (design one deliberately omits
+//! design two's mutation-epoch validation): a superseded controller's slot
+//! MUTATION is not rejected by the lock itself — the mutual exclusion comes
+//! from create-once ownership plus the local-lock serialization of recovery,
+//! not from token-checking every mutation. A controller that lost its lock
+//! to a recovery must not mutate; the protocol prevents it from HOLDING
+//! (its claim is gone, its release is a compare-and-delete mismatch), but a
+//! misbehaving controller could still write. Design two's per-mutation epoch
+//! validation is the documented alternative, rejected above for the
+//! filesystem substrate.
 
 mod mutation;
 mod observed;
@@ -35,7 +111,6 @@ use crate::identity::{BehaviorContract, GenerationId, ReleaseId, ReleaseRecord};
 use crate::remote::layout;
 use crate::remote::transport::{CreateNewVerdict, Remote, RemoveIfVerdict, VerifiedExisting};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 
 #[derive(Clone, Debug, Default)]
 pub struct RemoteStatus {
@@ -56,28 +131,11 @@ pub struct RemoteStatus {
 
 pub struct RemoteHelper<'a> {
     pub(crate) remote: &'a dyn Remote,
-    /// The lease clock: the injectable time source behind every lease
-    /// expiry. Production uses the real wall clock ([`RealClock`], the
-    /// codebase's jiff time source); the lock proptest drives a shared
-    /// deterministic fake so the expiry is testable.
-    clock: Arc<dyn LeaseClock>,
 }
 
 impl<'a> RemoteHelper<'a> {
     pub fn new(remote: &'a dyn Remote) -> Self {
-        RemoteHelper {
-            remote,
-            clock: Arc::new(RealClock),
-        }
-    }
-
-    /// Test seam: build a helper whose lease clock is the supplied shared
-    /// clock (the two-controller lock proptest advances ONE fake clock for
-    /// both controllers). Production code goes through [`Self::new`] and the
-    /// real wall clock.
-    #[cfg(test)]
-    pub(crate) fn with_clock(remote: &'a dyn Remote, clock: Arc<dyn LeaseClock>) -> Self {
-        RemoteHelper { remote, clock }
+        RemoteHelper { remote }
     }
 
     pub fn remote(&self) -> &dyn Remote {
@@ -126,27 +184,35 @@ impl<'a> RemoteHelper<'a> {
         })
     }
 
-    /// Acquire the server mutation lock as a LEASE-CARRYING record (see
-    /// [`LockRecord`] and the module contract on this file). `force`
-    /// overrides a held lock (used only during recovery) — but the override
-    /// is a compare-and-delete BREAK, never a blind overwrite: the lock is
-    /// removed only if it still carries the EXACT record that was read, so a
-    /// valid successor's lock that changed between the read and the delete
-    /// is never removed. Returns the authoritative record now held — a
-    /// caller MUST present the SAME record to [`Self::release_lock`], so a
-    /// stale release can never delete a successor's lock.
+    /// Acquire the server mutation lock as a CREATE-ONCE OWNERSHIP record
+    /// (see [`LockRecord`] and the module contract on this file). The lock
+    /// is installed by atomic create-if-absent: `Created` (I won the race)
+    /// and `AlreadyPresent` with IDENTICAL bytes (the identical retry — my
+    /// own record is already installed) both mean the lock now carries my
+    /// record. A DIFFERENT holder's record FAILS with "held by X (epoch N)"
+    /// — NO automatic break, NO time check, no expiry: a held lock never
+    /// becomes breakable on its own.
+    ///
+    /// `force` breaks a held lock — used ONLY by the recovery path (see
+    /// [`Self::recover_lock`]); the override is a compare-and-delete BREAK,
+    /// never a blind overwrite: the lock is removed only if it still carries
+    /// the EXACT record that was read, so a valid successor's lock that
+    /// changed between the read and the delete is never removed. Returns the
+    /// authoritative record now held — a caller MUST present the SAME record
+    /// to [`Self::release_lock`], so a stale release can never delete a
+    /// successor's lock.
     pub fn acquire_lock(&self, op_id: &str, force: bool) -> Result<LockRecord> {
         let p = &layout::operation_lock();
-        // The FENCING TOKEN of a fresh lock is 1 (the first generation of
-        // the slot); every break/replacement writes the broken record's
-        // token + 1, so tokens are monotonically increasing per slot and a
-        // generation is never re-used.
-        let mut token = 1u64;
-        for _ in 0..ACQUIRE_BREAK_ATTEMPTS {
+        // A FRESH lock's epoch is 1 (the slot's first generation); every
+        // recovery break writes the broken record's epoch + 1, so epochs are
+        // monotonically increasing per slot and a generation is never
+        // re-used (the record is persisted, so a fresh process reading the
+        // lock sees the current epoch).
+        let mut epoch = 1u64;
+        for _ in 0..RECOVERY_BREAK_ATTEMPTS {
             let record = LockRecord {
                 owner: op_id.to_string(),
-                token,
-                expires_at_ms: self.clock.now_ms() + LEASE_DURATION_MS,
+                epoch,
             };
             let bytes = serde_json::to_vec(&record)
                 .map_err(|e| Error::remote(format!("serialize lock record: {e}")))?;
@@ -160,8 +226,8 @@ impl<'a> RemoteHelper<'a> {
             // is the read-the-winner path below, while a METADATA conflict
             // (a directory or symlink where the lock file should be, a mode
             // mismatch, an unreadable entry) is a REAL conflict: the lock is
-            // never silently accepted and the entry is never treated as a
-            // lease record.
+            // never silently accepted and the entry is never treated as an
+            // ownership record.
             match self.remote.try_write_new(p, &bytes)? {
                 CreateNewVerdict::Created | CreateNewVerdict::AlreadyPresent => return Ok(record),
                 CreateNewVerdict::Conflict(VerifiedExisting::ContentMismatch) => {}
@@ -192,40 +258,41 @@ impl<'a> RemoteHelper<'a> {
                 }
             }
             // Already held by a different record: read the winner and decide
-            // — a same-owner retry (the file's record is authoritative),
-            // a VALID foreign lease (fail, the current behavior), or an
-            // EXPIRED lease (break it via compare-and-delete, then retry).
+            // — a same-owner retry (the file's record is authoritative)
+            // converges on it; any other holder is a FAIL (the current
+            // behavior — no automatic break) UNLESS `force` (recovery only)
+            // requests a compare-and-delete break.
             let held = self.remote.read(p)?;
             let held_rec: LockRecord = serde_json::from_slice(&held).map_err(|e| {
                 Error::integrity(format!(
-                    "mutation lock {} is not a lease record: {e}",
+                    "mutation lock {} is not an ownership record: {e}",
                     p.display()
                 ))
             })?;
             if held_rec.owner == op_id {
                 return Ok(held_rec);
             }
-            let expired = held_rec.expires_at_ms <= self.clock.now_ms();
-            if !expired && !force {
+            if !force {
                 return Err(Error::remote(format!(
-                    "remote mutation lock held by '{}' (token {}, lease valid until {}), not '{op_id}'",
-                    held_rec.owner, held_rec.token, held_rec.expires_at_ms
+                    "remote mutation lock held by '{}' (epoch {}), not '{op_id}' — no automatic \
+                     takeover; explicit recovery is required after confirming the holder died",
+                    held_rec.owner, held_rec.epoch
                 )));
             }
-            // BREAK: atomic compare-and-delete of the EXACT record that was
-            // read. A lock that changed between the read and the delete (a
-            // successor's newer generation) is NEVER removed — the break
-            // fails and the loop re-reads. Only a `Removed` verdict frees
-            // the slot and advances our fencing token.
+            // BREAK (recovery only): atomic compare-and-delete of the EXACT
+            // record that was read. A lock that changed between the read and
+            // the delete (a successor's newer generation) is NEVER removed —
+            // the break fails and the loop re-reads. Only a `Removed` verdict
+            // frees the slot and advances our epoch.
             match self.remote.remove_file_if(p, &held)? {
                 RemoveIfVerdict::Removed => {
-                    token = held_rec.token + 1;
+                    epoch = held_rec.epoch + 1;
                 }
                 RemoveIfVerdict::Mismatch | RemoveIfVerdict::Absent => {}
             }
         }
         Err(Error::remote(format!(
-            "remote mutation lock contended beyond {ACQUIRE_BREAK_ATTEMPTS} attempts (slot {})",
+            "remote mutation lock contended beyond {RECOVERY_BREAK_ATTEMPTS} attempts (slot {})",
             p.display()
         )))
     }
@@ -233,13 +300,13 @@ impl<'a> RemoteHelper<'a> {
     /// Release the mutation lock: atomic compare-and-delete with the record
     /// returned by [`Self::acquire_lock`]. The file is removed ONLY if it
     /// still carries EXACTLY this record — a STALE release (the lock now
-    /// belongs to a successor generation, e.g. our lease expired and a
-    /// contender broke and re-acquired it) FAILS explicitly and NEVER
-    /// deletes the successor's lock. An already-absent lock is an idempotent
-    /// success (it was already released, or expired and broken). A release
-    /// failure is an EXPLICIT error — callers never swallow it silently, and
-    /// the LEASE is the backstop: a failed release expires and a contender
-    /// breaks it, so a slot can never block forever.
+    /// belongs to a successor generation, e.g. a recovery re-took the slot)
+    /// FAILS explicitly and NEVER deletes the successor's lock. An
+    /// already-absent lock is an idempotent success (it was already
+    /// released). A release failure is an EXPLICIT error — callers never
+    /// swallow it silently. There is NO lease backstop: a failed release
+    /// leaves the lock HELD until an explicit recovery (the only removal
+    /// besides the owner's own release).
     pub fn release_lock(&self, record: &LockRecord) -> Result<()> {
         let p = &layout::operation_lock();
         let bytes = serde_json::to_vec(record)
@@ -247,8 +314,99 @@ impl<'a> RemoteHelper<'a> {
         match self.remote.remove_file_if(p, &bytes)? {
             RemoveIfVerdict::Removed | RemoveIfVerdict::Absent => Ok(()),
             RemoveIfVerdict::Mismatch => Err(Error::remote(format!(
-                "stale mutation-lock release: the lock no longer carries {}'s record (token {}) — a successor holds it; refusing to delete the successor's lock",
-                record.owner, record.token
+                "stale mutation-lock release: the lock no longer carries {}'s record (epoch {}) — a successor holds it; refusing to delete the successor's lock",
+                record.owner, record.epoch
+            ))),
+        }
+    }
+
+    /// EXPLICIT RECOVERY of a crashed controller's lock — the ONLY way a
+    /// held lock changes hands besides its owner's own release. A fresh
+    /// acquire NEVER takes over a held lock; a held lock remains held until
+    /// this path removes it.
+    ///
+    /// # The recovery contract (explicit, evidence-requiring, serialized)
+    ///
+    /// * **CONFIRMATION**: the caller is an OPERATOR who has CONFIRMED the
+    ///   holding controller is dead — a named, explicit recovery call (or
+    ///   `--recover`-style command), NEVER automatic. The call is performed
+    ///   WHILE HOLDING the controller's authoritative local application-store
+    ///   lock ([`crate::deploy::lock::FileLock`] on the store's
+    ///   `operation.lock`): a LIVE controller always holds that local lock
+    ///   while it operates, so a recovery under it cannot race a live
+    ///   controller on the same store.
+    /// * **THE PREMISE**: `observed` is the record the operator READ (the
+    ///   dead controller's record) — recovery is read → verify → remove,
+    ///   never a blind overwrite. The current on-disk record must be EXACTLY
+    ///   `observed`; a lock that changed (a successor's newer epoch) or is
+    ///   already gone is REFUSED.
+    /// * **THE REMOVE**: compare-and-delete against the EXACT observed
+    ///   bytes — a lock that changed between the verify-read and the delete
+    ///   is NEVER removed.
+    /// * **THE EPOCH ADVANCE**: the successor record carries epoch =
+    ///   `observed.epoch + 1` — strictly greater, monotonically increasing
+    ///   per slot, never reused — and is installed by create-if-absent, so a
+    ///   concurrent fresh acquire in the tiny remove/install window loses the
+    ///   race (the recovery FAILS explicitly rather than overwriting).
+    ///
+    /// Returns the successor record the recovering controller now holds (its
+    /// acquisition — the slot is never left free after a recovery).
+    pub fn recover_lock(&self, observed: &LockRecord, new_owner: &str) -> Result<LockRecord> {
+        let p = &layout::operation_lock();
+        // READ + VERIFY: the recovery premise. The current on-disk record
+        // must be EXACTLY the observed record — a successor's newer epoch
+        // (or genuine absence after a release) is refused; the operator must
+        // re-read and re-confirm.
+        let current = read_lock_record(self.remote, p)?;
+        match &current {
+            None => {
+                return Err(Error::remote(
+                    "no lock to recover: the slot is already free (the observed record is gone) \
+                     — no recovery needed",
+                ));
+            }
+            Some(rec) if rec != observed => {
+                return Err(Error::remote(format!(
+                    "recovery refused: the lock no longer carries the observed record (now held by \
+                     '{}', epoch {}) — a successor's newer epoch is never removed; re-read and \
+                     re-confirm",
+                    rec.owner, rec.epoch
+                )));
+            }
+            Some(_) => {}
+        }
+        // REMOVE: compare-and-delete the EXACT observed record.
+        let bytes = serde_json::to_vec(observed)
+            .map_err(|e| Error::remote(format!("serialize lock record: {e}")))?;
+        match self.remote.remove_file_if(p, &bytes)? {
+            RemoveIfVerdict::Removed => {}
+            RemoveIfVerdict::Mismatch => {
+                return Err(Error::remote(
+                    "recovery race: the lock changed between the verify-read and the remove — a \
+                     successor's newer epoch is never removed; re-read and re-confirm",
+                ));
+            }
+            RemoveIfVerdict::Absent => {
+                return Err(Error::remote(
+                    "the lock vanished during recovery; re-read and re-confirm",
+                ));
+            }
+        }
+        // INSTALL the successor record: epoch = observed.epoch + 1, by
+        // create-if-absent. A concurrent fresh acquire in the window between
+        // the remove and this install wins the race and this install FAILS —
+        // recovery never overwrites; the caller re-reads and re-decides.
+        let record = LockRecord {
+            owner: new_owner.to_string(),
+            epoch: observed.epoch + 1,
+        };
+        let bytes = serde_json::to_vec(&record)
+            .map_err(|e| Error::remote(format!("serialize lock record: {e}")))?;
+        match self.remote.try_write_new(p, &bytes)? {
+            CreateNewVerdict::Created | CreateNewVerdict::AlreadyPresent => Ok(record),
+            CreateNewVerdict::Conflict(reason) => Err(Error::remote(format!(
+                "recovery install contended (a concurrent acquire won the freed slot: {reason:?}); \
+                 re-read and re-confirm"
             ))),
         }
     }
@@ -257,8 +415,9 @@ impl<'a> RemoteHelper<'a> {
     /// on drop, so every return path (including early errors) releases the
     /// lock. Returns an error only if the lock is held by a different
     /// operation. An explicit [`LockGuard::release`] surfaces the release
-    /// outcome; the drop path is best-effort with the lease as the backstop
-    /// (see [`LockGuard`]).
+    /// outcome; the drop path is best-effort — with no lease, a failed
+    /// drop-time release leaves the lock HELD until explicit recovery (see
+    /// [`LockGuard`]).
     pub fn acquire_lock_guard(&self, op_id: &str) -> Result<LockGuard<'_>> {
         let record = self.acquire_lock(op_id, false)?;
         Ok(LockGuard {
@@ -291,13 +450,15 @@ impl<'a> RemoteHelper<'a> {
 /// return path, including early errors). The release is a compare-and-delete
 /// against the record acquired ([`LockGuard::release`] surfaces the outcome
 /// as a `Result`); the drop path cannot return errors, so a drop-time release
-/// failure is never destructive and never permanent — the record's LEASE
-/// expires and a contender's break removes it (the lease is the backstop),
-/// so a failed release can never permanently block the slot. Callers that
-/// need the release outcome call [`LockGuard::release`] explicitly.
+/// failure is never destructive but — with NO LEASE in the protocol — it is
+/// also no longer self-healing: a failed drop-time release leaves the lock
+/// HELD until an EXPLICIT RECOVERY ([`RemoteHelper::recover_lock`]) removes
+/// it. The recovery path is the only removal besides the owner's own
+/// release. Callers that need the release outcome call [`LockGuard::release`]
+/// explicitly.
 pub struct LockGuard<'a> {
     helper: &'a RemoteHelper<'a>,
-    /// The authoritative lock record (owner + fencing token + lease expiry)
+    /// The authoritative lock record (owner + persisted monotonic epoch)
     /// this guard holds; release compares the on-disk lock against EXACTLY
     /// this record, so a stale release can never delete a successor's lock.
     record: LockRecord,
@@ -323,10 +484,11 @@ impl<'a> Drop for LockGuard<'a> {
     fn drop(&mut self) {
         if self.active {
             // Best-effort compare-and-delete; a failure is NOT propagated
-            // (drop cannot return errors) but is also never destructive and
-            // never permanent: the lease expires and a contender breaks it,
-            // so the slot is never blocked forever. Callers that need the
-            // release outcome use the explicit [`LockGuard::release`].
+            // (drop cannot return errors) and is never destructive — but with
+            // no lease the protocol does not self-heal: a failed drop-time
+            // release leaves the lock HELD until an EXPLICIT recovery
+            // ([`RemoteHelper::recover_lock`]) removes it. Callers that need
+            // the release outcome use the explicit [`LockGuard::release`].
             let _ = self.helper.release_lock(&self.record);
         }
     }
@@ -336,97 +498,55 @@ pub fn now_rfc3339() -> String {
     jiff::Timestamp::now().to_string()
 }
 
-/// The lease duration of the per-slot mutation lock: 24 hours. Every
-/// operation the lock guards (finalization, retention, publish) completes in
-/// minutes at most, so a generous lease exceeds any operation by orders of
-/// magnitude and NO heartbeat is needed — the lease exists so a CRASHED
-/// owner's lock eventually becomes breakable (a contender breaks the expired
-/// record via compare-and-delete). A future long-running operation would
-/// renew by re-acquiring; the codebase has none.
-pub(crate) const LEASE_DURATION_MS: i64 = 24 * 60 * 60 * 1000;
-
-/// The bounded retry budget of the acquire break loop. Each iteration either
-/// installs our record, converges (identical retry), fails on a VALID
-/// holder, or breaks EXACTLY ONE expired lock it verified (compare-and-delete
+/// The bounded retry budget of the recovery break loop in
+/// [`RemoteHelper::acquire_lock`] (the `force` path) and the create/install
+/// convergence of the healthy path. Each iteration either installs our
+/// record, converges (identical retry), fails on a DIFFERENT holder, or —
+/// with `force` — breaks EXACTLY ONE record it verified (compare-and-delete
 /// never removes a successor's lock), so progress is guaranteed and the cap
-/// only bounds adversarially-repeated foreign breaks.
-const ACQUIRE_BREAK_ATTEMPTS: usize = 8;
+/// only bounds adversarially-repeated foreign breaks. There is NO automatic
+/// break: a held lock is only ever broken by this explicit recovery path.
+const RECOVERY_BREAK_ATTEMPTS: usize = 8;
 
-/// The on-server mutation-lock record: owner identity, a per-slot FENCING
-/// TOKEN, and the LEASE EXPIRY. The record IS the lock's content — the
-/// compare-and-delete primitive ([`Remote::remove_file_if`]) removes the
-/// file only when its bytes still match, so a stale release can never delete
-/// a successor's lock and an expired-lease break can never remove a newer
-/// generation.
+/// The on-server mutation-lock record: owner identity plus a PERSISTED
+/// MONOTONIC EPOCH (the fencing generation). The record IS the lock's
+/// content — the compare-and-delete primitive ([`Remote::remove_file_if`])
+/// removes the file only when its bytes still match, so a stale release can
+/// never delete a successor's lock and a recovery can never remove a newer
+/// generation. The record is CREATE-ONCE: it is installed by atomic
+/// create-if-absent (a different holder's record fails a contender — no
+/// automatic takeover, no time anywhere) and removed only by its OWNER's
+/// release or by EXPLICIT recovery ([`RemoteHelper::recover_lock`]).
 ///
 /// * `owner` — the operation id holding the lock.
-/// * `token` — the fencing token: a per-slot MONOTONICALLY INCREASING value
-///   identifying the lock's generation (a fresh lock is 1; every
-///   break/replacement writes the broken record's token + 1), so a
-///   generation is never re-used and two different generations always carry
-///   different records.
-/// * `expires_at_ms` — the LEASE EXPIRY in epoch milliseconds (the
-///   [`LeaseClock`]'s units): the lock is VALID until this instant and
-///   BREAKABLE after it.
+/// * `epoch` — the PERSISTED MONOTONIC EPOCH: a per-slot strictly
+///   increasing value identifying the lock's generation (a fresh lock is 1;
+///   every recovery writes the broken record's epoch + 1), so a generation
+///   is never re-used, two different generations always carry different
+///   records, and a fresh process reading the persisted record sees the
+///   current epoch.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LockRecord {
     pub owner: String,
-    pub token: u64,
-    pub expires_at_ms: i64,
+    pub epoch: u64,
 }
 
-/// The lock's time source: an injectable clock so lease expiry is testable.
-/// Production uses the real wall clock ([`RealClock`], the codebase's jiff
-/// time source); the two-controller lock proptest drives one shared
-/// deterministic fake for both controllers.
-pub(crate) trait LeaseClock: Send + Sync {
-    /// Current time in epoch milliseconds.
-    fn now_ms(&self) -> i64;
-}
-
-/// The production clock: jiff's wall clock, the codebase's time source.
-pub(crate) struct RealClock;
-
-impl LeaseClock for RealClock {
-    fn now_ms(&self) -> i64 {
-        jiff::Timestamp::now().as_millisecond()
-    }
-}
-
-/// A deterministic clock whose time a test can advance (the lease expiry
-/// seam of the lock proptest). Starts at a fixed epoch; advances only via
-/// [`Self::advance`]/[`Self::set`]; shared by both controllers so they
-/// observe ONE timeline.
-#[cfg(test)]
-pub(crate) struct FakeClock {
-    now_ms: std::sync::atomic::AtomicI64,
-}
-
-#[cfg(test)]
-impl FakeClock {
-    pub(crate) fn new(start_ms: i64) -> Self {
-        Self {
-            now_ms: std::sync::atomic::AtomicI64::new(start_ms),
-        }
-    }
-
-    /// Advance the clock by `ms` (a lease expires once `now` passes it).
-    pub(crate) fn advance(&self, ms: i64) {
-        self.now_ms
-            .fetch_add(ms, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Read the current fake time (epoch milliseconds).
-    pub(crate) fn read(&self) -> i64 {
-        self.now_ms.load(std::sync::atomic::Ordering::Relaxed)
-    }
-}
-
-#[cfg(test)]
-impl LeaseClock for FakeClock {
-    fn now_ms(&self) -> i64 {
-        self.read()
-    }
+/// Read the current on-disk lock record (typed absence probe first): `None`
+/// for genuine absence, the parsed record otherwise, `Err` for a transport
+/// fault or a present-but-not-a-record file. The typed `metadata_opt` probe
+/// means a failed read is NEVER indistinguishable from absence.
+fn read_lock_record(remote: &dyn Remote, p: &std::path::Path) -> Result<Option<LockRecord>> {
+    let Some(_) = remote.metadata_opt(p)? else {
+        return Ok(None);
+    };
+    let data = remote.read(p)?;
+    let rec: LockRecord = serde_json::from_slice(&data).map_err(|e| {
+        Error::integrity(format!(
+            "mutation lock {} is not an ownership record: {e}",
+            p.display()
+        ))
+    })?;
+    Ok(Some(rec))
 }
 
 #[cfg(test)]
@@ -463,7 +583,10 @@ mod tests {
         // After the guard dropped, the lock file is gone and another
         // operation can acquire the lock.
         assert!(
-            !remote.exists(&layout::operation_lock()),
+            remote
+                .metadata_opt(&layout::operation_lock())
+                .unwrap()
+                .is_none(),
             "the lock file must be removed on drop"
         );
         assert!(
@@ -472,31 +595,28 @@ mod tests {
         );
     }
 
-    /// The lease protocol's healthy round trip: a fresh acquire installs a
-    /// record carrying the owner's identity, fencing token 1, and a lease
-    /// expiry in the future; a VALID lease blocks a contender; a release
-    /// with the SAME record removes it (atomic compare-and-delete); and the
-    /// next generation restarts the fencing token.
+    /// The create-once protocol's healthy round trip: a fresh acquire
+    /// installs a record carrying the owner's identity and epoch 1; a
+    /// DIFFERENT holder's record blocks a contender (no automatic takeover —
+    /// a fresh acquire on a held lock FAILS no matter what); a release with
+    /// the SAME record removes it (atomic compare-and-delete); and the next
+    /// generation of a FREE slot restarts the epoch at 1.
     #[test]
-    fn lease_acquire_release_round_trip() {
+    fn acquire_release_round_trip() {
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
-        let clock = Arc::new(FakeClock::new(1_700_000_000_000));
         let remote =
             LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
                 .unwrap();
-        let helper = RemoteHelper::with_clock(&remote, clock.clone());
+        let helper = RemoteHelper::new(&remote);
 
         let record = helper.acquire_lock("op-1", false).unwrap();
         assert_eq!(record.owner, "op-1");
-        assert_eq!(record.token, 1, "a fresh lock's fencing token starts at 1");
-        assert!(
-            record.expires_at_ms > clock.read(),
-            "the lease must expire in the future"
-        );
-        // A VALID lease blocks a different operation (the current behavior).
+        assert_eq!(record.epoch, 1, "a fresh lock's epoch starts at 1");
+        // A DIFFERENT holder's record blocks a contender — NO automatic
+        // takeover: the lock never becomes breakable on its own.
         assert!(
             helper.acquire_lock("op-2", false).is_err(),
-            "a valid foreign lease must block a contender"
+            "a held lock must block a contender (no automatic takeover)"
         );
         // Release with the same record: compare-and-delete removes the lock.
         helper.release_lock(&record).unwrap();
@@ -507,40 +627,68 @@ mod tests {
                 .is_none(),
             "the lock must be removed by the release"
         );
-        // The slot is free again; the next generation restarts the token.
+        // The slot is free again; the next generation of the free slot
+        // restarts the epoch.
         let r2 = helper.acquire_lock("op-2", false).unwrap();
-        assert_eq!(r2.token, 1);
+        assert_eq!(r2.epoch, 1);
         helper.release_lock(&r2).unwrap();
     }
 
-    /// THE core lease/fencing property: A acquires (token 1), its lease
-    /// expires; B BREAKS it (token 2 — the successor fencing token) and
-    /// holds; A's DELAYED release then FAILS (compare-and-delete mismatch —
-    /// an explicit stale-release error) and B's lock survives byte-for-byte;
-    /// the slot is never blocked forever.
+    /// THE core no-takeover/fencing property: A acquires (epoch 1) and never
+    /// releases (a crash); B's fresh acquire FAILS (no automatic takeover —
+    /// the lock is not breakable on its own); B's EXPLICIT recovery — under
+    /// the authoritative local lock, taking A's observed record as its
+    /// premise — removes A's record and installs B's successor record with
+    /// epoch 2; A's DELAYED release then FAILS (compare-and-delete mismatch —
+    /// an explicit stale-release error) and B's lock survives byte-for-byte.
     #[test]
-    fn expired_lease_break_and_stale_release_preserves_successor() {
+    fn crash_then_recover_and_stale_release_preserves_successor() {
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
-        let clock = Arc::new(FakeClock::new(1_700_000_000_000));
         let remote =
             LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
                 .unwrap();
-        let helper_a = RemoteHelper::with_clock(&remote, clock.clone());
-        let helper_b = RemoteHelper::with_clock(&remote, clock.clone());
+        let helper_a = RemoteHelper::new(&remote);
+        let helper_b = RemoteHelper::new(&remote);
 
         let a = helper_a.acquire_lock("A", false).unwrap();
-        assert_eq!(a.token, 1);
-        // B cannot take the lock while A's lease is valid.
+        assert_eq!(a.epoch, 1);
+        // B cannot take the lock while A holds it — no matter what: no
+        // expiry, no automatic break.
         assert!(helper_b.acquire_lock("B", false).is_err());
-        // A's lease expires...
-        clock.advance(LEASE_DURATION_MS + 1);
-        // ...and B BREAKS the expired record (compare-and-delete), writing
-        // the successor fencing token.
-        let b = helper_b.acquire_lock("B", false).unwrap();
+        // A "crashes" (its lock stays in place — no release). The lock is
+        // held forever until explicit recovery: B's fresh acquire still
+        // fails even with `force: false` obviously, and there is no time
+        // that would ever make it succeed on its own.
+        assert!(
+            helper_b.acquire_lock("B", false).is_err(),
+            "a crashed owner's lock is held until explicit recovery"
+        );
+        // EXPLICIT RECOVERY under the authoritative local application-store
+        // lock (a live controller always holds it while operating, so a
+        // recovery under it cannot race a live controller): the operator
+        // confirms A died and calls the named recovery with A's OBSERVED
+        // record as the premise. The successor record advances the epoch.
+        let store_dir = dir.path().join("store");
+        let _local_guard = crate::deploy::lock::FileLock::acquire(
+            &store_dir.join("operation.lock"),
+            "recovery-op",
+        )
+        .expect("the authoritative local lock must be acquirable");
+        let b = helper_b
+            .recover_lock(&a, "B")
+            .expect("explicit recovery of the confirmed-dead controller succeeds");
         assert_eq!(
-            b.token,
-            a.token + 1,
-            "a break must write the successor fencing token"
+            b.epoch,
+            a.epoch + 1,
+            "a recovery must write the broken record's epoch + 1 (strictly greater)"
+        );
+        assert_eq!(b.owner, "B");
+        assert!(
+            remote
+                .metadata_opt(&layout::operation_lock())
+                .unwrap()
+                .is_some(),
+            "the successor record must be installed by the recovery"
         );
         // A's DELAYED release: the lock no longer carries A's record — the
         // compare-and-delete mismatches, the release FAILS explicitly, and
@@ -569,26 +717,86 @@ mod tests {
         );
     }
 
+    /// Recovery is evidence-requiring (read → verify → remove, never a blind
+    /// overwrite): recovering with a STALE observed record (a successor
+    /// already recovered the slot) is REFUSED and the successor's newer-epoch
+    /// lock survives byte-for-byte.
+    #[test]
+    fn recovery_with_stale_observed_record_refuses_and_preserves_successor() {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let remote =
+            LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
+                .unwrap();
+        let helper_a = RemoteHelper::new(&remote);
+        let helper_b = RemoteHelper::new(&remote);
+        let helper_c = RemoteHelper::new(&remote);
+
+        // A acquires (epoch 1) and crashes.
+        let a = helper_a.acquire_lock("A", false).unwrap();
+        // B recovers the slot: epoch advances to 2.
+        let b = helper_b.recover_lock(&a, "B").unwrap();
+        assert_eq!(b.epoch, 2);
+        // C tries to recover the slot with A's OLD observed record (stale —
+        // the slot now carries B's epoch-2 record): REFUSED, and B's lock
+        // survives byte-for-byte.
+        let err = helper_c
+            .recover_lock(&a, "C")
+            .expect_err("a recovery with a stale observed record must be refused");
+        assert!(
+            err.to_string().contains("recovery refused"),
+            "the failure must name the refusal, got: {err}"
+        );
+        let held = remote.read(&layout::operation_lock()).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<LockRecord>(&held).unwrap(),
+            b,
+            "the successor's newer-epoch lock must survive a refused recovery byte-for-byte"
+        );
+        // Recovery with the CURRENT observed record succeeds: epoch advances
+        // to 3 (monotonic, never reused).
+        let c = helper_c.recover_lock(&b, "C").unwrap();
+        assert_eq!(c.epoch, 3, "recoveries advance the epoch monotonically");
+        helper_c.release_lock(&c).unwrap();
+    }
+
+    /// Recovery of an ALREADY-FREE slot is refused (the premise — a dead
+    /// controller's record — no longer holds; the operator re-reads and
+    /// re-confirms, and a fresh acquire proceeds directly).
+    #[test]
+    fn recovery_of_a_free_slot_is_refused() {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let remote =
+            LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
+                .unwrap();
+        let helper = RemoteHelper::new(&remote);
+
+        let record = helper.acquire_lock("op-1", false).unwrap();
+        helper.release_lock(&record).unwrap();
+        let err = helper
+            .recover_lock(&record, "op-2")
+            .expect_err("recovering a free slot must be refused");
+        assert!(err.to_string().contains("already free"));
+        // A fresh acquire proceeds directly (create-once on the free slot).
+        assert!(helper.acquire_lock("op-2", false).is_ok());
+    }
+
     /// The compare-and-delete release is record-exact: releasing with a
-    /// DIFFERENT record (a foreign token or owner) is a Mismatch — an
+    /// DIFFERENT record (a foreign epoch or owner) is a Mismatch — an
     /// explicit error that never touches the current lock.
     #[test]
     fn release_with_foreign_record_fails_without_touching_lock() {
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
-        let clock = Arc::new(FakeClock::new(1_700_000_000_000));
         let remote =
             LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
                 .unwrap();
-        let helper = RemoteHelper::with_clock(&remote, clock.clone());
+        let helper = RemoteHelper::new(&remote);
 
         let held = helper.acquire_lock("op-1", false).unwrap();
-        // A fabricated record with the same owner but a WRONG token (and an
-        // already-expired lease): the release must fail as stale and the
-        // real lock must survive.
+        // A fabricated record with the same owner but a WRONG epoch: the
+        // release must fail as stale and the real lock must survive.
         let forged = LockRecord {
             owner: "op-1".to_string(),
-            token: held.token + 42,
-            expires_at_ms: 0,
+            epoch: held.epoch + 42,
         };
         let err = helper
             .release_lock(&forged)

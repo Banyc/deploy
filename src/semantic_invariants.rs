@@ -82,9 +82,7 @@ use crate::ledger;
 use crate::ledger::DeploymentStatus;
 use crate::ledger::LedgerEntry;
 use crate::ledger::SlotOutcomeKind;
-use crate::remote::helper::{
-    FakeClock, GenerationAssignment, LEASE_DURATION_MS, LockRecord, RemoteHelper,
-};
+use crate::remote::helper::{GenerationAssignment, LockRecord, RemoteHelper};
 use crate::remote::layout;
 use crate::remote::transport::{
     CreateNewVerdict, ExecOutcome, FsBytes, LocalTransport, Remote, RemoteEntry, RemoteMeta,
@@ -7123,89 +7121,118 @@ proptest! {
 }
 
 // ---------------------------------------------------------------------------
-// Two-controller mutation-lock lease/fencing proptest
+// Three-controller mutation-lock no-takeover proptest
 // ---------------------------------------------------------------------------
 //
-// The per-slot mutation lock is a LEASE-carrying record (owner + fencing
-// token + expiry) removed only by atomic compare-and-delete. This property
-// drives a TWO-CONTROLLER state machine over ONE slot with one-shot faults
-// injected at the four seams — acquire (try_write_new), read (winner read),
-// remove (compare-and-delete), drop (the RAII drop release) — and a
-// deterministic fake clock shared by both controllers so lease expiry is
-// testable. After EVERY step it asserts:
+// The per-slot mutation lock is a CREATE-ONCE OWNERSHIP record (owner + a
+// PERSISTED MONOTONIC EPOCH) removed only by atomic compare-and-delete.
+// There is NO automatic takeover and NO TIME anywhere in the protocol: no
+// lease, no expiry, no clock is consulted — a held lock never becomes
+// breakable on its own; it changes hands only via EXPLICIT RECOVERY (read →
+// verify → remove under the authoritative local lock, writing the successor
+// epoch = broken epoch + 1). This property drives a THREE-CONTROLLER state
+// machine over ONE slot with three INDEPENDENTLY SKEWABLE clocks (generated
+// and freely skewed — the protocol must be IMMUNE to them, asserted
+// explicitly: the same steps are run under the generated skews and under
+// zero skews, and the outcome TRACES must be IDENTICAL) and one-shot faults
+// injected at every step — claim (create-if-absent), read (observe the
+// record), compare (the release-vs-recovery decision), restore (the
+// compare-and-delete release), mutate (a slot mutation under the lock),
+// recover (the explicit recovery's compare-and-delete). After EVERY step it
+// asserts:
 //
-// * MUTUAL EXCLUSION: at no point do two controllers hold the same slot's
-//   lock with a VALID lease — a holder's lease may EXPIRE (the expiry is
-//   what makes the slot recoverable), but two valid holdings never overlap;
-//   and a present valid-lease record is held by EXACTLY one controller.
-// * STALE RELEASES CANNOT DELETE SUCCESSOR LOCKS: a release that FAILS
+// * AT MOST ONE EPOCH CAN MUTATE: never two controllers holding the slot
+//   simultaneously — the create-once invariant: at most one `claim`
+//   succeeds (claims are atomic create-if-absent; a held lock fails a
+//   contender, with no automatic break), and a mutation happens only under
+//   a successful claim (the mutation marker is written only by the current
+//   holder and carries the on-disk record's owner + epoch; a superseded
+//   controller's mutate is REFUSED).
+// * EPOCH NEVER REPEATS: every successful recovery writes the removed
+//   record's epoch + 1 (strictly greater); recovery-installed epochs are
+//   STRICTLY INCREASING over the whole run; and a claim (epoch 1) only ever
+//   installs on a genuinely ABSENT slot — a crashed-and-recovered slot never
+//   reuses an epoch (the epoch is persisted in the record and a recovery
+//   installs its successor before returning).
+// * A STALE RELEASE NEVER DISPLACES A LIVE HOLDER: a release that FAILS
 //   (compare-and-delete mismatch or transport fault) never leaves the file
-//   absent — the current lock (a successor's record, or our own record that
-//   the failed release could not remove) survives the failed release.
-// * CRASHED OWNERS EVENTUALLY BECOME RECOVERABLE: whenever the lock holds an
-//   EXPIRED record, a fresh contender's acquire always succeeds (the break
-//   removes the expired record via compare-and-delete) — a crash or a
-//   failed drop-time release leaves a lease that expires and is broken, so
-//   the slot never blocks forever (also asserted at end of run with all
-//   leases expired).
+//   absent and never alters it — the live holder's lock survives
+//   byte-for-byte (asserted by comparing the on-disk record before and
+//   after the failed release).
 
-/// One step of the two-controller lock state machine: which controller acts
-/// (0 or 1) and what it does. `Acquire` takes the lock; `Release` releases
-/// explicitly (surfacing the outcome); `Drop` releases via the RAII drop
-/// path (best-effort — the outcome is swallowed, exactly like
-/// [`LockGuard`](crate::remote::helper::LockGuard)'s Drop); `Crash`
-/// abandons the lock WITHOUT any release (the owner dies; the lease is the
-/// only backstop — the controller may still act later, e.g. its DELAYED
-/// release arriving after a successor took the lock); `Advance` moves the
-/// shared fake clock (a lease expires once `now` passes it).
+/// One step of the three-controller lock state machine: which controller
+/// acts (0, 1, or 2) and what it does. `Claim` tries to take the lock
+/// (atomic create-if-absent — the only way a record is installed on a free
+/// slot); `Read` observes the on-disk record (interruptible); `Compare`
+/// decides whether the controller's held record still IS the on-disk record
+/// (release is safe) or was superseded by a recovery (recovery is required);
+/// `Restore` releases explicitly (compare-and-delete — a stale release
+/// fails and never displaces a successor); `Mutate` performs a slot
+/// mutation under the lock (only the current holder may); `Recover` performs
+/// EXPLICIT recovery of the record the controller observed, under the
+/// authoritative local lock, taking the observed record as its premise
+/// (read → verify → remove → install epoch + 1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LockAction {
-    Acquire(u8),
-    Release(u8),
-    Drop(u8),
-    Crash(u8),
-    Advance(i64),
+enum CtrlAction {
+    Claim(u8),
+    Read(u8),
+    Compare(u8),
+    Restore(u8),
+    Mutate(u8),
+    Recover(u8),
 }
 
-/// The four fault seams of the state machine: a one-shot fault armed at the
-/// named stage of the NEXT action. `Acquire` fails the atomic create
-/// (try_write_new), `Read` fails the winner read, `Remove` fails the
-/// compare-and-delete, and `Drop` fails the drop-time release (the release
-/// fails and the LEASE must be the backstop — the slot stays recoverable).
+/// The one-shot fault seams of the state machine: a fault armed at the named
+/// stage of the NEXT action. `Claim` fails the atomic create (try_write_new),
+/// `Read` fails the record read, `Compare` fails the record read behind the
+/// release-vs-recovery decision, `Restore` fails the compare-and-delete
+/// release, `Mutate` fails the slot-mutation write, and `Recover` fails the
+/// recovery's compare-and-delete.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LockFault {
+enum CtrlFault {
     None,
-    Acquire,
+    Claim,
     Read,
-    Remove,
-    Drop,
+    Compare,
+    Restore,
+    Mutate,
+    Recover,
 }
 
 /// The one-shot fault registry shared by the fault-injecting transport.
 #[derive(Default)]
-struct LockFaultState {
-    fail_acquire: bool,
+struct CtrlFaultState {
+    fail_claim: bool,
     fail_read: bool,
     fail_remove: bool,
+    fail_mutate: bool,
+}
+
+/// The on-remote path of the slot-mutation probe: a mutation marker the
+/// Mutate step writes UNDER the lock, tagged with the holder's record. The
+/// probe is a real remote write (faultable at the `Mutate` seam) and the
+/// test asserts it always carries the on-disk record's owner + epoch.
+fn mutation_probe() -> PathBuf {
+    Path::new("state").join("mutation.probe")
 }
 
 /// A transport that injects ONE-SHOT faults at the mutation lock's
-/// acquire/read/remove seams, then passes through to `LocalTransport` (which
-/// realizes the atomic compare-and-delete). Deterministic, no sleeps; a
-/// fault is consumed by the FIRST matching operation, so it can never leak
-/// into a later step.
-struct LockFaultRemote {
+/// claim/read/remove seams and the slot-mutation write seam, then passes
+/// through to `LocalTransport` (which realizes the atomic create-if-absent
+/// and compare-and-delete). Deterministic, no sleeps; a fault is consumed by
+/// the FIRST matching operation, so it can never leak into a later step.
+struct CtrlFaultRemote {
     inner: LocalTransport,
-    faults: Arc<Mutex<LockFaultState>>,
+    faults: Arc<Mutex<CtrlFaultState>>,
 }
 
-impl LockFaultRemote {
+impl CtrlFaultRemote {
     fn hits_lock(rel: &Path) -> bool {
         rel == layout::operation_lock()
     }
 }
 
-impl Remote for LockFaultRemote {
+impl Remote for CtrlFaultRemote {
     fn root(&self) -> &Path {
         self.inner.root()
     }
@@ -7219,13 +7246,19 @@ impl Remote for LockFaultRemote {
         self.inner.read(rel)
     }
     fn write(&self, rel: &Path, data: &[u8], mode: u32) -> crate::error::Result<()> {
+        if rel == mutation_probe() && self.faults.lock().unwrap().fail_mutate {
+            self.faults.lock().unwrap().fail_mutate = false;
+            return Err(crate::error::Error::transport(
+                "injected mutation write failure".to_string(),
+            ));
+        }
         self.inner.write(rel, data, mode)
     }
     fn try_write_new(&self, rel: &Path, data: &[u8]) -> crate::error::Result<CreateNewVerdict> {
-        if Self::hits_lock(rel) && self.faults.lock().unwrap().fail_acquire {
-            self.faults.lock().unwrap().fail_acquire = false;
+        if Self::hits_lock(rel) && self.faults.lock().unwrap().fail_claim {
+            self.faults.lock().unwrap().fail_claim = false;
             return Err(crate::error::Error::transport(
-                "injected lock acquire failure".to_string(),
+                "injected lock claim failure".to_string(),
             ));
         }
         self.inner.try_write_new(rel, data)
@@ -7292,222 +7325,448 @@ impl Remote for LockFaultRemote {
 }
 
 fn controller_op(c: u8) -> &'static str {
-    if c == 0 { "ctrl-A" } else { "ctrl-B" }
-}
-
-/// The current on-disk lock record (typed): `None` for genuine absence, the
-/// parsed record otherwise. The lock file is ONLY ever written by this
-/// protocol (a valid record), so a parse failure is a test bug — panic.
-fn read_lock_record(remote: &dyn Remote) -> Option<LockRecord> {
-    match remote
-        .metadata_opt(&layout::operation_lock())
-        .expect("lock metadata_opt must succeed")
-    {
-        None => None,
-        Some(_) => {
-            let data = remote
-                .read(&layout::operation_lock())
-                .expect("lock read must succeed");
-            Some(serde_json::from_slice(&data).expect("the lock file must carry a lease record"))
-        }
+    match c {
+        0 => "ctrl-A",
+        1 => "ctrl-B",
+        _ => "ctrl-C",
     }
 }
 
-/// One bounded case of the two-controller lock state machine: apply each
-/// (action, fault) step and assert the three invariants after every step.
-fn run_lock_state_case(
-    steps: Vec<(LockAction, LockFault)>,
-) -> std::result::Result<(), proptest::test_runner::TestCaseError> {
+/// The current on-disk lock record (typed): `Ok(None)` for genuine absence,
+/// `Ok(Some(rec))` for the parsed record, `Err` for a transport fault (the
+/// one-shot read fault lands here — the action handles it) or a
+/// present-but-not-a-record file (a test bug). The lock file is ONLY ever
+/// written by this protocol, so a parse failure is a test bug — panic.
+fn read_lock_record(remote: &dyn Remote) -> crate::error::Result<Option<LockRecord>> {
+    let Some(_) = remote.metadata_opt(&layout::operation_lock())? else {
+        return Ok(None);
+    };
+    let data = remote.read(&layout::operation_lock())?;
+    Ok(Some(
+        serde_json::from_slice(&data).expect("the lock file must carry an ownership record"),
+    ))
+}
+
+/// One bounded case of the three-controller lock state machine: apply each
+/// (action, fault) step and assert the invariants after every step, returning
+/// the OUTCOME TRACE (one event per step). `_skews` are the three controllers'
+/// independently skewable clocks — DELIBERATELY NOT CONSULTED anywhere: the
+/// protocol is time-free, so the trace is identical for every clock
+/// assignment (the property runs the same steps under the generated skews
+/// and under zero skews and asserts the traces match).
+fn run_three_controller_case(
+    steps: Vec<(CtrlAction, CtrlFault)>,
+    _skews: [i64; 3],
+) -> std::result::Result<Vec<String>, proptest::test_runner::TestCaseError> {
     let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
-    // A fixed epoch start: both controllers share ONE deterministic timeline.
-    let clock = Arc::new(FakeClock::new(1_700_000_000_000));
     let inner =
         LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote")).unwrap();
-    let faults = Arc::new(Mutex::new(LockFaultState::default()));
-    let remote = LockFaultRemote {
+    let faults = Arc::new(Mutex::new(CtrlFaultState::default()));
+    let remote = CtrlFaultRemote {
         inner,
         faults: faults.clone(),
     };
-    let helper_a = RemoteHelper::with_clock(&remote, clock.clone());
-    let helper_b = RemoteHelper::with_clock(&remote, clock.clone());
-    let mut a_held: Option<LockRecord> = None;
-    let mut b_held: Option<LockRecord> = None;
+    let helpers = [
+        RemoteHelper::new(&remote),
+        RemoteHelper::new(&remote),
+        RemoteHelper::new(&remote),
+    ];
+    // Per-controller state: `held` is the record the controller believes it
+    // holds (its live claim / recovery result); `observed` is the last record
+    // it READ — the premise a later explicit recovery takes.
+    let mut helds: [Option<LockRecord>; 3] = [None, None, None];
+    let mut observed: [Option<LockRecord>; 3] = [None, None, None];
+    // The EPOCH CHAINS: each continuous-holding window of the slot (the
+    // period during which the slot is never absent) is one chain — a fresh
+    // claim opens a chain at epoch 1, every successful recovery advances it
+    // by exactly +1, and a release closes it (the next claim starts a NEW
+    // chain at 1). The persisted-monotonicity invariant: within every chain
+    // the epoch sequence is STRICTLY INCREASING — a crashed-and-recovered
+    // slot never reuses an epoch (asserted over the whole run).
+    let mut chains: Vec<Vec<u64>> = Vec::new();
+    let mut current_chain: Vec<u64> = Vec::new();
+    let mut trace: Vec<String> = Vec::new();
 
     for (action, fault) in steps {
-        // Arm the step's one-shot fault at the named seam (Drop and Remove
-        // both fault the compare-and-delete; Drop's release is additionally
-        // swallowed by the action below).
+        // Arm the step's one-shot fault at the named seam. A fault names the
+        // SEAM it targets, so it fires only on the action that uses that seam:
+        // `Claim` on claim (try_write_new), `Read`/`Compare` on the record
+        // read, `Restore`/`Recover` on the compare-and-delete, `Mutate` on
+        // the slot-mutation write. A mismatched (action, fault) pair is a
+        // clean step (the fault has no seam to hit).
         {
             let mut f = faults.lock().unwrap();
-            f.fail_acquire = fault == LockFault::Acquire;
-            f.fail_read = fault == LockFault::Read;
-            f.fail_remove = fault == LockFault::Remove || fault == LockFault::Drop;
+            f.fail_claim = matches!(action, CtrlAction::Claim(_)) && fault == CtrlFault::Claim;
+            f.fail_read = matches!(action, CtrlAction::Read(_) | CtrlAction::Compare(_))
+                && (fault == CtrlFault::Read || fault == CtrlFault::Compare);
+            f.fail_remove = matches!(action, CtrlAction::Restore(_) | CtrlAction::Recover(_))
+                && (fault == CtrlFault::Restore || fault == CtrlFault::Recover);
+            f.fail_mutate = matches!(action, CtrlAction::Mutate(_)) && fault == CtrlFault::Mutate;
         }
 
         match action {
-            LockAction::Acquire(c) => {
-                let helper = if c == 0 { &helper_a } else { &helper_b };
-                let held = if c == 0 { &mut a_held } else { &mut b_held };
-                // A successful acquire installs (or converges on) OUR
-                // record: the belief is the record returned (the file's
-                // authoritative record for a same-owner retry). A failed
-                // acquire (fault, or a VALID foreign holder) changes
-                // nothing: the belief survives.
-                if let Ok(rec) = helper.acquire_lock(controller_op(c), false) {
-                    *held = Some(rec);
+            CtrlAction::Claim(c) => {
+                let helper = &helpers[c as usize];
+                let held = &mut helds[c as usize];
+                // No read fault is armed for Claim (the claim seam is
+                // try_write_new), so this pre-read cannot fault.
+                let before = read_lock_record(&remote)
+                    .expect("a claim's pre-read cannot be faulted (no read fault armed for Claim)");
+                observed[c as usize] = before.clone();
+                match helper.acquire_lock(controller_op(c), false) {
+                    Ok(rec) => {
+                        if before.is_none() {
+                            // A fresh install: create-once writes epoch 1 on
+                            // a genuinely absent slot.
+                            prop_assert_eq!(
+                                rec.epoch,
+                                1,
+                                "a fresh claim must write epoch 1, got {:?}",
+                                rec
+                            );
+                        } else {
+                            // The slot was already present: the only way the
+                            // claim succeeds is the IDENTICAL-RETRY — our own
+                            // record is already installed (we still hold it).
+                            prop_assert!(
+                                held.as_ref() == Some(&rec),
+                                "a claim on a present slot must converge only on our own record, \
+                                 got held {held:?}, on-disk {before:?}, returned {rec:?}"
+                            );
+                        }
+                        *held = Some(rec.clone());
+                        observed[c as usize] = Some(rec.clone());
+                        trace.push(format!("claim:{c}:ok:e{}", rec.epoch));
+                    }
+                    Err(_) => {
+                        // A failed claim (a DIFFERENT holder's record — no
+                        // automatic takeover — or a one-shot fault) changes
+                        // nothing.
+                        trace.push(format!("claim:{c}:fail"));
+                    }
                 }
             }
-            LockAction::Release(c) => {
-                let helper = if c == 0 { &helper_a } else { &helper_b };
-                let held = if c == 0 { &mut a_held } else { &mut b_held };
+            CtrlAction::Read(c) => {
+                // Interruptible observation: the one-shot read fault lands
+                // here — the controller observes NOTHING (its belief is
+                // unchanged) and the step records the fault.
+                match read_lock_record(&remote) {
+                    Ok(file) => {
+                        observed[c as usize] = file.clone();
+                        trace.push(format!("read:{c}:{:?}", file.as_ref().map(|r| r.epoch)));
+                    }
+                    Err(_) => trace.push(format!("read:{c}:fault")),
+                }
+            }
+            CtrlAction::Compare(c) => {
+                // The release-vs-recovery decision. Interruptible: the read
+                // fault lands here — the decision is not made, the belief is
+                // unchanged.
+                match read_lock_record(&remote) {
+                    Ok(file) => {
+                        observed[c as usize] = file.clone();
+                        let held = &helds[c as usize];
+                        // Our held record still IS the on-disk record
+                        // (restore is safe), a DIFFERENT record is present
+                        // (we were superseded by a recovery — recovery is
+                        // required), or the slot is free.
+                        let decision = match (held.as_ref(), file.as_ref()) {
+                            (Some(rec), Some(disk)) if rec == disk => "held",
+                            (Some(_), Some(_)) => "superseded",
+                            (Some(_), None) => "free",
+                            (None, _) => "no-hold",
+                        };
+                        trace.push(format!("compare:{c}:{decision}"));
+                    }
+                    Err(_) => trace.push(format!("compare:{c}:fault")),
+                }
+            }
+            CtrlAction::Restore(c) => {
+                let helper = &helpers[c as usize];
+                let held = &mut helds[c as usize];
                 if let Some(rec) = held.take() {
+                    // No read fault is armed for Restore (the seam is the
+                    // compare-and-delete), so these reads cannot fault.
+                    let before = read_lock_record(&remote)
+                        .expect("a restore's pre-read cannot be faulted (no read fault armed)");
                     match helper.release_lock(&rec) {
-                        Ok(()) => {}
-                        Err(e) => {
-                            // A FAILED release never deleted the current
-                            // lock: the file must still carry SOME record —
-                            // our own (a transport fault, the lease is the
-                            // backstop) or a SUCCESSOR's (a stale release:
-                            // compare-and-delete refused to delete it). The
-                            // successor's lock survives.
-                            let file = read_lock_record(&remote);
+                        Ok(()) => {
+                            // The compare-and-delete matched our record: the
+                            // slot is now free (our own release).
+                            observed[c as usize] = None;
+                            trace.push(format!("restore:{c}:ok"));
+                        }
+                        Err(_) => {
+                            // A FAILED release never displaces a live holder:
+                            // the on-disk record is UNCHANGED (byte-for-byte)
+                            // and still present — our own record (a transport
+                            // fault; we still hold) or a SUCCESSOR's record
+                            // (a stale release: compare-and-delete refused to
+                            // delete it — the live holder survives).
+                            let file = read_lock_record(&remote)
+                                .expect("the post-failure read cannot be faulted");
                             prop_assert!(
                                 file.is_some(),
                                 "a failed release must never delete the current lock (stale \
-                                 release {rec:?} failed: {e})"
+                                 release {rec:?})"
                             );
-                            // Re-derive the belief: if the file still carries
-                            // our record, the release failed mid-way and we
-                            // STILL hold (until the lease expires); otherwise
-                            // the lock passed to a successor and we no longer
-                            // hold.
+                            prop_assert!(
+                                before == file,
+                                "a failed release must never alter the on-disk record: before \
+                                 {before:?}, after {file:?}"
+                            );
                             if file.as_ref() == Some(&rec) {
+                                // The release failed mid-way: we still hold.
                                 *held = Some(rec);
                             }
+                            trace.push(format!("restore:{c}:fail"));
                         }
                     }
+                } else {
+                    trace.push(format!("restore:{c}:no-hold"));
                 }
             }
-            LockAction::Drop(c) => {
-                // The RAII drop path: release best-effort, outcome swallowed
-                // (exactly like LockGuard's Drop). If the release fails (the
-                // Drop fault), our record stays and the LEASE is the
-                // backstop — asserted by the recoverability probe below.
-                let helper = if c == 0 { &helper_a } else { &helper_b };
-                let held = if c == 0 { &mut a_held } else { &mut b_held };
-                if let Some(rec) = held.take() {
-                    let _ = helper.release_lock(&rec);
-                    if read_lock_record(&remote).as_ref() == Some(&rec) {
-                        // The drop-time release failed: we still hold (the
-                        // record is in the file with its lease) until the
-                        // lease expires and a contender breaks it.
-                        *held = Some(rec);
+            CtrlAction::Mutate(c) => {
+                let helper = &helpers[c as usize];
+                let held = &helds[c as usize];
+                // No read fault is armed for Mutate (the seam is the
+                // slot-mutation write), so this read cannot fault.
+                let file = read_lock_record(&remote)
+                    .expect("a mutate's read cannot be faulted (no read fault armed)");
+                observed[c as usize] = file.clone();
+                if let Some(rec) = held {
+                    if file.as_ref() == Some(rec) {
+                        // We hold: perform a slot mutation UNDER the lock, tagged
+                        // with our record (a one-shot fault makes the write fail —
+                        // then no mutation happened).
+                        let payload = serde_json::to_vec(rec).unwrap();
+                        match helper.remote().write(&mutation_probe(), &payload, 0o644) {
+                            Ok(()) => {
+                                let marker = serde_json::from_slice::<LockRecord>(
+                                    &helper
+                                        .remote()
+                                        .read(&mutation_probe())
+                                        .expect("the mutation marker must be readable"),
+                                )
+                                .unwrap();
+                                prop_assert_eq!(
+                                    marker,
+                                    rec.clone(),
+                                    "a mutation happens only under a successful claim: the \
+                                     mutation marker must carry the on-disk record's owner + epoch"
+                                );
+                                trace.push(format!("mutate:{c}:ok:e{}", rec.epoch));
+                            }
+                            Err(_) => trace.push(format!("mutate:{c}:fault")),
+                        }
+                    } else {
+                        // A SUPERSEDED controller cannot mutate: its held record no
+                        // longer matches the on-disk record (a successor recovered
+                        // the slot and the slot may already be free again) — a
+                        // mutation happens only under a successful claim, and the
+                        // refusal is well-founded exactly because the held record is
+                        // no longer the on-disk record.
+                        trace.push(format!("mutate:{c}:refused-stale"));
+                    }
+                } else {
+                    // No claim at all: nothing to mutate under — refused.
+                    trace.push(format!("mutate:{c}:no-hold"));
+                }
+            }
+            CtrlAction::Recover(c) => {
+                let helper = &helpers[c as usize];
+                let held = &mut helds[c as usize];
+                // The recovery premise: the record this controller observed
+                // (the operator confirmed the holder died). No observation —
+                // no premise: recovery is refused.
+                let Some(obs) = observed[c as usize].clone() else {
+                    trace.push(format!("recover:{c}:no-premise"));
+                    continue;
+                };
+                // No read fault is armed for Recover (the seam is the
+                // compare-and-delete), so these reads cannot fault.
+                let before = read_lock_record(&remote)
+                    .expect("a recover's pre-read cannot be faulted (no read fault armed)");
+                match helper.recover_lock(&obs, controller_op(c)) {
+                    Ok(rec) => {
+                        // EPOCH NEVER REPEATS: a successful recovery writes
+                        // the broken record's epoch + 1 (strictly greater,
+                        // never reused).
+                        prop_assert_eq!(
+                            rec.epoch,
+                            obs.epoch + 1,
+                            "a recovery must write the replaced record's epoch + 1, got {:?} \
+                             for replaced {:?}",
+                            rec,
+                            obs
+                        );
+                        *held = Some(rec.clone());
+                        observed[c as usize] = Some(rec.clone());
+                        // A recovery opens/extends the CURRENT chain: it
+                        // replaced the observed record, so it must advance the
+                        // chain by exactly +1 (asserted above).
+                        current_chain.push(rec.epoch);
+                        trace.push(format!("recover:{c}:ok:e{}", rec.epoch));
+                    }
+                    Err(_) => {
+                        // A REFUSED/FAILED recovery (a stale premise — a
+                        // successor already recovered — or the one-shot remove
+                        // fault) never alters the lock: the on-disk record is
+                        // unchanged.
+                        let after = read_lock_record(&remote)
+                            .expect("the post-recovery read cannot be faulted");
+                        prop_assert!(
+                            before == after,
+                            "a refused/failed recovery must never alter the lock: before \
+                             {before:?}, after {after:?}"
+                        );
+                        trace.push(format!("recover:{c}:fail"));
                     }
                 }
-            }
-            LockAction::Crash(c) => {
-                // The owner dies WITHOUT any release: the record stays in the
-                // file with its lease. The belief is kept so a later DELAYED
-                // release by this controller (after a successor broke the
-                // expired lease) exercises the stale-release path. The lease
-                // expiry is what makes the slot recoverable (asserted by the
-                // probe below).
-                let _ = c;
-            }
-            LockAction::Advance(ms) => {
-                // Move the shared clock: a lease expires once `now` passes it.
-                clock.advance(ms);
             }
         }
 
         // Disarm any unconsumed one-shot fault (step-scoped, never leaked).
         {
             let mut f = faults.lock().unwrap();
-            f.fail_acquire = false;
+            f.fail_claim = false;
             f.fail_read = false;
             f.fail_remove = false;
+            f.fail_mutate = false;
         }
 
         // ---- THE THREE INVARIANTS (after every step) ----
-        let now = clock.read();
+        // No fault can be armed here (disarmed above), so this read cannot
+        // fault.
+        let file = read_lock_record(&remote)
+            .expect("the invariant probe read cannot be faulted (faults are disarmed)");
 
-        // 1a. MUTUAL EXCLUSION: never two controllers with a VALID lease
-        // belief on the same slot.
-        let a_valid = a_held.as_ref().is_some_and(|r| r.expires_at_ms > now);
-        let b_valid = b_held.as_ref().is_some_and(|r| r.expires_at_ms > now);
+        // 1. AT MOST ONE EPOCH CAN MUTATE: never two controllers holding the
+        // slot simultaneously. A controller HOLDS only while its held record
+        // IS the on-disk record (its claim is live); at most one held record
+        // can equal the on-disk record — claims are create-once (a held lock
+        // admits no second claim, no automatic break) and recoveries replace
+        // the record atomically, so two controllers can never both believe
+        // they hold the same record.
+        let holders: Vec<u8> = (0u8..3)
+            .filter(|&c| helds[c as usize].is_some() && helds[c as usize].as_ref() == file.as_ref())
+            .collect();
         prop_assert!(
-            !(a_valid && b_valid),
-            "mutual exclusion violated after (action {action:?}, fault {fault:?}): A holds \
-             {a_held:?} and B holds {b_held:?} at now {now}"
+            holders.len() <= 1,
+            "mutual exclusion violated after (action {action:?}, fault {fault:?}): on-disk \
+             {file:?}, holders {holders:?} (helds {helds:?})"
         );
 
-        // 1b. A present VALID-lease record is held by EXACTLY ONE controller
-        // (its belief matches the on-disk record; the other's does not).
-        let file = read_lock_record(&remote);
-        if let Some(f) = &file {
-            if f.expires_at_ms > now {
-                let matches_a = a_held.as_ref() == Some(f);
-                let matches_b = b_held.as_ref() == Some(f);
-                prop_assert!(
-                    matches_a != matches_b,
-                    "the on-disk lock {f:?} is not held by exactly one controller at now {now}: \
-                     A={a_held:?} B={b_held:?}"
-                );
+        // 2. EPOCH NEVER REPEATS: every successful recovery writes the
+        // replaced record's epoch + 1 (asserted at the step — strictly
+        // greater, never reused); and the epoch sequence of every CHAIN — each
+        // continuous-holding window of the slot (a fresh claim opens a chain
+        // at 1, a release closes it) — is STRICTLY INCREASING over the whole
+        // run: a crashed-and-recovered slot never reuses an epoch, and a
+        // fresh claim (epoch 1) only ever opens a chain on a genuinely absent
+        // slot (asserted at the Claim step).
+        match &file {
+            None => {
+                // The slot is free: the current chain (if any) is closed —
+                // the next claim opens a NEW chain at epoch 1.
+                if !current_chain.is_empty() {
+                    chains.push(std::mem::take(&mut current_chain));
+                }
             }
-            // 3. RECOVERABILITY PROBE: an EXPIRED record is always breakable
-            // by a fresh contender — a crashed owner's residue (or a failed
-            // drop-time release's residue) never blocks the slot forever.
-            if f.expires_at_ms <= now {
-                let probe = RemoteHelper::with_clock(&remote, clock.clone());
-                let rec = probe.acquire_lock("probe", false).expect(
-                    "an expired lease must be breakable by a fresh contender \
-                     (the slot never blocks forever)",
-                );
-                probe
-                    .release_lock(&rec)
-                    .expect("probe release must succeed");
+            Some(rec) => {
+                // The slot is present. If the epoch changed since the last
+                // observed install (a claim on a free slot, or a recovery's
+                // successor), the chain advances; a re-read of the same epoch
+                // (Read/Compare/Mutate, an identical-retry claim) does not.
+                if current_chain.last() != Some(&rec.epoch) {
+                    current_chain.push(rec.epoch);
+                }
             }
         }
+        for chain in chains.iter().chain(std::iter::once(&current_chain)) {
+            for w in chain.windows(2) {
+                prop_assert!(
+                    w[0] < w[1],
+                    "the epoch sequence of a chain must be strictly increasing, got {chain:?} \
+                     (after action {action:?}, all chains {chains:?})"
+                );
+            }
+            if let Some(first) = chain.first() {
+                prop_assert!(
+                    *first == 1,
+                    "every chain must open at epoch 1 (a fresh claim on an absent slot), got \
+                     {chain:?}"
+                );
+            }
+        }
+
+        // 3. A STALE RELEASE NEVER DISPLACES A LIVE HOLDER is asserted inside
+        // the Restore step (the on-disk record is byte-identical before and
+        // after a failed release).
     }
 
-    // End of run: even with every lease expired, the slot is never blocked —
-    // a crashed owner's residue is always breakable and re-acquirable.
-    clock.advance(LEASE_DURATION_MS * 2);
-    let rec = helper_a
-        .acquire_lock("ctrl-A", false)
-        .expect("after all leases expire the slot must be acquirable (never blocked forever)");
-    helper_a
-        .release_lock(&rec)
-        .expect("final release must succeed");
-    Ok(())
+    // End of run: close the open chain; the final on-disk record, the
+    // mutation marker, and the epoch chains round out the trace (the
+    // clock-immunity comparison asserts these are identical for every
+    // generated clock assignment). No fault can be armed here.
+    if !current_chain.is_empty() {
+        chains.push(current_chain);
+    }
+    trace.push(format!(
+        "final-lock={:?}",
+        read_lock_record(&remote)
+            .expect("the final lock read cannot be faulted (faults are disarmed)")
+    ));
+    trace.push(format!(
+        "final-marker={:?}",
+        remote
+            .metadata_opt(&mutation_probe())
+            .expect("marker metadata_opt must succeed")
+            .map(|_| {
+                serde_json::from_slice::<LockRecord>(
+                    &remote
+                        .read(&mutation_probe())
+                        .expect("marker read must succeed"),
+                )
+                .expect("the marker must carry a record")
+            })
+    ));
+    trace.push(format!("epoch-chains={chains:?}"));
+    Ok(trace)
 }
 
-fn lock_step_strategy() -> impl Strategy<Value = (LockAction, LockFault)> {
-    let controller = prop::sample::select(vec![0u8, 1u8]);
+fn ctrl_step_strategy() -> impl Strategy<Value = (CtrlAction, CtrlFault)> {
+    let controller = prop::sample::select(vec![0u8, 1u8, 2u8]);
     let fault = prop_oneof![
-        6 => Just(LockFault::None),
-        1 => Just(LockFault::Acquire),
-        1 => Just(LockFault::Read),
-        1 => Just(LockFault::Remove),
-        1 => Just(LockFault::Drop),
+        8 => Just(CtrlFault::None),
+        1 => Just(CtrlFault::Claim),
+        1 => Just(CtrlFault::Read),
+        1 => Just(CtrlFault::Compare),
+        1 => Just(CtrlFault::Restore),
+        1 => Just(CtrlFault::Mutate),
+        1 => Just(CtrlFault::Recover),
     ];
     let action = prop_oneof![
-        4 => controller.clone().prop_map(LockAction::Acquire),
-        3 => controller.clone().prop_map(LockAction::Release),
-        3 => controller.clone().prop_map(LockAction::Drop),
-        1 => controller.clone().prop_map(LockAction::Crash),
-        2 => (0..=LEASE_DURATION_MS * 2).prop_map(LockAction::Advance),
+        5 => controller.clone().prop_map(CtrlAction::Claim),
+        3 => controller.clone().prop_map(CtrlAction::Read),
+        3 => controller.clone().prop_map(CtrlAction::Compare),
+        4 => controller.clone().prop_map(CtrlAction::Restore),
+        3 => controller.clone().prop_map(CtrlAction::Mutate),
+        3 => controller.clone().prop_map(CtrlAction::Recover),
     ];
     (action, fault)
 }
 
 proptest! {
-    // THE TWO-CONTROLLER LOCK LEASE/FENCING PROPERTY: bounded cases
+    // THE THREE-CONTROLLER NO-TAKEOVER LOCK PROPERTY: bounded cases
     // (`proptest_cases(64)`: fast default 16, full 64 under
     // `DEPLOY_FULL_TESTS=1`), fixed seed 0x5EED_5EED (house style), no
     // failure persistence — deterministic for CI. Each case drives its own
     // fixture (structurally isolated), and each step's fault is one-shot and
-    // step-scoped.
+    // step-scoped. The three controllers carry INDEPENDENTLY SKEWABLE clocks
+    // (generated and freely skewed): the protocol is time-free, so the same
+    // steps run under the generated skews and under zero skews must produce
+    // IDENTICAL outcome traces.
     #![proptest_config(ProptestConfig {
         cases: crate::testutil::proptest_cases(64),
         rng_seed: RngSeed::Fixed(0x5EED_5EED),
@@ -7516,12 +7775,29 @@ proptest! {
     })]
 
     #[test]
-    fn two_controller_lock_lease_fencing(
+    fn three_controller_no_takeover_lock(
         steps in prop::collection::vec(
-            lock_step_strategy(),
+            ctrl_step_strategy(),
             1..=crate::testutil::proptest_steps(40),
         ),
+        skew_a in -1_000_000_000i64..=1_000_000_000i64,
+        skew_b in -1_000_000_000i64..=1_000_000_000i64,
+        skew_c in -1_000_000_000i64..=1_000_000_000i64,
     ) {
-        run_lock_state_case(steps)?;
+        // Run the same steps under the GENERATED skewable clocks...
+        let trace_skewed = run_three_controller_case(steps.clone(), [skew_a, skew_b, skew_c])?;
+        // ...and under ZERO skews: the outcome must be IDENTICAL for every
+        // generated clock assignment — the protocol is immune to clock skew
+        // because NO time is consulted anywhere (no lease, no expiry).
+        let trace_zero = run_three_controller_case(steps, [0i64, 0, 0])?;
+        prop_assert_eq!(
+            trace_skewed,
+            trace_zero,
+            "the lock protocol is clock-immune: the outcome must be identical for every \
+             generated clock assignment (skewed {}/{} / {} vs zero)",
+            skew_a,
+            skew_b,
+            skew_c
+        );
     }
 }
