@@ -95,7 +95,7 @@ use crate::verify::release::{
     canonicalize_slots, release_digest, variant_slots_digest, verify_release_identity,
 };
 use proptest::prelude::*;
-use proptest::test_runner::{FileFailurePersistence, RngSeed};
+use proptest::test_runner::RngSeed;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -6475,32 +6475,38 @@ proptest! {
     // each test in its own thread, but proptest runs a test's cases
     // sequentially in that one thread — so the randomized-with-persistence
     // leg (4 cases) is SPLIT into two subtests of `cases: 4/2 = 2` each
-    // with DISTINCT FIXED seeds. The two subtests run concurrently on
+    // with DISTINCT default seeds. The two subtests run concurrently on
     // different harness threads, halving this leg's wall time, while the
-    // fixed seeds keep every subtest deterministic (CI-reproducible).
-    // FAILURE PERSISTENCE stays on THIS subtest only: the shared
+    // fixed default seeds keep every subtest deterministic
+    // (CI-reproducible). FAILURE PERSISTENCE is an env lever:
+    // `crate::testutil::proptest_persistence()` is `None` on the default
+    // dev run (no corpus file read or written — the fast deterministic
+    // path) and `FileFailurePersistence` on the CI lanes
+    // (`DEPLOY_PROPERSIST=1`): the shared
     // `proptest-regressions/semantic_invariants.txt` is keyed per source
-    // FILE, so every subtest with persistence would replay ALL persisted
-    // vectors — duplicating the replay K times measurably slowed the
-    // fixture-heavy suite — so only `_0` carries the persistence and the
-    // persisted vectors replay exactly once (verified green), while
-    // `_1` runs the same generator + assertions under its fixed seed. A
-    // failing vector still writes to the regression file; the case count
-    // stays bounded (each case drives a full fixture; the state-machine
-    // action vectors are capped at six actions — every action type and
-    // every prefix stays asserted, and the persisted regression vectors
-    // replay regardless of length). The FIXED-SEED regression leg below
-    // stays ONE test (the deterministic floor).
+    // FILE, so EVERY subtest with persistence on replays ALL persisted
+    // vectors — duplication is fine on the long-running CI diversity lane,
+    // and the dev run stays persistence-off. The SEED and the ACTION-TRACE
+    // LENGTH are the other env levers (`crate::testutil::proptest_seed` /
+    // `proptest_steps`): the diversity lane runs the same assertions under
+    // several CI-supplied seeds and longer traces. A failing vector writes
+    // to the regression file; the case count stays bounded (each case
+    // drives a full fixture), and the persisted regression vectors replay
+    // regardless of length. The FIXED-SEED regression leg below stays ONE
+    // test (the deterministic floor).
     #![proptest_config(ProptestConfig {
         cases: crate::testutil::proptest_cases(2),
-        rng_seed: RngSeed::Fixed(0x5EED_0001),
-        failure_persistence: Some(Box::new(FileFailurePersistence::default())),
+        rng_seed: crate::testutil::proptest_seed(0x5EED_0001),
+        failure_persistence: crate::testutil::proptest_persistence(),
         ..ProptestConfig::default()
     })]
 
     #[test]
     fn semantic_state_machine_0(
-        steps in prop::collection::vec((action_strategy(), failure_class_strategy()), 1..6)
+        steps in prop::collection::vec(
+            (action_strategy(), failure_class_strategy()),
+            1..=crate::testutil::proptest_steps(5),
+        )
     ) {
         run_semantic_state_case(steps);
     }
@@ -6509,21 +6515,25 @@ proptest! {
 proptest! {
     // The second half of the split randomized leg: the same generator and
     // the same assertions over the next slice of cases, under a DISTINCT
-    // fixed seed so the two subtests explore different (deterministic)
-    // interleavings and can run concurrently. No failure persistence here:
-    // the fixed seed alone makes any failure reproducible, and the shared
-    // regression file's vectors are replayed by `_0` (per-source-file
-    // persistence would duplicate the replay for no coverage gain).
+    // default seed so the two subtests explore different (deterministic)
+    // interleavings and can run concurrently. Same env levers as `_0`:
+    // seed (`proptest_seed`), trace length (`proptest_steps`) and
+    // persistence (`proptest_persistence` — `None` on the dev run, on for
+    // the CI lanes via `DEPLOY_PROPERSIST=1`, when the shared regression
+    // file's vectors are replayed here too).
     #![proptest_config(ProptestConfig {
         cases: crate::testutil::proptest_cases(2),
-        rng_seed: RngSeed::Fixed(0x5EED_0002),
-        failure_persistence: None,
+        rng_seed: crate::testutil::proptest_seed(0x5EED_0002),
+        failure_persistence: crate::testutil::proptest_persistence(),
         ..ProptestConfig::default()
     })]
 
     #[test]
     fn semantic_state_machine_1(
-        steps in prop::collection::vec((action_strategy(), failure_class_strategy()), 1..6)
+        steps in prop::collection::vec(
+            (action_strategy(), failure_class_strategy()),
+            1..=crate::testutil::proptest_steps(5),
+        )
     ) {
         run_semantic_state_case(steps);
     }
@@ -6531,23 +6541,28 @@ proptest! {
 
 proptest! {
     // FIXED-SEED REGRESSION: the deterministic floor for CI. The same
-    // generator under the pinned 0x5EED_5EED seed with no persistence runs
-    // the IDENTICAL vectors on every invocation, so the suite stays
-    // reproducible even when no failure has ever been persisted by the main
-    // test. The case count is bounded so the suite stays fast (and the
-    // action vectors are capped at six actions); the persisted regression
-    // vectors in `proptest-regressions/semantic_invariants.txt` replay
-    // regardless of count and length.
+    // generator under the pinned default seed with no persistence (dev
+    // run) runs the IDENTICAL vectors on every invocation, so the suite
+    // stays reproducible even when no failure has ever been persisted. On
+    // the CI lanes the env levers apply here too: the diversity lane runs
+    // this leg under its matrix seed with persistence on (`DEPLOY_PROPERSIST=1`
+    // replays the persisted vectors regardless of count and length), and
+    // the deterministic full lane keeps the fixed default seed while
+    // replaying the corpus. The case count stays bounded so the suite
+    // stays fast.
     #![proptest_config(ProptestConfig {
         cases: crate::testutil::proptest_cases(4),
-        rng_seed: RngSeed::Fixed(0x5EED_5EED),
-        failure_persistence: None,
+        rng_seed: crate::testutil::proptest_seed(0x5EED_5EED),
+        failure_persistence: crate::testutil::proptest_persistence(),
         ..ProptestConfig::default()
     })]
 
     #[test]
     fn semantic_state_machine_fixed_seed_regression(
-        steps in prop::collection::vec((action_strategy(), failure_class_strategy()), 1..6)
+        steps in prop::collection::vec(
+            (action_strategy(), failure_class_strategy()),
+            1..=crate::testutil::proptest_steps(5),
+        )
     ) {
         run_semantic_state_case(steps);
     }

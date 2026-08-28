@@ -90,6 +90,58 @@ pub(crate) fn proptest_cases(full: u32) -> u32 {
     }
 }
 
+/// The externally-selectable proptest SEED: `RngSeed::Fixed(<DEPLOY_PROPSEED>)`
+/// when the env var `DEPLOY_PROPSEED` is set (parsed as u64), else
+/// `RngSeed::Fixed(default)`. The DEFAULT (no env var) is byte-for-byte the
+/// current deterministic behavior — every test keeps its own house-style
+/// seed as the `default` argument — while the CI DIVERSITY lane sets
+/// `DEPLOY_PROPSEED` per matrix arm to run the same properties under
+/// SEVERAL CI-SUPPLIED SEEDS (depth is unchanged, diversity is new).
+#[cfg(test)]
+pub(crate) fn proptest_seed(default: u64) -> proptest::test_runner::RngSeed {
+    match std::env::var("DEPLOY_PROPSEED") {
+        Ok(v) => v.trim().parse::<u64>().map_or(
+            proptest::test_runner::RngSeed::Fixed(default),
+            proptest::test_runner::RngSeed::Fixed,
+        ),
+        Err(_) => proptest::test_runner::RngSeed::Fixed(default),
+    }
+}
+
+/// The externally-selectable ACTION-TRACE LENGTH for the semantic state
+/// machines: `DEPLOY_PROPSTEPS` (parsed as usize, clamped to at least 1) when
+/// the env var is set, else `default`. The DEFAULT (no env var) is the current
+/// bounded trace length — the `1..=proptest_steps(N)` step bounds reduce to
+/// the existing `1..=N` — while the diversity lane sets it to run LONGER
+/// action traces (e.g. 2x the default).
+#[cfg(test)]
+pub(crate) fn proptest_steps(default: usize) -> usize {
+    match std::env::var("DEPLOY_PROPSTEPS") {
+        Ok(v) => v.trim().parse::<usize>().map_or(default, |n| n.max(1)),
+        Err(_) => default,
+    }
+}
+
+/// The proptest FAILURE-PERSISTENCE lever: `DEPLOY_PROPERSIST=1` (the
+/// diversity lane sets it) enables proptest's file persistence writing to the
+/// CHECKED-IN `proptest-regressions/` corpus — `SourceParallel(
+/// "proptest-regressions")` resolves each source file's sibling corpus entry
+/// (e.g. `proptest-regressions/semantic_invariants.txt`, the exact layout the
+/// existing checked-in corpus files use), so a discovered MINIMAL failure is
+/// persisted there and REPLAYED on every later run (before new cases) by any
+/// test with persistence on. NOT set (the default dev run) → `None`: no
+/// corpus file is read or written, the current deterministic behavior.
+#[cfg(test)]
+pub(crate) fn proptest_persistence() -> Option<Box<dyn proptest::test_runner::FailurePersistence>> {
+    if std::env::var_os("DEPLOY_PROPERSIST").is_some_and(|v| v != "0") {
+        Some(Box::new(
+            proptest::test_runner::FileFailurePersistence::SourceParallel("proptest-regressions"),
+        ))
+    } else {
+        None
+    }
+}
+
 /// Test-only one-shot fault injection for crash-mid-finalization tests.
 ///
 /// A fault is a one-shot arm keyed by the DEPLOYMENT ID of the attempt under

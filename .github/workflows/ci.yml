@@ -4,6 +4,14 @@ on:
   push:
     branches: [main, master]
   pull_request:
+  # Nightly + manual triggers for the DIVERSITY lane only (the job below
+  # gates itself to these events): several CI-supplied proptest seeds over
+  # longer semantic state-machine traces, with discovered minimal failures
+  # persisted into the checked-in `proptest-regressions/` corpus.
+  schedule:
+    # Nightly at 03:23 UTC.
+    - cron: '23 3 * * *'
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -34,9 +42,18 @@ jobs:
         run: cargo nextest run
 
   full-proptests:
-    name: Full proptest budgets
+    name: Full proptest budgets (deterministic regression)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # The DETERMINISTIC regression lane keeps the fixed house seeds (no
+      # DEPLOY_PROPSEED) but turns persistence ON so the checked-in
+      # `proptest-regressions/` corpus — including any minimal failures the
+      # diversity lane discovered and persisted — is REPLAYED before the new
+      # fixed-seed cases (proptest replays persisted failures automatically
+      # when persistence is enabled). The DEV run stays persistence-off
+      # (`failure_persistence: None`); this env is CI-only.
+      DEPLOY_PROPERSIST: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -44,3 +61,57 @@ jobs:
         uses: taiki-e/install-nextest@v2
       - name: Full proptest budgets
         run: DEPLOY_FULL_TESTS=1 cargo nextest run
+
+  diverse-proptests:
+    name: Diverse proptest seeds (${{ matrix.seed }})
+    # STRICTLY scheduled + manual: never on push/PR.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      # One arm failing (a DISCOVERED bug — the point of the lane) must not
+      # cancel the other arms: each seed may surface a different failure,
+      # and every arm's persisted minimal vector must reach the corpus
+      # artifact.
+      fail-fast: false
+      matrix:
+        # Several CI-SUPPLIED seeds (fixed, reproducible). The first three
+        # are the project's house seeds (0x5EED_0001 / 0x5EED_0002 /
+        # 0x5EED_5EED), the last two the additional house-style values
+        # (0xC0FF_EE00 / 0xFA17_FA17) — DEPLOY_PROPSEED is parsed as a
+        # plain u64, so the matrix carries the decimal expansions.
+        seed: [1592590337, 1592590338, 1592614637, 3237998080, 4195875351]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-nextest
+        uses: taiki-e/install-nextest@v2
+      - name: State-machine proptests under seed ${{ matrix.seed }} (longer traces, persistence on)
+        run: |
+          DEPLOY_FULL_TESTS=1 \
+          DEPLOY_PROPSEED=${{ matrix.seed }} \
+          DEPLOY_PROPSTEPS=10 \
+          DEPLOY_PROPERSIST=1 \
+          cargo nextest run -E 'test(semantic_state_machine)'
+      # A failing run (a discovered minimal failure) writes the shrunk
+      # vector into `proptest-regressions/` in this runner's working tree.
+      # Stage it so the artifact below carries exactly the committable
+      # corpus delta; a maintainer commits it so the deterministic lanes
+      # replay it from then on.
+      - name: Stage persisted minimal failures for commit
+        if: always()
+        run: |
+          git add proptest-regressions/
+          if [ -n "$(git diff --cached --name-only)" ]; then
+            echo "::warning::New minimal failures persisted under proptest-regressions/. They are staged and uploaded as the 'proptest-regressions' artifact — commit and push them so the deterministic lanes replay them."
+            git diff --cached --stat
+          else
+            echo "No new persisted failures — the checked-in corpus is unchanged."
+          fi
+      - name: Upload regression corpus (commit me)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: proptest-regressions
+          path: proptest-regressions/
+          if-no-files-found: ignore
