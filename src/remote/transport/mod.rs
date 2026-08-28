@@ -24,7 +24,6 @@ pub use ssh::SshTransport;
 
 use crate::env::SysEnv;
 use crate::error::{Error, Result};
-use std::ffi::OsString;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -173,17 +172,19 @@ fn meta_to_remote(m: &std::fs::Metadata) -> RemoteMeta {
 /// host. It mirrors the SSH remote layout exactly.
 pub struct LocalTransport {
     base: PathBuf,
-    /// The child environment overlay: every spawned child (`exec`, `df`, the
-    /// timeout `kill`) receives THIS snapshot's variables
-    /// ([`SysEnv::child_env`]) — a deterministic environment resolved at the
+    /// The child environment snapshot: every spawned child (`exec`, `df`, the
+    /// timeout `kill`) receives THIS snapshot as its ENTIRE environment
+    /// ([`SysEnv::apply_to_command`]: `env_clear` first, then the snapshot's
+    /// variables) — a deterministic HERMETIC environment resolved at the
     /// construction boundary, never whatever the parent env looks like at
-    /// spawn time.
-    child_env: Vec<(OsString, OsString)>,
+    /// spawn time, and nothing else.
+    env: SysEnv,
 }
 
 impl LocalTransport {
     /// Build a transport rooted at `base` whose children run with the
-    /// environment snapshot `env` (see [`SysEnv::child_env`]). Construction
+    /// environment snapshot `env` (see [`SysEnv::apply_to_command`]) as their
+    /// ENTIRE environment. Construction
     /// is side-effect-free: no directories are created and nothing is
     /// touched on disk. Call [`Remote::provision_layout`] to create the
     /// deployment layout before the first mutation (the push engine does
@@ -203,7 +204,7 @@ impl LocalTransport {
         }
         Ok(LocalTransport {
             base,
-            child_env: env.child_env(),
+            env: env.clone(),
         })
     }
 }
@@ -446,8 +447,8 @@ impl Remote for LocalTransport {
             return Err(Error::transport("empty command"));
         }
         let mut cmd = std::process::Command::new(&argv[0]);
+        self.env.apply_to_command(&mut cmd);
         cmd.args(&argv[1..]);
-        cmd.envs(self.child_env.iter().cloned());
         cmd.current_dir(&self.base);
         let child = cmd
             .stdout(std::process::Stdio::piped())
@@ -467,11 +468,9 @@ impl Remote for LocalTransport {
             }
             Err(_) => {
                 // Timed out: kill the child.
-                let _ = std::process::Command::new("kill")
-                    .envs(self.child_env.iter().cloned())
-                    .arg("-9")
-                    .arg(pid.to_string())
-                    .status();
+                let mut kill_cmd = std::process::Command::new("kill");
+                self.env.apply_to_command(&mut kill_cmd);
+                let _ = kill_cmd.arg("-9").arg(pid.to_string()).status();
                 return Ok(ExecOutcome {
                     exit_code: -1,
                     stdout: String::new(),
@@ -487,8 +486,9 @@ impl Remote for LocalTransport {
     }
 
     fn filesystem_bytes(&self) -> Result<FsBytes> {
-        let out = std::process::Command::new("df")
-            .envs(self.child_env.iter().cloned())
+        let mut cmd = std::process::Command::new("df");
+        self.env.apply_to_command(&mut cmd);
+        let out = cmd
             .args(["-k", self.base.to_string_lossy().as_ref()])
             .output()
             .map_err(|e| Error::transport(format!("df: {e}")))?;

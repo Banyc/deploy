@@ -10,9 +10,10 @@
 //! The house pattern (mirroring `cli::run_with(std::env::args())`): the
 //! process boundary takes [`SysEnv::from_process`] ONCE and threads it down.
 //! The only other place `std::env::` is allowed is the child-process boundary
-//! ([`std::process::Command::envs`]): every spawned child receives this snapshot's
-//! variables, so a child's `PATH` (and any fake-bin/test variable) is the
-//! deterministic snapshot, never whatever `PATH` won the race in the parent.
+//! ([`SysEnv::apply_to_command`]): every spawned child receives this snapshot as
+//! its ENTIRE environment (`env_clear` + the snapshot's variables), so a child's
+//! `PATH` (and any fake-bin/test variable) is the deterministic snapshot, never
+//! whatever `PATH` won the race in the parent — and nothing else leaks in.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -97,15 +98,26 @@ impl SysEnv {
         }
     }
 
-    /// The full variable list as `(key, value)` pairs, for
-    /// [`std::process::Command::envs`]: every child spawned by a subsystem
-    /// gets THIS snapshot's environment — deterministic, and never dependent
-    /// on whatever the parent env looks like at spawn time.
+    /// The full variable list as `(key, value)` pairs. Used by tests to build
+    /// snapshot-based fixtures and by [`SysEnv::apply_to_command`] internally.
+    /// Production child-process boundaries MUST call [`SysEnv::apply_to_command`]
+    /// instead: a bare `envs` overlay would let the parent env leak into a
+    /// supposedly-hermetic snapshot.
     pub fn child_env(&self) -> Vec<(OsString, OsString)> {
         self.vars
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
+    }
+
+    /// Apply this snapshot to a child `Command` as the child's ENTIRE
+    /// environment: `env_clear()` first (the child inherits NOTHING from the
+    /// parent — an overlay would leak the parent env into a supposedly-hermetic
+    /// snapshot), then set exactly this snapshot's variables. Call this at EVERY
+    /// child-process boundary.
+    pub fn apply_to_command(&self, cmd: &mut std::process::Command) {
+        cmd.env_clear();
+        cmd.envs(self.vars.iter().map(|(k, v)| (k.clone(), v.clone())));
     }
 }
 
@@ -167,5 +179,26 @@ mod tests {
         assert_eq!(child.len(), 2);
         assert!(child.contains(&(OsString::from("PATH"), OsString::from("/bin:/usr/bin"))));
         assert!(child.contains(&(OsString::from("TMPDIR"), OsString::from("/t"))));
+    }
+
+    #[test]
+    fn apply_to_command_is_hermetic() {
+        let env = SysEnv::from_map(map(&[("PATH", "/snapshot/bin:/usr/bin")]));
+        let mut cmd = std::process::Command::new("true");
+        // A parent env that would leak through a plain `envs` overlay.
+        cmd.env("PATH", "/parent/bin");
+        cmd.env("LEAKY_VAR", "parent-value");
+        env.apply_to_command(&mut cmd);
+        // The child's env is EXACTLY the snapshot: nothing from the parent.
+        let vars: BTreeMap<OsString, OsString> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| v.map(|v| (k.to_owned(), v.to_owned())))
+            .collect();
+        assert_eq!(vars.len(), 1);
+        assert_eq!(
+            vars.get(OsStr::new("PATH")),
+            Some(&OsString::from("/snapshot/bin:/usr/bin"))
+        );
+        assert_eq!(vars.get(OsStr::new("LEAKY_VAR")), None);
     }
 }

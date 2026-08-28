@@ -1192,7 +1192,8 @@ mod fingerprint_ssh_tests {
     // (`FAKE_SSH_ROOT` / `FAKE_SSH_REMOTE_PREFIX`) and the per-test pin
     // cache (`DEPLOY_SSH_KNOWNHOSTS_DIR`). The transport spawns its children
     // (ssh / ssh-keyscan / ssh-keygen / stat) with that snapshot's variables
-    // (`cmd.envs(env.child_env())`), so the fake binaries resolve and their
+    // (`SysEnv::apply_to_command`: env_clear + the snapshot's vars), so the
+    // fake binaries resolve and their
     // inputs ride the same child env — the process-global environment is
     // NEVER touched (no lock, no set_var, no cross-test interference).
 

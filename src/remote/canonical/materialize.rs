@@ -1218,10 +1218,16 @@ mod tests_materialize {
     fn tree_digest_independent_of_umask() {
         let exe = std::env::current_exe().expect("current test binary");
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let env = crate::testutil::fixture_env();
         let mut snapshots: Vec<(u32, TreeMetadata)> = Vec::new();
         for umask in [0o022, 0o002, 0o000, 0o077] {
             let result_file = dir.path().join(format!("umask-{umask:o}.json"));
-            let out = std::process::Command::new(&exe)
+            // The probe child re-executes this test binary with the snapshot as
+            // its ENTIRE environment (hermetic, via apply_to_command), then the
+            // two probe vars on top.
+            let mut cmd = std::process::Command::new(&exe);
+            env.apply_to_command(&mut cmd);
+            let out = cmd
                 .arg("umask_probe_child")
                 .env("UMASK_PROBE_MODE", format!("{umask:o}"))
                 .env("UMASK_RESULT_FILE", &result_file)

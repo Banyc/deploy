@@ -160,13 +160,16 @@ pub(crate) fn pin_known_hosts(
 
 /// Pipe a single key line into `ssh-keygen -lf` and return whether its
 /// fingerprint (the second whitespace-separated field) matches `expected`.
-/// The child receives the environment snapshot's variables (`env.child_env()`)
-/// so its `PATH` (and any fake-bin variable) is the deterministic snapshot.
+/// The child receives the environment snapshot as its ENTIRE environment
+/// ([`SysEnv::apply_to_command`]: `env_clear` + the snapshot's variables) so
+/// its `PATH` (and any fake-bin variable) is the deterministic hermetic
+/// snapshot.
 pub(crate) fn key_matches_fingerprint(line: &str, expected: &str, env: &SysEnv) -> bool {
-    let mut keygen = match Command::new("ssh-keygen")
+    let mut cmd = Command::new("ssh-keygen");
+    env.apply_to_command(&mut cmd);
+    let mut keygen = match cmd
         .arg("-lf")
         .arg("-")
-        .envs(env.child_env())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

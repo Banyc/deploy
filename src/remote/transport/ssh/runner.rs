@@ -3,7 +3,6 @@
 //! after connection establishment.
 
 use crate::env::SysEnv;
-use std::ffi::OsString;
 use std::os::fd::AsRawFd;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -120,18 +119,17 @@ trait SshRunnerSeam: Send + Sync {
 
 /// Production seam: real `ssh` / `ssh-keyscan` subprocesses.
 struct RealRunner {
-    /// The child environment overlay: every spawned child receives THIS
-    /// snapshot's variables ([`SysEnv::child_env`]) — a deterministic
-    /// environment resolved at the transport boundary, never whatever the
-    /// parent env looks like at spawn time.
-    env: Vec<(OsString, OsString)>,
+    /// The child environment snapshot: every spawned child receives THIS
+    /// snapshot as its ENTIRE environment ([`SysEnv::apply_to_command`]:
+    /// `env_clear` first, then the snapshot's variables) — a deterministic
+    /// HERMETIC environment resolved at the transport boundary, never
+    /// whatever the parent env looks like at spawn time, and nothing else.
+    env: SysEnv,
 }
 
 impl RealRunner {
     fn new(env: &SysEnv) -> Self {
-        RealRunner {
-            env: env.child_env(),
-        }
+        RealRunner { env: env.clone() }
     }
 }
 
@@ -143,8 +141,8 @@ impl SshRunnerSeam for RealRunner {
         stdin: Option<Vec<u8>>,
     ) -> std::io::Result<SpawnedChild> {
         let mut cmd = std::process::Command::new(&argv[0]);
+        self.env.apply_to_command(&mut cmd);
         cmd.args(&argv[1..]);
-        cmd.envs(self.env.iter().cloned());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         if stdin.is_some() {
@@ -340,8 +338,8 @@ pub(crate) struct SshRunner {
 
 impl SshRunner {
     /// Build the runner for the environment snapshot `env`: every real child
-    /// this runner spawns receives the snapshot's variables (see
-    /// [`SysEnv::child_env`]).
+    /// this runner spawns receives the snapshot as its ENTIRE environment
+    /// (see [`SysEnv::apply_to_command`]).
     pub(crate) fn new(env: &SysEnv) -> Self {
         SshRunner {
             seam: Arc::new(RealRunner::new(env)),
