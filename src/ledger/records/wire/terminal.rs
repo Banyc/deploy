@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::super::observation::{Observation, ObservedGeneration};
-use super::super::{CompleteRollback, DeploymentStatus, LedgerRollbackWire, SlotTable};
+use super::super::{CompleteRollback, DeploymentStatus, LedgerRollback, SlotTable};
 use super::outcomes::{SlotOutcome, SlotOutcomeKind, SlotResult, SlotTransition};
 /// The DISPOSITION of a deployment's terminal event — the DOMAIN replaces
 /// the wire's `status: String` + optional rollback TAG-PLUS-OPTIONAL-PAYLOAD
@@ -236,7 +236,7 @@ impl LedgerTerminal {
                 let map: BTreeMap<SlotId, SlotOutcome> = activated
                     .iter()
                     .map(|sid| {
-                        let rb = rollback.slots.get(sid).expect(
+                        let rb = rollback.get(sid).expect(
                             "a Successful terminal's activated slots are always covered by its rollback — the conversion enforces activated ⊆ rollback == full",
                         );
                         (
@@ -244,7 +244,7 @@ impl LedgerTerminal {
                             SlotOutcome {
                                 outcome: SlotOutcomeKind::Activated,
                                 observation: Observation::Known(ObservedGeneration {
-                                    generation: rb.generation.clone(),
+                                    generation: rb.generation().clone(),
                                 }),
                                 compensated: false,
                                 error: None,
@@ -322,7 +322,7 @@ pub struct LedgerTerminalWire {
     pub recorded_at: String,
     pub outcomes: BTreeMap<SlotId, SlotResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rollback: Option<LedgerRollbackWire>,
+    pub rollback: Option<LedgerRollback>,
     /// The SELECTED membership — the slots this deployment actually
     /// selected / deployed (the outcomes' keys; a group push's group
     /// slots; a full push's every target slot). REQUIRED since schema v3
@@ -430,10 +430,7 @@ impl LedgerTerminalWire {
                 self.deployment_id, self.status
             )));
         }
-        let rollback = match self.rollback {
-            Some(wire) => Some(wire.into_domain()?),
-            None => None,
-        };
+        let rollback = self.rollback;
         // OUTCOME OWN-KEY AGREEMENT (self-contained half): each wire
         // outcome's value names ITS OWN map key — an outcome for a different
         // slot is a disagreement. (The other half — the outcome KEY SET vs
@@ -482,7 +479,7 @@ impl LedgerTerminalWire {
                 // memberships NON-EMPTY (a successful deployment selected
                 // and covered at least one slot).
                 let outcome_keys: BTreeSet<SlotId> = outcomes.keys().cloned().collect();
-                let rollback_slot_keys: BTreeSet<SlotId> = rollback.slots.keys().cloned().collect();
+                let rollback_slot_keys: BTreeSet<SlotId> = rollback.keys().cloned().collect();
                 // THE MEMBERSHIP EQUATIONS (terminal-local half) are enforced
                 // by the SHARED helper in [`crate::ledger::records`]:
                 // outcomes == selected_membership, rollback slots ==
@@ -520,7 +517,7 @@ impl LedgerTerminalWire {
                 // selected slot must carry:
                 //   * Known(g) — a successful slot's state is Known, never
                 //     KnownAbsent/Unknown (a successful slot was deployed);
-                //   * g == rollback.slots[slot].generation — the OBSERVED
+                //   * g == rollback.get(slot).unwrap().generation() — the OBSERVED
                 //     generation EQUALS the rollback's authoritative
                 //     generation for that slot (the outcome can never claim
                 //     a generation the rollback did not actually advance);
@@ -537,7 +534,10 @@ impl LedgerTerminalWire {
                 for (key, r) in outcomes.iter() {
                     // Every outcome key is a rollback slot (rollback == full
                     // ⊇ outcomes == selected — enforced above).
-                    let rb_gen = &rollback.slots[key].generation;
+                    let rb_gen = rollback
+                        .get(key)
+                        .expect("rollback covers outcome key")
+                        .generation();
                     let mut violations: Vec<String> = Vec::new();
                     match &r.observation {
                         Observation::Known(og) => {
@@ -560,7 +560,7 @@ impl LedgerTerminalWire {
                     }
                     if !violations.is_empty() {
                         return Err(Error::integrity(format!(
-                            "terminal {}: status Successful outcome for slot '{key}' contradicts the rollback — the outcome's per-slot facts must EQUAL the rollback's (Known(g), g == rollback.slots['{key}'].generation, error == None, compensated == false); violated: {}",
+                            "terminal {}: status Successful outcome for slot '{key}' contradicts the rollback — the outcome's per-slot facts must EQUAL the rollback's (Known(g), g == rollback.get('{key}').unwrap().generation(), error == None, compensated == false); violated: {}",
                             self.deployment_id,
                             violations.join("; ")
                         )));
@@ -675,9 +675,7 @@ impl LedgerTerminalWire {
         t: &LedgerTerminal,
     ) -> Self {
         let rollback = match &t.disposition {
-            TerminalDisposition::Successful { rollback, .. } => {
-                Some(LedgerRollbackWire::from(rollback))
-            }
+            TerminalDisposition::Successful { rollback, .. } => Some(rollback.clone()),
             _ => None,
         };
         let (selected_membership, full_membership) = match &t.disposition {

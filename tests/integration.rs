@@ -404,23 +404,23 @@ fn snapshot_records_each_slots_physical_binding() -> Result<()> {
     };
     assert_eq!(
         rollback_of(&snapshots[0])
-            .bindings
-            .get(&SlotId::parse("p1").unwrap()),
+            .get(&SlotId::parse("p1").unwrap())
+            .map(|e| e.binding()),
         Some(&binding("server-01"))
     );
     assert_eq!(
         rollback_of(&snapshots[0])
-            .bindings
-            .get(&SlotId::parse("p2").unwrap()),
+            .get(&SlotId::parse("p2").unwrap())
+            .map(|e| e.binding()),
         Some(&binding("server-02"))
     );
     assert_eq!(
         rollback_of(&snapshots[0])
-            .bindings
-            .get(&SlotId::parse("p3").unwrap()),
+            .get(&SlotId::parse("p3").unwrap())
+            .map(|e| e.binding()),
         Some(&binding("server-03"))
     );
-    assert_eq!(rollback_of(&snapshots[0]).bindings.len(), 3);
+    assert_eq!(rollback_of(&snapshots[0]).len(), 3);
 
     Ok(())
 }
@@ -508,8 +508,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     let dep0 = latest_deployment_id(&store, "production");
     assert_eq!(
         rollback_of(&snapshots[0])
-            .bindings
-            .get(&SlotId::parse("p1").unwrap()),
+            .get(&SlotId::parse("p1").unwrap())
+            .map(|e| e.binding()),
         Some(&PhysicalBinding {
             server: ServerId::parse("server-01").unwrap(),
             deploy_dir: "/srv/deploy/rebind".to_string(),
@@ -680,8 +680,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     assert_eq!(snapshots.len(), 1);
     assert_eq!(
         rollback_of(&snapshots[0])
-            .bindings
-            .get(&SlotId::parse("p1").unwrap()),
+            .get(&SlotId::parse("p1").unwrap())
+            .map(|e| e.binding()),
         Some(&PhysicalBinding {
             server: ServerId::parse("server-01").unwrap(),
             deploy_dir: "/srv/move/movedir-a".to_string(),

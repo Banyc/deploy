@@ -350,7 +350,7 @@ pub fn finalize_successful_locked(
     // the overlay covers exactly the frozen full slots; this check pins the
     // invariant at the WRITER so a drift surfaces as a clear error here
     // rather than as a ledger that can never be read again.
-    let rollback_keys: BTreeSet<SlotId> = rollback.slots.keys().cloned().collect();
+    let rollback_keys: BTreeSet<SlotId> = rollback.keys().cloned().collect();
     let current: BTreeSet<SlotId> = current_slot_ids.iter().cloned().collect();
     if rollback_keys != current {
         return Err(Error::integrity(format!(
@@ -535,18 +535,16 @@ fn verify_rollback_matches_desired(
     attempt: &DeploymentIntent,
 ) -> Result<()> {
     for (sid, slot) in attempt.slots.iter() {
-        let rb = rollback.slots.get(sid).ok_or_else(|| {
+        let rb = rollback.get(sid).ok_or_else(|| {
             Error::integrity(format!(
                 "finalize {deployment_id}: the rollback snapshot has no entry for selected slot '{sid}' — every selected slot's rollback entry must exactly equal the frozen desired assignment"
             ))
         })?;
-        if rb.generation != slot.desired.generation
-            || rb.assignment.artifact != slot.desired.artifact
-        {
+        if rb.generation() != &slot.desired.generation || rb.artifact() != &slot.desired.artifact {
             return Err(Error::integrity(format!(
                 "finalize {deployment_id}: the rollback entry for selected slot '{sid}' ({:?}, {:?}) does not exactly equal the frozen desired assignment ({:?}, {:?}) — the rollback must reproduce exactly the verified desired state (generation AND artifact); refusing to append a stale or diverged snapshot",
-                rb.generation,
-                rb.assignment.artifact,
+                rb.generation(),
+                rb.artifact(),
                 slot.desired.generation,
                 slot.desired.artifact
             )));
@@ -892,15 +890,16 @@ mod tests {
             "the activated slot-id set is derived from the intent's selected slots"
         );
         let rb = rollback
-            .slots
             .get(&SlotId::new("p1"))
             .expect("the rollback covers the selected slot");
         assert_eq!(
-            rb.generation, desired.generation,
+            rb.generation().clone(),
+            desired.generation.clone(),
             "the rollback generation equals the frozen desired (the verified live value), never the stale observation"
         );
         assert_eq!(
-            rb.assignment.artifact, desired.artifact,
+            rb.artifact().clone(),
+            desired.artifact.clone(),
             "the rollback artifact equals the frozen desired (the verified live value), never the stale observation"
         );
     }
@@ -919,39 +918,115 @@ mod tests {
         let desired = &attempt.slots[&sid].desired;
         // The MATCHING rollback: the selected entry reproduces the frozen
         // desired assignment exactly (generation AND artifact).
-        let matching = crate::ledger::LedgerRollback {
-            slots: BTreeMap::from([(
-                sid.clone(),
-                GenerationRef {
-                    generation: desired.generation.clone(),
-                    assignment: PlacementSlotAssignment {
-                        placement_slot: sid.clone(),
-                        artifact: desired.artifact.clone(),
+        let matching = {
+            let __slots: BTreeMap<crate::identity::SlotId, crate::identity::GenerationRef> =
+                BTreeMap::from([(
+                    sid.clone(),
+                    GenerationRef {
+                        generation: desired.generation.clone(),
+                        assignment: PlacementSlotAssignment {
+                            placement_slot: sid.clone(),
+                            artifact: desired.artifact.clone(),
+                        },
                     },
-                },
-            )]),
-            bindings: BTreeMap::new(),
+                )]);
+            let __bindings: BTreeMap<
+                crate::identity::SlotId,
+                crate::ledger::records::PhysicalBinding,
+            > = BTreeMap::new();
+            let mut __entries: BTreeMap<
+                crate::identity::SlotId,
+                crate::ledger::records::RollbackEntry,
+            > = BTreeMap::new();
+            for (k, v) in __slots.clone() {
+                let b = __bindings.get(&k).cloned().unwrap_or(
+                    crate::ledger::records::PhysicalBinding {
+                        server: crate::identity::ServerId::new("s1"),
+                        deploy_dir: format!("/srv/deploy/{}", k.as_str()),
+                    },
+                );
+                __entries.insert(
+                    k.clone(),
+                    crate::ledger::records::RollbackEntry::new(
+                        v.generation.clone(),
+                        v.assignment.artifact.clone(),
+                        b,
+                    ),
+                );
+            }
+            for (k, b) in __bindings.clone() {
+                __entries.entry(k.clone()).or_insert_with(|| {
+                    crate::ledger::records::RollbackEntry::new(
+                        crate::identity::GenerationId::new("gen-missing".to_string()),
+                        crate::identity::ArtifactRef {
+                            release: crate::identity::test_release_id("rel-missing"),
+                            variant: crate::identity::VariantName::new("standard".to_string()),
+                            tree: crate::identity::test_tree_digest("missing"),
+                        },
+                        b.clone(),
+                    )
+                });
+            }
+            crate::ledger::records::LedgerRollback::from_entries(__entries)
         };
         verify_rollback_matches_desired(&attempt.deployment_id, &matching, &attempt)
             .expect("the matching rollback passes the pre-append guard");
         // A DIVERGED rollback: the selected entry carries a DIFFERENT
         // generation AND a different artifact — refused before any append.
-        let diverged = crate::ledger::LedgerRollback {
-            slots: BTreeMap::from([(
-                sid.clone(),
-                GenerationRef {
-                    generation: test_generation_id("gen-stale"),
-                    assignment: PlacementSlotAssignment {
-                        placement_slot: sid.clone(),
-                        artifact: ArtifactRef {
-                            release: crate::identity::test_release_id("rel-stale"),
-                            variant: VariantName::new("standard".to_string()),
-                            tree: test_tree_digest("tree-stale"),
+        let diverged = {
+            let __slots: BTreeMap<crate::identity::SlotId, crate::identity::GenerationRef> =
+                BTreeMap::from([(
+                    sid.clone(),
+                    GenerationRef {
+                        generation: test_generation_id("gen-stale"),
+                        assignment: PlacementSlotAssignment {
+                            placement_slot: sid.clone(),
+                            artifact: ArtifactRef {
+                                release: crate::identity::test_release_id("rel-stale"),
+                                variant: VariantName::new("standard".to_string()),
+                                tree: test_tree_digest("tree-stale"),
+                            },
                         },
                     },
-                },
-            )]),
-            bindings: BTreeMap::new(),
+                )]);
+            let __bindings: BTreeMap<
+                crate::identity::SlotId,
+                crate::ledger::records::PhysicalBinding,
+            > = BTreeMap::new();
+            let mut __entries: BTreeMap<
+                crate::identity::SlotId,
+                crate::ledger::records::RollbackEntry,
+            > = BTreeMap::new();
+            for (k, v) in __slots.clone() {
+                let b = __bindings.get(&k).cloned().unwrap_or(
+                    crate::ledger::records::PhysicalBinding {
+                        server: crate::identity::ServerId::new("s1"),
+                        deploy_dir: format!("/srv/deploy/{}", k.as_str()),
+                    },
+                );
+                __entries.insert(
+                    k.clone(),
+                    crate::ledger::records::RollbackEntry::new(
+                        v.generation.clone(),
+                        v.assignment.artifact.clone(),
+                        b,
+                    ),
+                );
+            }
+            for (k, b) in __bindings.clone() {
+                __entries.entry(k.clone()).or_insert_with(|| {
+                    crate::ledger::records::RollbackEntry::new(
+                        crate::identity::GenerationId::new("gen-missing".to_string()),
+                        crate::identity::ArtifactRef {
+                            release: crate::identity::test_release_id("rel-missing"),
+                            variant: crate::identity::VariantName::new("standard".to_string()),
+                            tree: crate::identity::test_tree_digest("missing"),
+                        },
+                        b.clone(),
+                    )
+                });
+            }
+            crate::ledger::records::LedgerRollback::from_entries(__entries)
         };
         let err = verify_rollback_matches_desired(&attempt.deployment_id, &diverged, &attempt)
             .expect_err("a diverged rollback entry must refuse the finalization before any append");

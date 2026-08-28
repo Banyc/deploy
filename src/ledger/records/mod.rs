@@ -10,7 +10,7 @@
 //!
 //! The SHARED core comes first — the deployment-record fields
 //! ([`SlotAttemptState`] / [`DeploymentStatus`]), the ROLLBACK records
-//! ([`LedgerRollback`] / [`LedgerRollbackWire`] / [`PhysicalBinding`] /
+//! ([`LedgerRollback`] / [`RollbackEntry`] / [`PhysicalBinding`] /
 //! [`CompleteRollback`]), the PLAN/report records ([`BehaviorIndex`],
 //! [`SlotPlan`], [`DeploymentPlanWire`] / [`DeploymentPlan`], [`PlanSource`] /
 //! [`PlanOrigin`]), and the pins/server records ([`Pins`] /
@@ -43,6 +43,7 @@
 //! * **schema versions** — the format-version constants
 //!   (`LEDGER_SCHEMA_VERSION` / `PINS_SCHEMA_VERSION`).
 //!
+//! The ROLLBACK payload IS the domain struct serialized directly; the schema version gates old shapes.
 //! The per-slot ordered TABLES ([`crate::ledger::tables::SlotTable`] /
 //! [`crate::ledger::tables::NonEmptySlotTable`] over the private ordered
 //! map) are generic slot collection INFRASTRUCTURE and stay in
@@ -70,7 +71,7 @@
 //! through methods (`membership()`, `releases()`, `behavior_digest()`,
 //! [`LedgerTerminal::remaining_changes`], [`LedgerTerminal::compensation`]);
 //! the redundant on-disk members exist only in the WIRE types (the raw serde
-//! shapes, [`LedgerIntentWire`], [`LedgerRollbackWire`], [`LedgerTerminalWire`],
+//! shapes, [`LedgerIntentWire`], [`LedgerTerminalWire`],
 //! [`DeploymentPlanWire`]) and are RECONCILED by a VERIFYING CONVERSION
 //! (`Wire::into_domain`). A disagreement is an
 //! [`crate::error::Error::integrity`] error (fail closed). The rest of the
@@ -93,7 +94,7 @@
 use crate::error::{Error, Result};
 use crate::identity::{
     ArtifactRef, BehaviorContract, BehaviorDigest, DeploymentId, GenerationId, GenerationRef,
-    ReleaseId, ServerId, SlotId, TargetName, TreeDigest,
+    PlacementSlotAssignment, ReleaseId, ServerId, SlotId, TargetName, TreeDigest,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
@@ -199,150 +200,80 @@ pub struct PhysicalBinding {
 }
 
 /// The ROLLBACK STATE carried by the terminal event of a SUCCESSFUL
-/// deployment, the VALIDATED DOMAIN form: the snapshot payload of the attempt
-/// — the complete per-slot [`GenerationRef`]s it advanced to (a successful
-/// terminal always has a generation per slot) and the physical bindings
-/// (`{server, deploy_dir}`) each slot had.
-///
-/// THERE IS NO SNAPSHOT-WIDE RELEASE/BEHAVIOR: each slot's [`GenerationRef`]
-/// carries its OWN artifact binding (`release`, `variant`, `tree`), and a
-/// PARTIAL snapshot can legitimately carry slots from DIFFERENT releases
-/// (group pushes over time: group A pushed release R1, group B pushed
-/// release R2, and the overlay snapshot keeps each slot's own artifact). The
-/// referenced releases are DERIVED from `slots` ([`LedgerRollback::releases`])
-/// — never stored once per snapshot — and rollback resolves EACH SLOT's
-/// behavior from ITS OWN (release, variant) binding. Legacy ledger lines that
-/// still carry the old snapshot-wide `behavior_sha256`/`release` members
-/// deserialize into the WIRE form ([`LedgerRollbackWire`]), where the stored
-/// `release` must equal the snapshot's ONE derived release (a disagreement
-/// → `Error::integrity`); the legacy `behavior_sha256` is not derivable from
-/// the per-slot payload (behavior contracts are not stored) and is carried
-/// only for wire parseability, never interpreted.
-///
-/// `bindings` records the COMPLETE PHYSICAL BINDING each slot had when the
-/// deployment ran. The snapshot maps a terminal's generations to slots by
-/// SLOT, so without this map a slot that rebinds to a different server — or
-/// moves to a different `deploy_dir` on the same server — in `deploy.toml`
-/// would silently roll back onto the wrong host/location. The bindings key
-/// set must equal the `slots` key set EXACTLY (every slotted generation has
-/// a physical binding and vice versa — no missing, no extra binding keys):
-/// a MISSING entry makes the binding unverifiable (rollback must never
-/// guess the host), an EXTRA entry binds a slot that carried no generation,
-/// and the wire → domain conversion REFUSES both at CONVERSION time —
-/// before history rendering, rollback resolution, reconciliation, or the
-/// GC sweep can consume the payload. Kept as a separate `#[serde(default)]`
-/// field so the `slots` map and its [`GenerationRef`]s stay intact and
-/// ledger lines without a bindings map still deserialize (the exact-key
-/// conversion then refuses any payload whose slots are non-empty).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// deployment: the snapshot payload of the attempt — one entry per slot
+/// carrying its generation, artifact, and physical binding. The payload IS
+/// the domain struct serialized directly; the schema version gates old shapes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LedgerRollback {
-    /// Per-slot generation refs, keyed by [`SlotId`]. Each
-    /// generation ref's assignment carries the slot's OWN artifact binding
-    /// (`release`, `variant`, `tree`); the referenced releases are the set
-    /// derived from these bindings ([`LedgerRollback::releases`]).
-    pub slots: BTreeMap<SlotId, GenerationRef>,
-    /// The complete physical binding (`{server, deploy_dir}`) each slot had
-    /// at deployment time, keyed by [`SlotId`]. Every binding key
-    /// must be a slotted generation (verified by the wire → domain
-    /// conversion).
     #[serde(default)]
-    pub bindings: BTreeMap<SlotId, PhysicalBinding>,
+    entries: BTreeMap<SlotId, RollbackEntry>,
 }
-
-impl LedgerRollback {
-    /// The distinct releases referenced by the snapshot's per-slot generation
-    /// bindings — DERIVED from the authoritative `slots` map, never stored
-    /// once per snapshot (a partial snapshot can legitimately span several
-    /// releases).
-    pub fn releases(&self) -> BTreeSet<ReleaseId> {
-        self.slots
-            .values()
-            .map(|g| g.assignment.artifact.release.clone())
-            .collect()
+impl PartialEq for LedgerRollback {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries
     }
 }
-
-/// The WIRE shape of a rollback payload: the snapshot's `slots` + `bindings`
-/// plus the legacy snapshot-wide `behavior_sha256`/`release` members (carried
-/// so pre-refactor ledger lines still deserialize; writers never emit them).
+impl Eq for LedgerRollback {}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LedgerRollbackWire {
-    pub slots: BTreeMap<SlotId, GenerationRef>,
-    #[serde(default)]
-    pub bindings: BTreeMap<SlotId, PhysicalBinding>,
-    /// Legacy snapshot-wide behavior digest. NOT derivable from the per-slot
-    /// payload (behavior contracts are not stored) — carried only for wire
-    /// parseability, never interpreted (per-slot behavior resolution governs).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub behavior_sha256: Option<String>,
-    /// Legacy snapshot-wide release. When present it must equal the
-    /// snapshot's ONE derived release (the conversion fails closed on a
-    /// disagreement — a multi-release partial snapshot cannot be represented
-    /// by the legacy single release).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub release: Option<ReleaseId>,
+pub struct RollbackEntry {
+    generation: GenerationId,
+    artifact: ArtifactRef,
+    binding: PhysicalBinding,
 }
-
-impl LedgerRollbackWire {
-    /// VERIFYING CONVERSION (wire → domain): every duplicate projection must
-    /// agree — each slot's [`crate::identity::GenerationRef`] assignment names
-    /// its own map key, the `bindings` key set EQUALS the `slots` key set
-    /// EXACTLY (every slotted generation has a physical binding and vice
-    /// versa — no missing/extra binding keys), and the legacy snapshot-wide
-    /// `release` (when present) equals the snapshot's ONE derived release.
-    /// A disagreement → `Error::integrity`.
-    pub fn into_domain(self) -> Result<LedgerRollback> {
-        for (key, g) in &self.slots {
-            if &g.assignment.placement_slot != key {
-                return Err(Error::integrity(format!(
-                    "rollback: generation for slot '{key}' names placement '{}'",
-                    g.assignment.placement_slot
-                )));
-            }
+impl RollbackEntry {
+    pub fn new(generation: GenerationId, artifact: ArtifactRef, binding: PhysicalBinding) -> Self {
+        Self {
+            generation,
+            artifact,
+            binding,
         }
-        // EXACT ROLLBACK BINDING KEYS (cross-field invariant): the
-        // `bindings` key set must equal the `slots` key set EXACTLY. A
-        // missing binding makes the slot's physical location unverifiable;
-        // an extra binding names a slot with no generation. Both are
-        // REFUSED here, at conversion time, before rollback resolution can
-        // consume the payload (a hand-constructed or tampered record can
-        // never be read as whichever projection a consumer happens to use).
-        let slot_keys: BTreeSet<&SlotId> = self.slots.keys().collect();
-        let binding_keys: BTreeSet<&SlotId> = self.bindings.keys().collect();
-        if slot_keys != binding_keys {
-            let missing: Vec<&SlotId> = slot_keys.difference(&binding_keys).copied().collect();
-            let extra: Vec<&SlotId> = binding_keys.difference(&slot_keys).copied().collect();
-            return Err(Error::integrity(format!(
-                "rollback: bindings must key EXACTLY the slotted generations (missing bindings for {missing:?}; extra bindings for {extra:?})"
-            )));
-        }
-        if let Some(legacy) = &self.release {
-            let derived: BTreeSet<ReleaseId> = self
-                .slots
-                .values()
-                .map(|g| g.assignment.artifact.release.clone())
-                .collect();
-            if derived.len() != 1 || !derived.contains(legacy) {
-                return Err(Error::integrity(format!(
-                    "rollback: legacy release '{legacy}' disagrees with the derived snapshot releases {derived:?}"
-                )));
-            }
-        }
-        Ok(LedgerRollback {
-            slots: self.slots,
-            bindings: self.bindings,
+    }
+    pub fn generation(&self) -> &GenerationId {
+        &self.generation
+    }
+    pub fn artifact(&self) -> &ArtifactRef {
+        &self.artifact
+    }
+    pub fn binding(&self) -> &PhysicalBinding {
+        &self.binding
+    }
+}
+impl LedgerRollback {
+    pub fn from_entries(entries: BTreeMap<SlotId, RollbackEntry>) -> Self {
+        Self { entries }
+    }
+    pub fn iter(&self) -> impl Iterator<Item = (&SlotId, &RollbackEntry)> {
+        self.entries.iter()
+    }
+    pub fn get(&self, slot: &SlotId) -> Option<&RollbackEntry> {
+        self.entries.get(slot)
+    }
+    pub fn keys(&self) -> impl Iterator<Item = &SlotId> {
+        self.entries.keys()
+    }
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+    pub fn into_entries(self) -> BTreeMap<SlotId, RollbackEntry> {
+        self.entries
+    }
+    pub fn generation_ref(&self, slot: &SlotId) -> Option<GenerationRef> {
+        self.entries.get(slot).map(|e| GenerationRef {
+            generation: e.generation.clone(),
+            assignment: PlacementSlotAssignment {
+                placement_slot: slot.clone(),
+                artifact: e.artifact.clone(),
+            },
         })
     }
-}
-
-impl From<&LedgerRollback> for LedgerRollbackWire {
-    fn from(r: &LedgerRollback) -> Self {
-        LedgerRollbackWire {
-            slots: r.slots.clone(),
-            bindings: r.bindings.clone(),
-            behavior_sha256: None,
-            release: None,
-        }
+    pub fn releases(&self) -> BTreeSet<ReleaseId> {
+        self.entries
+            .values()
+            .map(|e| e.artifact.release.clone())
+            .collect()
     }
 }
 
@@ -947,11 +878,49 @@ mod tests {
                     .iter()
                     .map(|k| (k.clone(), outcome_for(k, SlotOutcomeKind::Activated)))
                     .collect(),
-                rollback: Some(LedgerRollbackWire {
-                    slots: keys.iter().map(|k| (k.clone(), gen_ref_for(k))).collect(),
-                    bindings: keys.iter().map(|k| (k.clone(), binding(k))).collect(),
-                    behavior_sha256: None,
-                    release: None,
+                rollback: Some({
+                    let __slots: BTreeMap<crate::identity::SlotId, crate::identity::GenerationRef> =
+                        keys.iter().map(|k| (k.clone(), gen_ref_for(k))).collect();
+                    let __bindings: BTreeMap<
+                        crate::identity::SlotId,
+                        crate::ledger::records::PhysicalBinding,
+                    > = keys.iter().map(|k| (k.clone(), binding(k))).collect();
+                    let mut __entries: BTreeMap<
+                        crate::identity::SlotId,
+                        crate::ledger::records::RollbackEntry,
+                    > = BTreeMap::new();
+                    for (k, v) in __slots.clone() {
+                        let b = __bindings.get(&k).cloned().unwrap_or(
+                            crate::ledger::records::PhysicalBinding {
+                                server: crate::identity::ServerId::new("s1"),
+                                deploy_dir: format!("/srv/deploy/{}", k.as_str()),
+                            },
+                        );
+                        __entries.insert(
+                            k.clone(),
+                            crate::ledger::records::RollbackEntry::new(
+                                v.generation.clone(),
+                                v.assignment.artifact.clone(),
+                                b,
+                            ),
+                        );
+                    }
+                    for (k, b) in __bindings.clone() {
+                        __entries.entry(k.clone()).or_insert_with(|| {
+                            crate::ledger::records::RollbackEntry::new(
+                                crate::identity::GenerationId::new("gen-missing".to_string()),
+                                crate::identity::ArtifactRef {
+                                    release: crate::identity::test_release_id("rel-missing"),
+                                    variant: crate::identity::VariantName::new(
+                                        "standard".to_string(),
+                                    ),
+                                    tree: crate::identity::test_tree_digest("missing"),
+                                },
+                                b.clone(),
+                            )
+                        });
+                    }
+                    crate::ledger::records::LedgerRollback::from_entries(__entries)
                 }),
                 selected_membership: keys.to_vec(),
                 full_membership: keys.to_vec(),
@@ -1302,7 +1271,7 @@ mod tests {
         else {
             panic!("Successful maps to Successful {{ rollback, activated, full_membership }}");
         };
-        assert_eq!(rollback.slots.len(), 2, "the complete rollback payload");
+        assert_eq!(rollback.len(), 2, "the complete rollback payload");
         assert_eq!(
             activated.len(),
             2,
@@ -1360,11 +1329,47 @@ mod tests {
             "FailedPreflight with outcomes is refused"
         );
         let mut bad = agreeing_terminal(&keys, 1); // FailedPreflight
-        bad.rollback = Some(LedgerRollbackWire {
-            slots: BTreeMap::new(),
-            bindings: BTreeMap::new(),
-            behavior_sha256: None,
-            release: None,
+        bad.rollback = Some({
+            let __slots: BTreeMap<crate::identity::SlotId, crate::identity::GenerationRef> =
+                BTreeMap::new();
+            let __bindings: BTreeMap<
+                crate::identity::SlotId,
+                crate::ledger::records::PhysicalBinding,
+            > = BTreeMap::new();
+            let mut __entries: BTreeMap<
+                crate::identity::SlotId,
+                crate::ledger::records::RollbackEntry,
+            > = BTreeMap::new();
+            for (k, v) in __slots.clone() {
+                let b = __bindings.get(&k).cloned().unwrap_or(
+                    crate::ledger::records::PhysicalBinding {
+                        server: crate::identity::ServerId::new("s1"),
+                        deploy_dir: format!("/srv/deploy/{}", k.as_str()),
+                    },
+                );
+                __entries.insert(
+                    k.clone(),
+                    crate::ledger::records::RollbackEntry::new(
+                        v.generation.clone(),
+                        v.assignment.artifact.clone(),
+                        b,
+                    ),
+                );
+            }
+            for (k, b) in __bindings.clone() {
+                __entries.entry(k.clone()).or_insert_with(|| {
+                    crate::ledger::records::RollbackEntry::new(
+                        crate::identity::GenerationId::new("gen-missing".to_string()),
+                        crate::identity::ArtifactRef {
+                            release: crate::identity::test_release_id("rel-missing"),
+                            variant: crate::identity::VariantName::new("standard".to_string()),
+                            tree: crate::identity::test_tree_digest("missing"),
+                        },
+                        b.clone(),
+                    )
+                });
+            }
+            crate::ledger::records::LedgerRollback::from_entries(__entries)
         });
         assert!(
             bad.into_domain().is_err(),
@@ -1439,8 +1444,8 @@ mod tests {
         let TerminalDisposition::Successful { rollback, .. } = &d_terminal.disposition else {
             panic!("Successful disposition");
         };
-        assert_eq!(rollback.slots.len(), d_intent.slots.len());
-        assert_eq!(rollback.bindings.len(), d_intent.slots.len());
+        assert_eq!(rollback.len(), d_intent.slots.len());
+        assert_eq!(rollback.len(), d_intent.slots.len());
         // The PERSISTED memberships are exposed and prove the equations.
         assert_eq!(
             d_terminal.selected_membership(),
@@ -1485,24 +1490,34 @@ mod tests {
             "Successful with an extra outcome key fails the conversion"
         );
 
-        // SUCCESSFUL with a MISSING rollback slot (and binding) → Err
+        // SUCCESSFUL with a MISSING rollback slot → Err
         // (rollback != full).
         let mut bad = terminal.clone();
-        let rb = bad.rollback.as_mut().unwrap();
-        rb.slots.remove(&slot(1));
-        rb.bindings.remove(&slot(1));
+        {
+            let rb = bad.rollback.take().unwrap();
+            let mut entries = rb.into_entries();
+            entries.remove(&slot(1));
+            bad.rollback = Some(LedgerRollback::from_entries(entries));
+        }
         assert!(
             bad.into_domain().is_err(),
             "Successful with a missing rollback slot fails the conversion (rollback must EXACTLY equal the full_membership)"
         );
 
-        // SUCCESSFUL with an EXTRA rollback slot (and binding) → Err
+        // SUCCESSFUL with an EXTRA rollback slot → Err
         // (rollback != full — the complete snapshot covers EXACTLY the full
         // membership).
         let mut bad = terminal.clone();
-        let rb = bad.rollback.as_mut().unwrap();
-        rb.slots.insert(slot(9), gen_ref_for(&slot(9)));
-        rb.bindings.insert(slot(9), binding(&slot(9)));
+        {
+            let rb = bad.rollback.take().unwrap();
+            let mut entries = rb.into_entries();
+            let gr = gen_ref_for(&slot(9));
+            entries.insert(
+                slot(9),
+                RollbackEntry::new(gr.generation, gr.assignment.artifact, binding(&slot(9))),
+            );
+            bad.rollback = Some(LedgerRollback::from_entries(entries));
+        }
         assert!(
             bad.into_domain().is_err(),
             "Successful with an extra rollback slot fails the conversion"
@@ -1609,60 +1624,26 @@ mod tests {
             "FailedRolledBack with a missing outcome fails the pair read"
         );
     }
-    /// kept duplicate-projection checks (assignment own-key, bindings ⊆
-    /// slotted generations, the legacy snapshot-wide release when present).
     #[test]
     fn rollback_wire_disagreement_per_duplicate_fails_closed() {
-        let wire = LedgerRollbackWire {
-            slots: BTreeMap::from([(slot(1), gen_ref_for(&slot(1)))]),
-            bindings: BTreeMap::from([(slot(1), binding(&slot(1)))]),
-            behavior_sha256: None,
-            release: None,
-        };
-        let domain = wire.clone().into_domain().unwrap();
-        assert_eq!(
-            domain.releases(),
-            BTreeSet::from([test_release_id("slot-1")])
-        );
-        let json = serde_json::to_string(&domain).unwrap();
-        let wire2: LedgerRollbackWire = serde_json::from_str(&json).unwrap();
-        let domain2 = wire2.into_domain().unwrap();
-        assert_eq!(domain2.releases(), domain.releases());
-
-        let mut bad = wire.clone();
-        bad.bindings.insert(slot(2), binding(&slot(2)));
-        assert!(
-            bad.into_domain().is_err(),
-            "a binding without a generation fails closed"
-        );
-        let mut bad = wire.clone();
-        bad.bindings.remove(&slot(1));
-        assert!(
-            bad.into_domain().is_err(),
-            "a slotted generation without its binding fails closed (exact binding keys)"
-        );
-        let mut bad = wire.clone();
-        bad.slots
-            .get_mut(&slot(1))
-            .unwrap()
-            .assignment
-            .placement_slot = slot(2);
-        assert!(
-            bad.into_domain().is_err(),
-            "an assignment naming another placement fails closed"
-        );
-        let mut bad = wire.clone();
-        bad.release = Some(test_release_id("rel-other"));
-        assert!(
-            bad.into_domain().is_err(),
-            "a legacy release disagreeing with the derived release fails closed"
-        );
-        let mut good = wire.clone();
-        good.release = Some(test_release_id("slot-1"));
-        assert!(
-            good.into_domain().is_ok(),
-            "an agreeing legacy release passes"
-        );
+        let rb = LedgerRollback::from_entries(BTreeMap::from([(
+            slot(1),
+            RollbackEntry::new(
+                test_generation_id("slot-1"),
+                ArtifactRef {
+                    release: test_release_id("slot-1"),
+                    variant: VariantName::new("standard".to_string()),
+                    tree: test_tree_digest("slot-1"),
+                },
+                binding(&slot(1)),
+            ),
+        )]));
+        assert_eq!(rb.releases(), BTreeSet::from([test_release_id("slot-1")]));
+        let json = serde_json::to_string(&rb).unwrap();
+        assert!(json.contains("\"entries\""));
+        let rb2: LedgerRollback = serde_json::from_str(&json).unwrap();
+        assert_eq!(rb2.releases(), rb.releases());
+        assert_eq!(rb2.len(), 1);
     }
     /// [`LedgerTerminalWire`]: an agreeing terminal converts and round-trips
     /// stably; the STATUS/ROLLBACK TRUTH TABLE (Successful ⇔ rollback
@@ -1671,11 +1652,47 @@ mod tests {
     /// variants (Successful + rollback, failed + no rollback) pass.
     #[test]
     fn terminal_wire_truth_table_and_rollback_agreement_fails_closed() {
-        let rollback = || LedgerRollbackWire {
-            slots: BTreeMap::from([(slot(1), gen_ref_for(&slot(1)))]),
-            bindings: BTreeMap::from([(slot(1), binding(&slot(1)))]),
-            behavior_sha256: None,
-            release: None,
+        let rollback = || {
+            let __slots: BTreeMap<crate::identity::SlotId, crate::identity::GenerationRef> =
+                BTreeMap::from([(slot(1), gen_ref_for(&slot(1)))]);
+            let __bindings: BTreeMap<
+                crate::identity::SlotId,
+                crate::ledger::records::PhysicalBinding,
+            > = BTreeMap::from([(slot(1), binding(&slot(1)))]);
+            let mut __entries: BTreeMap<
+                crate::identity::SlotId,
+                crate::ledger::records::RollbackEntry,
+            > = BTreeMap::new();
+            for (k, v) in __slots.clone() {
+                let b = __bindings.get(&k).cloned().unwrap_or(
+                    crate::ledger::records::PhysicalBinding {
+                        server: crate::identity::ServerId::new("s1"),
+                        deploy_dir: format!("/srv/deploy/{}", k.as_str()),
+                    },
+                );
+                __entries.insert(
+                    k.clone(),
+                    crate::ledger::records::RollbackEntry::new(
+                        v.generation.clone(),
+                        v.assignment.artifact.clone(),
+                        b,
+                    ),
+                );
+            }
+            for (k, b) in __bindings.clone() {
+                __entries.entry(k.clone()).or_insert_with(|| {
+                    crate::ledger::records::RollbackEntry::new(
+                        crate::identity::GenerationId::new("gen-missing".to_string()),
+                        crate::identity::ArtifactRef {
+                            release: crate::identity::test_release_id("rel-missing"),
+                            variant: crate::identity::VariantName::new("standard".to_string()),
+                            tree: crate::identity::test_tree_digest("missing"),
+                        },
+                        b.clone(),
+                    )
+                });
+            }
+            crate::ledger::records::LedgerRollback::from_entries(__entries)
         };
         let outcome = || SlotResult {
             slot_id: slot(1),
@@ -1744,24 +1761,7 @@ mod tests {
             bad.into_domain().is_err(),
             "an outcome naming a different placement fails closed"
         );
-        // EXACT BINDING KEYS: a generation without its binding …
-        let mut bad = wire.clone();
-        bad.rollback.as_mut().unwrap().bindings.remove(&slot(1));
-        assert!(
-            bad.into_domain().is_err(),
-            "a slotted generation without its binding fails closed"
-        );
-        // … and a binding without its generation.
-        let mut bad = wire.clone();
-        bad.rollback
-            .as_mut()
-            .unwrap()
-            .bindings
-            .insert(slot(2), binding(&slot(2)));
-        assert!(
-            bad.into_domain().is_err(),
-            "a binding without a generation fails closed"
-        );
+        // In the single-map shape the cross-map key equality is structurally impossible; no separate binding check.
 
         // The other truth-table variant stays VALID: a failed terminal with
         // NO rollback, NO outcomes, and NO memberships (only a Successful
@@ -1818,13 +1818,13 @@ mod tests {
         );
         for key in outcomes.keys() {
             assert!(
-                rollback.slots.contains_key(key),
+                rollback.get(key).is_some(),
                 "every activated slot is covered by the rollback (the facts source)"
             );
             assert_eq!(
                 outcomes[key].observation,
                 Observation::Known(ObservedGeneration {
-                    generation: rollback.slots[key].generation.clone(),
+                    generation: rollback.get(key).unwrap().generation().clone(),
                 }),
                 "the derived view's generation EQUALS the rollback's authoritative generation"
             );
@@ -1998,7 +1998,48 @@ mod tests {
                 keys.iter().map(|k| (k.clone(), gen_ref_for(k))).collect();
             let bindings: BTreeMap<SlotId, PhysicalBinding> =
                 slots.keys().map(|k| (k.clone(), binding(k))).collect();
-            LedgerRollback { slots, bindings }
+            {
+                let __slots: BTreeMap<crate::identity::SlotId, crate::identity::GenerationRef> =
+                    slots;
+                let __bindings: BTreeMap<
+                    crate::identity::SlotId,
+                    crate::ledger::records::PhysicalBinding,
+                > = bindings;
+                let mut __entries: BTreeMap<
+                    crate::identity::SlotId,
+                    crate::ledger::records::RollbackEntry,
+                > = BTreeMap::new();
+                for (k, v) in __slots.clone() {
+                    let b = __bindings.get(&k).cloned().unwrap_or(
+                        crate::ledger::records::PhysicalBinding {
+                            server: crate::identity::ServerId::new("s1"),
+                            deploy_dir: format!("/srv/deploy/{}", k.as_str()),
+                        },
+                    );
+                    __entries.insert(
+                        k.clone(),
+                        crate::ledger::records::RollbackEntry::new(
+                            v.generation.clone(),
+                            v.assignment.artifact.clone(),
+                            b,
+                        ),
+                    );
+                }
+                for (k, b) in __bindings.clone() {
+                    __entries.entry(k.clone()).or_insert_with(|| {
+                        crate::ledger::records::RollbackEntry::new(
+                            crate::identity::GenerationId::new("gen-missing".to_string()),
+                            crate::identity::ArtifactRef {
+                                release: crate::identity::test_release_id("rel-missing"),
+                                variant: crate::identity::VariantName::new("standard".to_string()),
+                                tree: crate::identity::test_tree_digest("missing"),
+                            },
+                            b.clone(),
+                        )
+                    });
+                }
+                crate::ledger::records::LedgerRollback::from_entries(__entries)
+            }
         })
     }
 
@@ -2015,7 +2056,7 @@ mod tests {
             // rollback's slots (one activated slot per slotted generation),
             // and the memberships equal that set — the proven shape the
             // round trip preserves.
-            let membership: BTreeSet<SlotId> = rollback.slots.keys().cloned().collect();
+            let membership: BTreeSet<SlotId> = rollback.keys().cloned().collect();
             LedgerTerminal {
                 recorded_at: "2026-01-01T00:00:00Z".to_string(),
                 disposition: TerminalDisposition::Successful {

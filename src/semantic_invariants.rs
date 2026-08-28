@@ -5981,7 +5981,7 @@ fn assert_semantic_invariants(model: &Model, system: &Fixture) {
             // The snapshot's OWN first slot (a slot has exactly one owning
             // target, so a t1 snapshot carries p1/p2 and a t2 snapshot p3).
             let pid = Model::target_slots(t)[0].clone();
-            let art = rollback.slots[&pid].assignment.artifact.clone();
+            let art = rollback.get(&pid).unwrap().artifact().clone();
             learn_artifact(
                 &mut learned,
                 &ctx,

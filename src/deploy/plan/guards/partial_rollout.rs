@@ -86,7 +86,7 @@ pub(crate) fn validate_partial_rollout(
                         .expect("validated server id is a safe segment"),
                     deploy_dir: slot.deploy_dir().to_string_lossy().into_owned(),
                 };
-                if !base.slots.contains_key(&slot_id) {
+                if base.get(&slot_id).is_none() {
                     return Err(Error::preflight(format!(
                         "partial rollout of target '{}' with group '{}' is refused: unselected slot \
                          '{}' has no prior assignment in the latest successful snapshot (it was \
@@ -96,7 +96,7 @@ pub(crate) fn validate_partial_rollout(
                         slot_id
                     )));
                 }
-                let recorded = base.bindings.get(&slot_id).ok_or_else(|| {
+                let recorded = base.get(&slot_id).map(|e| e.binding()).ok_or_else(|| {
                     Error::preflight(format!(
                         "partial rollout of target '{}' with group '{}' is refused: unselected slot \
                          '{}' has no recorded physical binding in the latest successful snapshot",

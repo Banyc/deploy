@@ -723,28 +723,68 @@ mod tests {
         LedgerTerminal {
             recorded_at: recorded_at.to_string(),
             disposition: TerminalDisposition::Successful {
-                rollback: LedgerRollback {
-                    slots: BTreeMap::from([(
-                        p1.clone(),
-                        GenerationRef {
-                            generation: test_generation_id("gen-1"),
-                            assignment: PlacementSlotAssignment {
-                                placement_slot: p1.clone(),
-                                artifact: ArtifactRef {
-                                    release: test_release_id("rel-1"),
-                                    variant: VariantName::new("standard".to_string()),
-                                    tree: test_tree_digest("tree-1"),
+                rollback: {
+                    let __slots: BTreeMap<crate::identity::SlotId, crate::identity::GenerationRef> =
+                        BTreeMap::from([(
+                            p1.clone(),
+                            GenerationRef {
+                                generation: test_generation_id("gen-1"),
+                                assignment: PlacementSlotAssignment {
+                                    placement_slot: p1.clone(),
+                                    artifact: ArtifactRef {
+                                        release: test_release_id("rel-1"),
+                                        variant: VariantName::new("standard".to_string()),
+                                        tree: test_tree_digest("tree-1"),
+                                    },
                                 },
                             },
-                        },
-                    )]),
-                    bindings: BTreeMap::from([(
+                        )]);
+                    let __bindings: BTreeMap<
+                        crate::identity::SlotId,
+                        crate::ledger::records::PhysicalBinding,
+                    > = BTreeMap::from([(
                         p1.clone(),
                         crate::ledger::PhysicalBinding {
                             server: ServerId::new("s1".to_string()),
                             deploy_dir: "/srv/deploy/p1".to_string(),
                         },
-                    )]),
+                    )]);
+                    let mut __entries: BTreeMap<
+                        crate::identity::SlotId,
+                        crate::ledger::records::RollbackEntry,
+                    > = BTreeMap::new();
+                    for (k, v) in __slots.clone() {
+                        let b = __bindings.get(&k).cloned().unwrap_or(
+                            crate::ledger::records::PhysicalBinding {
+                                server: crate::identity::ServerId::new("s1"),
+                                deploy_dir: format!("/srv/deploy/{}", k.as_str()),
+                            },
+                        );
+                        __entries.insert(
+                            k.clone(),
+                            crate::ledger::records::RollbackEntry::new(
+                                v.generation.clone(),
+                                v.assignment.artifact.clone(),
+                                b,
+                            ),
+                        );
+                    }
+                    for (k, b) in __bindings.clone() {
+                        __entries.entry(k.clone()).or_insert_with(|| {
+                            crate::ledger::records::RollbackEntry::new(
+                                crate::identity::GenerationId::new("gen-missing".to_string()),
+                                crate::identity::ArtifactRef {
+                                    release: crate::identity::test_release_id("rel-missing"),
+                                    variant: crate::identity::VariantName::new(
+                                        "standard".to_string(),
+                                    ),
+                                    tree: crate::identity::test_tree_digest("missing"),
+                                },
+                                b.clone(),
+                            )
+                        });
+                    }
+                    LedgerRollback::from_entries(__entries)
                 },
                 // SUCCESS IS THE ACTIVATED SLOT-ID SET: the per-slot
                 // generation/artifact facts are DERIVED from the rollback

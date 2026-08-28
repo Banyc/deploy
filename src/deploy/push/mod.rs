@@ -629,14 +629,20 @@ pub(crate) mod push_tests {
             _ => panic!("a successful outcome records a Known observation"),
         };
         assert_eq!(
-            rollback_of(snap).slots[&SlotId::new("p1")].generation,
-            wire_generation
+            rollback_of(snap)
+                .get(&SlotId::new("p1"))
+                .unwrap()
+                .generation()
+                .clone(),
+            wire_generation.clone()
         );
         let actual = &r.attempt.as_ref().unwrap().slots[&SlotId::new("p1")];
         assert_eq!(
-            rollback_of(snap).slots[&SlotId::new("p1")]
-                .assignment
-                .artifact,
+            rollback_of(snap)
+                .get(&SlotId::new("p1"))
+                .unwrap()
+                .artifact()
+                .clone(),
             known_artifact(actual).clone()
         );
     }

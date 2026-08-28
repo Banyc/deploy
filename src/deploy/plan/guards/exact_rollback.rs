@@ -45,7 +45,7 @@ pub(crate) fn verify_exact_rollback_bindings(
                 .expect("validated server id is a safe segment"),
             deploy_dir: slot.deploy_dir().to_string_lossy().into_owned(),
         };
-        let recorded = entry.bindings.get(&slot_id).ok_or_else(|| {
+        let recorded = entry.get(&slot_id).map(|e| e.binding()).ok_or_else(|| {
             Error::rollback(format!(
                 "slot '{slot_id}' has no recorded physical binding in deployment '{deployment_id}' of target '{ft}'; exact rollback cannot verify the deployment location"
             ))

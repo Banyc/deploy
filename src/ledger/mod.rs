@@ -16,7 +16,7 @@
 //!   foundational three-state observation lives in
 //!   `crate::ledger::records::observation`. The record names are all
 //!   re-exported at [`crate::ledger::records`]: the rollback records
-//!   ([`LedgerRollback`] / [`LedgerRollbackWire`] /
+//!   ([`LedgerRollback`] /
 //!   [`PhysicalBinding`] / [`CompleteRollback`]), the plan/report records
 //!   ([`DeploymentPlanWire`] / [`DeploymentPlan`] / [`PlanSource`] /
 //!   [`PlanOrigin`] / [`BehaviorIndex`] / [`SlotPlan`]), the pins/server
@@ -87,11 +87,11 @@ pub use log::render_log;
 pub use records::{
     ArtifactRefWire, BehaviorIndex, CompensationReport, CompleteRollback, DeploymentIntent,
     DeploymentPlan, DeploymentPlanWire, DeploymentStatus, DesiredGeneration, FrozenSlotTopology,
-    IntentSlot, LedgerIntentReport, LedgerIntentWire, LedgerRollback, LedgerRollbackWire,
-    LedgerTerminal, LedgerTerminalWire, NonEmptySlotTable, Observation, ObservationError,
-    ObservationWire, ObservedAssignment, ObservedGeneration, ObservedGenerationWire, ObservedSlot,
-    ObservedTarget, PhysicalBinding, Pins, PlanOrigin, PlanSource, PreviousGeneration,
-    RebindingPlan, ServerState, SlotAttemptState, SlotAttemptStateWire, SlotOutcome,
+    IntentSlot, LedgerIntentReport, LedgerIntentWire, LedgerRollback, LedgerTerminal,
+    LedgerTerminalWire, NonEmptySlotTable, Observation, ObservationError, ObservationWire,
+    ObservedAssignment, ObservedGeneration, ObservedGenerationWire, ObservedSlot, ObservedTarget,
+    PhysicalBinding, Pins, PlanOrigin, PlanSource, PreviousGeneration, RebindingPlan,
+    RollbackEntry, ServerState, SlotAttemptState, SlotAttemptStateWire, SlotOutcome,
     SlotOutcomeKind, SlotPlan, SlotResult, SlotTable, SlotTransition, TerminalDisposition,
     VerifiedReleaseRebinding,
 };

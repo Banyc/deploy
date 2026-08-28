@@ -392,9 +392,51 @@ pub(crate) fn seed_snapshot(
                 // Successful terminal must carry one activated slot per
                 // slotted generation).
                 disposition: TerminalDisposition::Successful {
-                    rollback: crate::ledger::LedgerRollback {
-                        slots: slots.clone(),
-                        bindings,
+                    rollback: {
+                        let __slots: BTreeMap<
+                            crate::identity::SlotId,
+                            crate::identity::GenerationRef,
+                        > = slots.clone();
+                        let __bindings: BTreeMap<
+                            crate::identity::SlotId,
+                            crate::ledger::records::PhysicalBinding,
+                        > = bindings;
+                        let mut __entries: BTreeMap<
+                            crate::identity::SlotId,
+                            crate::ledger::records::RollbackEntry,
+                        > = BTreeMap::new();
+                        for (k, v) in __slots.clone() {
+                            let b = __bindings.get(&k).cloned().unwrap_or(
+                                crate::ledger::records::PhysicalBinding {
+                                    server: crate::identity::ServerId::new("s1"),
+                                    deploy_dir: format!("/srv/deploy/{}", k.as_str()),
+                                },
+                            );
+                            __entries.insert(
+                                k.clone(),
+                                crate::ledger::records::RollbackEntry::new(
+                                    v.generation.clone(),
+                                    v.assignment.artifact.clone(),
+                                    b,
+                                ),
+                            );
+                        }
+                        for (k, b) in __bindings.clone() {
+                            __entries.entry(k.clone()).or_insert_with(|| {
+                                crate::ledger::records::RollbackEntry::new(
+                                    crate::identity::GenerationId::new("gen-missing".to_string()),
+                                    crate::identity::ArtifactRef {
+                                        release: crate::identity::test_release_id("rel-missing"),
+                                        variant: crate::identity::VariantName::new(
+                                            "standard".to_string(),
+                                        ),
+                                        tree: crate::identity::test_tree_digest("missing"),
+                                    },
+                                    b.clone(),
+                                )
+                            });
+                        }
+                        crate::ledger::records::LedgerRollback::from_entries(__entries)
                     },
                     activated: slots.keys().cloned().collect(),
                     // THE EXACT-EQUAL MEMBERSHIPS: activated == full ==

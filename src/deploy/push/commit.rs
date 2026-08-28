@@ -725,14 +725,14 @@ pub(crate) mod commit_tests {
         assert_finalized(&h, &intent);
         let snap = h.store.read_snapshots("t1").unwrap();
         assert_eq!(snap.len(), 1);
-        let g = &rollback_of(&snap[0]).slots[&SlotId::new("p1")];
+        let g = rollback_of(&snap[0]).get(&SlotId::new("p1")).unwrap();
         let desired = &intent.desired[&SlotId::new("p1")];
         assert_eq!(
-            g.generation.as_str(),
+            g.generation().as_str(),
             desired.generation.as_str(),
             "snapshot generation comes from the verified desired state"
         );
-        assert_eq!(g.assignment.artifact.tree, desired.assignment.artifact.tree);
+        assert_eq!(g.artifact().tree, desired.assignment.artifact.tree);
         assert_eq!(h.store.read_attempts("t1").unwrap().len(), 1);
     }
 
@@ -1179,20 +1179,22 @@ pub(crate) mod commit_tests {
         assert_eq!(snapshots.len(), 2, "baseline + the group-b snapshot");
         let s1 = rollback_of(&snapshots[1]);
         assert_eq!(
-            s1.slots.len(),
+            s1.len(),
             2,
             "the group push's rollback is the COMPLETE resulting snapshot — the unselected slot is carried forward from the base"
         );
         assert_eq!(
-            s1.slots[&slot_a].assignment.artifact.release, r1_release,
+            s1.get(&slot_a).unwrap().artifact().release,
+            r1_release,
             "the unselected slot is carried forward at its base release (R1)"
         );
         assert_eq!(
-            s1.slots[&slot_b].assignment.artifact.release, r2_release,
+            s1.get(&slot_b).unwrap().artifact().release,
+            r2_release,
             "the group push's rollback records its selected slot's own release (R2)"
         );
         assert_eq!(
-            s1.bindings.len(),
+            s1.len(),
             2,
             "the complete snapshot binds the full membership"
         );
@@ -1354,9 +1356,7 @@ pub(crate) mod commit_tests {
             let snapshots = h.store.read_snapshots("t1").unwrap();
             assert_eq!(snapshots.len(), 1, "the full baseline is the first snapshot");
             assert_eq!(
-                rollback_of(&snapshots[0])
-                    .slots
-                    .keys()
+                rollback_of(&snapshots[0]).keys()
                     .cloned()
                     .collect::<BTreeSet<_>>(),
                 full_membership,
@@ -1387,12 +1387,12 @@ pub(crate) mod commit_tests {
                 let snapshots = h.store.read_snapshots("t1").unwrap();
                 let last = rollback_of(snapshots.last().unwrap());
                 assert_eq!(
-                    last.slots.keys().cloned().collect::<BTreeSet<_>>(),
+                    last.keys().cloned().collect::<BTreeSet<_>>(),
                     full_membership,
                     "group push {i} ({group}) must record the complete membership in its snapshot (the unselected slot is carried forward)"
                 );
                 assert_eq!(
-                    last.bindings.keys().cloned().collect::<BTreeSet<_>>(),
+                    last.keys().cloned().collect::<BTreeSet<_>>(),
                     full_membership,
                     "group push {i} ({group}) must bind the complete membership"
                 );
@@ -1453,20 +1453,22 @@ pub(crate) mod commit_tests {
         assert_eq!(snapshots.len(), 2);
         let last = rollback_of(&snapshots[1]);
         assert_eq!(
-            last.slots.keys().cloned().collect::<BTreeSet<_>>(),
+            last.keys().cloned().collect::<BTreeSet<_>>(),
             full_membership,
             "the group push's snapshot has the full membership"
         );
         assert_eq!(
-            last.slots[&slot_a].assignment.artifact.release, r2_release,
+            last.get(&slot_a).unwrap().artifact().release,
+            r2_release,
             "the selected slot records its own release"
         );
         assert_eq!(
-            last.slots[&slot_b].assignment.artifact.release, r1_release,
+            last.get(&slot_b).unwrap().artifact().release,
+            r1_release,
             "the unselected slot is carried forward at its base release"
         );
         assert_eq!(
-            last.bindings.keys().cloned().collect::<BTreeSet<_>>(),
+            last.keys().cloned().collect::<BTreeSet<_>>(),
             full_membership,
             "the bindings cover the full membership"
         );
@@ -1543,7 +1545,7 @@ pub(crate) mod commit_tests {
             let snapshots = h.store.read_snapshots("t1").unwrap();
             let last = rollback_of(snapshots.last().unwrap());
             assert_eq!(
-                last.slots.keys().cloned().collect::<BTreeSet<_>>(),
+                last.keys().cloned().collect::<BTreeSet<_>>(),
                 full_membership,
                 "the repeated group push still records the complete membership"
             );
@@ -1593,12 +1595,12 @@ pub(crate) mod commit_tests {
             panic!("the full push is Successful");
         };
         assert_eq!(
-            rollback.slots.keys().cloned().collect::<BTreeSet<_>>(),
+            rollback.keys().cloned().collect::<BTreeSet<_>>(),
             full_membership,
             "the full push's rollback slots equal the membership"
         );
         assert_eq!(
-            rollback.bindings.keys().cloned().collect::<BTreeSet<_>>(),
+            rollback.keys().cloned().collect::<BTreeSet<_>>(),
             full_membership,
             "the full push's rollback bindings equal the membership"
         );
@@ -1803,12 +1805,12 @@ pub(crate) mod commit_tests {
                     let rb = rollback_of(&snapshots[0]);
                     for (sid, slot) in intent.slots.iter() {
                         assert_eq!(
-                            rb.bindings.get(sid),
+                            rb.get(sid).map(|e| e.binding()),
                             Some(&slot.binding),
                             "the rollback binding for {sid} must come from the FROZEN intent, not the live config"
                         );
                         assert_eq!(
-                            rb.slots.get(sid).map(|g| &g.generation),
+                            rb.get(sid).map(|e| e.generation()),
                             Some(&slot.desired.generation),
                             "the rollback generation for {sid} must equal the frozen desired generation"
                         );
@@ -2094,15 +2096,14 @@ pub(crate) mod commit_tests {
                     let rb = rollback_of(&snapshots[0]);
                     for (sid, slot) in intent.slots.iter() {
                         let rbs = rb
-                            .slots
                             .get(sid)
                             .expect("the rollback covers every selected slot");
                         assert_eq!(
-                            rbs.generation, slot.desired.generation,
+                            rbs.generation().clone(), slot.desired.generation.clone(),
                             "rollback generation for {sid} must equal the frozen desired generation"
                         );
                         assert_eq!(
-                            rbs.assignment.artifact, slot.desired.artifact,
+                            rbs.artifact().clone(), slot.desired.artifact.clone(),
                             "rollback artifact for {sid} must equal the frozen desired artifact (release/variant/tree)"
                         );
                     }
@@ -2337,28 +2338,25 @@ pub(crate) mod commit_tests {
             let rb = rollback_of(&snapshots[0]);
             for (sid, slot) in intent.slots.iter() {
                 let rbs = rb
-                    .slots
                     .get(sid)
                     .expect("the rollback covers every selected slot");
                 assert_eq!(
-                    rbs.generation, slot.desired.generation,
+                    rbs.generation().clone(), slot.desired.generation.clone(),
                     "the rollback generation for {sid} equals the frozen desired (the verified live value), never the stale observation (stale {stale:?})"
                 );
                 assert_eq!(
-                    rbs.assignment.artifact, slot.desired.artifact,
+                    rbs.artifact().clone(), slot.desired.artifact.clone(),
                     "the rollback artifact for {sid} equals the frozen desired (the verified live value), never the stale observation (stale {stale:?})"
                 );
                 let (stale_gen, stale_art) = stale_of(sid);
                 match stale {
-                    StaleDivergence::Generation | StaleDivergence::Both => assert_ne!(
-                        rbs.generation, stale_gen,
+                    StaleDivergence::Generation | StaleDivergence::Both => assert_ne!(rbs.generation().clone(), stale_gen,
                         "the stale generation for {sid} must never leak into the rollback payload (stale {stale:?})"
                     ),
                     StaleDivergence::Artifact => {}
                 }
                 match stale {
-                    StaleDivergence::Artifact | StaleDivergence::Both => assert_ne!(
-                        rbs.assignment.artifact, stale_art,
+                    StaleDivergence::Artifact | StaleDivergence::Both => assert_ne!(rbs.artifact().clone(), stale_art,
                         "the stale artifact for {sid} must never leak into the rollback payload (stale {stale:?})"
                     ),
                     StaleDivergence::Generation => {}
@@ -2575,8 +2573,8 @@ pub(crate) mod commit_tests {
                         panic!("a successful finalization appends a Successful terminal");
                     };
                     assert_eq!(
-                        rollback.slots.keys().collect::<BTreeSet<_>>(),
-                        rollback.bindings.keys().collect::<BTreeSet<_>>(),
+                        rollback.keys().collect::<BTreeSet<_>>(),
+                        rollback.keys().collect::<BTreeSet<_>>(),
                         "the appended rollback's bindings key EXACTLY its slots (one validated map — no parallel maps to drift)"
                     );
                 }

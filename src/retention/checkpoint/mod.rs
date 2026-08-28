@@ -504,28 +504,66 @@ mod tests {
     }
 
     fn rollback_for(release: &str) -> LedgerRollback {
-        LedgerRollback {
-            slots: BTreeMap::from([(
-                SlotId::new("p1".to_string()),
-                GenerationRef {
-                    generation: crate::identity::test_generation_id("gen-1"),
-                    assignment: PlacementSlotAssignment {
-                        placement_slot: SlotId::new("p1".to_string()),
-                        artifact: ArtifactRef {
-                            release: crate::identity::test_release_id(release),
-                            variant: VariantName::new("standard".to_string()),
-                            tree: test_tree_digest("tree-1"),
+        {
+            let __slots: BTreeMap<crate::identity::SlotId, crate::identity::GenerationRef> =
+                BTreeMap::from([(
+                    SlotId::new("p1".to_string()),
+                    GenerationRef {
+                        generation: crate::identity::test_generation_id("gen-1"),
+                        assignment: PlacementSlotAssignment {
+                            placement_slot: SlotId::new("p1".to_string()),
+                            artifact: ArtifactRef {
+                                release: crate::identity::test_release_id(release),
+                                variant: VariantName::new("standard".to_string()),
+                                tree: test_tree_digest("tree-1"),
+                            },
                         },
                     },
-                },
-            )]),
-            bindings: BTreeMap::from([(
+                )]);
+            let __bindings: BTreeMap<
+                crate::identity::SlotId,
+                crate::ledger::records::PhysicalBinding,
+            > = BTreeMap::from([(
                 SlotId::new("p1".to_string()),
                 crate::ledger::PhysicalBinding {
                     server: ServerId::new("s1".to_string()),
                     deploy_dir: "/srv/deploy/p1".to_string(),
                 },
-            )]),
+            )]);
+            let mut __entries: BTreeMap<
+                crate::identity::SlotId,
+                crate::ledger::records::RollbackEntry,
+            > = BTreeMap::new();
+            for (k, v) in __slots.clone() {
+                let b = __bindings.get(&k).cloned().unwrap_or(
+                    crate::ledger::records::PhysicalBinding {
+                        server: crate::identity::ServerId::new("s1"),
+                        deploy_dir: format!("/srv/deploy/{}", k.as_str()),
+                    },
+                );
+                __entries.insert(
+                    k.clone(),
+                    crate::ledger::records::RollbackEntry::new(
+                        v.generation.clone(),
+                        v.assignment.artifact.clone(),
+                        b,
+                    ),
+                );
+            }
+            for (k, b) in __bindings.clone() {
+                __entries.entry(k.clone()).or_insert_with(|| {
+                    crate::ledger::records::RollbackEntry::new(
+                        crate::identity::GenerationId::new("gen-missing".to_string()),
+                        crate::identity::ArtifactRef {
+                            release: crate::identity::test_release_id("rel-missing"),
+                            variant: crate::identity::VariantName::new("standard".to_string()),
+                            tree: crate::identity::test_tree_digest("missing"),
+                        },
+                        b.clone(),
+                    )
+                });
+            }
+            crate::ledger::records::LedgerRollback::from_entries(__entries)
         }
     }
 
@@ -772,8 +810,22 @@ interval_seconds = 0
             TerminalDisposition::Successful { rollback, .. } => rollback,
             _ => unreachable!("seed_success always builds a Successful terminal"),
         };
-        for g in rollback.slots.values_mut() {
-            g.assignment.artifact.tree = test_tree_digest(tree);
+        {
+            let entries = rollback.clone().into_entries();
+            let mut new_entries = BTreeMap::new();
+            for (k, e) in entries {
+                let mut art = e.artifact().clone();
+                art.tree = test_tree_digest(tree);
+                new_entries.insert(
+                    k.clone(),
+                    crate::ledger::records::RollbackEntry::new(
+                        e.generation().clone(),
+                        art,
+                        e.binding().clone(),
+                    ),
+                );
+            }
+            *rollback = crate::ledger::records::LedgerRollback::from_entries(new_entries);
         }
         store
             .append_terminal(target, &test_deployment_id(id), &term)

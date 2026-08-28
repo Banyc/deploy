@@ -14,7 +14,7 @@
 /// version themselves separately from the configuration format, so bumping
 /// one never invalidates the other.
 ///
-/// The current format is version 6 (the ONLY version writers emit and
+/// The current format is version 7 (the ONLY version writers emit and
 /// readers accept): deployment records use the canonical
 /// placement-slot-keyed shape (`BTreeMap<SlotId, _>` maps, nested
 /// artifact/generation refs), carry the exclusive owning target + the
@@ -35,7 +35,8 @@
 /// current one is REJECTED on read (no compatibility fallback), so a
 /// record is interpreted only under exactly the schema that wrote it:
 ///
-/// * version 6 (CURRENT): the INTENT record FREEZES each selected slot's
+/// * version 7 (CURRENT): the rollback payload is a single `entries: BTreeMap<SlotId, RollbackEntry>` map (generation + artifact + binding per slot) serialized directly; the schema version gates old shapes.
+/// * version 6: the INTENT record FREEZES each selected slot's
 ///   PHYSICAL BINDING — a required `bindings: BTreeMap<SlotId,
 ///   PhysicalBinding>` projection whose key set must EQUAL the selected
 ///   membership EXACTLY. The plan-time `{server, deploy_dir}` is now a
@@ -93,7 +94,7 @@
 /// frozen bindings are REQUIRED, no serde default). A hypothetical
 /// pre-rekeying shape that keyed these maps by server ID with flat
 /// artifact fields is NOT the current schema and never loads.
-pub(crate) const LEDGER_SCHEMA_VERSION: u32 = 6;
+pub(crate) const LEDGER_SCHEMA_VERSION: u32 = 7;
 
 /// The `pins.json` record format version (`Pins.schema_version`). Pins are
 /// durable, store-global retention anchors for artifact CONTENT ONLY (see

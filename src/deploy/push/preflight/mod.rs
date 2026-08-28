@@ -302,11 +302,7 @@ pub(crate) fn run_preflight(
             PushRef::Deployment {
                 target: ft,
                 deployment_id,
-            } => ledger::resolve_deployment(store, ft, deployment_id)?
-                .slots
-                .values()
-                .map(|g| g.assignment.artifact.release.clone())
-                .collect(),
+            } => ledger::resolve_deployment(store, ft, deployment_id)?.releases(),
             PushRef::Release { release, .. } => BTreeSet::from([release.clone()]),
             PushRef::Head => unreachable!(),
         };

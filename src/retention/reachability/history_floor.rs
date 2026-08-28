@@ -409,11 +409,10 @@ impl LocalStore {
                 if let Some(t) = entry.terminal.as_ref()
                     && let TerminalDisposition::Successful { rollback, .. } = &t.disposition
                 {
-                    for g in rollback.slots.values() {
+                    for (_, e) in rollback.iter() {
                         out.releases
-                            .insert(g.assignment.artifact.release.as_str().to_string());
-                        out.trees
-                            .insert(g.assignment.artifact.tree.as_str().to_string());
+                            .insert(e.artifact().release.as_str().to_string());
+                        out.trees.insert(e.artifact().tree.as_str().to_string());
                     }
                 }
             }
@@ -810,9 +809,49 @@ impl LocalStore {
         // append cannot supply).
         let disposition = match status {
             DeploymentStatus::Successful => TerminalDisposition::Successful {
-                rollback: LedgerRollback {
-                    slots: BTreeMap::new(),
-                    bindings: BTreeMap::new(),
+                rollback: {
+                    let __slots: BTreeMap<crate::identity::SlotId, crate::identity::GenerationRef> =
+                        BTreeMap::new();
+                    let __bindings: BTreeMap<
+                        crate::identity::SlotId,
+                        crate::ledger::records::PhysicalBinding,
+                    > = BTreeMap::new();
+                    let mut __entries: BTreeMap<
+                        crate::identity::SlotId,
+                        crate::ledger::records::RollbackEntry,
+                    > = BTreeMap::new();
+                    for (k, v) in __slots.clone() {
+                        let b = __bindings.get(&k).cloned().unwrap_or(
+                            crate::ledger::records::PhysicalBinding {
+                                server: crate::identity::ServerId::new("s1"),
+                                deploy_dir: format!("/srv/deploy/{}", k.as_str()),
+                            },
+                        );
+                        __entries.insert(
+                            k.clone(),
+                            crate::ledger::records::RollbackEntry::new(
+                                v.generation.clone(),
+                                v.assignment.artifact.clone(),
+                                b,
+                            ),
+                        );
+                    }
+                    for (k, b) in __bindings.clone() {
+                        __entries.entry(k.clone()).or_insert_with(|| {
+                            crate::ledger::records::RollbackEntry::new(
+                                crate::identity::GenerationId::new("gen-missing".to_string()),
+                                crate::identity::ArtifactRef {
+                                    release: crate::identity::test_release_id("rel-missing"),
+                                    variant: crate::identity::VariantName::new(
+                                        "standard".to_string(),
+                                    ),
+                                    tree: crate::identity::test_tree_digest("missing"),
+                                },
+                                b.clone(),
+                            )
+                        });
+                    }
+                    LedgerRollback::from_entries(__entries)
                 },
                 // Status-only append: no memberships are supplied. NOTE: a
                 // Successful terminal with EMPTY memberships is refused by
