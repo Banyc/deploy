@@ -47,6 +47,7 @@ pub fn run_verification(
 mod tests {
     use super::*;
     use crate::config::VerificationConfig;
+    use crate::remote::transport::CreateNewVerdict;
     use std::cell::RefCell;
     use std::path::{Path, PathBuf};
 
@@ -77,7 +78,7 @@ mod tests {
         fn write(&self, _rel: &Path, _data: &[u8], _mode: u32) -> Result<()> {
             unreachable!("not used by run_verification")
         }
-        fn try_write_new(&self, _rel: &Path, _data: &[u8]) -> Result<bool> {
+        fn try_write_new(&self, _rel: &Path, _data: &[u8]) -> Result<CreateNewVerdict> {
             unreachable!("not used by run_verification")
         }
         fn create_dir(&self, _rel: &Path) -> Result<()> {

@@ -3,6 +3,7 @@
 
 use crate::error::{Error, Result};
 use crate::remote::layout;
+use crate::remote::transport::CreateNewVerdict;
 
 use super::super::RemoteHelper;
 
@@ -37,16 +38,23 @@ impl<'a> RemoteHelper<'a> {
         }
         let bytes = serde_json::to_vec_pretty(&payload)
             .map_err(|e| Error::remote(format!("serialize commit: {e}")))?;
-        if self.remote.try_write_new(&p, &bytes)? {
-            return Ok(());
+        // The TYPED verdict: `Created` installed the marker, `AlreadyPresent`
+        // means the winner is byte-and-mode identical (the identical retry
+        // converges — treat like success with "already there" semantics).
+        // Only a `Conflict` (different bytes or mode) needs the read-back
+        // comparison, which decides the semantic verdict exactly as before.
+        match self.remote.try_write_new(&p, &bytes)? {
+            CreateNewVerdict::Created | CreateNewVerdict::AlreadyPresent => Ok(()),
+            CreateNewVerdict::Conflict => {
+                let existing = self.remote.read(&p)?;
+                if existing != bytes {
+                    return Err(Error::integrity(format!(
+                        "commit marker for {deployment_id} already exists with different content"
+                    )));
+                }
+                Ok(())
+            }
         }
-        let existing = self.remote.read(&p)?;
-        if existing != bytes {
-            return Err(Error::integrity(format!(
-                "commit marker for {deployment_id} already exists with different content"
-            )));
-        }
-        Ok(())
     }
 }
 

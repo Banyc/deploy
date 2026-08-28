@@ -86,15 +86,19 @@ pub trait Remote {
     /// destination directory, applies the FINAL MODE, fsyncs the file,
     /// publishes WITHOUT replacement (a concurrent winner is never replaced),
     /// removes the temp, and fsyncs the PARENT DIRECTORY — every failure
-    /// propagates. Returns `Ok(true)` if the file was created, `Ok(false)` if
-    /// it already existed (the existing content is left untouched; an
-    /// identical retry converges — the existing entry is verified
-    /// byte-and-mode identical — while a different winner is a conflict the
-    /// caller's read-back comparison decides), or `Err` on other failures.
-    /// This is the non-racy primitive used for lock acquisition:
+    /// propagates. Returns the TYPED [`CreateNewVerdict`]: `Created` when the
+    /// record was durably installed by this call; `AlreadyPresent` when the
+    /// destination already existed with IDENTICAL bytes and final mode (the
+    /// identical retry converges — the parent directory is synced here too,
+    /// so the retry returns with a durable entry); `Conflict` when it existed
+    /// with DIFFERENT bytes or mode (the winner is NEVER replaced or
+    /// modified — the caller's read-back comparison decides the semantic
+    /// verdict); or `Err` on every other failure (a pre-install failure, a
+    /// failed parent-dir sync, a transport fault — never a verdict). This is
+    /// the non-racy primitive used for lock acquisition:
     /// `exists`-then-`write` would let two controllers both observe "no lock"
     /// and both proceed.
-    fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<bool>;
+    fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<CreateNewVerdict>;
     fn create_dir(&self, rel: &Path) -> Result<()>;
     fn create_dir_all(&self, rel: &Path) -> Result<()>;
     /// Apply a permission mode to an existing remote entry (file or directory).
@@ -190,8 +194,11 @@ fn meta_to_remote(m: &std::fs::Metadata) -> RemoteMeta {
 pub(crate) const IMMUTABLE_RECORD_MODE: u32 = 0o644;
 
 /// The verdict of one canonical create-new attempt ([`durable_create_new`]).
+/// `pub` because it crosses the [`Remote`] trait boundary: every transport's
+/// `try_write_new` returns it, and every caller (and external test crate)
+/// branches on it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CreateNewVerdict {
+pub enum CreateNewVerdict {
     /// The record was durably installed: exact bytes, the final mode, and a
     /// parent-directory-fsync'd directory entry all hold.
     Created,
@@ -621,13 +628,16 @@ impl Remote for LocalTransport {
             .map_err(|e| Error::transport(format!("remove {}: {e}", p.display())))
     }
 
-    fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<bool> {
+    fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<CreateNewVerdict> {
         // The ONE canonical create-new primitive (see `durable_create_new`):
         // temp -> write -> final chmod -> file fsync -> no-replace publish ->
         // unlink temp -> parent-directory fsync, every failure propagated, and
         // verify-on-retry. The immutable records this installs carry the
         // canonical final mode (`IMMUTABLE_RECORD_MODE`), never the umask.
-        match durable_create_new(
+        // The TYPED verdict survives this trait boundary untouched — Created
+        // for a fresh durable install, AlreadyPresent for an identical retry
+        // (parent-sync'd too), Conflict for a different winner.
+        durable_create_new(
             &self.base,
             rel,
             data,
@@ -635,10 +645,7 @@ impl Remote for LocalTransport {
                 mode: IMMUTABLE_RECORD_MODE,
                 fault: None,
             },
-        )? {
-            CreateNewVerdict::Created => Ok(true),
-            CreateNewVerdict::AlreadyPresent | CreateNewVerdict::Conflict => Ok(false),
-        }
+        )
     }
 
     fn remove_dir_all(&self, rel: &Path) -> Result<()> {
@@ -864,12 +871,14 @@ mod tests {
     }
 
     /// The transport-level contract of the shared primitive: `try_write_new`
-    /// reports `Ok(true)` for a fresh DURABLE install, `Ok(false)` for an
-    /// identical retry (convergent — the winner is verified byte-and-mode
-    /// identical, never replaced), and `Ok(false)` for a different-content
-    /// conflict (the winner is never touched; the caller's read-back
-    /// comparison decides the semantic verdict). The installed record carries
-    /// the canonical final mode, not the process umask.
+    /// reports `Ok(Created)` for a fresh DURABLE install, `Ok(AlreadyPresent)`
+    /// for an identical retry (convergent — the winner is verified
+    /// byte-and-mode identical, never replaced), and `Ok(Conflict)` for a
+    /// different-content OR different-mode winner (the winner is never
+    /// touched; the caller's read-back comparison decides the semantic
+    /// verdict). The TYPED verdict survives the trait boundary — no bool
+    /// collapse. The installed record carries the canonical final mode, not
+    /// the process umask.
     #[test]
     fn try_write_new_durable_install_and_conflict_contract() {
         use std::os::unix::fs::MetadataExt;
@@ -879,7 +888,11 @@ mod tests {
         let rel = Path::new("state/op.json");
         let data = b"{\"op\":\"1\"}";
 
-        assert!(t.try_write_new(rel, data).unwrap(), "a fresh install wins");
+        assert_eq!(
+            t.try_write_new(rel, data).unwrap(),
+            CreateNewVerdict::Created,
+            "a fresh install wins"
+        );
         let p = t.root().join(rel);
         assert_eq!(std::fs::read(&p).unwrap(), data, "exact bytes installed");
         assert_eq!(
@@ -887,9 +900,10 @@ mod tests {
             IMMUTABLE_RECORD_MODE & 0o7777,
             "the record must carry the canonical final mode"
         );
-        // Identical retry: convergent — Ok(false), no error, no replace.
-        assert!(
-            !t.try_write_new(rel, data).unwrap(),
+        // Identical retry: convergent — AlreadyPresent, no error, no replace.
+        assert_eq!(
+            t.try_write_new(rel, data).unwrap(),
+            CreateNewVerdict::AlreadyPresent,
             "an identical retry converges to already-present"
         );
         assert_eq!(
@@ -897,9 +911,10 @@ mod tests {
             data,
             "the identical retry must not touch the winner"
         );
-        // Different content: the conflict verdict — Ok(false), never replaced.
-        assert!(
-            !t.try_write_new(rel, b"other").unwrap(),
+        // Different content: the conflict verdict — never replaced.
+        assert_eq!(
+            t.try_write_new(rel, b"other").unwrap(),
+            CreateNewVerdict::Conflict,
             "a different-content conflict is the verdict"
         );
         assert_eq!(
@@ -910,8 +925,10 @@ mod tests {
     }
 
     /// The durability property's scenario dimension: the healthy install, a
-    /// one-shot crash/failure at one of the SEVEN stages, and the two
-    /// pre-existing-winner retry cases (identical / different).
+    /// one-shot crash/failure at one of the SEVEN stages, and the
+    /// pre-existing-winner retry cases (identical / different content /
+    /// different mode / published-before-parent-sync / the retry's parent
+    /// fsync faulted).
     #[derive(Clone, Copy, Debug)]
     enum CreateNewScenario {
         Healthy,
@@ -919,6 +936,15 @@ mod tests {
         PreExistingIdentical,
         PreExistingDifferent,
         PreExistingDifferentMode,
+        /// A crash-simulated state: the entry EXISTS with the intended bytes
+        /// and mode, but its parent directory was never fsync'd (a crash
+        /// after publish, before the parent fsync).
+        PublishedBeforeParentSync,
+        /// The retry over an identical existing entry arms a one-shot
+        /// ParentFsync fault: the AlreadyPresent branch must RUN the parent
+        /// fsync, so the faulted retry propagates an error instead of
+        /// claiming durability.
+        IdenticalRetryParentFsyncFault,
     }
 
     fn create_new_scenario() -> impl Strategy<Value = CreateNewScenario> {
@@ -927,6 +953,8 @@ mod tests {
             Just(CreateNewScenario::PreExistingIdentical),
             Just(CreateNewScenario::PreExistingDifferent),
             Just(CreateNewScenario::PreExistingDifferentMode),
+            Just(CreateNewScenario::PublishedBeforeParentSync),
+            Just(CreateNewScenario::IdenticalRetryParentFsyncFault),
             Just(CreateNewScenario::FailAt(CreateNewStep::CreateTemp)),
             Just(CreateNewScenario::FailAt(CreateNewStep::Write)),
             Just(CreateNewScenario::FailAt(CreateNewStep::Chmod)),
@@ -1133,6 +1161,380 @@ mod tests {
                         other_mode,
                         "the mode mismatch must never be replaced"
                     );
+                }
+                CreateNewScenario::PublishedBeforeParentSync => {
+                    // A crash-simulated state: the entry EXISTS with the
+                    // intended bytes and mode but its parent directory was
+                    // NEVER fsync'd (a crash after publish, before the parent
+                    // fsync). The identical retry must verify it as
+                    // AlreadyPresent — and ESTABLISH the parent durability:
+                    // the AlreadyPresent branch runs the parent fsync, so a
+                    // fresh directory read (a simulated crash-after-return)
+                    // still sees the entry.
+                    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+                    std::fs::write(&dest, &content).unwrap();
+                    std::fs::set_permissions(
+                        &dest,
+                        std::fs::Permissions::from_mode(mode & 0o7777),
+                    )
+                    .unwrap();
+                    let verdict = durable_create_new(
+                        &root,
+                        rel,
+                        &content,
+                        CreateNewOptions { mode, fault: None },
+                    )
+                    .expect("the identical retry over a published-before-parent-sync entry must converge");
+                    prop_assert_eq!(verdict, CreateNewVerdict::AlreadyPresent);
+                    prop_assert_eq!(
+                        std::fs::read(&dest).unwrap(),
+                        content,
+                        "the winner must stay intact"
+                    );
+                    let meta = std::fs::metadata(&dest).unwrap();
+                    prop_assert_eq!(
+                        meta.mode() & 0o7777,
+                        mode & 0o7777,
+                        "the winner's mode must stay intact"
+                    );
+                    let names: Vec<String> = std::fs::read_dir(dest.parent().unwrap())
+                        .expect("the parent must be readable")
+                        .flatten()
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect();
+                    prop_assert!(
+                        names.contains(&dest_name),
+                        "the AlreadyPresent retry must have established the parent durability, dir has: {names:?}"
+                    );
+                }
+                CreateNewScenario::IdenticalRetryParentFsyncFault => {
+                    // The retry's AlreadyPresent branch RUNS the parent fsync:
+                    // arm the one-shot ParentFsync fault for a retry over an
+                    // identical existing entry — the retry must return Err
+                    // (the faulted parent fsync), never a false
+                    // Ok(AlreadyPresent) that claims durability.
+                    durable_create_new(&root, rel, &content, CreateNewOptions { mode, fault: None })
+                        .expect("the first install must succeed");
+                    let fault = CreateNewFault::new(CreateNewStep::ParentFsync);
+                    let err = durable_create_new(
+                        &root,
+                        rel,
+                        &content,
+                        CreateNewOptions {
+                            mode,
+                            fault: Some(&fault),
+                        },
+                    )
+                    .expect_err(
+                        "the AlreadyPresent retry must run — and propagate the failure of — the parent fsync",
+                    );
+                    prop_assert!(
+                        err.to_string().contains("forced to fail (once)"),
+                        "the faulted parent fsync must be the propagated failure, got: {err}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A `Remote` wrapper that arms ONE one-shot stage fault inside
+    /// `try_write_new` — the trait-level stage-failure model for
+    /// `LocalTransport` (production `LocalTransport` never arms one; the
+    /// fault is the same `CreateNewFault` the primitive proptest uses). Every
+    /// other method delegates to the inner transport untouched.
+    struct FaultyLocalRemote {
+        inner: LocalTransport,
+        fault: CreateNewFault,
+    }
+
+    impl Remote for FaultyLocalRemote {
+        fn root(&self) -> &Path {
+            self.inner.root()
+        }
+        fn read(&self, rel: &Path) -> Result<Vec<u8>> {
+            self.inner.read(rel)
+        }
+        fn write(&self, rel: &Path, data: &[u8], mode: u32) -> Result<()> {
+            self.inner.write(rel, data, mode)
+        }
+        fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<CreateNewVerdict> {
+            durable_create_new(
+                self.inner.root(),
+                rel,
+                data,
+                CreateNewOptions {
+                    mode: IMMUTABLE_RECORD_MODE,
+                    fault: Some(&self.fault),
+                },
+            )
+        }
+        fn create_dir(&self, rel: &Path) -> Result<()> {
+            self.inner.create_dir(rel)
+        }
+        fn create_dir_all(&self, rel: &Path) -> Result<()> {
+            self.inner.create_dir_all(rel)
+        }
+        fn set_mode(&self, rel: &Path, mode: u32) -> Result<()> {
+            self.inner.set_mode(rel, mode)
+        }
+        fn list(&self, rel: &Path) -> Result<Vec<RemoteEntry>> {
+            self.inner.list(rel)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+            self.inner.rename(from, to)
+        }
+        fn symlink(&self, target: &Path, link: &Path) -> Result<()> {
+            self.inner.symlink(target, link)
+        }
+        fn read_link(&self, rel: &Path) -> Result<PathBuf> {
+            self.inner.read_link(rel)
+        }
+        fn remove_file(&self, rel: &Path) -> Result<()> {
+            self.inner.remove_file(rel)
+        }
+        fn remove_dir_all(&self, rel: &Path) -> Result<()> {
+            self.inner.remove_dir_all(rel)
+        }
+        fn exists(&self, rel: &Path) -> bool {
+            self.inner.exists(rel)
+        }
+        fn metadata(&self, rel: &Path) -> Result<RemoteMeta> {
+            self.inner.metadata(rel)
+        }
+        fn exec(&self, argv: &[String], timeout: Duration) -> Result<ExecOutcome> {
+            self.inner.exec(argv, timeout)
+        }
+        fn filesystem_bytes(&self) -> Result<FsBytes> {
+            self.inner.filesystem_bytes()
+        }
+    }
+
+    /// The trait-level verdict matrix for [`Remote::try_write_new`] on
+    /// `LocalTransport` — the typed verdict survives the trait boundary, no
+    /// bool collapse:
+    ///
+    /// * `Created` for a FRESH write (exact bytes, final mode, durable entry);
+    /// * `AlreadyPresent` for an EXACT existing entry — the identical retry —
+    ///   which must ESTABLISH the parent durability (the parent fsync runs on
+    ///   the AlreadyPresent branch; a fresh directory read still sees the
+    ///   entry);
+    /// * `Conflict` for DIFFERENT BYTES and for a MODE MISMATCH over identical
+    ///   bytes (the spec: "a mode mismatch must remain Conflict") — the
+    ///   winner is never replaced or modified;
+    /// * published-before-parent-sync: an existing entry whose parent was
+    ///   never synced is verified as `AlreadyPresent` (bytes+mode match) and
+    ///   the retry establishes the parent durability;
+    /// * every STAGE FAILURE (via the one-shot fault through the trait)
+    ///   propagates as an `Err` naming the injected stage — never a false
+    ///   verdict — and the identical retry converges.
+    #[derive(Clone, Copy, Debug)]
+    enum TransportVerdictState {
+        Fresh,
+        ExactExisting,
+        DifferentBytes,
+        DifferentMode,
+        PublishedBeforeParentSync,
+        FailAt(CreateNewStep),
+    }
+
+    fn transport_verdict_state() -> impl Strategy<Value = TransportVerdictState> {
+        prop_oneof![
+            Just(TransportVerdictState::Fresh),
+            Just(TransportVerdictState::ExactExisting),
+            Just(TransportVerdictState::DifferentBytes),
+            Just(TransportVerdictState::DifferentMode),
+            Just(TransportVerdictState::PublishedBeforeParentSync),
+            Just(TransportVerdictState::FailAt(CreateNewStep::CreateTemp)),
+            Just(TransportVerdictState::FailAt(CreateNewStep::Write)),
+            Just(TransportVerdictState::FailAt(CreateNewStep::Chmod)),
+            Just(TransportVerdictState::FailAt(CreateNewStep::FileFsync)),
+            Just(TransportVerdictState::FailAt(CreateNewStep::Publish)),
+            Just(TransportVerdictState::FailAt(CreateNewStep::Unlink)),
+            Just(TransportVerdictState::FailAt(CreateNewStep::ParentFsync)),
+        ]
+    }
+
+    proptest! {
+        // Bounded cases, fixed seed 0x5EED_5EED (house style), no persistence.
+        #![proptest_config(ProptestConfig {
+            cases: crate::testutil::proptest_cases(64),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn try_write_new_verdict_matrix(
+            content in prop::collection::vec(any::<u8>(), 0..128),
+            state in transport_verdict_state(),
+        ) {
+            use std::os::unix::fs::PermissionsExt;
+
+            let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+            let t = LocalTransport::new(&SysEnv::from_process(), dir.path().join("r")).unwrap();
+            let rel = Path::new("state/record.bin");
+            let dest = t.root().join(rel);
+            let dest_name = rel.file_name().unwrap().to_string_lossy().into_owned();
+            let final_mode = IMMUTABLE_RECORD_MODE & 0o7777;
+
+            match state {
+                TransportVerdictState::Fresh => {
+                    let verdict = t
+                        .try_write_new(rel, &content)
+                        .expect("the fresh install must succeed");
+                    prop_assert_eq!(verdict, CreateNewVerdict::Created);
+                    prop_assert_eq!(
+                        std::fs::read(&dest).unwrap(),
+                        content,
+                        "Ok(Created) must imply exact bytes"
+                    );
+                    let meta = std::fs::metadata(&dest).unwrap();
+                    prop_assert_eq!(
+                        meta.mode() & 0o7777,
+                        final_mode,
+                        "Ok(Created) must imply the final mode"
+                    );
+                    let names: Vec<String> = std::fs::read_dir(dest.parent().unwrap())
+                        .unwrap()
+                        .flatten()
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect();
+                    prop_assert!(
+                        names.contains(&dest_name),
+                        "Ok(Created) must imply a durable directory entry, dir has: {names:?}"
+                    );
+                }
+                TransportVerdictState::ExactExisting => {
+                    // An EXACT existing entry (bytes AND mode identical): the
+                    // identical retry converges — AlreadyPresent, and the
+                    // parent durability is established (the parent fsync runs
+                    // on this branch).
+                    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+                    std::fs::write(&dest, &content).unwrap();
+                    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(final_mode))
+                        .unwrap();
+                    let verdict = t
+                        .try_write_new(rel, &content)
+                        .expect("an identical retry must converge, not error");
+                    prop_assert_eq!(verdict, CreateNewVerdict::AlreadyPresent);
+                    prop_assert_eq!(
+                        std::fs::read(&dest).unwrap(),
+                        content,
+                        "the identical retry must not touch the winner"
+                    );
+                    let names: Vec<String> = std::fs::read_dir(dest.parent().unwrap())
+                        .unwrap()
+                        .flatten()
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect();
+                    prop_assert!(
+                        names.contains(&dest_name),
+                        "the AlreadyPresent retry must leave the durable entry, dir has: {names:?}"
+                    );
+                }
+                TransportVerdictState::DifferentBytes => {
+                    // A winner with DIFFERENT bytes: Conflict, never replaced.
+                    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+                    let other: Vec<u8> = if content.is_empty() {
+                        vec![0u8]
+                    } else {
+                        content.iter().map(|b| b.wrapping_add(1)).collect()
+                    };
+                    prop_assert_ne!(&other, &content, "the winner must differ from the intent");
+                    std::fs::write(&dest, &other).unwrap();
+                    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(final_mode))
+                        .unwrap();
+                    let verdict = t
+                        .try_write_new(rel, &content)
+                        .expect("a different-content winner is a verdict, not an I/O error");
+                    prop_assert_eq!(verdict, CreateNewVerdict::Conflict);
+                    prop_assert_eq!(
+                        std::fs::read(&dest).unwrap(),
+                        other,
+                        "the conflict must NEVER replace the winner"
+                    );
+                }
+                TransportVerdictState::DifferentMode => {
+                    // Identical bytes but a DIFFERENT mode: still Conflict —
+                    // the mode is part of the record, and a mode mismatch must
+                    // remain Conflict (never a convergent AlreadyPresent).
+                    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+                    std::fs::write(&dest, &content).unwrap();
+                    let other_mode = if final_mode == 0o600 { 0o640 } else { 0o600 };
+                    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(other_mode))
+                        .unwrap();
+                    let verdict = t
+                        .try_write_new(rel, &content)
+                        .expect("a mode mismatch is a verdict, not an I/O error");
+                    prop_assert_eq!(verdict, CreateNewVerdict::Conflict);
+                    let meta = std::fs::metadata(&dest).unwrap();
+                    prop_assert_eq!(
+                        meta.mode() & 0o7777,
+                        other_mode,
+                        "the mode mismatch must never be replaced"
+                    );
+                }
+                TransportVerdictState::PublishedBeforeParentSync => {
+                    // A crash-simulated state: the entry EXISTS with the
+                    // intended bytes and mode, but its parent was never synced.
+                    // The retry verifies it as AlreadyPresent AND establishes
+                    // the parent durability.
+                    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+                    std::fs::write(&dest, &content).unwrap();
+                    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(final_mode))
+                        .unwrap();
+                    let verdict = t
+                        .try_write_new(rel, &content)
+                        .expect("the retry over a published-before-parent-sync entry must converge");
+                    prop_assert_eq!(verdict, CreateNewVerdict::AlreadyPresent);
+                    prop_assert_eq!(
+                        std::fs::read(&dest).unwrap(),
+                        content,
+                        "the winner must stay intact"
+                    );
+                    let names: Vec<String> = std::fs::read_dir(dest.parent().unwrap())
+                        .unwrap()
+                        .flatten()
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect();
+                    prop_assert!(
+                        names.contains(&dest_name),
+                        "the AlreadyPresent retry must establish the parent durability, dir has: {names:?}"
+                    );
+                }
+                TransportVerdictState::FailAt(step) => {
+                    // EVERY STAGE FAILURE through the trait boundary: the
+                    // faulted attempt propagates as Err naming the injected
+                    // stage — never a false verdict — and the one-shot fault
+                    // being consumed, the identical retry converges.
+                    let w = FaultyLocalRemote {
+                        inner: t,
+                        fault: CreateNewFault::new(step),
+                    };
+                    let err = w
+                        .try_write_new(rel, &content)
+                        .expect_err("a failure at every stage must propagate as Err");
+                    prop_assert!(
+                        err.to_string().contains("forced to fail (once)"),
+                        "the injected fault must be the propagated failure, got: {err}"
+                    );
+                    let retry = w
+                        .try_write_new(rel, &content)
+                        .expect("the identical retry must converge");
+                    prop_assert!(
+                        matches!(
+                            retry,
+                            CreateNewVerdict::Created | CreateNewVerdict::AlreadyPresent
+                        ),
+                        "the identical retry must converge, got: {retry:?}"
+                    );
+                    if dest.exists() {
+                        prop_assert_eq!(
+                            std::fs::read(&dest).unwrap(),
+                            content,
+                            "the destination must be the fully-written identical content, never partial"
+                        );
+                    }
                 }
             }
         }

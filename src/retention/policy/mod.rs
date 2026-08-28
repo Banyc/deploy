@@ -280,7 +280,9 @@ mod tests {
     };
     use crate::remote::helper::{GenerationAssignment, RemoteHelper};
     use crate::remote::layout;
-    use crate::remote::transport::{LocalTransport, Remote, RemoteEntry, RemoteMeta};
+    use crate::remote::transport::{
+        CreateNewVerdict, LocalTransport, Remote, RemoteEntry, RemoteMeta,
+    };
     use crate::store::local::LocalStore;
     use crate::verify::release::RELEASE_RECORD_SCHEMA_VERSION;
     use crate::verify::release::build_release;
@@ -1659,7 +1661,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         fn write(&self, rel: &Path, data: &[u8], mode: u32) -> Result<()> {
             self.inner.write(rel, data, mode)
         }
-        fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<bool> {
+        fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<CreateNewVerdict> {
             self.inner.try_write_new(rel, data)
         }
         fn create_dir(&self, rel: &Path) -> Result<()> {
@@ -2084,7 +2086,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         fn write(&self, rel: &Path, data: &[u8], mode: u32) -> Result<()> {
             self.inner.write(rel, data, mode)
         }
-        fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<bool> {
+        fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<CreateNewVerdict> {
             self.inner.try_write_new(rel, data)
         }
         fn create_dir(&self, rel: &Path) -> Result<()> {

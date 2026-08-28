@@ -158,7 +158,7 @@ mod capacity_tests {
     };
     use crate::remote::helper::RemoteHelper;
     use crate::remote::transport::{
-        ExecOutcome, FsBytes, LocalTransport, Remote, RemoteEntry, RemoteMeta,
+        CreateNewVerdict, ExecOutcome, FsBytes, LocalTransport, Remote, RemoteEntry, RemoteMeta,
     };
     use crate::store::local::LocalStore;
     use std::path::{Path, PathBuf};
@@ -192,7 +192,7 @@ mod capacity_tests {
         fn write(&self, rel: &Path, data: &[u8], mode: u32) -> Result<()> {
             self.inner.write(rel, data, mode)
         }
-        fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<bool> {
+        fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<CreateNewVerdict> {
             self.inner.try_write_new(rel, data)
         }
         fn create_dir(&self, rel: &Path) -> Result<()> {

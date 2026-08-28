@@ -33,7 +33,7 @@ pub use state::current::{CurrentState, ExpectedCurrent};
 use crate::error::{Error, Result};
 use crate::identity::{BehaviorContract, GenerationId, ReleaseId, ReleaseRecord};
 use crate::remote::layout;
-use crate::remote::transport::Remote;
+use crate::remote::transport::{CreateNewVerdict, Remote};
 
 #[derive(Clone, Debug, Default)]
 pub struct RemoteStatus {
@@ -112,10 +112,17 @@ impl<'a> RemoteHelper<'a> {
     pub fn acquire_lock(&self, op_id: &str, force: bool) -> Result<bool> {
         let p = &layout::operation_lock();
         // Atomic create-if-absent: only one caller wins the race for a free lock.
+        // The TYPED verdict maps to the lock semantics directly: `Created`
+        // (I won the race) and `AlreadyPresent` with IDENTICAL bytes (the lock
+        // already names `op_id` — the identical retry) both mean the lock is
+        // now owned by `op_id`; `Conflict` means a DIFFERENT holder won — read
+        // who holds it and honor `force` (never overwrite a foreign lock
+        // silently).
         match self.remote.try_write_new(p, op_id.as_bytes())? {
-            true => Ok(true),
-            false => {
-                // The lock already existed. Read who holds it.
+            CreateNewVerdict::Created | CreateNewVerdict::AlreadyPresent => Ok(true),
+            CreateNewVerdict::Conflict => {
+                // The lock already existed with a different owner. Read who
+                // holds it.
                 let held = self.remote.read(p)?;
                 let held = String::from_utf8_lossy(&held).trim().to_string();
                 if held == op_id {

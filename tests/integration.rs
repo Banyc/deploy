@@ -7,7 +7,7 @@ use deploy::error::Result;
 use deploy::identity::{ServerId, SlotId, TreeDigest};
 use deploy::ledger::{DeploymentStatus, LedgerEntry, LedgerRollback, PhysicalBinding};
 
-use deploy::remote::transport::{FsBytes, LocalTransport, Remote};
+use deploy::remote::transport::{CreateNewVerdict, FsBytes, LocalTransport, Remote};
 use deploy::store::local::LocalStore;
 use std::path::Path;
 
@@ -1057,7 +1057,11 @@ impl Remote for SpyRemote {
             "SpyRemote: write is forbidden",
         ))
     }
-    fn try_write_new(&self, _rel: &Path, _data: &[u8]) -> deploy::error::Result<bool> {
+    fn try_write_new(
+        &self,
+        _rel: &Path,
+        _data: &[u8],
+    ) -> deploy::error::Result<deploy::remote::transport::CreateNewVerdict> {
         self.mutations.fetch_add(1, Ordering::SeqCst);
         Err(deploy::error::Error::remote(
             "SpyRemote: write is forbidden",
@@ -1220,7 +1224,11 @@ impl Remote for FaultRemote {
         }
         self.inner.write(rel, data, mode)
     }
-    fn try_write_new(&self, rel: &Path, data: &[u8]) -> deploy::error::Result<bool> {
+    fn try_write_new(
+        &self,
+        rel: &Path,
+        data: &[u8],
+    ) -> deploy::error::Result<deploy::remote::transport::CreateNewVerdict> {
         self.attempted.fetch_add(1, Ordering::SeqCst);
         if self.fail_write {
             return Err(deploy::error::Error::remote(
@@ -1331,7 +1339,7 @@ impl Remote for FailOnceMarkerRemote {
         }
         self.inner.write(rel, data, mode)
     }
-    fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<bool> {
+    fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<CreateNewVerdict> {
         if self.fail_marker(rel) {
             self.armed.store(false, Ordering::SeqCst);
             return Err(deploy::error::Error::remote(
@@ -1442,7 +1450,7 @@ impl Remote for FailOnceRetentionRemote {
         }
         self.inner.write(rel, data, mode)
     }
-    fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<bool> {
+    fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<CreateNewVerdict> {
         self.inner.try_write_new(rel, data)
     }
     fn remove_file(&self, rel: &Path) -> Result<()> {
@@ -1549,7 +1557,7 @@ impl Remote for ConflictingMarkerRemote {
         }
         self.inner.write(rel, data, mode)
     }
-    fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<bool> {
+    fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<CreateNewVerdict> {
         if self.conflict_marker(rel) {
             // Install the conflicting payload FIRST so the exclusive create
             // below reports "already exists" (`Ok(false)`), and

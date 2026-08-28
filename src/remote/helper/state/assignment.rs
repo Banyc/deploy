@@ -4,6 +4,7 @@
 use crate::error::{Error, Result};
 use crate::identity::{ArtifactRef, DeploymentId, GenerationId, TargetName};
 use crate::remote::layout;
+use crate::remote::transport::CreateNewVerdict;
 use serde::{Deserialize, Serialize};
 
 use super::super::RemoteHelper;
@@ -51,13 +52,19 @@ impl<'a> RemoteHelper<'a> {
         let json = serde_json::to_vec_pretty(assignment)
             .map_err(|e| Error::remote(format!("serialize assignment: {e}")))?;
         let assignment_path = gen_dir.join("assignment.json");
-        if !self.remote.try_write_new(&assignment_path, &json)? {
-            let existing = self.remote.read(&assignment_path)?;
-            if existing != json {
-                return Err(Error::integrity(format!(
-                    "generation {} already exists with different content",
-                    assignment.generation_id
-                )));
+        // The TYPED verdict: `Created`/`AlreadyPresent` (the identical retry)
+        // skip the read-back; only a `Conflict` (different bytes or mode)
+        // performs it — the winner is never replaced, exactly as before.
+        match self.remote.try_write_new(&assignment_path, &json)? {
+            CreateNewVerdict::Created | CreateNewVerdict::AlreadyPresent => {}
+            CreateNewVerdict::Conflict => {
+                let existing = self.remote.read(&assignment_path)?;
+                if existing != json {
+                    return Err(Error::integrity(format!(
+                        "generation {} already exists with different content",
+                        assignment.generation_id
+                    )));
+                }
             }
         }
         // The `root` symlink lives inside `generations/<gen>/`, so it must be

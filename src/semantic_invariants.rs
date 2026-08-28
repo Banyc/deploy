@@ -85,7 +85,7 @@ use crate::ledger::SlotOutcomeKind;
 use crate::remote::helper::{GenerationAssignment, RemoteHelper};
 use crate::remote::layout;
 use crate::remote::transport::{
-    ExecOutcome, FsBytes, LocalTransport, Remote, RemoteEntry, RemoteMeta,
+    CreateNewVerdict, ExecOutcome, FsBytes, LocalTransport, Remote, RemoteEntry, RemoteMeta,
 };
 use crate::retention::checkpoint::{CheckpointReport, run_checkpoint_unlocked};
 use crate::retention::compute_retained;
@@ -406,7 +406,7 @@ impl Remote for FailOnceRemote {
         }
         self.inner.write(rel, data, mode)
     }
-    fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<bool> {
+    fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<CreateNewVerdict> {
         if self.should_fail(rel) {
             return Err(crate::error::Error::transport(format!(
                 "injected write failure at {}",

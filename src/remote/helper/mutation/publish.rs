@@ -6,7 +6,7 @@
 use crate::error::{Error, Result};
 use crate::identity::ReleaseRecord;
 use crate::remote::layout;
-use crate::remote::transport::Remote;
+use crate::remote::transport::{CreateNewVerdict, Remote};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use walkdir::WalkDir;
@@ -118,17 +118,24 @@ impl<'a> RemoteHelper<'a> {
     /// semantic for JSON (key order and whitespace may differ between
     /// serializations of the same contract) and byte-exact otherwise.
     fn publish_release_file(&self, rel: &Path, data: &[u8]) -> Result<()> {
-        if self.remote.try_write_new(rel, data)? {
-            return Ok(());
+        // The TYPED verdict: `Created`/`AlreadyPresent` (the identical retry
+        // — byte-and-mode identical, so trivially equivalent) are success;
+        // only a `Conflict` needs the semantic read-back comparison (JSON key
+        // order/whitespace may differ between serializations of the same
+        // contract — the winner is never replaced, exactly as before).
+        match self.remote.try_write_new(rel, data)? {
+            CreateNewVerdict::Created | CreateNewVerdict::AlreadyPresent => Ok(()),
+            CreateNewVerdict::Conflict => {
+                let existing = self.remote.read(rel)?;
+                if json_semantically_equal(&existing, data) {
+                    return Ok(());
+                }
+                Err(Error::integrity(format!(
+                    "refusing to replace existing {} with different content",
+                    rel.display()
+                )))
+            }
         }
-        let existing = self.remote.read(rel)?;
-        if json_semantically_equal(&existing, data) {
-            return Ok(());
-        }
-        Err(Error::integrity(format!(
-            "refusing to replace existing {} with different content",
-            rel.display()
-        )))
     }
 
     /// Stage a tree into a deployment-specific incoming directory (invisible to

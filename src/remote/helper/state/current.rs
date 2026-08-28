@@ -1400,7 +1400,11 @@ mod tests_current {
         fn write(&self, rel: &std::path::Path, data: &[u8], mode: u32) -> crate::error::Result<()> {
             self.inner.write(rel, data, mode)
         }
-        fn try_write_new(&self, rel: &std::path::Path, data: &[u8]) -> crate::error::Result<bool> {
+        fn try_write_new(
+            &self,
+            rel: &std::path::Path,
+            data: &[u8],
+        ) -> crate::error::Result<crate::remote::transport::CreateNewVerdict> {
             self.inner.try_write_new(rel, data)
         }
         fn create_dir(&self, rel: &std::path::Path) -> crate::error::Result<()> {
@@ -1623,7 +1627,11 @@ mod tests_current {
         fn write(&self, rel: &std::path::Path, data: &[u8], mode: u32) -> crate::error::Result<()> {
             self.inner.write(rel, data, mode)
         }
-        fn try_write_new(&self, rel: &std::path::Path, data: &[u8]) -> crate::error::Result<bool> {
+        fn try_write_new(
+            &self,
+            rel: &std::path::Path,
+            data: &[u8],
+        ) -> crate::error::Result<crate::remote::transport::CreateNewVerdict> {
             self.inner.try_write_new(rel, data)
         }
         fn create_dir(&self, rel: &std::path::Path) -> crate::error::Result<()> {

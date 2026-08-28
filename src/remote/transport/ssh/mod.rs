@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::{
-    FsBytes, IMMUTABLE_RECORD_MODE, Remote, RemoteEntry, RemoteMeta,
+    CreateNewVerdict, FsBytes, IMMUTABLE_RECORD_MODE, Remote, RemoteEntry, RemoteMeta,
     has_normal_component_below_root,
 };
 use hostkey::pin_known_hosts;
@@ -54,13 +54,23 @@ const LSTAT_ERRNO_ENOTDIR: i32 = 20;
 
 /// The reserved exit code the remote `try_write_new` script (`write_new_cmd`)
 /// exits with when the no-clobber `ln` hit an EXISTING destination — the
-/// conflict/lost-race verdict. It is the ONLY nonzero exit the transport maps
-/// to `Ok(false)`; every other nonzero exit (a failed pre-install step OR the
-/// final parent-directory sync) is a propagated error. `17` cannot collide
+/// conflict/verdict decision point. It is the ONLY nonzero exit the transport
+/// maps to a verdict; every other nonzero exit (a failed pre-install step OR
+/// the final parent-directory sync) is a propagated error. `17` cannot collide
 /// with the pre-install steps' own failures (each exits nonzero, but the
 /// transport distinguishes the verdict by code, never by `exists`-sniffing),
-/// and it is deliberately distinct from `SSH_STAT_ABSENT_EXIT`.
+/// and it is deliberately distinct from [`SSH_TWRITE_PREINSTALL_EXIT`].
 pub const SSH_TWRITE_CONFLICT_EXIT: i32 = 17;
+
+/// The exit code the remote `write_new_cmd` script uses for a PRE-INSTALL
+/// failure — any failure BEFORE the no-clobber publish: the parent `mkdir`,
+/// the `mktemp` allocation, the payload write, the final `chmod`, or the file
+/// `sync`. Such a failure means the operation never reached the publish
+/// decision point, so it is a propagated Error, NEVER a verdict — the
+/// transport refuses to guess the destination's state. Deliberately distinct
+/// from [`SSH_TWRITE_CONFLICT_EXIT`] so the script can tell "the install never
+/// happened" from "the destination already existed".
+pub const SSH_TWRITE_PREINSTALL_EXIT: i32 = 1;
 
 /// A transport that drives a real remote host over SSH.
 pub struct SshTransport {
@@ -442,12 +452,24 @@ impl SshTransport {
     ///
     /// The parent directory is created first (the remote layout is not
     /// provisioned by SSH the way LocalTransport does it), so a fresh remote
-    /// root still allows the first lock acquisition. The chain is
-    /// `&&`-connected: if `mktemp` (or any pre-install step) fails, the
-    /// command exits non-zero without installing anything (fail closed). The
-    /// final `sync <parent>` runs ONLY on the install-success path, and its
-    /// exit status is the command's exit status — a real `sync <dir>`/fsync,
-    /// never a best-effort swallow.
+    /// root still allows the first lock acquisition. The PRE-INSTALL chain
+    /// (`mkdir` .. `sync "$tmp"`) is `&&`-connected and its exit status is
+    /// captured separately: if ANY pre-install step fails, the command exits
+    /// [`SSH_TWRITE_PREINSTALL_EXIT`] WITHOUT installing anything (fail
+    /// closed) — a pre-install failure is a propagated ERROR, never the
+    /// conflict verdict, because the operation never reached the publish
+    /// decision point. Only the no-clobber `ln` failure is then examined: a
+    /// NONZERO `ln` exit with the destination PRESENT (`[ -e ]`/`[ -L ]`) is
+    /// the confirmed-EEXIST verdict [`SSH_TWRITE_CONFLICT_EXIT`] (the winner
+    /// is never replaced; the transport verifies it and decides
+    /// AlreadyPresent vs Conflict); a nonzero `ln` exit with the destination
+    /// ABSENT is a real publish failure, again the pre-install exit (an
+    /// error). The final `sync <parent>` runs ONLY on the install-success
+    /// path, and its exit status is the command's exit status — a real
+    /// `sync <dir>`/fsync, never a best-effort swallow. (The
+    /// AlreadyPresent retry's parent sync runs in the TRANSPORT — see
+    /// [`SshTransport::try_write_new`] — mirroring the local primitive's
+    /// "parent fsync on Created AND AlreadyPresent, never on Conflict".)
     //
     // Portability notes: `mktemp TEMPLATE` accepts a template argument on
     // both GNU and BSD/macOS, provided `XXXXXX` ends the final component
@@ -463,11 +485,14 @@ impl SshTransport {
             .unwrap_or_else(|| ".".to_string());
         // Durability protocol — the seven-step sequence is documented on
         // this function; the comment here only notes the pieces that are
-        // invisible in the final string: the `&&` chain fails closed BEFORE
-        // the install (a failed pre-install step installs nothing), the `rc`
-        // capture keeps the temp cleanup outside the chain so it runs on the
-        // conflict path too, and the parent-dir sync runs ONLY after a
-        // successful install and its failure is the command's exit status.
+        // invisible in the final string: the pre-install chain fails closed
+        // with the PRE-INSTALL exit (distinct from the conflict verdict), the
+        // confirmed-EEXIST decision is made by checking the destination's
+        // PRESENCE after a failed `ln` (never by swallowing every `ln`
+        // failure as a verdict), the `rc` capture keeps the temp cleanup
+        // outside the chain so it runs on the conflict path too, and the
+        // parent-dir sync runs ONLY after a successful install and its
+        // failure is the command's exit status.
         let basename = Path::new(&remote_path_str)
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -482,13 +507,14 @@ impl SshTransport {
         let tmp_template = format!("{}/.{}.tmp.XXXXXX", parent.trim_end_matches('/'), basename,);
         let mode_str = format!("{:o}", mode & 0o7777);
         format!(
-            "mkdir -p {p} && tmp=$(mktemp {tpl}) && printf '%s' {payload} > \"$tmp\" && chmod {mode} \"$tmp\" && sync \"$tmp\" && ln \"$tmp\" {d}; rc=$?; rm -f \"$tmp\"; if [ \"$rc\" -ne 0 ]; then exit {conflict}; fi; sync {parent}; exit $?",
+            "mkdir -p {p} && tmp=$(mktemp {tpl}) && printf '%s' {payload} > \"$tmp\" && chmod {mode} \"$tmp\" && sync \"$tmp\"; pre=$?; if [ \"$pre\" -ne 0 ]; then rm -f \"$tmp\"; exit {preinst}; fi; ln \"$tmp\" {d}; rc=$?; rm -f \"$tmp\"; if [ \"$rc\" -eq 0 ]; then sync {parent}; exit $?; fi; if [ -e {d} ] || [ -L {d} ]; then exit {conflict}; fi; exit {preinst}",
             p = shell_quote(&parent),
             tpl = shell_quote(&tmp_template),
             payload = shell_quote(payload),
             mode = mode_str,
             d = shell_quote(&remote_path_str),
             conflict = SSH_TWRITE_CONFLICT_EXIT,
+            preinst = SSH_TWRITE_PREINSTALL_EXIT,
             parent = shell_quote(&parent),
         )
     }
@@ -877,35 +903,58 @@ impl Remote for SshTransport {
         })
     }
 
-    fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<bool> {
+    fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<CreateNewVerdict> {
         let payload = String::from_utf8_lossy(data).into_owned();
         let cmd = Self::write_new_cmd(&self.root, rel, &payload, IMMUTABLE_RECORD_MODE);
         let out = self.run_remote(&cmd)?;
         if out.status.success() {
             // All seven steps completed: the record is installed with the
             // final mode and a parent-directory-sync'd durable entry.
-            Ok(true)
-        } else if out.status.code() == Some(SSH_TWRITE_CONFLICT_EXIT) && self.exists(rel) {
-            // The no-clobber `ln` lost the race (or the destination was
-            // already present): the winner is untouched — NEVER replaced. The
-            // caller's read-back comparison (every try_write_new caller
-            // performs one) decides whether the retry converges (identical
-            // content) or is a genuine conflict; the reserved exit code
-            // guarantees a REAL failure — e.g. the parent-directory sync —
-            // is never misread as a lost race.
-            Ok(false)
-        } else {
-            Err(Error::transport(format!(
+            return Ok(CreateNewVerdict::Created);
+        }
+        // A pre-install failure (the temp allocation, the payload write, the
+        // final chmod, or the file fsync) or the final parent-dir sync failure
+        // exits with a code other than the reserved conflict code: the
+        // operation never reached (or never finished) the publish decision
+        // point, so this is a propagated ERROR — never a verdict. The
+        // transport never guesses the destination's state from a failed
+        // pre-install.
+        if out.status.code() != Some(SSH_TWRITE_CONFLICT_EXIT) {
+            return Err(Error::transport(format!(
                 "ssh try_write_new failed: {}",
                 String::from_utf8_lossy(&out.stderr)
-            )))
+            )));
         }
+        // CONFIRMED EEXIST: the no-clobber `ln` found the destination already
+        // present — the verdict decision point. The winner is NEVER replaced.
+        // VERIFY the existing entry INSIDE the transport — its bytes AND mode
+        // against the intent: identical → AlreadyPresent (and the PARENT
+        // DIRECTORY is synced here, so the convergent retry returns with a
+        // durable entry — the same parent-sync guarantee a fresh Created
+        // install gets); anything else — different bytes OR a mode mismatch
+        // over identical bytes — → Conflict (a genuine conflict, not ours to
+        // bless). A failed verification read is a propagated error, never a
+        // fabricated verdict.
+        let existing = self.read(rel)?;
+        let meta = self.metadata(rel)?;
+        if existing == data && (meta.mode & 0o7777) == (IMMUTABLE_RECORD_MODE & 0o7777) {
+            let remote_path_str = self.root.join(rel).to_string_lossy().into_owned();
+            let parent = Path::new(&remote_path_str)
+                .parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| ".".to_string());
+            self.run_remote_ok(&format!("sync {}", shell_quote(&parent)))?;
+            return Ok(CreateNewVerdict::AlreadyPresent);
+        }
+        Ok(CreateNewVerdict::Conflict)
     }
 }
 
 #[cfg(test)]
 mod tests_ssh {
     use super::*;
+    use proptest::prelude::*;
+    use proptest::test_runner::RngSeed;
     use std::os::unix::fs::MetadataExt;
     use std::path::Path;
 
@@ -1479,6 +1528,122 @@ mod tests_ssh {
             b"gen-1",
             "the conflict must NEVER replace the winner"
         );
+    }
+
+    /// The stage-failure dimension of the ssh protocol: a failure at EVERY
+    /// script-failable stage must exit with a code that is NEITHER 0 NOR the
+    /// reserved conflict verdict — a pre-install failure or a real publish/
+    /// sync failure is a propagated ERROR, never a verdict (the verdict is
+    /// ONLY a CONFIRMED EEXIST at the no-clobber publish). `Unlink` is not
+    /// script-failable (`rm -f` is best-effort cleanup by design); that crash
+    /// point is covered by the local primitive's `FailAt(Unlink)` case and by
+    /// `try_write_new_recovers_from_stale_hardlinked_temp`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum SshStageFailure {
+        /// `mktemp` fails — the temp allocation (step 1).
+        CreateTemp,
+        /// The payload write fails — a fake `mktemp` hands back an unwritable
+        /// path so the `printf > "$tmp"` redirect fails (step 2; `printf` is
+        /// a shell builtin, so a PATH fake cannot shadow it).
+        Write,
+        /// `chmod` fails (step 3).
+        Chmod,
+        /// `sync "$tmp"` fails (step 4).
+        FileFsync,
+        /// `ln` fails for a reason OTHER than EEXIST (step 5) — with the
+        /// destination ABSENT, so the script must NOT call it a verdict.
+        Publish,
+        /// `sync <dir>` fails (step 7) — the file sync passes, the
+        /// parent-dir sync is the propagated failure.
+        ParentFsync,
+    }
+
+    fn ssh_stage_failure() -> impl Strategy<Value = SshStageFailure> {
+        prop_oneof![
+            Just(SshStageFailure::CreateTemp),
+            Just(SshStageFailure::Write),
+            Just(SshStageFailure::Chmod),
+            Just(SshStageFailure::FileFsync),
+            Just(SshStageFailure::Publish),
+            Just(SshStageFailure::ParentFsync),
+        ]
+    }
+
+    proptest! {
+        // Bounded cases, fixed seed 0x5EED_5EED (house style), no persistence.
+        #![proptest_config(ProptestConfig {
+            cases: crate::testutil::proptest_cases(16),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn write_new_cmd_stage_failures_propagate(stage in ssh_stage_failure()) {
+            let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+            let root = dir.path().to_path_buf();
+            let rel = Path::new("state/op.json");
+            let dest = root.join(rel);
+            let cmd = SshTransport::write_new_cmd(&root, rel, "payload-data", IMMUTABLE_RECORD_MODE);
+            let fakebin = dir.path().join("fakebin");
+            std::fs::create_dir_all(&fakebin).unwrap();
+
+            let (name, body) = match stage {
+                SshStageFailure::CreateTemp => ("mktemp", "#!/bin/sh\nexit 1\n"),
+                SshStageFailure::Write => (
+                    "mktemp",
+                    "#!/bin/sh\nprintf '%s\\n' '/definitely/unwritable/.op.json.tmp.XXXXXX'\n",
+                ),
+                SshStageFailure::Chmod => ("chmod", "#!/bin/sh\nexit 1\n"),
+                SshStageFailure::FileFsync => ("sync", "#!/bin/sh\nexit 1\n"),
+                SshStageFailure::Publish => ("ln", "#!/bin/sh\nexit 1\n"),
+                SshStageFailure::ParentFsync => (
+                    "sync",
+                    "#!/bin/sh\nif [ -d \"$1\" ]; then echo 'sync: dir sync failed' >&2; exit 9; fi\nexit 0\n",
+                ),
+            };
+            let p = fakebin.join(name);
+            std::fs::write(&p, body).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "PATH={fake}:$PATH; {cmd}",
+                    fake = shell_quote(&fakebin.to_string_lossy())
+                ))
+                .output()
+                .expect("spawn sh -c");
+            prop_assert_ne!(
+                out.status.code(),
+                Some(0),
+                "the faulted stage must fail the attempt"
+            );
+            prop_assert_ne!(
+                out.status.code(),
+                Some(SSH_TWRITE_CONFLICT_EXIT),
+                "a stage failure is NEVER the conflict verdict — the verdict is ONLY a confirmed EEXIST, got: {:?}",
+                out.status.code()
+            );
+            match stage {
+                SshStageFailure::ParentFsync => {
+                    // The install completed; the failure is EXACTLY the final
+                    // durability step, and the record is fully written.
+                    prop_assert_eq!(
+                        std::fs::read(&dest).unwrap(),
+                        b"payload-data",
+                        "the parent-sync failure must come after a fully-written install"
+                    );
+                }
+                _ => {
+                    prop_assert!(
+                        !dest.exists(),
+                        "a pre-install/publish failure must install nothing"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -2412,5 +2577,255 @@ exec /bin/mv "$@"
                 .exists(&crate::remote::layout::tree_root(garbage.as_str())),
             "the garbage tree must survive the failed retention"
         );
+    }
+
+    /// The transport maps a PRE-INSTALL failure to an ERROR, never a verdict:
+    /// with a fake `mktemp` that fails, `try_write_new` returns `Err` — the
+    /// operation never reached the publish decision point, so it must not be
+    /// misread as `AlreadyPresent`/`Conflict` (the old script collapsed every
+    /// `ln` failure into the conflict code, so a pre-install failure was
+    /// indistinguishable from a confirmed EEXIST).
+    #[test]
+    fn try_write_new_preinstall_failure_is_an_error_never_a_verdict() {
+        let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let fake = FakeSsh::new(
+            tmp.path().join("bin"),
+            tmp.path().join("remote"),
+            "preinst-ssh.test",
+            Path::new("/srv/deploy/preinst-ssh"),
+        );
+        let cache = tmp.path().join("knownhosts");
+        let env = fake_env(
+            &fake.bin,
+            &cache,
+            &fake.remote_root,
+            "/srv/deploy/preinst-ssh",
+        );
+        let t = fake.transport(&cache, &env);
+        t.prepare_identity().unwrap();
+        let remote_deploy = fake.remote_root.join("srv/deploy/preinst-ssh");
+        std::fs::create_dir_all(&remote_deploy).unwrap();
+
+        // The temp allocation fails remotely: the script exits the reserved
+        // PRE-INSTALL code (never the conflict verdict), and the transport
+        // propagates the error.
+        write_fake_bin(&fake.bin, "mktemp", "#!/bin/sh\nexit 1\n");
+        let err = t
+            .try_write_new(Path::new("state/op.json"), b"payload")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("ssh try_write_new failed"),
+            "a pre-install failure must be a propagated error, got: {err}"
+        );
+        assert!(
+            !remote_deploy.join("state/op.json").exists(),
+            "a pre-install failure must install nothing"
+        );
+    }
+
+    /// The transport-level verdict matrix over the fake ssh remote: the TYPED
+    /// verdict survives the ssh transport boundary. A fake `sync` logger in
+    /// the fake bin dir records every sync the remote script (and the
+    /// transport's AlreadyPresent retry) performs, so the parent-durability
+    /// property is OBSERVABLE: the parent sync runs for `Created` AND for
+    /// `AlreadyPresent` (an identical retry establishes the parent's
+    /// durability — the fix for the old script, which only synced on the
+    /// fresh-install path), and NOT for `Conflict` (a different winner is not
+    /// ours to bless). A mode mismatch over identical bytes stays `Conflict`.
+    #[derive(Clone, Copy, Debug)]
+    enum SshVerdictState {
+        Fresh,
+        ExactExisting,
+        DifferentBytes,
+        DifferentMode,
+        PublishedBeforeParentSync,
+    }
+
+    fn ssh_verdict_state() -> impl Strategy<Value = SshVerdictState> {
+        prop_oneof![
+            Just(SshVerdictState::Fresh),
+            Just(SshVerdictState::ExactExisting),
+            Just(SshVerdictState::DifferentBytes),
+            Just(SshVerdictState::DifferentMode),
+            Just(SshVerdictState::PublishedBeforeParentSync),
+        ]
+    }
+
+    proptest! {
+        // Bounded cases, fixed seed 0x5EED_5EED (house style), no persistence.
+        #![proptest_config(ProptestConfig {
+            cases: crate::testutil::proptest_cases(16),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn try_write_new_verdicts_over_ssh(
+            payload in prop::collection::vec(prop::char::range('a', 'z'), 1..32),
+            state in ssh_verdict_state(),
+        ) {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+            let payload: String = payload.into_iter().collect();
+            let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+            let fake = FakeSsh::new(
+                tmp.path().join("bin"),
+                tmp.path().join("remote"),
+                "verdict-ssh.test",
+                Path::new("/srv/deploy/verdict-ssh"),
+            );
+            let cache = tmp.path().join("knownhosts");
+            let env = fake_env(
+                &fake.bin,
+                &cache,
+                &fake.remote_root,
+                "/srv/deploy/verdict-ssh",
+            );
+            let t = fake.transport(&cache, &env);
+            t.prepare_identity().unwrap();
+            let remote_deploy = fake.remote_root.join("srv/deploy/verdict-ssh");
+            std::fs::create_dir_all(&remote_deploy).unwrap();
+
+            // A fake `sync` that records every invocation and exits 0 — the
+            // remote script's file fsync AND parent-dir sync AND the
+            // transport's retry sync all land here, so the test can prove
+            // WHICH branch synced (the durable-entry claim).
+            let sync_log = tmp.path().join("sync.log");
+            write_fake_bin(
+                &fake.bin,
+                "sync",
+                &format!(
+                    "#!/bin/sh\nprintf 'sync:%s\\n' \"$*\" >> '{log}'\n",
+                    log = sync_log.display(),
+                ),
+            );
+
+            let rel = Path::new("state/record.json");
+            let dest = remote_deploy.join(rel);
+            let parent = dest.parent().unwrap().to_path_buf();
+            let data = payload.as_bytes();
+            let final_mode = IMMUTABLE_RECORD_MODE & 0o7777;
+
+            match state {
+                SshVerdictState::Fresh => {
+                    let verdict = t
+                        .try_write_new(rel, data)
+                        .expect("the fresh ssh install must succeed");
+                    prop_assert_eq!(verdict, CreateNewVerdict::Created);
+                    prop_assert_eq!(
+                        std::fs::read(&dest).unwrap(),
+                        data,
+                        "Ok(Created) must imply exact bytes"
+                    );
+                    let meta = std::fs::metadata(&dest).unwrap();
+                    prop_assert_eq!(
+                        meta.mode() & 0o7777,
+                        final_mode,
+                        "Ok(Created) must imply the final mode"
+                    );
+                    let log = std::fs::read_to_string(&sync_log).unwrap_or_default();
+                    prop_assert!(
+                        log.lines().any(|l| l == format!("sync:{}", parent.display())),
+                        "Created must sync the parent directory, log: {log:?}"
+                    );
+                }
+                SshVerdictState::ExactExisting => {
+                    // An EXACT existing entry (bytes AND mode identical): the
+                    // identical retry converges — AlreadyPresent, and the
+                    // retry ESTABLISHES the parent durability (the transport
+                    // syncs the parent on this branch too).
+                    std::fs::create_dir_all(&parent).unwrap();
+                    std::fs::write(&dest, data).unwrap();
+                    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(final_mode))
+                        .unwrap();
+                    let verdict = t
+                        .try_write_new(rel, data)
+                        .expect("an identical retry must converge, not error");
+                    prop_assert_eq!(verdict, CreateNewVerdict::AlreadyPresent);
+                    prop_assert_eq!(
+                        std::fs::read(&dest).unwrap(),
+                        data,
+                        "the identical retry must not touch the winner"
+                    );
+                    let log = std::fs::read_to_string(&sync_log).unwrap_or_default();
+                    prop_assert!(
+                        log.lines().any(|l| l == format!("sync:{}", parent.display())),
+                        "AlreadyPresent must sync the parent directory, log: {log:?}"
+                    );
+                }
+                SshVerdictState::DifferentBytes => {
+                    // A winner with DIFFERENT bytes: Conflict, never replaced,
+                    // and NOT synced (a foreign winner is not ours to bless).
+                    std::fs::create_dir_all(&parent).unwrap();
+                    std::fs::write(&dest, b"foreign-winner").unwrap();
+                    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(final_mode))
+                        .unwrap();
+                    let verdict = t
+                        .try_write_new(rel, data)
+                        .expect("a different-content winner is a verdict, not an I/O error");
+                    prop_assert_eq!(verdict, CreateNewVerdict::Conflict);
+                    prop_assert_eq!(
+                        std::fs::read(&dest).unwrap(),
+                        b"foreign-winner",
+                        "the conflict must NEVER replace the winner"
+                    );
+                    let log = std::fs::read_to_string(&sync_log).unwrap_or_default();
+                    prop_assert!(
+                        !log.lines().any(|l| l == format!("sync:{}", parent.display())),
+                        "Conflict must not sync the foreign winner's parent, log: {log:?}"
+                    );
+                }
+                SshVerdictState::DifferentMode => {
+                    // Identical bytes but a DIFFERENT mode: still Conflict —
+                    // the mode is part of the record (the spec: "a mode
+                    // mismatch must remain Conflict"), never blessed.
+                    std::fs::create_dir_all(&parent).unwrap();
+                    std::fs::write(&dest, data).unwrap();
+                    let other_mode = if final_mode == 0o600 { 0o640 } else { 0o600 };
+                    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(other_mode))
+                        .unwrap();
+                    let verdict = t
+                        .try_write_new(rel, data)
+                        .expect("a mode mismatch is a verdict, not an I/O error");
+                    prop_assert_eq!(verdict, CreateNewVerdict::Conflict);
+                    let meta = std::fs::metadata(&dest).unwrap();
+                    prop_assert_eq!(
+                        meta.mode() & 0o7777,
+                        other_mode,
+                        "the mode mismatch must never be replaced"
+                    );
+                    let log = std::fs::read_to_string(&sync_log).unwrap_or_default();
+                    prop_assert!(
+                        !log.lines().any(|l| l == format!("sync:{}", parent.display())),
+                        "a mode-mismatch Conflict must not sync, log: {log:?}"
+                    );
+                }
+                SshVerdictState::PublishedBeforeParentSync => {
+                    // A crash-simulated state: the entry EXISTS with the
+                    // intended bytes and mode, but its parent was never synced.
+                    // The retry verifies it as AlreadyPresent AND establishes
+                    // the parent durability.
+                    std::fs::create_dir_all(&parent).unwrap();
+                    std::fs::write(&dest, data).unwrap();
+                    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(final_mode))
+                        .unwrap();
+                    let verdict = t
+                        .try_write_new(rel, data)
+                        .expect("the retry over a published-before-parent-sync entry must converge");
+                    prop_assert_eq!(verdict, CreateNewVerdict::AlreadyPresent);
+                    prop_assert_eq!(
+                        std::fs::read(&dest).unwrap(),
+                        data,
+                        "the winner must stay intact"
+                    );
+                    let log = std::fs::read_to_string(&sync_log).unwrap_or_default();
+                    prop_assert!(
+                        log.lines().any(|l| l == format!("sync:{}", parent.display())),
+                        "the AlreadyPresent retry must establish the parent durability, log: {log:?}"
+                    );
+                }
+            }
+        }
     }
 }

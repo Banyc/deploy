@@ -868,7 +868,7 @@ pub(crate) mod test_remotes {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use crate::error::{Error, Result};
-    use crate::remote::transport::{LocalTransport, Remote};
+    use crate::remote::transport::{CreateNewVerdict, LocalTransport, Remote};
 
     /// A remote that fails commit marker writes exactly once: the first
     /// write/create under `state/commits/` errors (leaving the marker absent),
@@ -910,7 +910,7 @@ pub(crate) mod test_remotes {
             }
             self.inner.write(rel, data, mode)
         }
-        fn try_write_new(&self, rel: &std::path::Path, data: &[u8]) -> Result<bool> {
+        fn try_write_new(&self, rel: &std::path::Path, data: &[u8]) -> Result<CreateNewVerdict> {
             if self.fail_marker(rel) {
                 self.armed.store(false, Ordering::SeqCst);
                 return Err(Error::remote(
@@ -999,7 +999,7 @@ pub(crate) mod test_remotes {
         fn write(&self, rel: &std::path::Path, data: &[u8], mode: u32) -> Result<()> {
             self.inner.write(rel, data, mode)
         }
-        fn try_write_new(&self, rel: &std::path::Path, data: &[u8]) -> Result<bool> {
+        fn try_write_new(&self, rel: &std::path::Path, data: &[u8]) -> Result<CreateNewVerdict> {
             if self.fail_generation(rel) {
                 self.armed.store(false, Ordering::SeqCst);
                 return Err(Error::remote(
@@ -1101,7 +1101,7 @@ pub(crate) mod test_remotes {
             }
             self.inner.write(rel, data, mode)
         }
-        fn try_write_new(&self, rel: &std::path::Path, data: &[u8]) -> Result<bool> {
+        fn try_write_new(&self, rel: &std::path::Path, data: &[u8]) -> Result<CreateNewVerdict> {
             self.inner.try_write_new(rel, data)
         }
         fn create_dir(&self, rel: &std::path::Path) -> Result<()> {
@@ -1196,7 +1196,7 @@ pub(crate) mod test_remotes {
             }
             self.inner.write(rel, data, mode)
         }
-        fn try_write_new(&self, rel: &std::path::Path, data: &[u8]) -> Result<bool> {
+        fn try_write_new(&self, rel: &std::path::Path, data: &[u8]) -> Result<CreateNewVerdict> {
             self.inner.try_write_new(rel, data)
         }
         fn create_dir(&self, rel: &std::path::Path) -> Result<()> {
@@ -1279,7 +1279,7 @@ pub(crate) mod test_remotes {
             self.tick();
             self.inner.write(rel, data, mode)
         }
-        fn try_write_new(&self, rel: &std::path::Path, data: &[u8]) -> Result<bool> {
+        fn try_write_new(&self, rel: &std::path::Path, data: &[u8]) -> Result<CreateNewVerdict> {
             self.tick();
             self.inner.try_write_new(rel, data)
         }

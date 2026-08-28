@@ -25,7 +25,7 @@ pub(crate) use crate::ledger::{
     ObservationWire, ObservedAssignment, ObservedGenerationWire, RefExpr, SlotAttemptState,
     TerminalDisposition,
 };
-pub(crate) use crate::remote::transport::{FsBytes, LocalTransport, Remote};
+pub(crate) use crate::remote::transport::{CreateNewVerdict, FsBytes, LocalTransport, Remote};
 pub(crate) use crate::store::local::LocalStore;
 pub(crate) use crate::testutil::test_remotes::FailOnceMarkerRemote;
 pub(crate) use crate::verify::release::RELEASE_RECORD_SCHEMA_VERSION;
@@ -469,7 +469,7 @@ impl Remote for RecordingRemote {
     fn write(&self, rel: &Path, data: &[u8], mode: u32) -> Result<()> {
         self.inner.write(rel, data, mode)
     }
-    fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<bool> {
+    fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<CreateNewVerdict> {
         self.inner.try_write_new(rel, data)
     }
     fn create_dir(&self, rel: &Path) -> Result<()> {
@@ -908,7 +908,7 @@ impl Remote for FakeCapacityRemote {
     fn write(&self, rel: &std::path::Path, data: &[u8], mode: u32) -> Result<()> {
         self.inner.write(rel, data, mode)
     }
-    fn try_write_new(&self, rel: &std::path::Path, data: &[u8]) -> Result<bool> {
+    fn try_write_new(&self, rel: &std::path::Path, data: &[u8]) -> Result<CreateNewVerdict> {
         self.inner.try_write_new(rel, data)
     }
     fn create_dir(&self, rel: &std::path::Path) -> Result<()> {
