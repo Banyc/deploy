@@ -439,8 +439,8 @@ fn rollback_refuses_rebound_slot() -> Result<()> {
     let remotes_base = tmp.path().join("remotes");
     std::fs::create_dir_all(&remotes_base).unwrap();
 
-    // Two physical servers; the slot starts bound to server-01. `local://`
-    // addresses need no host identity.
+    // Two physical servers; the slot starts bound to server-01. The `local`
+    // marker needs no host identity.
     let config_toml = r#"
 schema_version = 2
 application = "rebind"
@@ -448,12 +448,12 @@ release = "v1"
 
 [[servers]]
 id = "server-01"
-address = "local:///srv/s01"
+address = "local"
 user = "deploy"
 
 [[servers]]
 id = "server-02"
-address = "local:///srv/s02"
+address = "local"
 user = "deploy"
 
 [targets.production]
@@ -627,7 +627,7 @@ release = "v1"
 
 [[servers]]
 id = "server-01"
-address = "local:///srv/s01"
+address = "local"
 user = "deploy"
 
 [targets.production]
@@ -1707,9 +1707,10 @@ fn cli_reaches_configured_endpoint() -> Result<()> {
     let endpoints = tmp.path().join("endpoints");
     std::fs::create_dir_all(&endpoints).unwrap();
 
-    // Addresses are explicit `local://` paths: the configured endpoint, NOT the
-    // application store's `remotes/` directory. Retention is a top-level setting
-    // of `deploy.toml`.
+    // A LOCAL connection is pathless: the slot's deploy_dir is the SOLE
+    // physical root, so the transport operates on the deploy_dir directory
+    // below — never the application store's `remotes/` directory. Retention
+    // is a top-level setting of `deploy.toml`.
     let config_toml = r#"
 schema_version = 2
 application = "example"
@@ -1717,17 +1718,15 @@ release = "v1"
 
 [[servers]]
 id = "server-01"
-address = "local:///dev/null/should-not-be-used"
+address = "local"
 user = "deploy"
 
 [targets.production]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
 "#;
-    // The slot's deploy_dir IS the configured endpoint directory: under
-    // exact-endpoint semantics a local connection must operate on the slot's
-    // recorded deploy_dir, so the fixture's deploy_dir matches the `local://`
-    // address patched in below (a divergent placeholder like the old
-    // `/srv/deploy/example` would now be refused by create_remote).
+    // The slot's deploy_dir IS the transport root: under the pathless local
+    // kind the deploy_dir is the one authoritative physical root, so the
+    // fixture points it at the real endpoint directory below.
     let variant_toml = format!(
         r#"
 [[slots]]
@@ -1767,21 +1766,17 @@ interval_seconds = 0
     write_file(&artifacts.join("build/output/app/server"), "v1\n");
     write_file(&artifacts.join("deployment/common/README"), "common\n");
 
-    let mut config = ProjectConfig::load(&proj.join("deploy.toml"))?;
+    let config = ProjectConfig::load(&proj.join("deploy.toml"))?;
     let store = LocalStore::with_base(store_base.clone())?;
 
-    // Plug the real endpoint directory into the server address and use the real
-    // CLI remote factory (create_remote), which routes `local://` addresses to
-    // the configured endpoint rather than the application store's remotes/.
-    config = config
-        .with_server_connection(
-            "server-01",
-            deploy::config::ServerConnection::Local {
-                address: format!("local://{}", endpoints.join("server-01").display()),
-                identity: deploy::config::HostIdentity::Local,
-            },
-        )
-        .unwrap();
+    // The loaded config already carries the pathless local connection; the
+    // real CLI remote factory (create_remote) roots the local transport at
+    // the slot's deploy_dir — the configured endpoint — rather than the
+    // application store's remotes/.
+    assert!(matches!(
+        config.server("server-01").unwrap().connection(),
+        deploy::config::ServerConnection::Local { .. }
+    ));
 
     let factory = move |s: &deploy::config::ServerDef,
                         slot: &deploy::config::SlotConfig|

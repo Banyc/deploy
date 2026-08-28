@@ -16,7 +16,7 @@ use crate::ledger::{
     DeploymentIntent, DesiredGeneration, IntentSlot, LEDGER_SCHEMA_VERSION, LedgerIntentWire,
     LedgerLine, NonEmptySlotTable,
 };
-use crate::remote::{EffectiveDeployRoot, create_remote};
+use crate::remote::create_remote;
 use crate::store::local::LocalStore;
 use proptest::prelude::*;
 use proptest::test_runner::RngSeed;
@@ -721,7 +721,7 @@ fn two_local_slots_never_share_a_deploy_dir_even_across_servers() {
     let mut p = minimal_raw_project();
     p.manifest.servers.push(raw::RawServer {
         id: "s2".to_string(),
-        address: "local:///srv-2".to_string(),
+        address: "local".to_string(),
         user: "u".to_string(),
         port: 22,
         known_hosts: None,
@@ -852,8 +852,8 @@ fn server_capacity_is_validated_and_defaults() {
     assert_eq!(cfg.servers_ref()[0].capacity.reserve_percent.get(), 10);
 }
 
-/// SSH addresses require EXACTLY ONE host-identity source; `local://`
-/// addresses are exempt. Neither (would-be trust-on-first-use) and both
+/// SSH addresses require EXACTLY ONE host-identity source; the `local`
+/// marker is exempt. Neither (would-be trust-on-first-use) and both
 /// (ambiguous) are rejected at load time, naming the server.
 #[test]
 fn ssh_identity_requires_exactly_one_source() {
@@ -893,13 +893,13 @@ fn ssh_identity_requires_exactly_one_source() {
         "error must name the server and the ambiguity, got: {msg}"
     );
 
-    // local:// address + neither source: fine (no host verification).
+    // The local marker + neither source: fine (no host verification).
     let local = deploy_toml("v1")
-        .replace("address = \"a\"", "address = \"local:///srv/forced\"")
+        .replace("address = \"a\"", "address = \"local\"")
         .replace("host_key_fingerprint = \"SHA256:test\"\n", "");
     std::fs::write(&p, local).unwrap();
-    let cfg = ProjectConfig::load(&p).expect("local:// address needs no identity");
-    assert!(cfg.server("s1").unwrap().address().starts_with("local://"));
+    let cfg = ProjectConfig::load(&p).expect("local marker needs no identity");
+    assert_eq!(cfg.server("s1").unwrap().address(), "local");
 
     // SSH address + exactly one source: valid.
     std::fs::write(&p, deploy_toml("v1")).unwrap();
@@ -930,13 +930,13 @@ fn ssh_identity_requires_exactly_one_source() {
     ));
 }
 
-/// `local://` addresses never perform host verification, so their domain
+/// The `local` marker never performs host verification, so its domain
 /// identity is ALWAYS [`HostIdentity::Local`] — the raw identity fields
 /// (whatever the file says) are collapsed by the conversion, and a local
 /// server can never carry a `KnownHosts`/`Fingerprint` form. The old
 /// exemption allowed a local endpoint to declare identity fields; the
 /// typed enum makes the option space total: `Local` is the ONE form for
-/// a local endpoint, exactly-one by construction.
+/// a local server, exactly-one by construction.
 #[test]
 fn local_address_identity_collapses_to_local() {
     let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
@@ -945,46 +945,46 @@ fn local_address_identity_collapses_to_local() {
     write_standard_release(&project, "v1");
     let p = project.join("deploy.toml");
     let local = deploy_toml("v1")
-        .replace("address = \"a\"", "address = \"local:///srv/forced\"")
+        .replace("address = \"a\"", "address = \"local\"")
         .replace("host_key_fingerprint = \"SHA256:test\"\n", "");
 
-    // local:// with no identity: Local.
+    // The marker with no identity: Local.
     std::fs::write(&p, local.clone()).unwrap();
-    let cfg = ProjectConfig::load(&p).expect("local:// without identity loads");
-    assert!(cfg.server("s1").unwrap().address().starts_with("local://"));
+    let cfg = ProjectConfig::load(&p).expect("local marker without identity loads");
+    assert_eq!(cfg.server("s1").unwrap().address(), "local");
     assert_eq!(cfg.server("s1").unwrap().identity(), &HostIdentity::Local);
 
-    // local:// + known_hosts: the file may say it, but the domain
-    // identity is still Local (a local endpoint never verifies a host).
+    // The marker + known_hosts: the file may say it, but the domain
+    // identity is still Local (a local server never verifies a host).
     let with_kh = local.replace(
         "user = \"u\"",
         "user = \"u\"\nknown_hosts = \"/etc/ssh/known_hosts\"",
     );
     std::fs::write(&p, with_kh).unwrap();
-    let cfg = ProjectConfig::load(&p).expect("local:// + known_hosts is allowed");
+    let cfg = ProjectConfig::load(&p).expect("local marker + known_hosts is allowed");
     assert_eq!(cfg.server("s1").unwrap().identity(), &HostIdentity::Local);
 
-    // local:// + host_key_fingerprint: allowed, still Local.
+    // The marker + host_key_fingerprint: allowed, still Local.
     let with_fp = local.replace(
         "user = \"u\"",
         "user = \"u\"\nhost_key_fingerprint = \"SHA256:test\"",
     );
     std::fs::write(&p, with_fp).unwrap();
-    let cfg = ProjectConfig::load(&p).expect("local:// + fingerprint is allowed");
+    let cfg = ProjectConfig::load(&p).expect("local marker + fingerprint is allowed");
     assert_eq!(cfg.server("s1").unwrap().identity(), &HostIdentity::Local);
 
-    // local:// + BOTH identity sources: still allowed — the ambiguity
+    // The marker + BOTH identity sources: still allowed — the ambiguity
     // rule is scoped to SSH addresses only (the exact same pair is
     // rejected above for an SSH address), and the domain collapses to
     // Local either way.
     let with_both = deploy_toml("v1")
-        .replace("address = \"a\"", "address = \"local:///srv/forced\"")
+        .replace("address = \"a\"", "address = \"local\"")
         .replace(
             "host_key_fingerprint = \"SHA256:test\"",
             "host_key_fingerprint = \"SHA256:test\"\nknown_hosts = \"/etc/ssh/known_hosts\"",
         );
     std::fs::write(&p, with_both).unwrap();
-    let cfg = ProjectConfig::load(&p).expect("local:// + both identities is allowed");
+    let cfg = ProjectConfig::load(&p).expect("local marker + both identities is allowed");
     assert_eq!(cfg.server("s1").unwrap().identity(), &HostIdentity::Local);
 }
 
@@ -1589,7 +1589,7 @@ pub(crate) fn minimal_raw_project() -> RawProject {
             pins: Vec::new(),
             servers: vec![raw::RawServer {
                 id: "s1".to_string(),
-                address: "local:///srv".to_string(),
+                address: "local".to_string(),
                 user: "u".to_string(),
                 port: 22,
                 known_hosts: None,
@@ -1691,7 +1691,7 @@ fn conversion_rejects_duplicate_identifiers() {
     let mut p = minimal_raw_project();
     p.manifest.servers.push(raw::RawServer {
         id: "s1".to_string(),
-        address: "local:///srv-2".to_string(),
+        address: "local".to_string(),
         user: "u".to_string(),
         port: 22,
         known_hosts: None,
@@ -1925,10 +1925,11 @@ fn conversion_accepts_minimal_and_invariants_hold() {
     assert_eq!(cfg.release().as_str(), "v1");
     assert_eq!(cfg.targets().count(), 1);
 
-    // A local:// server's identity is EXACTLY ONE form: Local.
+    // A local server's identity is EXACTLY ONE form: Local, and its
+    // address is the pathless marker.
     assert_eq!(cfg.servers().count(), 1);
     assert_eq!(cfg.server("s1").unwrap().identity(), &HostIdentity::Local);
-    assert!(cfg.server("s1").unwrap().address().starts_with("local://"));
+    assert_eq!(cfg.server("s1").unwrap().address(), "local");
 
     // The variant carries the typed activation enum (none here), its
     // slot, and its slot-owned retention.
@@ -2332,11 +2333,12 @@ fn arbitrary_raw_project() -> impl Strategy<Value = RawProject> {
 /// successful validated rebuild operation) must produce: valid + unique
 /// identifiers, every reference resolves (slot->server, slot->target,
 /// slot->variant, group names), the connection enum is well-formed (a
-/// local form carries a `local://` absolute address and a `Local`
-/// identity; an SSH form carries a `KnownHosts`/`Fingerprint` identity
-/// with an absolute `known_hosts`), the activation enum covers the
-/// space, and the per-target graph rules hold. This inspects the
-/// DomainConfig itself — it never re-runs the validation.
+/// local form carries a `Local` identity — it carries NO root path, the
+/// slot's deploy_dir is the sole physical root; an SSH form carries a
+/// `KnownHosts`/`Fingerprint` identity with an absolute `known_hosts`),
+/// the activation enum covers the space, and the per-target graph rules
+/// hold. This inspects the DomainConfig itself — it never re-runs the
+/// validation.
 pub(crate) fn assert_domain_invariants(cfg: &ProjectConfig) {
     let mut server_ids = HashSet::new();
     for s in cfg.servers() {
@@ -2350,20 +2352,16 @@ pub(crate) fn assert_domain_invariants(cfg: &ProjectConfig) {
             "server ids must be unique"
         );
         match s.connection() {
-            ServerConnection::Local { address, identity } => {
+            ServerConnection::Local { identity } => {
                 assert_eq!(
                     identity,
                     &HostIdentity::Local,
                     "a local connection must carry a Local identity"
                 );
-                assert!(
-                    address.starts_with("local://"),
-                    "a local connection must carry a local:// address"
-                );
-                let path = address.trim_start_matches("local://");
-                assert!(
-                    Path::new(path).is_absolute(),
-                    "a local:// endpoint must be an absolute path"
+                assert_eq!(
+                    s.address(),
+                    "local",
+                    "a local connection's address is the pathless marker"
                 );
             }
             ServerConnection::Ssh {
@@ -3083,23 +3081,45 @@ fn loaded_config_always_constructs_its_store() {
 }
 
 // =====================================================================
-// LOCAL SLOTS OPERATE ON THEIR RECORDED BINDING — the endpoint x slot dir
-// x multi-slot graph prop test
+// THE CONSTRUCTION <=> TRANSPORT-CREATION EQUIVALENCE — the arbitrary
+// graph prop test
 // =====================================================================
 //
-// A local slot operates on EXACTLY the directory its physical binding
-// records (`slot.deploy_dir`), and that directory is the one authoritative
-// `EffectiveDeployRoot`: `create_remote` parses the `local://` endpoint as
-// a validated [`AbsoluteDeployDir`] (traversal rejected) and REQUIRES it to
-// EQUAL the slot's deploy_dir (both compared as canonical effective roots).
-// The validated config graph stores the deploy_dir in the same canonical
-// form, so `create_remote(...).root() == PhysicalBinding.deploy_dir` holds
-// for every accepted local slot by construction.
+// THE USER'S REQUIREMENT: no accepted config graph may fail LATER at
+// transport creation because of a static relationship. Under design 1 the
+// local connection is PATHLESS ([`crate::config::ServerConnection::Local`]
+// carries no endpoint): the slot's typed deploy_dir is the SOLE physical
+// root — `create_remote` roots the transport exactly there, with no
+// server-side endpoint to parse or compare. Over ARBITRARY graphs
+// (local-marker, legacy `local://`, and SSH servers; slots with arbitrary
+// deploy_dirs; several targets with memberships) the property asserts the
+// exact equivalence:
+//
+//   ProjectConfig construction succeeds  <=>  transport creation succeeds
+//                                               for EVERY slot.
+//
+// The deploy_dir IS the root, so "transport creation succeeds for every
+// slot" is exactly "every slot's deploy_dir is a valid
+// [`AbsoluteDeployDir`]" plus the graph-level rules the conversion gates
+// independently of any endpoint (injective local effective roots — two
+// local slots never share a directory; no legacy `local://` endpoint; one
+// slot per (server, target) pair). The property therefore asserts on every
+// generated graph:
+//
+// * ACCEPTED: every slot's deploy_dir is valid, the local roots are
+//   injective, no (server, deploy_dir) location is shared, no legacy
+//   endpoint, no shared (server, target) — and `create_remote` SUCCEEDS for
+//   EVERY slot (`create_remote(...).root() == PhysicalBinding.deploy_dir`),
+//   so no accepted graph fails later on a static relationship.
+// * REJECTED: the graph carries a rejecting cause — an invalid deploy_dir,
+//   a duplicate local effective root, a shared (server, deploy_dir)
+//   location, a legacy `local://` address, or a shared (server, target)
+//   pair.
 
-/// A valid local endpoint path, possibly in a MESSY spelling: absolute and
-/// traversal-free, but with a trailing slash or doubled separators that
+/// A valid absolute deploy_dir path, possibly in a MESSY spelling: absolute
+/// and traversal-free, but with a trailing slash or doubled separators that
 /// [`AbsoluteDeployDir`] folds into the same canonical form.
-fn valid_endpoint_path() -> impl Strategy<Value = String> {
+fn valid_deploy_dir() -> impl Strategy<Value = String> {
     prop::collection::vec(
         prop::sample::select(&["srv", "app", "deploy", "x1", "x2"]),
         1..=3,
@@ -3114,26 +3134,11 @@ fn valid_endpoint_path() -> impl Strategy<Value = String> {
     })
 }
 
-/// An arbitrary `local://` server address: valid (possibly messy)
-/// endpoints, traversal-carrying endpoints, a relative endpoint, and the
-/// filesystem root.
-fn arbitrary_local_address() -> impl Strategy<Value = String> {
-    prop_oneof![
-        valid_endpoint_path().prop_map(|p| format!("local://{p}")),
-        Just("local:///srv/../escape".to_string()),
-        Just("local:///srv/./dot".to_string()),
-        Just("local:///srv/a/..".to_string()),
-        Just("local:///..".to_string()),
-        Just("local://rel/relative".to_string()),
-        Just("local:///".to_string()),
-    ]
-}
-
 /// An arbitrary slot deploy_dir: valid (possibly messy) absolute paths,
 /// traversal-carrying paths, a relative path, and the filesystem root.
 fn arbitrary_deploy_dir() -> impl Strategy<Value = String> {
     prop_oneof![
-        valid_endpoint_path(),
+        valid_deploy_dir(),
         Just("/srv/../escape".to_string()),
         Just("/srv/./dot".to_string()),
         Just("rel/relative".to_string()),
@@ -3142,60 +3147,120 @@ fn arbitrary_deploy_dir() -> impl Strategy<Value = String> {
     ]
 }
 
-/// One generated LOCAL multi-slot graph: 1..=2 local servers (each with an
-/// arbitrary `local://` address, server id `s{i}`) and 1..=3 slots (ids
-/// `p{i}`, target `t1`) bound to them. Deploy_dirs are drawn independently,
-/// so SHARED dirs between slots arise naturally — the graphs the injection
-/// rule must reject.
-#[derive(Clone, Debug)]
-struct LocalGraph {
-    endpoints: Vec<String>,
-    /// `(slot id, server id, deploy_dir)`.
-    slots: Vec<(String, String, String)>,
+/// An arbitrary server address: the `local` MARKER (the pathless local
+/// connection kind — valid), the LEGACY `local://<path>` endpoint form
+/// (rejected by the conversion: a pathless kind accepts no path), or an SSH
+/// host (whose exactly-one fingerprint identity is fixed by construction).
+fn arbitrary_server_address() -> impl Strategy<Value = String> {
+    prop_oneof![
+        Just("local".to_string()),
+        prop::collection::vec(
+            prop::sample::select(&["srv", "app", "deploy", "x1", "x2"]),
+            1..=3,
+        )
+        .prop_map(|segs| format!("local:///{}", segs.join("/"))),
+        Just("app.example.com".to_string()),
+        Just("db.example.com".to_string()),
+    ]
 }
 
-fn local_graph() -> impl Strategy<Value = LocalGraph> {
-    prop::collection::vec(arbitrary_local_address(), 1..=2).prop_flat_map(|endpoints| {
-        prop::collection::vec((0..endpoints.len(), arbitrary_deploy_dir()), 1..=3).prop_map(
-            move |raw_slots| LocalGraph {
-                endpoints: endpoints.clone(),
-                slots: raw_slots
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, (server_idx, dir))| (format!("p{i}"), format!("s{server_idx}"), dir))
-                    .collect(),
-            },
-        )
+/// One generated ARBITRARY graph: servers (local marker, legacy
+/// `local://`, or SSH host), slots with arbitrary deploy_dirs and target
+/// memberships, and the target names. Every other graph rule — unique
+/// ids, resolvable slot->server / slot->target references, at least one
+/// member per target, an exactly-one SSH identity — holds by construction,
+/// so the ONLY possible rejection causes are the ones the property
+/// analyzes.
+#[derive(Clone, Debug)]
+struct ArbitraryGraph {
+    /// Server addresses, indexed by the slots' `server` field.
+    servers: Vec<String>,
+    /// `(slot id, server index, deploy_dir, target index)`.
+    slots: Vec<(String, usize, String, usize)>,
+    /// Target names (each generated target has at least one member slot by
+    /// construction).
+    targets: Vec<String>,
+}
+
+fn arbitrary_graph() -> impl Strategy<Value = ArbitraryGraph> {
+    prop::collection::vec(arbitrary_server_address(), 1..=3).prop_flat_map(|servers| {
+        // 1..=2 DISTINCT targets (a subsequence never repeats a name); the
+        // mandatory slots below give each target at least one member.
+        prop::sample::subsequence(&["t1", "t2", "t3"], 1..=2)
+            .prop_map(|ts| ts.into_iter().map(|t| t.to_string()).collect::<Vec<_>>())
+            .prop_flat_map(move |targets| {
+                // One mandatory slot per target (target `i` on server
+                // `i % n`, so the mandatory (server, target) pairs are
+                // distinct), plus 0..=2 EXTRA slots with arbitrary
+                // (server, target) and a single drawn deploy_dir — extra
+                // slots may share a (server, target) pair or a local root,
+                // which are the rejecting causes the property analyzes.
+                let n_servers = servers.len();
+                let n_targets = targets.len();
+                let mandatory = (0..n_targets)
+                    .map(|i| (format!("p{i}"), i % n_servers, format!("/srv/p{i}"), i))
+                    .collect::<Vec<_>>();
+                let servers = servers.clone();
+                let targets = targets.clone();
+                (0usize..=2, arbitrary_deploy_dir()).prop_flat_map(move |(extra, dir)| {
+                    let servers = servers.clone();
+                    let targets = targets.clone();
+                    let mandatory = mandatory.clone();
+                    prop::collection::vec((0..servers.len(), 0..targets.len()), extra).prop_map(
+                        move |extra_slots| {
+                            let mut slots = mandatory.clone();
+                            for (k, (server, target)) in extra_slots.into_iter().enumerate() {
+                                slots.push((
+                                    format!("p{}", mandatory.len() + k),
+                                    server,
+                                    dir.clone(),
+                                    target,
+                                ));
+                            }
+                            ArbitraryGraph {
+                                servers: servers.clone(),
+                                slots,
+                                targets: targets.clone(),
+                            }
+                        },
+                    )
+                })
+            })
     })
 }
 
 /// Build the raw project for a generated graph (one variant file carrying
-/// every slot; every other graph rule — unique ids, resolvable references,
-/// one target — holds by construction).
-fn raw_project_for(graph: &LocalGraph) -> RawProject {
+/// every slot; ids, references, and memberships are valid by construction;
+/// an SSH host carries the exactly-one fingerprint identity).
+fn raw_project_for(graph: &ArbitraryGraph) -> RawProject {
     let servers = graph
-        .endpoints
+        .servers
         .iter()
         .enumerate()
-        .map(|(i, address)| raw::RawServer {
-            id: format!("s{i}"),
-            address: address.clone(),
-            user: "u".to_string(),
-            port: 22,
-            known_hosts: None,
-            host_key_fingerprint: None,
-            capacity: raw::RawCapacityConfig::default(),
+        .map(|(i, address)| {
+            // A local marker (or the legacy `local://` form) needs no
+            // identity; an SSH host gets exactly one by construction.
+            let is_ssh = address != "local" && !address.starts_with("local://");
+            raw::RawServer {
+                id: format!("s{i}"),
+                address: address.clone(),
+                user: "u".to_string(),
+                port: 22,
+                known_hosts: None,
+                host_key_fingerprint: is_ssh.then(|| "SHA256:test".to_string()),
+                capacity: raw::RawCapacityConfig::default(),
+            }
         })
         .collect();
     let slots = graph
         .slots
         .iter()
-        .map(|(id, server, dir)| {
+        .map(|(id, server, dir, target)| {
             SlotConfig::new(
                 id.clone(),
-                server.clone(),
+                format!("s{server}"),
                 PathBuf::from(dir),
-                "t1",
+                graph.targets[*target].clone(),
                 Vec::new(),
             )
         })
@@ -3207,12 +3272,18 @@ fn raw_project_for(graph: &LocalGraph) -> RawProject {
             release: ReleaseName::new("v1"),
             pins: Vec::new(),
             servers,
-            targets: BTreeMap::from([(
-                "t1".to_string(),
-                raw::RawTargetConfig {
-                    rollout: raw::RawRolloutConfig::default(),
-                },
-            )]),
+            targets: graph
+                .targets
+                .iter()
+                .map(|t| {
+                    (
+                        t.clone(),
+                        raw::RawTargetConfig {
+                            rollout: raw::RawRolloutConfig::default(),
+                        },
+                    )
+                })
+                .collect(),
         },
         variants: BTreeMap::from([(
             "standard".to_string(),
@@ -3249,151 +3320,148 @@ fn canonical_or_empty(s: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Whether `create_remote` ACCEPTS the slot: the endpoint parses as an
-/// [`EffectiveDeployRoot`] (absolute, traversal-free, normalized) AND equals
-/// the slot's deploy_dir — both compared as canonical effective roots.
-fn slot_accepts(endpoint: &str, deploy_dir: &str) -> bool {
-    let Some(path) = endpoint.strip_prefix("local://") else {
-        return false;
-    };
-    match (
-        EffectiveDeployRoot::parse(path),
-        EffectiveDeployRoot::parse(deploy_dir),
-    ) {
-        (Ok(endpoint), Ok(dir)) => endpoint == dir,
-        _ => false,
-    }
-}
-
 proptest! {
-    // THE PROPERTY: over generated LOCAL multi-slot graphs (arbitrary
-    // `local://` endpoints — valid/messy/traversal/relative/root — arbitrary
-    // slot deploy_dirs, and several slots that may SHARE a deploy_dir), the
-    // acceptance boundary is EXACTLY:
-    //   config loads  <=> every deploy_dir is a valid AbsoluteDeployDir AND
-    //                     the effective local roots are INJECTIVE AND every
-    //                     local:// endpoint is absolute;
-    //   create_remote accepts a slot <=> its endpoint (a validated
-    //   EffectiveDeployRoot) EQUALS the slot's deploy_dir.
-    // Every ACCEPTED graph therefore has traversal-free, injective
-    // effective roots, and `create_remote(...).root() ==
-    // PhysicalBinding.deploy_dir` for every slot. Bounded 16 cases, fixed
-    // seed 0x5EED_5EED per house style.
+    // THE PROPERTY: over ARBITRARY graphs (local marker, legacy local://,
+    // and SSH servers; arbitrary slot deploy_dirs; several targets with
+    // guaranteed memberships), construction succeeds EXACTLY when
+    // transport creation succeeds for every slot: every slot's deploy_dir
+    // is a valid [`AbsoluteDeployDir`] (the deploy_dir IS the local root),
+    // the LOCAL effective roots are injective, no legacy `local://`
+    // endpoint is present, and no (server, target) pair is shared. Every
+    // ACCEPTED graph therefore creates its transports for EVERY slot —
+    // no accepted graph fails later on a static relationship — and
+    // `create_remote(...).root() == PhysicalBinding.deploy_dir` for every
+    // slot. Bounded 64 cases, fixed seed 0x5EED_5EED per house style, no
+    // failure persistence.
     #![proptest_config(ProptestConfig {
-        cases: 16,
+        cases: 64,
         rng_seed: RngSeed::Fixed(0x5EED_5EED),
         failure_persistence: None,
         ..ProptestConfig::default()
     })]
 
     #[test]
-    fn local_slots_operate_on_their_recorded_binding(graph in local_graph()) {
-        let dirs_valid = graph
+    fn construction_iff_transport_creation_for_every_slot(graph in arbitrary_graph()) {
+        // The transport-creation side, computed from the generated data:
+        // every slot's deploy_dir must be a valid [`AbsoluteDeployDir`]
+        // (the root IS the deploy_dir), the LOCAL effective roots must be
+        // injective (two local slots never share a directory), no (server,
+        // deploy_dir) location may be shared by two slots, no legacy
+        // `local://` endpoint may be present, and no (server, target) pair
+        // may be shared.
+        let all_dirs_valid = graph
             .slots
             .iter()
-            .all(|(_, _, d)| AbsoluteDeployDir::parse(d).is_ok());
-        let mut seen = HashSet::new();
-        let roots_injective = graph.slots.iter().all(|(_, _, d)| {
-            let c = canonical_or_empty(d);
-            c.is_empty() || seen.insert(c)
-        });
-        let endpoints_absolute = graph.endpoints.iter().all(|e| {
-            e.strip_prefix("local://")
-                .map(|p| Path::new(p).is_absolute())
-                .unwrap_or(false)
-        });
+            .all(|(_, _, d, _)| AbsoluteDeployDir::parse(d).is_ok());
+        let mut seen_local_roots: HashSet<String> = HashSet::new();
+        let mut local_roots_injective = true;
+        for (_, server, dir, _) in &graph.slots {
+            if graph.servers[*server] == "local" {
+                let c = canonical_or_empty(dir);
+                if c.is_empty() || !seen_local_roots.insert(c) {
+                    local_roots_injective = false;
+                }
+            }
+        }
+        let has_legacy_local = graph.servers.iter().any(|a| a.starts_with("local://"));
+        // The location rule: each (server, deploy_dir) pair names one
+        // on-server deployment location that exactly one slot may own
+        // (canonicalized — messy spellings of the same dir collide).
+        let mut seen_locations: HashSet<(usize, String)> = HashSet::new();
+        let mut shared_location = false;
+        for (_, server, dir, _) in &graph.slots {
+            let c = canonical_or_empty(dir);
+            if !c.is_empty() && !seen_locations.insert((*server, c)) {
+                shared_location = true;
+            }
+        }
+        let mut seen_pairs: HashSet<(usize, usize)> = HashSet::new();
+        let mut shared_server_target = false;
+        for (_, server, _, target) in &graph.slots {
+            if !seen_pairs.insert((*server, *target)) {
+                shared_server_target = true;
+            }
+        }
 
         let project = raw_project_for(&graph);
         match ProjectConfig::from_raw_parts(project.manifest, project.variants) {
             Err(e) => {
                 // A REJECTED graph must carry a rejecting cause: an invalid
-                // deploy_dir, duplicate effective local roots, or a relative
-                // local:// endpoint (every other graph rule holds by
-                // construction).
+                // deploy_dir, duplicate local effective roots, a shared
+                // (server, deploy_dir) location, a legacy `local://`
+                // address, or a shared (server, target) pair (every other
+                // graph rule holds by construction).
                 prop_assert!(
-                    !dirs_valid || !roots_injective || !endpoints_absolute,
+                    !all_dirs_valid
+                        || !local_roots_injective
+                        || shared_location
+                        || has_legacy_local
+                        || shared_server_target,
                     "rejected graph without a rejecting cause: {:?} (err {})",
                     graph,
                     e
                 );
             }
             Ok(cfg) => {
-                // An ACCEPTED graph: every deploy_dir valid, the effective
-                // roots injective, every endpoint absolute.
+                // An ACCEPTED graph: every deploy_dir valid, the local
+                // roots injective, no shared location, no legacy endpoint,
+                // no shared pair.
                 prop_assert!(
-                    dirs_valid && roots_injective && endpoints_absolute,
-                    "accepted graph must have valid, injective effective roots: {:?}",
+                    all_dirs_valid
+                        && local_roots_injective
+                        && !shared_location
+                        && !has_legacy_local
+                        && !shared_server_target,
+                    "accepted graph must have valid, injective local roots and no legacy endpoint: {:?}",
                     graph
                 );
                 assert_domain_invariants(&cfg);
 
-                let env = SysEnv::from_process();
-                let bindings = cfg.target_slot_bindings("t1").unwrap();
-                let mut roots: Vec<(String, PathBuf)> = Vec::new();
-                let mut rejected: Option<String> = None;
-                for (slot, server) in cfg.target_slots("t1").unwrap() {
-                    match create_remote(&env, server, slot.deploy_dir()) {
-                        Ok(remote) => roots.push((slot.id.clone(), remote.root().to_path_buf())),
-                        Err(e) => {
-                            rejected = Some(e.to_string());
-                            break;
-                        }
-                    }
+                // The recorded physical bindings, aggregated over targets.
+                let mut bindings: BTreeMap<SlotId, crate::ledger::PhysicalBinding> = BTreeMap::new();
+                for (tname, _) in cfg.targets() {
+                    bindings.extend(cfg.target_slot_bindings(tname).unwrap());
                 }
 
-                // EXACT ENDPOINT SEMANTICS: create_remote accepts every slot
-                // iff each slot's endpoint EQUALS its deploy_dir.
-                let all_match = graph.slots.iter().all(|(_, server_id, dir)| {
-                    let idx: usize = server_id[1..].parse().unwrap();
-                    slot_accepts(&graph.endpoints[idx], dir)
-                });
+                let env = SysEnv::from_process();
+                let mut local_roots: Vec<PathBuf> = Vec::new();
+                for slot in cfg.slot_defs() {
+                    let server = cfg
+                        .server(&slot.server)
+                        .expect("a validated graph resolves every slot->server reference");
+                    // THE NO-LATE-FAILURE ASSERTION: construction succeeded,
+                    // so transport creation must succeed for this slot —
+                    // there is no static relationship left that could fail
+                    // at transport creation.
+                    let remote = create_remote(&env, server, slot.deploy_dir())
+                        .unwrap_or_else(|e| {
+                            panic!("accepted graph must create slot '{}' transport: {e}", slot.id)
+                        });
+                    // THE ROOT IS THE RECORDED BINDING: create_remote's
+                    // root equals the slot's deploy_dir — and therefore the
+                    // recorded PhysicalBinding.deploy_dir — for EVERY slot
+                    // (local and SSH alike).
+                    let binding = &bindings[&SlotId::parse(&slot.id).expect("validated slot id")];
+                    prop_assert_eq!(
+                        remote.root(),
+                        Path::new(binding.deploy_dir.as_str()),
+                        "create_remote(...).root() must equal PhysicalBinding.deploy_dir for slot '{}'",
+                        slot.id
+                    );
+                    if matches!(server.connection(), ServerConnection::Local { .. }) {
+                        local_roots.push(remote.root().to_path_buf());
+                    }
+                }
+                // LOCAL EFFECTIVE ROOTS ARE INJECTIVE in the accepted graph
+                // (the injection rule; SSH roots live on different hosts, so
+                // they are not compared).
+                let unique: HashSet<&PathBuf> = local_roots.iter().collect();
                 prop_assert_eq!(
-                    rejected.is_none(),
-                    all_match,
-                    "create_remote must accept exactly the slots whose endpoint equals the deploy_dir: {:?}",
+                    unique.len(),
+                    local_roots.len(),
+                    "accepted graph must have injective local effective roots: {:?}",
                     graph
                 );
-
-                if rejected.is_none() {
-                    // EVERY ACCEPTED GRAPH:
-                    // (1) TRAVERSAL-FREE effective roots — absolute, no `.`/`..`
-                    //     component anywhere, validated as an EffectiveDeployRoot.
-                    for (slot_id, root) in &roots {
-                        let root_str = root.to_string_lossy();
-                        let rp = Path::new(root_str.as_ref());
-                        prop_assert!(
-                            rp.is_absolute()
-                                && rp.components()
-                                    .all(|c| matches!(c, std::path::Component::Normal(_))),
-                            "accepted slot '{}' has a traversal-free effective root: {}",
-                            slot_id,
-                            root_str
-                        );
-                        prop_assert!(
-                            EffectiveDeployRoot::parse(&root_str).is_ok(),
-                            "accepted slot '{}' root is a validated EffectiveDeployRoot: {}",
-                            slot_id,
-                            root_str
-                        );
-                        // (3) THE RECORDED BINDING: create_remote(...).root()
-                        //     == PhysicalBinding.deploy_dir.
-                        let binding = &bindings[&SlotId::parse(slot_id).unwrap()];
-                        prop_assert_eq!(
-                            root.as_path(),
-                            Path::new(binding.deploy_dir.as_str()),
-                            "create_remote(...).root() must equal PhysicalBinding.deploy_dir for slot '{}'",
-                            slot_id
-                        );
-                    }
-                    // (2) INJECTIVE EFFECTIVE ROOTS: no two slots share a root.
-                    let unique: HashSet<&PathBuf> = roots.iter().map(|(_, r)| r).collect();
-                    prop_assert_eq!(
-                        unique.len(),
-                        roots.len(),
-                        "accepted graph must have injective effective roots: {:?}",
-                        graph
-                    );
-                }
             }
         }
     }

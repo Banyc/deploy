@@ -39,7 +39,10 @@ use crate::config::raw::{CONFIG_SCHEMA_VERSION, RawConfig, RawVariant};
 use crate::config::release_name::{ReleaseName, validate_release_name};
 use crate::config::retention::RetentionConfig;
 use crate::config::rollout::RolloutConfig;
-use crate::config::servers::{ServerConnection, ServerDef, validate_server_identity};
+use crate::config::servers::{
+    LOCAL_ADDRESS_MARKER, ServerConnection, ServerDef, is_legacy_local_endpoint, is_local_address,
+    validate_server_identity,
+};
 use crate::config::slots::SlotConfig;
 use crate::config::verification::VerificationConfig;
 use crate::error::{Error, Result};
@@ -533,23 +536,26 @@ impl TryFrom<RawProject> for ProjectConfig {
             // (the per-source format checks apply to every server; the
             // exactly-one rule is scoped to SSH addresses).
             let identity = validate_server_identity(s)?;
-            // Build the EXACTLY ONE connection form: a `local://` address
-            // becomes `Local` (the path after the prefix must be absolute —
-            // the transport is rooted there), an SSH address becomes `Ssh`
-            // with the validated host/user/nonzero port and the exactly-one
-            // host identity.
-            let connection = if s.address.starts_with("local://") {
-                let path = s.address.trim_start_matches("local://");
-                if !Path::new(path).is_absolute() {
-                    return Err(Error::config(format!(
-                        "server '{}': local:// endpoint must be an absolute path",
-                        s.id
-                    )));
-                }
-                ServerConnection::Local {
-                    address: s.address.clone(),
-                    identity,
-                }
+            // Build the EXACTLY ONE connection form: the `local` marker
+            // becomes `Local` — a PATHLESS connection kind whose sole
+            // physical root is the referencing slot's typed deploy_dir (the
+            // transport is rooted there, never at a server-side endpoint). A
+            // legacy `local://<path>` address is REJECTED here, at the load:
+            // the connection carries no root path, so a `local://` endpoint
+            // could only silently diverge from (or be ignored in favor of)
+            // the slot's deploy_dir — the mismatch class this design
+            // eliminates. An SSH address becomes `Ssh` with the validated
+            // host/user/nonzero port and the exactly-one host identity.
+            let connection = if is_local_address(&s.address) {
+                ServerConnection::Local { identity }
+            } else if is_legacy_local_endpoint(&s.address) {
+                return Err(Error::config(format!(
+                    "server '{}': address '{}' is the legacy local:// endpoint form; \
+                     a local connection no longer carries a path — use address = \"{}\" \
+                     (the slot's deploy_dir is the sole physical root, so a local:// path \
+                     could silently diverge from the slot's recorded directory)",
+                    s.id, s.address, LOCAL_ADDRESS_MARKER
+                )));
             } else {
                 let address = Host::parse(&s.address).map_err(|_| {
                     Error::config(format!(

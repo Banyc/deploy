@@ -39,7 +39,8 @@ PROJECT STRUCTURE (forced):\n\
   releases/<name>/artifacts/    artifact sources referenced by variant mappings\n\
 \n\
 The quickest start is `deploy init` — it scaffolds a working project with a\n\
-LOCAL deployment endpoint (local://...), so `deploy push production` works\n\
+LOCAL deployment root (the pathless `local` connection; the slot's
+\ndeploy_dir is the sole physical root), so `deploy push production` works\n\
 end-to-end with nothing but this binary. See `deploy help init`.\n\
 \n\
 Every push is transactional per server: immutable release + artifact objects,\n\
@@ -68,7 +69,7 @@ releases/ tree):\n\
   releases/v1/systemd.toml           example `systemd` activation variant with a real unit\n\
   releases/v1/artifacts/build/output/app/hello   placeholder artifact source\n\
   releases/v1/artifacts/systemd/example.service  the unit shipped by the systemd variant\n\
-  .deploy-remote/                    LOCAL deployment endpoint (see below)\n\
+  .deploy-remote/                    LOCAL deployment root (see below)\n\
   .gitignore                         ignores the local endpoint in a repo\n\
 \n\
 Slots are declared INSIDE the variant files: releases/v1/standard.toml\n\
@@ -82,8 +83,9 @@ BEFORE creating anything, re-loads the written project through the strict\n\
 loader, and removes the scaffold if that load fails: success always means\n\
 the generated project is valid.\n\
 \n\
-LOCAL-FIRST DEFAULT: the server address is `local://<project>/.deploy-remote`,\n\
-a local-filesystem endpoint, so `deploy push production` runs end-to-end with\n\
+LOCAL-FIRST DEFAULT: the server address is the pathless `local` marker and\n\
+the slot's deploy_dir defaults to `<project>/.deploy-remote` — the sole\n\
+physical root — so `deploy push production` runs end-to-end with\n\
 zero SSH or server infrastructure. For a real server, pass --address, --user,\n\
 and EXACTLY ONE of --known-hosts or --host-key-fingerprint (SSH\n\
 trust-on-first-use is refused, and the two flags are mutually exclusive: a\n\
@@ -116,8 +118,9 @@ Then, from inside the project:\n\
         /// directory's name).
         #[arg(long)]
         name: Option<String>,
-        /// Server address. Default: local://<project>/.deploy-remote (a local
-        /// filesystem endpoint, zero SSH). Use a hostname for SSH.
+        /// Server address. Default: the pathless `local` marker (the slot's
+        /// deploy_dir — default `<project>/.deploy-remote` — is the sole
+        /// physical root; zero SSH). Use a hostname for SSH.
         #[arg(long)]
         address: Option<String>,
         /// SSH user (default: "deploy").
@@ -535,7 +538,7 @@ fn print_init_report(report: &crate::init::InitReport) {
         println!("  {}", f.display());
     }
     for d in &report.dirs {
-        println!("  {}/  (local deployment endpoint)", d.display());
+        println!("  {}/  (local deployment root)", d.display());
     }
     println!();
     println!("next steps (from inside the project):");
@@ -1277,13 +1280,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     #[test]
     fn help_is_self_documenting() {
         // The full help text is a first-class documentation surface: the
-        // forced project layout, local:// vs SSH, and the next commands must
-        // all be present.
+        // forced project layout, the local marker vs SSH, and the next
+        // commands must all be present.
         let help = Cli::command().render_long_help().to_string();
         for needle in [
             "releases/<name>",
             "releases/<name>/<variant>.toml",
-            "local://",
+            "local",
             "deploy init",
         ] {
             assert!(help.contains(needle), "top-level help missing {needle:?}");
@@ -1296,7 +1299,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .to_string();
         for needle in [
             ".deploy-remote",
-            "local://",
+            "local",
             "--host-key-fingerprint",
             "--known-hosts",
             "deploy push production",

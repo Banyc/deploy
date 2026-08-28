@@ -34,10 +34,10 @@ deploy init my-app
 cd my-app
 ```
 
-`deploy init` is **local-first**: the server address defaults to
-`local://<project>/.deploy-remote`, a local filesystem endpoint, so
-`deploy push production` works end-to-end with nothing but this binary — no
-SSH, no server, no provisioning. It never clobbers: re-running against a
+`deploy init` is **local-first**: the server address is the pathless `local`
+marker and the slot's deploy_dir defaults to `<project>/.deploy-remote` — the
+sole physical root — so `deploy push production` works end-to-end with nothing
+but this binary — no SSH, no server, no provisioning. It never clobbers: re-running against a
 project that already has `deploy.toml` (or a `releases/` tree) fails.
 
 What it generates (also visible in `deploy init --help`):
@@ -88,8 +88,8 @@ or edit `deploy.toml` afterwards (it is annotated with exactly what to change).
 SSH always uses strict host-key checking — trust-on-first-use is refused. Every
 SSH server must configure EXACTLY ONE host-identity source: a dedicated
 `known_hosts` file (an absolute path) or a pre-verified `host_key_fingerprint`
-(`SHA256:...`); configuring both is ambiguous and rejected, and `local://`
-addresses need neither.
+(`SHA256:...`); configuring both is ambiguous and rejected, and the `local`
+marker needs neither.
 
 ## Commands
 
@@ -291,7 +291,7 @@ release = "v1"               # active release dir under releases/
 
 [[servers]]                  # declared once; slots reference by id
 id = "server-01"             # durable ID; never rename it
-address = "local:///abs/path"   # or a hostname for SSH
+address = "local"               # the pathless local marker, or a hostname for SSH
 user = "deploy"
 capacity = { reserve_bytes = 0, reserve_percent = 0 }  # per-server headroom, zero by default
 # port = 22
@@ -382,8 +382,8 @@ must name a declared `[targets.<name>]` key, and each target must have at
 least one member slot. Every
 SSH-shaped server address must configure
 EXACTLY ONE of `known_hosts` or `host_key_fingerprint` (neither means
-trust-on-first-use, which is refused; both are ambiguous) — `local://`
-addresses are exempt. A config that fails validation is rejected at load time,
+trust-on-first-use, which is refused; both are ambiguous) — the `local`
+marker is exempt. A config that fails validation is rejected at load time,
 before anything is touched.
 
 ## Maintenance

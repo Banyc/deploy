@@ -31,70 +31,36 @@ use crate::env::SysEnv;
 use crate::error::{Error, Result};
 use crate::identity::AbsoluteDeployDir;
 use crate::remote::transport::{LocalTransport, Remote};
-use std::fmt;
-use std::path::Path;
 
 /// THE ONE AUTHORITATIVE LOCAL DEPLOYMENT ROOT: the canonical directory a
-/// LOCAL slot operates on. It is the validated [`AbsoluteDeployDir`] (absolute,
-/// TRAVERSAL-FREE — no `.`/`..` component at any position — normalized
-/// canonical form, the filesystem root refused) that BOTH the transport's
-/// [`Remote::root`] AND the recorded [`crate::ledger::PhysicalBinding::deploy_dir`]
-/// derive from. There is exactly ONE effective root per local slot, and every
-/// consumer sees the same value:
+/// LOCAL slot operates on. It is the slot's validated [`AbsoluteDeployDir`]
+/// (absolute, TRAVERSAL-FREE — no `.`/`..` component at any position —
+/// normalized canonical form, the filesystem root refused). A local
+/// connection is PATHLESS ([`ServerConnection::Local`] carries no endpoint),
+/// so the slot's typed deploy_dir IS the root — there is no server-side
+/// endpoint to parse or compare, and every consumer sees the same value:
 ///
-/// * [`create_remote`] parses the `local://` ENDPOINT as an
-///   [`EffectiveDeployRoot`] (rejecting relative and traversal-carrying
-///   endpoints) and REQUIRES it to EQUAL the slot's deploy_dir (also parsed
-///   as an [`EffectiveDeployRoot`]) — the "exact endpoint" rule. A local
-///   connection therefore operates EXACTLY on the slot's recorded directory;
-///   a divergent endpoint fails closed.
-/// * the transport's [`Remote::root`] is the effective root's canonical path
-///   ([`LocalTransport`] is rooted there).
-/// * the recorded [`crate::ledger::PhysicalBinding::deploy_dir`] is the slot's
-///   deploy_dir in the validated [`crate::config::ProjectConfig`] graph, which
-///   the raw -> domain conversion stores in the SAME canonical form
-///   ([`crate::config::SlotConfig::with_canonical_deploy_dir`]) — so
+/// * [`create_remote`] validates the slot's deploy_dir through the
+///   [`AbsoluteDeployDir`] scalar and roots [`LocalTransport`] exactly there
+///   — the canonical form the raw -> domain conversion already stored in the
+///   validated [`crate::config::ProjectConfig`] graph
+///   ([`crate::config::SlotConfig::with_canonical_deploy_dir`]).
+/// * the transport's [`Remote::root`] is that same canonical path, so
 ///   `create_remote(...).root() == PhysicalBinding.deploy_dir` for every
 ///   accepted local slot by construction.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct EffectiveDeployRoot(AbsoluteDeployDir);
-
-impl EffectiveDeployRoot {
-    /// Parse and validate an effective root: an absolute, TRAVERSAL-FREE
-    /// path with at least one normal component below the root, normalized to
-    /// its canonical form (the [`AbsoluteDeployDir`] gate). A relative path,
-    /// any `.`/`..` component at any position, or the filesystem root is
-    /// rejected.
-    pub fn parse(s: &str) -> Result<EffectiveDeployRoot> {
-        Ok(EffectiveDeployRoot(AbsoluteDeployDir::parse(s)?))
-    }
-
-    /// The canonical effective root path.
-    pub fn as_path(&self) -> &Path {
-        self.0.as_path()
-    }
-
-    /// The underlying validated scalar.
-    pub fn as_absolute(&self) -> &AbsoluteDeployDir {
-        &self.0
-    }
-}
-
-impl fmt::Display for EffectiveDeployRoot {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// Build the remote handle for one server from the configuration.
+///
+/// The `Local` connection carries no root of its own: a graph can never
+/// reference a slot whose root differs from the server's connection (there is
+/// no connection root), so no accepted graph can fail transport creation on a
+/// static endpoint-vs-deploy_dir relationship.
 ///
 /// Production pushes use the SSH transport keyed by the server's
 /// [`ServerConnection::Ssh`] host/user/port and the slot's absolute
 /// `deploy_dir`, with strict host-key verification. The local transport is
 /// reserved for tests and for servers whose connection is
-/// [`ServerConnection::Local`] (an explicit `local://` endpoint), which
-/// routes the transport to that exact filesystem location rather than the
-/// application store's `remotes/` directory.
+/// [`ServerConnection::Local`] — the PATHLESS local kind — which roots the
+/// transport at the SLOT's deploy_dir (the one authoritative local root),
+/// never at a server-side endpoint.
 ///
 /// `env` is the environment snapshot taken at the process boundary: the
 /// transport's children receive its variables ([`SysEnv::child_env`]) and
@@ -107,50 +73,27 @@ pub fn create_remote(
     deploy_dir: &std::path::Path,
 ) -> Result<Box<dyn Remote>> {
     match server.connection() {
-        ServerConnection::Local { address, .. } => {
-            let Some(local_path) = address.strip_prefix("local://") else {
-                return Err(Error::transport(format!(
-                    "local connection must carry a local:// address: '{address}'"
-                )));
-            };
-            // THE EFFECTIVE ROOT: the `local://` endpoint is parsed through
-            // the [`AbsoluteDeployDir`] scalar — a relative path, ANY traversal
-            // component (`.`/`..` at any position), or the filesystem root is
-            // rejected here, and the accepted endpoint is the validated,
-            // normalized canonical form. The endpoint is NEVER a raw
-            // unvalidated `PathBuf`.
-            let endpoint = EffectiveDeployRoot::parse(local_path).map_err(|_| {
+        ServerConnection::Local { .. } => {
+            // THE EFFECTIVE ROOT: the slot's deploy_dir IS the root — a
+            // local connection carries no endpoint, so there is nothing to
+            // parse or compare (the mismatch class is gone by construction:
+            // a local server can never reference a root other than the
+            // slot's deploy_dir). The deploy_dir is still validated through
+            // the [`AbsoluteDeployDir`] scalar here — a relative path, ANY
+            // traversal component (`.`/`..` at any position), or the
+            // filesystem root is rejected, and the accepted root is the
+            // validated, normalized canonical form the config graph already
+            // stored. The root is NEVER a raw unvalidated `PathBuf`.
+            let root = AbsoluteDeployDir::parse(&deploy_dir.to_string_lossy()).map_err(|_| {
                 Error::transport(format!(
-                    "local:// endpoint '{local_path}' must be an absolute, traversal-free path (no `.`/`..` components) with at least one normal component below the root"
+                    "local server '{}': slot deploy_dir '{}' must be an absolute, traversal-free path (no `.`/`..` components) with at least one normal component below the root",
+                    server.id,
+                    deploy_dir.display()
                 ))
             })?;
-            // EXACT ENDPOINT SEMANTICS: a local connection operates EXACTLY on
-            // the slot's recorded deploy_dir (the physical binding used for
-            // exact rollback). Both sides are compared as validated effective
-            // roots — normalized, so `local:///srv/a` and a deploy_dir of
-            // `/srv/a/` name the SAME root and agree, while any genuine
-            // divergence fails closed with both paths named.
-            let slot_root = EffectiveDeployRoot::parse(&deploy_dir.to_string_lossy()).map_err(
-                |_| {
-                    Error::transport(format!(
-                        "slot deploy_dir '{}' must be an absolute, traversal-free path (no `.`/`..` components)",
-                        deploy_dir.display()
-                    ))
-                },
-            )?;
-            if endpoint != slot_root {
-                return Err(Error::transport(format!(
-                    "local server '{}': the local:// endpoint '{}' (effective root '{}') differs from the slot's deploy_dir '{}' (effective root '{}'); a local connection must operate on the slot's recorded deploy_dir",
-                    server.id,
-                    local_path,
-                    endpoint,
-                    deploy_dir.display(),
-                    slot_root
-                )));
-            }
             Ok(Box::new(LocalTransport::new(
                 env,
-                endpoint.as_path().to_path_buf(),
+                root.as_path().to_path_buf(),
             )?))
         }
         ServerConnection::Ssh {
@@ -199,11 +142,10 @@ mod tests {
     use crate::identity::{CapacityPercent, Identifier};
     use std::path::Path;
 
-    fn local_server(address: &str) -> ServerDef {
+    fn local_server() -> ServerDef {
         ServerDef::new(
             Identifier::parse("s1").unwrap(),
             ServerConnection::Local {
-                address: address.to_string(),
                 identity: HostIdentity::Local,
             },
             CapacityConfig {
@@ -213,26 +155,25 @@ mod tests {
         )
     }
 
-    /// The `local://` endpoint is parsed as a validated [`EffectiveDeployRoot`]:
-    /// a traversal component (`.`/`..`) at ANY position is rejected, even when
-    /// the raw path is absolute and would otherwise reach a real directory.
+    /// A local connection is PATHLESS: the slot's deploy_dir IS the root —
+    /// there is no endpoint to parse or compare. The deploy_dir is validated
+    /// through the [`AbsoluteDeployDir`] gate: a traversal component
+    /// (`.`/`..`) at ANY position is rejected, even when the raw path is
+    /// absolute and would otherwise reach a real directory.
     #[test]
-    fn create_remote_local_rejects_traversal_endpoint() {
-        for address in [
-            "local:///srv/../escape",
-            "local:///srv/./dot",
-            "local:///srv/a/..",
-            "local:///..",
+    fn create_remote_local_rejects_traversal_deploy_dir() {
+        for dir in [
+            "/srv/../escape",
+            "/srv/./dot",
+            "/srv/a/..",
+            "/..",
+            "rel/relative",
         ] {
-            let err = create_remote(
-                &SysEnv::from_process(),
-                &local_server(address),
-                Path::new("/srv/escape"),
-            )
-            .err()
-            .unwrap_or_else(|| {
-                panic!("a traversal-carrying local:// endpoint must be rejected: {address}")
-            });
+            let err = create_remote(&SysEnv::from_process(), &local_server(), Path::new(dir))
+                .err()
+                .unwrap_or_else(|| {
+                    panic!("a traversal-carrying deploy_dir must be rejected: {dir}")
+                });
             assert!(
                 err.to_string().contains("traversal-free"),
                 "error must name the traversal rule, got: {err}"
@@ -240,60 +181,33 @@ mod tests {
         }
     }
 
-    /// A relative `local://` endpoint is rejected (the endpoint is a validated
+    /// A relative slot deploy_dir is rejected (the root is a validated
     /// [`AbsoluteDeployDir`], never a raw `PathBuf`).
     #[test]
-    fn create_remote_local_rejects_relative_endpoint() {
-        let err = create_remote(
-            &SysEnv::from_process(),
-            &local_server("local://rel/relative"),
-            Path::new("/srv/x"),
-        )
-        .err()
-        .unwrap_or_else(|| panic!("a relative local:// endpoint must be rejected"));
+    fn create_remote_local_rejects_relative_deploy_dir() {
+        let err = create_remote(&SysEnv::from_process(), &local_server(), Path::new("rel/x"))
+            .err()
+            .unwrap_or_else(|| panic!("a relative deploy_dir must be rejected"));
         assert!(
             err.to_string().contains("traversal-free"),
             "error must name the absoluteness/traversal rule, got: {err}"
         );
     }
 
-    /// EXACT ENDPOINT SEMANTICS: a local connection whose endpoint differs
-    /// from the slot's deploy_dir is rejected with BOTH paths named — a slot
-    /// must never operate on a directory other than its recorded binding.
+    /// The happy path: ANY valid slot deploy_dir is accepted (a local
+    /// connection carries no endpoint, so there is nothing that could
+    /// diverge), and the transport's root is the validated NORMALIZED
+    /// canonical form — messy spellings (`//`, a trailing slash) fold to the
+    /// same root, so `root()` is exactly what the recorded binding carries.
     #[test]
-    fn create_remote_local_rejects_endpoint_deploy_dir_mismatch() {
-        let err = create_remote(
-            &SysEnv::from_process(),
-            &local_server("local:///srv/a"),
-            Path::new("/srv/b"),
-        )
-        .err()
-        .unwrap_or_else(|| panic!("a divergent local endpoint must be rejected"));
-        let msg = err.to_string();
-        assert!(
-            msg.contains("/srv/a") && msg.contains("/srv/b"),
-            "error must name both the endpoint and the deploy_dir, got: {msg}"
-        );
-    }
-
-    /// The happy path: an endpoint EQUAL to the slot's deploy_dir is accepted,
-    /// and the transport's root is the validated NORMALIZED canonical form —
-    /// messy spellings (`//`, a trailing slash) fold to the same effective
-    /// root, so `root()` is exactly what the recorded binding carries.
-    #[test]
-    fn create_remote_local_accepts_exact_endpoint_and_normalizes() {
-        for (address, deploy_dir) in [
-            ("local:///srv/app", "/srv/app"),
-            ("local:///srv/app//", "/srv/app"),
-            ("local:///srv/app/", "/srv/app"),
-            ("local:///srv//app", "/srv/app"),
-        ] {
+    fn create_remote_local_roots_at_slot_deploy_dir() {
+        for deploy_dir in ["/srv/app", "/srv/app//", "/srv/app/", "/srv//app"] {
             let remote = create_remote(
                 &SysEnv::from_process(),
-                &local_server(address),
+                &local_server(),
                 Path::new(deploy_dir),
             )
-            .unwrap_or_else(|e| panic!("{address} with {deploy_dir} must be accepted: {e}"));
+            .unwrap_or_else(|e| panic!("{deploy_dir} must be accepted: {e}"));
             assert_eq!(
                 remote.root(),
                 Path::new("/srv/app"),
@@ -308,20 +222,14 @@ mod tests {
     }
 
     /// The filesystem root (in any spelling that normalizes to it) is refused
-    /// as a local endpoint — the same rule the [`AbsoluteDeployDir`] parse
+    /// as a local root — the same rule the [`AbsoluteDeployDir`] parse
     /// enforces.
     #[test]
-    fn create_remote_local_rejects_root_endpoint() {
-        for address in ["local:///", "local:////", "local:////./"] {
-            let err = create_remote(
-                &SysEnv::from_process(),
-                &local_server(address),
-                Path::new("/srv/x"),
-            )
-            .err()
-            .unwrap_or_else(|| {
-                panic!("the filesystem root is not a valid local endpoint: {address}")
-            });
+    fn create_remote_local_rejects_root_deploy_dir() {
+        for dir in ["/", "//", "//./"] {
+            let err = create_remote(&SysEnv::from_process(), &local_server(), Path::new(dir))
+                .err()
+                .unwrap_or_else(|| panic!("the filesystem root is not a valid local root: {dir}"));
             assert!(
                 err.to_string().contains("traversal-free"),
                 "error must name the rule, got: {err}"

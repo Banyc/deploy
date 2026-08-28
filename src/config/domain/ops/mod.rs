@@ -58,9 +58,10 @@ impl ProjectConfig {
     fn validate_graph(&self) -> Result<()> {
         // Server ids are validated [`Identifier`]s by construction; the graph
         // rule is uniqueness. The connection enum must be well-formed: a
-        // local form carries a `local://` address whose path is absolute and
-        // a `Local` identity; an SSH form carries a `KnownHosts`/`Fingerprint`
-        // identity (never `Local`) with an absolute `known_hosts`.
+        // local form carries a `Local` identity (it carries NO root path —
+        // the slot's deploy_dir is the sole physical root); an SSH form
+        // carries a `KnownHosts`/`Fingerprint` identity (never `Local`) with
+        // an absolute `known_hosts`.
         let mut server_ids = HashSet::new();
         for s in &self.servers {
             if !server_ids.insert(s.id.as_str()) {
@@ -70,22 +71,10 @@ impl ProjectConfig {
                 )));
             }
             match s.connection() {
-                ServerConnection::Local { address, identity } => {
+                ServerConnection::Local { identity } => {
                     if identity != &HostIdentity::Local {
                         return Err(Error::config(format!(
                             "server '{}': a local connection must carry a Local identity",
-                            s.id
-                        )));
-                    }
-                    let Some(path) = address.strip_prefix("local://") else {
-                        return Err(Error::config(format!(
-                            "server '{}': a local connection must carry a local:// address",
-                            s.id
-                        )));
-                    };
-                    if !Path::new(path).is_absolute() {
-                        return Err(Error::config(format!(
-                            "server '{}': local:// endpoint must be an absolute path",
                             s.id
                         )));
                     }

@@ -46,7 +46,7 @@ type ServerTemplate = (
 /// per target). The conversion always succeeds.
 fn valid_raw_project() -> impl Strategy<Value = RawProject> {
     let server_templates: Vec<ServerTemplate> = vec![
-        ("s1", "local:///srv/s1", "u", None, None),
+        ("s1", "local", "u", None, None),
         (
             "s2",
             "db.example.com",
@@ -186,8 +186,10 @@ fn arbitrary_identity() -> impl Strategy<Value = HostIdentity> {
 /// SSH connection).
 fn arbitrary_connection() -> impl Strategy<Value = ServerConnection> {
     prop_oneof![
-        arbitrary_identifier().prop_map(|address| ServerConnection::Local {
-            address,
+        // A local connection is PATHLESS: the kind carries no address —
+        // the slot's deploy_dir is the sole physical root — so the form is
+        // always well-formed.
+        Just(ServerConnection::Local {
             identity: HostIdentity::Local,
         }),
         (
@@ -354,7 +356,6 @@ fn with_server_adds_and_replaces() {
         .with_server(ServerDef::new(
             Identifier::parse("s1").unwrap(),
             ServerConnection::Local {
-                address: "local:///srv/other".to_string(),
                 identity: HostIdentity::Local,
             },
             CapacityConfig::default(),
@@ -494,7 +495,6 @@ fn with_slot_adds_and_rejects_invalid() {
         .with_server(ServerDef::new(
             Identifier::parse("s2").unwrap(),
             ServerConnection::Local {
-                address: "local:///srv/s2".to_string(),
                 identity: HostIdentity::Local,
             },
             CapacityConfig::default(),
@@ -598,22 +598,27 @@ fn with_server_connection_validates_the_enum() {
         ServerConnection::Local { .. }
     ));
 
-    // A local connection with a non-local address is rejected.
-    let bad = cfg.with_server_connection(
-        "s1",
-        ServerConnection::Local {
-            address: "not-local".to_string(),
-            identity: HostIdentity::Local,
-        },
-    );
-    assert!(bad.is_err());
+    // A local connection is PATHLESS and always well-formed (the slot's
+    // deploy_dir is the sole physical root), so the Local form itself can
+    // never be rejected; replacing back to it succeeds.
+    let back = cfg
+        .with_server_connection(
+            "s1",
+            ServerConnection::Local {
+                identity: HostIdentity::Local,
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        back.server("s1").unwrap().connection(),
+        ServerConnection::Local { .. }
+    ));
 
     // An unknown server fails.
     assert!(
         cfg.with_server_connection(
             "ghost",
             ServerConnection::Local {
-                address: "local:///x".to_string(),
                 identity: HostIdentity::Local,
             },
         )

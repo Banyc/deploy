@@ -1,7 +1,7 @@
 //! Round-trip: `deploy init` scaffolds a project, and the scaffolded project
 //! pushes end-to-end (dry-run, then real) through the same engine path the CLI
-//! uses — with zero SSH, because the scaffold defaults to a `local://`
-//! endpoint inside the project.
+//! uses — with zero SSH, because the scaffold defaults to the pathless
+//! `local` connection (the slot's deploy_dir is the sole physical root).
 //!
 //! The CLI arm is exercised for `init` (`cli::run_with`), while the push is
 //! driven through `push::engine::push` with the real `create_remote` factory
@@ -18,7 +18,6 @@ use deploy::remote::helper::RemoteHelper;
 use deploy::remote::layout;
 use deploy::remote::transport::{LocalTransport, Remote};
 use deploy::store::local::LocalStore;
-use std::path::Path;
 
 /// The KNOWN artifact of a report actual ([`deploy::ledger::SlotAttemptState`]):
 /// a successful push's actuals are always `Known`. Test code asserting on a
@@ -131,11 +130,16 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
             .get(),
         0
     );
-    let addr = &config.servers().next().unwrap().address();
+    let addr = config.servers().next().unwrap().address();
+    assert_eq!(
+        addr, "local",
+        "local-first connection is the pathless marker, got {addr}"
+    );
+    let slot = &config.slot_defs()[0];
     assert!(
-        addr.starts_with("local://")
-            && Path::new(addr.trim_start_matches("local://")).is_absolute(),
-        "local-first address must be an absolute local:// path, got {addr}"
+        slot.deploy_dir().is_absolute(),
+        "the local slot's deploy_dir (the sole physical root) is absolute: {}",
+        slot.deploy_dir().display()
     );
 
     // 4. Dry-run: plans the deployment, touches neither store nor endpoint.
@@ -337,7 +341,7 @@ fn cli_init_flags_reach_config() -> Result<()> {
     )?;
     let config = ProjectConfig::load(&proj.join("deploy.toml"))?;
     assert_eq!(config.application().as_str(), "backend");
-    // The SSH connection carries the deployment account (a local:// endpoint
+    // The SSH connection carries the deployment account (the local marker
     // has no SSH user).
     assert_eq!(config.servers().next().unwrap().user(), "ops");
     Ok(())

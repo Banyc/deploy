@@ -1,10 +1,11 @@
 //! `deploy init`: scaffold a fresh, immediately-valid deploy project.
 //!
-//! The generated project is LOCAL-FIRST: the server address defaults to
-//! `local://<project>/.deploy-remote`, a local-filesystem endpoint, so
-//! `deploy push production` works end-to-end with nothing but this binary (no
-//! SSH, no server, no provisioning). Point `--address` at a real host and add
-//! host-key verification to switch to SSH.
+//! The generated project is LOCAL-FIRST: the server address is the pathless
+//! `local` marker and the slot's deploy_dir defaults to
+//! `<target>/.deploy-remote`, so `deploy push production` works end-to-end
+//! with nothing but this binary (no SSH, no server, no provisioning). Point
+//! `--address` at a real host and add host-key verification to switch to
+//! SSH.
 //!
 //! The scaffold refuses to clobber: `deploy.toml` (or an existing `releases/`
 //! tree) at the target is an error, and init never writes outside the target
@@ -35,8 +36,10 @@ use std::path::{Path, PathBuf};
 pub struct InitOptions {
     /// Application name. Defaults to the target directory's name.
     pub name: Option<String>,
-    /// Server address. Defaults to `local://<target>/.deploy-remote`. Use a
-    /// real hostname (plus `user`, and `known_hosts` or
+    /// Server address. The local default is the pathless `local` marker (a
+    /// local connection carries NO root path — the slot's deploy_dir,
+    /// defaulting to `<target>/.deploy-remote`, is the sole physical root).
+    /// Use a real hostname (plus `user`, and `known_hosts` or
     /// `host_key_fingerprint`) for SSH.
     pub address: Option<String>,
     /// SSH user (default "deploy").
@@ -70,8 +73,8 @@ pub struct InitReport {
     pub target: PathBuf,
     /// Regular files created, relative to `target`, sorted.
     pub files: Vec<PathBuf>,
-    /// Directories created, relative to `target`, sorted (the `local://`
-    /// endpoint included).
+    /// Directories created, relative to `target`, sorted (the local
+    /// `.deploy-remote` deploy directory included).
     pub dirs: Vec<PathBuf>,
     /// The commands the user should run next, in order.
     pub next_steps: Vec<String>,
@@ -84,8 +87,10 @@ pub struct InitReport {
 /// 1. Option validation runs FIRST, before any directory or file exists:
 ///    an SSH `--address` must configure EXACTLY ONE host-identity source
 ///    (`known_hosts` or `host_key_fingerprint`), `known_hosts` must be
-///    absolute, a fingerprint must be `SHA256:...`, and a `local://` address
-///    must name an absolute path (it doubles as the slot's `deploy_dir`).
+///    absolute, a fingerprint must be `SHA256:...`, and a legacy
+///    `local://<path>` address is rejected — a local connection is the
+///    pathless `local` marker, and the slot's deploy_dir (defaulting to
+///    `<target>/.deploy-remote`) is its sole physical root.
 /// 2. The typed scaffold is assembled and serialized; the emitted TOML must
 ///    round-trip through the strict parsers `ProjectConfig::load` uses.
 /// 3. After every file is written, the project is RE-LOADED through
@@ -128,16 +133,22 @@ pub fn init_project(target: &Path, opts: &InitOptions) -> Result<InitReport> {
     });
     let address = match &opts.address {
         Some(a) => a.clone(),
-        None => format!("local://{}", target.join(".deploy-remote").display()),
+        // The local-first default: the pathless `local` marker. The slot's
+        // deploy_dir — the sole physical root — defaults to
+        // `<target>/.deploy-remote` below.
+        None => "local".to_string(),
     };
-    let deploy_dir = match address.strip_prefix("local://") {
-        // The local endpoint doubles as the slot's deploy location. The
-        // transport is rooted at the `local://` path; the deploy_dir must stay
-        // an absolute path per validation (enforced in stage 1).
-        Some(p) => PathBuf::from(p),
+    let deploy_dir = if address == "local" {
+        // The local marker carries no path: the slot's deploy_dir is the
+        // SOLE physical root, defaulting to `<target>/.deploy-remote` (set
+        // in the variant file's slot declaration). The legacy
+        // `local://<path>` form was already rejected by
+        // [`validate_init_options`].
+        target.join(".deploy-remote")
+    } else {
         // Real server: a conventional absolute location the deployment account
         // must be able to create (documented in `deploy init --help`).
-        None => PathBuf::from(format!("/srv/deploy/{name}")),
+        PathBuf::from(format!("/srv/deploy/{name}"))
     };
 
     // Stage 2: build the typed scaffold documents and serialize them. The
@@ -183,23 +194,27 @@ pub fn init_project(target: &Path, opts: &InitOptions) -> Result<InitReport> {
 /// or file is created. This mirrors the rules the config conversion
 /// (`ProjectConfig::load`) applies to
 /// the surfaces the flags expose (SSH identity, `known_hosts`, fingerprint,
-/// `local://` endpoint). The fixed template parts (capacity 0/0, rollout,
+/// the pathless `local` marker, the rejected legacy `local://` form). The fixed template parts (capacity 0/0, rollout,
 /// variant sanity) are covered by the typed round-trip in [`build_docs`] and,
 /// authoritatively, by the post-write `ProjectConfig::load`.
 fn validate_init_options(opts: &InitOptions) -> Result<()> {
     let has_known_hosts = opts.known_hosts.is_some();
     let has_fingerprint = opts.host_key_fingerprint.is_some();
     if let Some(a) = &opts.address {
-        if a.starts_with("local://") {
-            // The local endpoint doubles as the slot's deploy_dir, which must
-            // be an absolute path per validation.
-            let p = a.trim_start_matches("local://");
-            if !Path::new(p).is_absolute() {
-                return Err(Error::config(format!(
-                    "local address '{a}': the path after local:// must be absolute \
-                     (it becomes the slot's deploy_dir)"
-                )));
-            }
+        if a == "local" {
+            // The pathless local marker: no root path, no host verification
+            // (the slot's deploy_dir is the sole physical root).
+        } else if a.starts_with("local://") {
+            // The legacy `local://<path>` endpoint form is gone: a local
+            // connection carries no path, so a `local://` address could only
+            // silently diverge from (or be ignored in favor of) the slot's
+            // deploy_dir. Reject it with migration guidance, before anything
+            // is written.
+            return Err(Error::config(format!(
+                "local address '{a}': a local connection no longer carries a path — \
+                 use --address local (the slot's deploy_dir is the sole physical root; \
+                 it defaults to <target>/.deploy-remote and is set in the variant file)"
+            )));
         } else {
             match (has_known_hosts, has_fingerprint) {
                 (false, false) => {
@@ -477,10 +492,12 @@ fn manifest_doc() -> String {
 # variant files (releases/v1/standard.toml declares the project's one slot,
 # bound to its ONE owning target `production` by its `target` field).
 #
-# LOCAL-FIRST: `address` is a local:// filesystem endpoint (.deploy-remote/
-# in this project) so `deploy push production` runs with zero SSH. To deploy
-# to a real server, replace `address` with a hostname, set `user`, and add
-# EXACTLY ONE of `known_hosts` (absolute path) or `host_key_fingerprint`
+# LOCAL-FIRST: `address = \"local\"` is the pathless local marker — the
+# slot's deploy_dir (releases/v1/standard.toml, default
+# <project>/.deploy-remote) is the SOLE physical root — so `deploy push
+# production` runs with zero SSH. To deploy to a real server, replace
+# `address` with a hostname, set `user`, and add EXACTLY ONE of
+# `known_hosts` (absolute path) or `host_key_fingerprint`
 # (SHA256:...) — SSH trust-on-first-use is refused. `deploy init --help`
 # documents the full flag set.
 ",
@@ -533,8 +550,8 @@ under releases/v1/artifacts/ and run `deploy push production` again.\n";
 /// template module's `{{ deploy_dir }}` and `{{ user }}` variables (see
 /// [`crate::remote::canonical`]): the tree is content-addressed and shared across
 /// slots, so the unit's `ExecStart` and the deployment-account comment are
-/// rendered per slot at activation time — for the default `local://` project
-/// the slot's `deploy_dir` is the absolute `.deploy-remote` path.
+/// rendered per slot at activation time — for the default local project the
+/// slot's `deploy_dir` is the absolute `.deploy-remote` path.
 fn systemd_unit_file() -> String {
     r#"# systemd user unit for the scaffold's `systemd` example variant
 # (releases/v1/systemd.toml). `deploy push` renders this file with the slot's
@@ -593,8 +610,8 @@ struct CreatedTree {
 /// owner-write, then remove, mirroring the engine's cleanup convention) and
 /// the load error is returned: a failed init never leaves a half-written
 /// project, and success is only reported once the written project is known
-/// valid. `extra_dirs` are directories created up front (the `local://`
-/// endpoint).
+/// valid. `extra_dirs` are directories created up front (the local
+/// `.deploy-remote` deploy directory).
 fn write_and_verify(
     target: &Path,
     writes: &[(PathBuf, String)],
@@ -785,11 +802,13 @@ mod tests {
                 .is_file()
         );
 
-        // The local-first address routes the transport into the project.
-        let addr = config.server("server-01").unwrap().address();
-        assert!(
-            addr.starts_with("local://") && addr.ends_with("/.deploy-remote"),
-            "unexpected address {addr}"
+        // The local-first connection is the pathless marker; the slot's
+        // deploy_dir — the sole physical root — is the absolute
+        // `.deploy-remote` directory.
+        assert_eq!(config.server("server-01").unwrap().address(), "local");
+        assert_eq!(
+            config.slot_defs()[0].deploy_dir(),
+            &report.target.join(".deploy-remote")
         );
         assert!(config.slot_defs()[0].deploy_dir().is_absolute());
     }
@@ -852,7 +871,7 @@ mod tests {
             crate::config::HostIdentity::KnownHosts(_)
         ));
 
-        // local:// address with no identity stays the zero-SSH default.
+        // The local marker with no identity stays the zero-SSH default.
         let proj = tmp.path().join("local");
         init_project(&proj, &opts()).unwrap();
     }
@@ -942,9 +961,11 @@ mod tests {
         assert!(err.to_string().contains("SHA256:"), "got: {err}");
         assert!(!proj.exists());
 
-        // A local:// address must name an absolute path (it becomes the
-        // slot's deploy_dir).
-        let proj = tmp.path().join("relative-local");
+        // A legacy local://<path> address is rejected: a local connection is
+        // the pathless `local` marker, so a `local://` path could only
+        // silently diverge from the slot's deploy_dir (the sole physical
+        // root).
+        let proj = tmp.path().join("legacy-local");
         let err = init_project(
             &proj,
             &InitOptions {
@@ -953,8 +974,30 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(err.to_string().contains("absolute"), "got: {err}");
+        assert!(
+            err.to_string().contains("no longer carries a path"),
+            "got: {err}"
+        );
         assert!(!proj.exists());
+
+        // The pathless `local` marker itself is valid (the zero-SSH default;
+        // the slot's deploy_dir is the sole physical root).
+        let proj = tmp.path().join("marker-local");
+        let report = init_project(
+            &proj,
+            &InitOptions {
+                address: Some("local".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let config =
+            crate::config::ProjectConfig::load(&report.target.join("deploy.toml")).unwrap();
+        assert_eq!(config.server("server-01").unwrap().address(), "local");
+        assert_eq!(
+            config.slot_defs()[0].deploy_dir(),
+            &report.target.join(".deploy-remote")
+        );
     }
 
     // The scaffold is TYPED TOML: serializing the loaded config (and each
@@ -1127,8 +1170,8 @@ mod tests {
 
     // -------------------------------------------------------------------
     // THE SCAFFOLD/LOAD ROUND-TRIP PROPERTY: over ARBITRARY VALID
-    // `InitOptions` (the local-first default, a `local://` endpoint, an SSH
-    // host with a `known_hosts` file, and an SSH host with a
+    // `InitOptions` (the local-first default, an explicit `local` marker,
+    // an SSH host with a `known_hosts` file, and an SSH host with a
     // `host_key_fingerprint` — every combination the init handler and the
     // strict loader accept), the scaffold writes a project whose RELOADED
     // domain model carries exactly the emitted schema version and exactly
@@ -1142,11 +1185,11 @@ mod tests {
     /// Which connection shape the generated [`InitOptions`] describes.
     #[derive(Clone, Copy, Debug)]
     enum AddrKind {
-        /// `address: None` — the local-first default
-        /// (`local://<target>/.deploy-remote`).
+        /// `address: None` — the local-first default (the pathless `local`
+        /// marker; the slot's deploy_dir defaults to
+        /// `<target>/.deploy-remote`).
         Default,
-        /// `address: local://<absolute path>` — an explicit local endpoint
-        /// (the path doubles as the slot's deploy_dir).
+        /// `address: "local"` — the pathless local marker written explicitly.
         Local,
         /// `address: <host>` with a `known_hosts` identity.
         SshKnownHosts,
@@ -1187,7 +1230,10 @@ mod tests {
                 };
                 let address = match kind {
                     AddrKind::Default => None,
-                    AddrKind::Local => Some(format!("local:///srv/deploy/{name}")),
+                    // The pathless marker: a local connection carries no
+                    // root path — the slot's deploy_dir is the sole physical
+                    // root (defaulting to <target>/.deploy-remote).
+                    AddrKind::Local => Some("local".to_string()),
                     _ => address,
                 };
                 InitOptions {
@@ -1242,36 +1288,34 @@ mod tests {
             assert_eq!(config.release().as_str(), "v1");
 
             // The connection the options described: address, user, port, and
-            // the EXACTLY ONE identity form (local endpoints never verify;
-            // SSH addresses carry exactly one of known_hosts/fingerprint).
+            // the EXACTLY ONE identity form (the local marker never
+            // verifies; SSH addresses carry exactly one of
+            // known_hosts/fingerprint).
             let (expected_address, expected_deploy_dir) = match &opts.address {
-                Some(a) if a.starts_with("local://") => (
-                    a.clone(),
-                    PathBuf::from(a.trim_start_matches("local://")),
-                ),
+                // The pathless marker: the deploy_dir — the sole physical
+                // root — is the scaffold's `<target>/.deploy-remote`.
+                Some(a) if a == "local" => ("local".to_string(), report.target.join(".deploy-remote")),
                 Some(host) => (
                     host.clone(),
                     PathBuf::from(format!("/srv/deploy/{expected_name}")),
                 ),
-                None => {
-                    let base = report.target.join(".deploy-remote");
-                    (format!("local://{}", base.display()), base)
-                }
+                None => ("local".to_string(), report.target.join(".deploy-remote")),
             };
             let server = config.server("server-01").expect("scaffold writes server-01");
             assert_eq!(server.address(), expected_address);
             let is_local = match &opts.address {
                 None => true,
-                Some(a) => a.starts_with("local://"),
+                Some(a) => a == "local",
             };
             if is_local {
-                // A local endpoint drops the SSH user/port in the domain;
-                // its identity is ALWAYS Local (no host verification).
-                assert_eq!(server.user(), "", "local endpoints carry no SSH user");
+                // The pathless local kind drops the SSH user/port in the
+                // domain; its identity is ALWAYS Local (no host
+                // verification).
+                assert_eq!(server.user(), "", "the local kind carries no SSH user");
                 assert_eq!(server.port(), 22);
                 assert!(
                     matches!(server.identity(), crate::config::HostIdentity::Local),
-                    "a local endpoint's identity is always Local"
+                    "the local kind's identity is always Local"
                 );
             } else {
                     assert_eq!(server.user(), opts.user.as_str());
