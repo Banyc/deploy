@@ -162,9 +162,14 @@ impl LocalStore {
     /// claims disagree (the terminal's target vs the read path / its intent,
     /// every outcome key vs the intent's `slot_ids` membership, and — BY
     /// INTENT GROUP — the FULL-push Successful terminal's
-    /// selected_membership == full_membership equality; a GROUP push's
+    /// selected_membership == full_membership equality AND THE INTENT-BINDING
+    /// legs (a Successful terminal's `selected_membership` must EQUAL the
+    /// intent's FROZEN `selected_membership` and its `full_membership` must
+    /// EQUAL the intent's FROZEN `full_membership` — the terminal REPRODUCES
+    /// the immutable intent, never the live configuration; a GROUP push's
     /// Successful terminal carries its OWN proven memberships and needs no
-    /// membership leg beyond the terminal-local equations; a FailedPreflight
+    /// membership leg beyond the terminal-local equations + the intent
+    /// binding; a FailedPreflight
     /// terminal must carry NO outcomes, and every other terminal state's
     /// outcomes must EXACTLY cover the membership), is REFUSED with an
     /// integrity error — a hand-constructed or tampered record is never read
@@ -270,14 +275,12 @@ impl LocalStore {
                     // statuses in the new model: combined with the
                     // terminal-local outcomes == selected_membership
                     // equality, it makes selected_membership ⊆ the intent's
-                    // slot_ids (the intent's membership IS the historical
+                    // slot_ids (the intent's membership IS the frozen
                     // selected set). The EXACT equality intent.slot_ids ==
-                    // selected_membership is deliberately NOT required: the
-                    // intent's slot_ids is written BEFORE the push while the
-                    // terminal's memberships are proven at terminal time, and
-                    // a legitimate configuration change between the two
-                    // lines can make them differ (the read is a PURE
-                    // function of the persisted sets + mode — it never
+                    // selected_membership is the INTENT-BINDING leg below
+                    // (the intent FREEZES both memberships at plan time; the
+                    // terminal must REPRODUCE them — the read is a PURE
+                    // function of the persisted sets + mode, and never
                     // consults the live configuration for these equations).
                     for key in wire.outcomes.keys().cloned().collect::<Vec<_>>() {
                         if !out[pos].intent.slots.contains_key(&key) {
@@ -320,17 +323,17 @@ impl LocalStore {
                     //   OWN proven memberships (the conversion enforced
                     //   outcomes == selected_membership, rollback slots ==
                     //   full_membership, selected ⊆ full — the record is
-                    //   self-proving), so the read's only Successful leg is
-                    //   the FULL-push equality below (the mode lives in the
-                    //   intent's `group`). The intent's `slot_ids` is NOT
-                    //   compared to either membership here: the intent is the
-                    //   historical SELECTED set written before the push, the
-                    //   terminal's full_membership is the COMPLETE target
-                    //   membership at TERMINAL time, and a legitimate
-                    //   configuration change between the two lines makes them
-                    //   differ (the membership equations are a PURE function
-                    //   of the persisted sets + mode; the read never consults
-                    //   the live configuration).
+                    //   self-proving), so the read's Successful legs are the
+                    //   INTENT-BINDING legs below (the terminal must
+                    //   REPRODUCE the intent's frozen selected/full) plus the
+                    //   FULL-push equality (the mode lives in the intent's
+                    //   `group`). The intent's `slot_ids` is NOT compared to
+                    //   the terminal's memberships EXCEPT through the frozen
+                    //   binding: the intent's OWN frozen selected (== its
+                    //   table keys) and full are the AUTHORITATIVE facts, and
+                    //   a terminal whose memberships diverge is refused —
+                    //   the read is a PURE function of the persisted sets +
+                    //   mode; it never consults the live configuration.
                     // - FailedPreflight: outcomes EMPTY (a pre-mutation
                     //   failure touched no slot).
                     // - every other terminal state (FailedRolledBack,
@@ -346,28 +349,46 @@ impl LocalStore {
                             // memberships satisfy the terminal-local equations
                             // (outcomes == selected, rollback == full,
                             // selected ⊆ full — enforced by the conversion).
-                            // The ONLY cross-record leg is the FULL-push
-                            // equality: a FULL push (no group) selects every
-                            // target slot, so selected_membership must EQUAL
-                            // full_membership. A GROUP push allows a proper
-                            // subset (selected ⊆ full is already enforced by
-                            // the conversion).
-                            if entry.intent.group.is_none() {
-                                let (selected, full) = match &terminal.disposition {
-                                    TerminalDisposition::Successful {
-                                        selected_membership,
-                                        full_membership,
-                                        ..
-                                    } => (selected_membership, full_membership),
-                                    _ => unreachable!(
-                                        "a Successful terminal carries its rollback + memberships"
-                                    ),
-                                };
-                                if selected != full {
-                                    return Err(Error::integrity(format!(
-                                        "ledger of target '{target}': Successful terminal for deployment '{id}' records selected membership {selected:?} and full membership {full:?} — a FULL push (no group) selects every target slot, so its selected membership must EXACTLY equal its full membership"
-                                    )));
-                                }
+                            // THE INTENT-BINDING LEGS (the user's
+                            // requirement): the terminal's memberships must
+                            // REPRODUCE the intent's FROZEN values — the
+                            // intent is the IMMUTABLE record that froze
+                            // selected (its table keys) and full (the
+                            // complete target membership at plan time), and a
+                            // terminal whose memberships diverge from it is
+                            // refused (integrity error), so the terminal can
+                            // never be re-derived from the live configuration.
+                            // The FULL-push EQUALITY: a FULL push (no group)
+                            // selects every target slot, so selected_membership
+                            // must EQUAL full_membership. A GROUP push allows
+                            // a proper subset (selected ⊆ full is already
+                            // enforced by the conversion).
+                            let (selected, full) = match &terminal.disposition {
+                                TerminalDisposition::Successful {
+                                    selected_membership,
+                                    full_membership,
+                                    ..
+                                } => (selected_membership, full_membership),
+                                _ => unreachable!(
+                                    "a Successful terminal carries its rollback + memberships"
+                                ),
+                            };
+                            if selected != &entry.intent.selected_membership() {
+                                return Err(Error::integrity(format!(
+                                    "ledger of target '{target}': Successful terminal for deployment '{id}' records selected membership {selected:?} but the intent froze selected membership {:?} — the terminal must REPRODUCE the immutable intent's frozen selected membership (never the live configuration)",
+                                    entry.intent.selected_membership()
+                                )));
+                            }
+                            if full != entry.intent.full_membership() {
+                                return Err(Error::integrity(format!(
+                                    "ledger of target '{target}': Successful terminal for deployment '{id}' records full membership {full:?} but the intent froze full membership {:?} — the terminal must REPRODUCE the immutable intent's frozen full membership (the complete target membership at plan time, never the live configuration)",
+                                    entry.intent.full_membership()
+                                )));
+                            }
+                            if entry.intent.group.is_none() && selected != full {
+                                return Err(Error::integrity(format!(
+                                    "ledger of target '{target}': Successful terminal for deployment '{id}' records selected membership {selected:?} and full membership {full:?} — a FULL push (no group) selects every target slot, so its selected membership must EXACTLY equal its full membership"
+                                )));
                             }
                         }
                         DeploymentStatus::FailedPreflight => {
@@ -601,6 +622,7 @@ mod tests {
             attempted_at: "2026-01-01T00:00:00Z".to_string(),
             slots: NonEmptySlotTable::build(slots)
                 .expect("a seeded deployment always has at least one slot"),
+            full_membership: BTreeSet::from([SlotId::new("p1".to_string())]),
         }
     }
 
@@ -824,6 +846,8 @@ mod tests {
         let mut wire = LedgerIntentWire::from(&intent("deploy-x", target));
         let extra = SlotId::new("not-a-member".to_string());
         wire.slot_ids.push(extra.clone());
+        wire.selected_membership.push(extra.clone());
+        wire.full_membership.push(extra.clone());
         wire.desired.insert(
             extra.clone(),
             GenerationRef {
@@ -2138,6 +2162,7 @@ mod tests {
             attempted_at: "2026-01-01T00:00:00Z".to_string(),
             slots: NonEmptySlotTable::build(slots)
                 .expect("a seeded deployment always has at least one slot"),
+            full_membership: slot_ids.iter().cloned().collect(),
         }
     }
 

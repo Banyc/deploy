@@ -83,25 +83,21 @@ pub(crate) fn run_commit(
         // the CURRENT configuration: it is the live placement this attempt
         // actually used.
         let slot_bindings = config.target_slot_bindings(target_name)?;
-        // The CURRENT target slot set: the complete snapshot omits slots
-        // removed from the current configuration and carries every current
-        // unselected slot forward from the base. The rollback is the
-        // COMPLETE resulting target state (the base-overlay semantics): the
-        // SELECTED slots' actuals overlaid on the latest successful base,
-        // unselected slots carried forward — so the rollback's slots are the
-        // FULL current target membership, never just the selected slots. The
-        // terminal PERSISTS both memberships (selected = the outcome keys,
-        // full = these current slots) and the read path enforces the
-        // equations: outcomes == selected, rollback == full, selected ⊆
-        // full, and — for a FULL push (no group, distinguished by the
-        // intent's `group`) — selected == full.
-        let current_slot_ids: Vec<SlotId> = config
-            .target_slots(target_name)?
-            .into_iter()
-            .map(|(slot, _)| {
-                SlotId::parse(slot.id.as_str()).expect("validated slot id is a safe segment")
-            })
-            .collect();
+        // The terminal's FULL MEMBERSHIP is the INTENT'S FROZEN value — the
+        // finalizer reads `attempt.full_membership()` (the complete target
+        // membership resolved AT PLAN TIME, when the immutable intent was
+        // written), never recomputed from the current configuration. The
+        // rollback is the COMPLETE resulting target state (the base-overlay
+        // semantics): the SELECTED slots' actuals overlaid on the latest
+        // successful base, unselected slots carried forward — so the
+        // rollback's slots are the frozen FULL membership, never just the
+        // selected slots. The terminal PERSISTS both memberships (selected =
+        // the outcome keys, full = the frozen value) and the read path
+        // enforces the equations: outcomes == selected, rollback == full,
+        // selected ⊆ full, the INTENT-BINDING legs (the terminal must
+        // REPRODUCE the intent's frozen selected/full), and — for a FULL
+        // push (no group, distinguished by the intent's `group`) — selected
+        // == full.
         ledger::finalize_successful_attempt(
             store,
             attempt_intent,
@@ -109,7 +105,6 @@ pub(crate) fn run_commit(
             &execution.actual_servers,
             "push completed",
             &slot_bindings,
-            &current_slot_ids,
         )?;
         // The new successful deployment is keyed by its deployment id (the
         // public grammar is deployment-keyed — successful positions are
@@ -762,6 +757,7 @@ pub(crate) mod commit_tests {
                 },
             )]))
             .expect("one member slot"),
+            full_membership: BTreeSet::from([SlotId::new("p1".to_string())]),
         };
         h.store.append_attempt("t1", &intent).unwrap();
         assert_eq!(
@@ -836,6 +832,7 @@ pub(crate) mod commit_tests {
             group: None,
             behavior_sha256: baseline.behavior_sha256.as_str().to_string(),
             attempted_at: crate::remote::helper::now_rfc3339(),
+            full_membership: BTreeSet::from([SlotId::new("p1".to_string())]),
         };
         h.store.append_attempt("t1", &intent).unwrap();
         assert_eq!(
@@ -904,6 +901,7 @@ pub(crate) mod commit_tests {
                 },
             )]))
             .expect("one member slot"),
+            full_membership: BTreeSet::from([SlotId::new("p1".to_string())]),
         };
         let a = mk("deploy-multi-a");
         let b = mk("deploy-multi-b");

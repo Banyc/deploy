@@ -25,7 +25,11 @@ use crate::ledger::PreviousGeneration;
 /// deployment's TERMINAL EVENT. The DOMAIN intent stores ONE slot table (the
 /// membership + the desired/pre-push entries are the same table — the
 /// exact-key-set invariant is structural); the wire re-expands it on
-/// serialization.
+/// serialization. Since schema v4 the intent ALSO freezes BOTH memberships:
+/// the selected membership (the slot table's keys) and the FULL membership
+/// (the complete target membership resolved AT PLAN TIME from the current
+/// configuration) — the terminal must reproduce the frozen values and
+/// recovery must finalize from them, never from the live configuration.
 pub(crate) fn persist_intent(
     ctx: &PushContext,
     outcome: &PreflightOutcome,
@@ -67,6 +71,21 @@ pub(crate) fn persist_intent(
         behavior_sha256: desired_behavior_sha.clone(),
         attempted_at: crate::remote::helper::now_rfc3339(),
         slots: NonEmptySlotTable::build(intent_slots)?,
+        // THE FROZEN FULL MEMBERSHIP: the COMPLETE target membership AT PLAN
+        // TIME (every slot the target's current configuration owns when this
+        // immutable intent is written — a full push's every target slot, a
+        // group push's unselected slots included). The terminal event must
+        // REPRODUCE this frozen value and recovery must finalize from it —
+        // never from the live configuration, which may change arbitrarily
+        // after this intent is durable.
+        full_membership: ctx
+            .config
+            .target_slots(target_name)?
+            .into_iter()
+            .map(|(slot, _)| {
+                SlotId::parse(slot.id.as_str()).expect("validated slot id is a safe segment")
+            })
+            .collect(),
     };
     store.append_intent(target_name, &attempt_intent)?;
     Ok(attempt_intent)

@@ -20,9 +20,10 @@ use super::super::{NonEmptySlotTable, SlotAttemptState};
 /// JSONL carries, holding every redundant member the domain reconciles (the
 /// per-slot maps' key sets next to the authoritative `slot_ids` membership,
 /// each [`crate::identity::GenerationRef`]'s assignment slot next to its map
-/// key). [`crate::ledger::finalize::LedgerLine::Intent`] serializes this type; the ledger's wire
-/// format is therefore unchanged (existing ledgers keep loading — the wire
-/// reads the current format). The VERIFYING CONVERSION
+/// key, and — since schema v4 — the FROZEN MEMBERSHIPS next to the table).
+/// [`crate::ledger::finalize::LedgerLine::Intent`] serializes this type; the ledger's wire
+/// format is therefore unchanged for writers (existing ledgers keep loading
+/// the current format). The VERIFYING CONVERSION
 /// ([`LedgerIntentWire::into_domain`]) checks every duplicate projection and
 /// exposes only the validated [`DeploymentIntent`] domain type.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,8 +43,27 @@ pub struct LedgerIntentWire {
     /// is the AUTHORITATIVE membership: it must be DUPLICATE-FREE, and the
     /// `desired` / `pre_push` maps' key sets must EQUAL it EXACTLY (every
     /// member slot has exactly one desired + one pre_push entry), verified by
-    /// the wire → domain conversion.
+    /// the wire → domain conversion. It is the FROZEN SELECTED membership —
+    /// the exact slots this attempt planned to deploy.
     pub slot_ids: Vec<SlotId>,
+    /// THE FROZEN SELECTED MEMBERSHIP, persisted EXPLICITLY so the intent is
+    /// SELF-PROVING: the duplicate projection of `slot_ids` (the wire →
+    /// domain conversion re-checks the two AGREE — the selected set IS the
+    /// slot table's keys, no divergence). REQUIRED since schema v4 (no serde
+    /// default — an old-shape intent line fails deserialization fail
+    /// closed).
+    pub selected_membership: Vec<SlotId>,
+    /// THE FROZEN FULL MEMBERSHIP: the COMPLETE target membership at PLAN
+    /// TIME (every slot `config.target_slots(target)` owned when this
+    /// immutable intent was written — a group push's unselected slots
+    /// included, a full push's every target slot). REQUIRED since schema v4
+    /// (no serde default): the conversion requires it DUPLICATE-FREE and a
+    /// SUPERSET of the selected membership (selected ⊆ full — the frozen
+    /// intent's own consistency). The terminal event must REPRODUCE these
+    /// frozen values and recovery must finalize from them — never from the
+    /// live configuration, which may have changed arbitrarily since the
+    /// intent was written.
+    pub full_membership: Vec<SlotId>,
     pub behavior_sha256: String,
     pub attempted_at: String,
     /// Desired per-slot assignments (what the plan intended): each slot's
@@ -125,7 +145,58 @@ impl LedgerIntentWire {
                 )));
             }
         }
+        // THE FROZEN MEMBERSHIPS (schema v4) are validated FIRST, before the
+        // key-set agreement: each persisted membership list must be
+        // DUPLICATE-FREE — a duplicated member would silently weaken the set
+        // equations (the set collapses the duplicate, so the duplicated id
+        // would never be checked against the maps). The validated forms are
+        // the SORTED UNIQUE SETS the domain carries.
+        let mut seen_selected: BTreeSet<&SlotId> = BTreeSet::new();
+        for sid in &self.selected_membership {
+            if !seen_selected.insert(sid) {
+                return Err(Error::integrity(format!(
+                    "intent {}: selected_membership carries duplicate slot '{sid}' — the frozen membership must be unique",
+                    self.deployment_id
+                )));
+            }
+        }
+        let mut seen_full: BTreeSet<&SlotId> = BTreeSet::new();
+        for sid in &self.full_membership {
+            if !seen_full.insert(sid) {
+                return Err(Error::integrity(format!(
+                    "intent {}: full_membership carries duplicate slot '{sid}' — the frozen membership must be unique",
+                    self.deployment_id
+                )));
+            }
+        }
         let membership: BTreeSet<&SlotId> = self.slot_ids.iter().collect();
+        let selected_membership: BTreeSet<&SlotId> = self.selected_membership.iter().collect();
+        let full_membership: BTreeSet<&SlotId> = self.full_membership.iter().collect();
+        // NO DIVERGENCE: the persisted selected membership must EQUAL the
+        // authoritative `slot_ids` — the intent's table keys ARE its frozen
+        // selected set, and the wire persists both projections so the record
+        // is self-proving. A disagreement is a hand-constructed record,
+        // refused fail-closed.
+        if membership != selected_membership {
+            return Err(Error::integrity(format!(
+                "intent {}: selected_membership {:?} disagrees with the slot table keys {:?} — the frozen selected membership IS the slot table's keys (no divergence)",
+                self.deployment_id, selected_membership, membership
+            )));
+        }
+        // THE FROZEN INTENT'S OWN CONSISTENCY: selected ⊆ full — the frozen
+        // full membership is the COMPLETE target membership at plan time, so
+        // it must cover the slots the attempt selected. (A full push's
+        // selected == full naturally; a group push's selected is a subset.)
+        if !selected_membership.is_subset(&full_membership) {
+            let outside: Vec<&SlotId> = selected_membership
+                .difference(&full_membership)
+                .cloned()
+                .collect();
+            return Err(Error::integrity(format!(
+                "intent {}: the frozen selected membership includes slots outside the frozen full membership {outside:?} — selected ⊆ full is the intent's own consistency (the full membership is the complete target at plan time)",
+                self.deployment_id
+            )));
+        }
         let desired_keys: BTreeSet<&SlotId> = self.desired.keys().collect();
         let pre_push_keys: BTreeSet<&SlotId> = self.pre_push.keys().collect();
         // EXACT KEY-SET EQUALITY: every member slot has exactly one desired +
@@ -210,6 +281,10 @@ impl LedgerIntentWire {
             behavior_sha256: self.behavior_sha256,
             attempted_at: self.attempted_at,
             slots: NonEmptySlotTable::build(slots)?,
+            full_membership: full_membership
+                .into_iter()
+                .cloned()
+                .collect::<BTreeSet<SlotId>>(),
         })
     }
 }
@@ -268,11 +343,16 @@ pub struct PreviousGeneration {
 /// single [`NonEmptySlotTable<IntentSlot>`], so the exact-key-set invariant
 /// (`slot_ids == desired == pre_push`, no duplicates) is STRUCTURAL: the
 /// table has no duplicates (`BTreeMap` keys) and no missing keys (non-empty,
-/// every member carries its desired + pre_push entry). The `group`,
-/// `behavior_sha256` and `attempted_at` members are SINGLE facts (display /
-/// rollback context), not duplicated projections — they are not part of the
-/// reshape. The wire `deployment_schema_version` is a WIRE format concern
-/// (checked by the reader on the wire, refused if not
+/// every member carries its desired + pre_push entry). The SELECTED
+/// membership is that table's keys — the wire persists it redundantly
+/// (`selected_membership`, re-checked EQUAL to the keys by the conversion)
+/// so the record is SELF-PROVING — and the FROZEN FULL MEMBERSHIP is a
+/// SINGLE fact stored once (`full_membership`, the complete target
+/// membership at plan time). The `group`, `behavior_sha256` and
+/// `attempted_at` members are SINGLE facts (display / rollback context),
+/// not duplicated projections — they are not part of the reshape. The wire
+/// `deployment_schema_version` is a WIRE format concern (checked by the
+/// reader on the wire, refused if not
 /// `crate::ledger::LEDGER_SCHEMA_VERSION`); the validated domain does not
 /// carry it and writers emit exactly the constant.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -296,6 +376,15 @@ pub struct DeploymentIntent {
     /// unique by construction ([`NonEmptySlotTable`]) — the exact-key-set
     /// invariant is structural here, not checked.
     pub slots: NonEmptySlotTable<IntentSlot>,
+    /// THE FROZEN FULL MEMBERSHIP: the COMPLETE target membership at PLAN
+    /// TIME (when this immutable intent was written) — the terminal event
+    /// must REPRODUCE it and recovery must finalize from it, never from the
+    /// live configuration (which may have changed arbitrarily since the
+    /// intent was written). THE AUTHORITATIVE FROZEN FACT alongside the
+    /// selected membership (the `slots` table's keys — the wire persists
+    /// both; the conversion re-checks the selected projection against the
+    /// table keys, no divergence).
+    pub full_membership: BTreeSet<SlotId>,
 }
 
 impl DeploymentIntent {
@@ -303,6 +392,21 @@ impl DeploymentIntent {
     /// slots (in deployment order — the table's key order).
     pub fn membership(&self) -> Vec<SlotId> {
         self.slots.keys().cloned().collect()
+    }
+
+    /// THE FROZEN SELECTED MEMBERSHIP, as the SORTED UNIQUE SET — the slot
+    /// table's keys (the persisted wire projection is re-checked against the
+    /// table by the conversion, so this is the domain's ONE selected fact).
+    pub fn selected_membership(&self) -> BTreeSet<SlotId> {
+        self.slots.keys().cloned().collect()
+    }
+
+    /// THE FROZEN FULL MEMBERSHIP — the COMPLETE target membership at plan
+    /// time, THE authoritative frozen fact the terminal must reproduce and
+    /// recovery must finalize from (never derived from the live
+    /// configuration).
+    pub fn full_membership(&self) -> &BTreeSet<SlotId> {
+        &self.full_membership
     }
 
     /// The distinct releases referenced by the intent's per-slot desired
@@ -357,6 +461,8 @@ impl From<&DeploymentIntent> for LedgerIntentWire {
             target: i.target.clone(),
             group: i.group.clone(),
             slot_ids,
+            selected_membership: i.slots.keys().cloned().collect(),
+            full_membership: i.full_membership.iter().cloned().collect(),
             behavior_sha256: i.behavior_sha256.clone(),
             attempted_at: i.attempted_at.clone(),
             desired,

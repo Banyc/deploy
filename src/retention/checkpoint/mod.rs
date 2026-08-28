@@ -491,6 +491,7 @@ mod tests {
             attempted_at: "2026-01-01T00:00:00Z".to_string(),
             slots: NonEmptySlotTable::build(slots)
                 .expect("a fixture intent always has at least one slot"),
+            full_membership: BTreeSet::from([SlotId::new("p1".to_string())]),
         }
     }
 

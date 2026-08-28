@@ -349,6 +349,7 @@ pub(crate) fn seed_snapshot(
                 attempted_at: "2026-01-01T00:00:00Z".to_string(),
                 slots: NonEmptySlotTable::build(slot_table)
                     .expect("a seeded snapshot always has at least one slot"),
+                full_membership: slots.keys().cloned().collect(),
             },
         )
         .unwrap();

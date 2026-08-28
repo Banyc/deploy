@@ -88,13 +88,19 @@ mod tests_entry {
         }
     }
     fn agreeing_intent(keys: &[SlotId]) -> LedgerIntentWire {
-        agreeing_intent_with_group(keys, None)
+        agreeing_intent_with_group(keys, keys, None)
     }
 
-    /// [`agreeing_intent`] with an explicit GROUP MODE: `Some(g)` selects a
-    /// group push (the intent's `slot_ids` are the group's slots), `None` a
-    /// full push (the intent's `slot_ids` are every target slot).
-    fn agreeing_intent_with_group(keys: &[SlotId], group: Option<&str>) -> LedgerIntentWire {
+    /// [`agreeing_intent`] with an explicit GROUP MODE and FROZEN FULL
+    /// MEMBERSHIP: `Some(g)` selects a group push (the intent's `slot_ids`
+    /// are the group's slots), `None` a full push (the intent's `slot_ids`
+    /// are every target slot); `full` is the COMPLETE target membership the
+    /// intent FREEZES (⊇ `keys` — a full push freezes full == selected).
+    fn agreeing_intent_with_group(
+        keys: &[SlotId],
+        full: &[SlotId],
+        group: Option<&str>,
+    ) -> LedgerIntentWire {
         let desired: BTreeMap<SlotId, GenerationRef> =
             keys.iter().map(|k| (k.clone(), gen_ref_for(k))).collect();
         let pre_push: BTreeMap<SlotId, Option<SlotAttemptState>> =
@@ -105,6 +111,8 @@ mod tests_entry {
             target: TargetName::new("t1".to_string()),
             group: group.map(str::to_string),
             slot_ids: keys.to_vec(),
+            selected_membership: keys.to_vec(),
+            full_membership: full.to_vec(),
             behavior_sha256: "sha256-w".to_string(),
             attempted_at: "2026-01-01T00:00:00Z".to_string(),
             desired,
@@ -279,23 +287,44 @@ mod tests_entry {
         let membership: BTreeSet<&SlotId> = intent.slots.keys().collect();
         match terminal.status() {
             DeploymentStatus::Successful => {
-                if intent.group.is_none() {
-                    let (selected, full) = match &terminal.disposition {
-                        TerminalDisposition::Successful {
-                            selected_membership,
-                            full_membership,
-                            ..
-                        } => (selected_membership, full_membership),
-                        _ => {
-                            unreachable!("a Successful terminal carries its rollback + memberships")
-                        }
-                    };
-                    if selected != full {
-                        return Err(Error::integrity(format!(
-                            "terminal {}: Successful records selected membership {selected:?} and full membership {full:?} — a FULL push (no group) selects every target slot, so its selected membership must EXACTLY equal its full membership",
-                            pair.1.deployment_id
-                        )));
+                // THE INTENT-BINDING LEGS (the user's requirement): the
+                // terminal's memberships must REPRODUCE the intent's FROZEN
+                // values — the intent froze selected (its table keys) and
+                // full (the complete target membership at plan time), and a
+                // terminal whose memberships diverge is refused. The
+                // FULL-push equality: a FULL push (no group) selects every
+                // target slot, so selected == full; a GROUP push allows a
+                // proper subset (the ⊆ is already enforced by the
+                // conversion).
+                let (selected, full) = match &terminal.disposition {
+                    TerminalDisposition::Successful {
+                        selected_membership,
+                        full_membership,
+                        ..
+                    } => (selected_membership, full_membership),
+                    _ => {
+                        unreachable!("a Successful terminal carries its rollback + memberships")
                     }
+                };
+                if selected != &intent.selected_membership() {
+                    return Err(Error::integrity(format!(
+                        "terminal {}: Successful records selected membership {selected:?} but the intent froze selected membership {:?} — the terminal must REPRODUCE the immutable intent's frozen selected membership",
+                        pair.1.deployment_id,
+                        intent.selected_membership()
+                    )));
+                }
+                if full != intent.full_membership() {
+                    return Err(Error::integrity(format!(
+                        "terminal {}: Successful records full membership {full:?} but the intent froze full membership {:?} — the terminal must REPRODUCE the immutable intent's frozen full membership (the complete target membership at plan time)",
+                        pair.1.deployment_id,
+                        intent.full_membership()
+                    )));
+                }
+                if intent.group.is_none() && selected != full {
+                    return Err(Error::integrity(format!(
+                        "terminal {}: Successful records selected membership {selected:?} and full membership {full:?} — a FULL push (no group) selects every target slot, so its selected membership must EXACTLY equal its full membership",
+                        pair.1.deployment_id
+                    )));
                 }
             }
             DeploymentStatus::FailedPreflight => {
@@ -751,11 +780,14 @@ mod tests_entry {
     }
 
     /// Rebuild the intent wire with a NEW membership, keeping the intent's
-    /// internal agreement (slot_ids == desired == pre_push, each assignment
-    /// names its own key, the wire actuals map empty).
+    /// internal agreement (slot_ids == desired == pre_push == the FROZEN
+    /// selected_membership, each assignment names its own key, the wire
+    /// actuals map empty). `full` is the intent's FROZEN FULL MEMBERSHIP
+    /// (⊇ the selected membership — the terminal must reproduce it).
     fn intent_with_membership(
         intent: &LedgerIntentWire,
         membership: &BTreeSet<SlotId>,
+        full: &BTreeSet<SlotId>,
     ) -> LedgerIntentWire {
         let keys: Vec<SlotId> = membership.iter().cloned().collect();
         let desired: BTreeMap<SlotId, GenerationRef> =
@@ -768,6 +800,8 @@ mod tests_entry {
             target: intent.target.clone(),
             group: intent.group.clone(),
             slot_ids: keys.clone(),
+            selected_membership: keys.clone(),
+            full_membership: full.iter().cloned().collect(),
             behavior_sha256: intent.behavior_sha256.clone(),
             attempted_at: intent.attempted_at.clone(),
             desired,
@@ -782,12 +816,16 @@ mod tests_entry {
     /// slots keys — with the rollback's BINDINGS COUPLED to its slots
     /// (slots == bindings is the separate structural rollback invariant,
     /// NOT one of the four independent sets — the user's requirement
-    /// couples them here). The intent is REBUILT over the UNION of the four
-    /// resulting sets (so the intent never adds a verdict of its own: every
-    /// outcome key is an intent member by construction, and the read's
-    /// Successful leg compares only the terminal's OWN memberships) with the
-    /// given MODE applied to its `group` (`Some("g1")` = group push,
-    /// `None` = full push).
+    /// couples them here). The intent is REBUILT over the terminal's
+    /// SELECTED + FULL memberships — its table keys ARE its frozen selected
+    /// (no divergence) and its frozen full is the terminal's full, so the
+    /// INTENT-BINDING legs hold BY CONSTRUCTION and the read's verdict is
+    /// exactly the terminal-local equations (outcomes == selected, rollback
+    /// == full, selected ⊆ full, full-push selected == full) + non-emptiness:
+    /// the intent never adds a verdict of its own (when the equations hold,
+    /// outcomes == selected == the intent's table keys, so every outcome
+    /// key is an intent member by construction). The given MODE is applied
+    /// to its `group` (`Some("g1")` = group push, `None` = full push).
     fn apply_four_set_tamper(
         pair: &(LedgerIntentWire, LedgerTerminalWire),
         ops: [KeyOp; 4],
@@ -819,18 +857,13 @@ mod tests_entry {
             .map(|k| (k.clone(), gen_ref_for(k)))
             .collect();
         rb.bindings = new_slots.iter().map(|k| (k.clone(), binding(k))).collect();
-        // The intent: rebuilt over the UNION of the four resulting sets so it
-        // never adds a verdict (every outcome key is an intent member), with
-        // the mode applied to its `group`.
-        let union: BTreeSet<SlotId> = terminal
-            .outcomes
-            .keys()
-            .cloned()
-            .chain(terminal.selected_membership.iter().cloned())
-            .chain(terminal.full_membership.iter().cloned())
-            .chain(rb.slots.keys().cloned())
-            .collect();
-        let mut intent = intent_with_membership(intent, &union);
+        // The intent: rebuilt over the terminal's SELECTED (its table keys
+        // ARE the frozen selected — no divergence) and FULL memberships, so
+        // the intent-binding legs hold by construction and the intent never
+        // adds a verdict of its own; the mode is applied to its `group`.
+        let selected_set: BTreeSet<SlotId> = terminal.selected_membership.iter().cloned().collect();
+        let full_set: BTreeSet<SlotId> = terminal.full_membership.iter().cloned().collect();
+        let mut intent = intent_with_membership(intent, &selected_set, &full_set);
         intent.group = if group { Some("g1".to_string()) } else { None };
         (intent, terminal)
     }
@@ -968,6 +1001,247 @@ mod tests_entry {
         }
     }
 
+    // ---- THE SIX-SET MEMBERSHIP PROPERTY (Successful, WITH the intent) ----
+    //
+    // THE USER'S SIX-SET REQUIREMENT: the intent FREEZES its OWN selected
+    // and full memberships (schema v4), and the terminal must REPRODUCE
+    // them. Six INDEPENDENT SETS are generated — intent-selected,
+    // intent-full, terminal-selected, terminal-full, outcomes, rollback
+    // slots (bindings generated EQUAL to the rollback slots — the separate
+    // structural rollback invariant, kept coupled) — plus a group/full MODE
+    // (applied to the intent's `group`). Acceptance (read_ledger of the
+    // written intent + terminal pair) IFF:
+    //
+    // * terminal-selected == intent-selected (the intent-binding leg)
+    // * terminal-full == intent-full (the intent-binding leg)
+    // * outcomes == selected (== terminal-selected == intent-selected)
+    // * rollback slots == bindings == full (== terminal-full == intent-full)
+    // * selected ⊆ full (the intent's OWN frozen consistency AND the
+    //   terminal's)
+    // * (FULL mode) selected == full
+    // * plus the Successful non-emptiness.
+    //
+    // The intent is rebuilt over its OWN frozen values — its table keys ARE
+    // its selected membership (the conversion re-checks the two AGREE, no
+    // divergence), and its full is its frozen full — so the intent never
+    // adds a verdict of its own: when the equations hold, outcomes ==
+    // selected == the intent's table keys, so the read's outcome-membership
+    // leg holds by construction; when they fail, the read rejects through
+    // exactly the equation legs.
+
+    /// Apply SIX INDEPENDENT key ops to a valid Successful pair and return
+    /// the tampered pair: (0) the outcomes keys, (1) the TERMINAL's
+    /// selected_membership, (2) the TERMINAL's full_membership, (3) the
+    /// rollback's slots keys (bindings coupled), (4) the INTENT's frozen
+    /// selected_membership, (5) the INTENT's frozen full_membership. The
+    /// intent is REBUILT over its OWN frozen values (its table keys ARE its
+    /// frozen selected — the conversion re-checks the two AGREE), with the
+    /// given MODE applied to its `group` (`Some("g1")` = group push,
+    /// `None` = full push).
+    fn apply_six_set_tamper(
+        pair: &(LedgerIntentWire, LedgerTerminalWire),
+        ops: [KeyOp; 6],
+        group: bool,
+    ) -> (LedgerIntentWire, LedgerTerminalWire) {
+        let (intent, terminal) = pair;
+        let mut terminal = terminal.clone();
+        // (0) OUTCOMES keys.
+        let outcome_keys: BTreeSet<SlotId> = terminal.outcomes.keys().cloned().collect();
+        let new_outcomes = apply_key_op(&outcome_keys, ops[0]);
+        terminal.outcomes = new_outcomes
+            .iter()
+            .map(|k| (k.clone(), outcome_for(k, SlotOutcomeKind::Activated)))
+            .collect();
+        // (1) TERMINAL selected, (2) TERMINAL full.
+        let selected: BTreeSet<SlotId> = terminal.selected_membership.iter().cloned().collect();
+        terminal.selected_membership = apply_key_op(&selected, ops[1]).into_iter().collect();
+        let full: BTreeSet<SlotId> = terminal.full_membership.iter().cloned().collect();
+        terminal.full_membership = apply_key_op(&full, ops[2]).into_iter().collect();
+        // (3) ROLLBACK slots keys (bindings coupled to the slots).
+        let rb = terminal
+            .rollback
+            .as_mut()
+            .expect("a Successful terminal carries its rollback");
+        let slot_keys: BTreeSet<SlotId> = rb.slots.keys().cloned().collect();
+        let new_slots = apply_key_op(&slot_keys, ops[3]);
+        rb.slots = new_slots
+            .iter()
+            .map(|k| (k.clone(), gen_ref_for(k)))
+            .collect();
+        rb.bindings = new_slots.iter().map(|k| (k.clone(), binding(k))).collect();
+        // (4) INTENT selected, (5) INTENT full — the intent's OWN frozen
+        // values, generated INDEPENDENTLY of the terminal's.
+        let intent_selected: BTreeSet<SlotId> =
+            intent.selected_membership.iter().cloned().collect();
+        let new_intent_selected = apply_key_op(&intent_selected, ops[4]);
+        let intent_full: BTreeSet<SlotId> = intent.full_membership.iter().cloned().collect();
+        let new_intent_full = apply_key_op(&intent_full, ops[5]);
+        // Rebuild the intent over its OWN frozen selected (its table keys
+        // ARE the selected — the conversion re-checks the two AGREE, no
+        // divergence) + frozen full; the mode is applied to its `group`.
+        let mut intent = intent_with_membership(intent, &new_intent_selected, &new_intent_full);
+        intent.group = if group { Some("g1".to_string()) } else { None };
+        (intent, terminal)
+    }
+
+    /// Evaluate THE SIX-SET EQUATIONS for a written pair — the acceptance
+    /// criterion the properties assert `read_ledger` is EXACTLY EQUIVALENT
+    /// to: terminal-selected == intent-selected (the intent-binding leg),
+    /// terminal-full == intent-full (the intent-binding leg), outcomes ==
+    /// selected, rollback slots == bindings == full (bindings coupled by
+    /// construction), selected ⊆ full (the intent's OWN frozen consistency
+    /// AND the terminal's), (FULL mode) selected == full, plus the
+    /// Successful non-emptiness (non-empty outcomes and both memberships on
+    /// BOTH records).
+    fn six_set_equations_hold(pair: &(LedgerIntentWire, LedgerTerminalWire)) -> bool {
+        let intent = &pair.0;
+        let terminal = &pair.1;
+        let outcomes: BTreeSet<SlotId> = terminal.outcomes.keys().cloned().collect();
+        let t_selected: BTreeSet<SlotId> = terminal.selected_membership.iter().cloned().collect();
+        let t_full: BTreeSet<SlotId> = terminal.full_membership.iter().cloned().collect();
+        let rollback_slots: BTreeSet<SlotId> = terminal
+            .rollback
+            .as_ref()
+            .map(|rb| rb.slots.keys().cloned().collect())
+            .unwrap_or_default();
+        let i_selected: BTreeSet<SlotId> = intent.selected_membership.iter().cloned().collect();
+        let i_full: BTreeSet<SlotId> = intent.full_membership.iter().cloned().collect();
+        let full_mode = intent.group.is_none();
+        t_selected == i_selected
+            && t_full == i_full
+            && outcomes == t_selected
+            && rollback_slots == t_full
+            && i_selected.is_subset(&i_full)
+            && t_selected.is_subset(&t_full)
+            && (!full_mode || t_selected == t_full)
+            && !outcomes.is_empty()
+            && !t_selected.is_empty()
+            && !t_full.is_empty()
+            && !rollback_slots.is_empty()
+            && !i_selected.is_empty()
+            && !i_full.is_empty()
+    }
+
+    /// A key-op strategy BIASED toward `Unchanged` (3:1:1:1) so the
+    /// six-set property REACHES accepted configurations (the ops on the
+    /// selected-triple / full-triple agreeing often enough) instead of
+    /// generating almost exclusively rejected pairs.
+    fn six_set_key_op() -> impl Strategy<Value = KeyOp> {
+        prop_oneof![
+            3 => Just(KeyOp::Unchanged),
+            1 => Just(KeyOp::Delete),
+            1 => Just(KeyOp::Add),
+            1 => Just(KeyOp::Replace)
+        ]
+    }
+
+    proptest! {
+        // THE USER'S SIX-SET PROPERTY: generate the SIX INDEPENDENT SETS —
+        // intent-selected, intent-full, terminal-selected, terminal-full,
+        // outcomes, rollback slots (bindings generated EQUAL to the
+        // rollback slots — the coupled structural invariant) — by
+        // INDEPENDENT Delete/Add/Replace/Unchanged ops from a valid base
+        // pair, plus a group/full MODE (applied to the intent's `group`).
+        // READING (the real `read_ledger` of the written pair) SUCCEEDS IFF
+        // THE SIX EQUATIONS HOLD: terminal-selected == intent-selected,
+        // terminal-full == intent-full, outcomes == selected, rollback ==
+        // full, selected ⊆ full (both records' own consistency), (full
+        // mode) selected == full, plus the Successful non-emptiness. The
+        // intent is rebuilt over its OWN frozen values (its table keys ARE
+        // its frozen selected) so it never adds a verdict of its own; the
+        // mode is applied to its `group`.
+        //
+        // RECOVERY-INDEPENDENCE LEG (the user's requirement): for a pair
+        // that SATISFIES the equations, simulate an ARBITRARY CHANGE of the
+        // live configuration membership (construct the read with a DIFFERENT
+        // config whose target slots differ from the intent's frozen full)
+        // and assert acceptance is UNCHANGED — the read/recovery never
+        // consults the live configuration for the membership equations (the
+        // frozen intent values are the only source). Bounded 64 cases, fixed
+        // seed 0x5EED_5EED (house style), no persistence.
+        #![proptest_config(ProptestConfig {
+            cases: 64,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn six_set_membership_equations_are_necessary_and_sufficient(
+            (intent, terminal) in agreeing_pair().prop_filter(
+                "the property needs a Successful pair",
+                |(_, t)| t.status == DeploymentStatus::Successful,
+            ),
+            ops in prop::array::uniform6(six_set_key_op()),
+            group in membership_mode(),
+        ) {
+            let (t_intent, t_terminal) = apply_six_set_tamper(&(intent, terminal), ops, group);
+            let pair = (t_intent, t_terminal);
+            let expect_ok = six_set_equations_hold(&pair);
+            let read = write_pair_ledger(&pair);
+            assert_eq!(
+                read.is_ok(),
+                expect_ok,
+                "read_ledger must succeed iff the six equations hold (intent-selected {:?}, intent-full {:?}, terminal-selected {:?}, terminal-full {:?}, outcomes {:?}, rollback slots {:?}, full mode: {}); read: {:?}",
+                pair.0.selected_membership,
+                pair.0.full_membership,
+                pair.1.selected_membership,
+                pair.1.full_membership,
+                pair.1.outcomes.keys().collect::<BTreeSet<_>>(),
+                pair.1.rollback.as_ref().map(|rb| rb.slots.keys().collect::<BTreeSet<_>>()),
+                pair.0.group.is_none(),
+                read
+            );
+            // RECOVERY-INDEPENDENCE: an ACCEPTED pair stays accepted under
+            // an arbitrary live-configuration membership change — the read
+            // is a PURE function of the persisted sets + mode; the frozen
+            // intent values are the only source, never the live config.
+            if expect_ok {
+                let frozen_full = pair.0.full_membership.clone();
+                write_pair_ledger_under_config(&pair, &frozen_full)
+                    .expect("an accepted pair reads under a config matching its frozen full membership");
+                // A config whose target slots DIFFER from the intent's
+                // frozen full: acceptance is UNCHANGED (slot-9 is outside
+                // every generated set — the ops only touch slots 0..5).
+                write_pair_ledger_under_config(&pair, &[slot(9)]).expect(
+                    "an accepted pair's acceptance is a PURE function of the persisted sets + mode — a DIFFERENT live configuration membership does not change it (the frozen intent values are the only source)",
+                );
+            }
+        }
+
+        #[test]
+        fn mutating_any_single_sixth_set_causes_rejection(
+            (intent, terminal) in agreeing_pair().prop_filter(
+                "the property needs a Successful pair",
+                |(_, t)| t.status == DeploymentStatus::Successful,
+            ),
+            set_idx in 0u32..6,
+            op in key_op().prop_filter("the tamper must change the set", |op| {
+                *op != KeyOp::Unchanged
+            }),
+            group in membership_mode(),
+        ) {
+            let mut ops = [KeyOp::Unchanged; 6];
+            ops[set_idx as usize] = op;
+            let (t_intent, t_terminal) = apply_six_set_tamper(&(intent, terminal), ops, group);
+            let pair = (t_intent, t_terminal);
+            // A VALID base pair satisfies every equation (all six sets equal
+            // the base membership), so tampering EXACTLY ONE of the six sets
+            // must break at least one equation — and the read (the durable
+            // write → re-read crash-recovery path) must reject: a terminal
+            // that no longer REPRODUCES the intent's frozen values (or an
+            // intent whose own frozen consistency broke) is never read.
+            assert!(
+                !six_set_equations_hold(&pair),
+                "mutating exactly one of the six sets must break an equation (set {set_idx}, op {op:?})"
+            );
+            assert!(
+                write_pair_ledger(&pair).is_err(),
+                "mutating exactly one of the six sets (set {set_idx}, op {op:?}) must be rejected by read_ledger — the durable write → re-read is the crash-recovery read"
+            );
+        }
+    }
+
     #[test]
     fn successful_membership_equations_suffice_when_a_tamper_keeps_them_satisfied() {
         let keys = vec![slot(1), slot(2)];
@@ -978,9 +1252,13 @@ mod tests_entry {
             .expect("the exact-equal Successful pair reads");
         // FULL mode: add the SAME key (slot-9) to ALL FOUR sets — the
         // equations stay satisfied (outcomes == selected == full ==
-        // rollback slots), so the read still succeeds.
+        // rollback slots), so the read still succeeds. The INTENT's frozen
+        // memberships grow with it (its table keys ARE the selected, and
+        // its frozen full must equal the terminal's).
         let mut intent = intent;
         intent.slot_ids.push(slot(9));
+        intent.selected_membership.push(slot(9));
+        intent.full_membership.push(slot(9));
         intent.desired.insert(slot(9), gen_ref_for(&slot(9)));
         intent.pre_push.insert(slot(9), None);
         let mut terminal = terminal;
@@ -1010,17 +1288,20 @@ mod tests_entry {
         terminal.outcomes =
             BTreeMap::from([(slot(1), outcome_for(&slot(1), SlotOutcomeKind::Activated))]);
         terminal.selected_membership = selected.clone();
-        let intent = agreeing_intent_with_group(&selected, Some("g1"));
+        let intent = agreeing_intent_with_group(&selected, &full, Some("g1"));
         write_pair_ledger(&(intent.clone(), terminal.clone()))
             .expect("the group-proper-subset pair reads");
         // GROW THE FULL SIDE ONLY (full + rollback): selected ⊊ full stays —
-        // the read succeeds.
+        // the read succeeds. The INTENT's frozen full grows with it (the
+        // terminal must reproduce the intent's frozen value).
         let mut terminal2 = terminal.clone();
         terminal2.full_membership.push(slot(3));
         let rb = terminal2.rollback.as_mut().unwrap();
         rb.slots.insert(slot(3), gen_ref_for(&slot(3)));
         rb.bindings.insert(slot(3), binding(&slot(3)));
-        write_pair_ledger(&(intent.clone(), terminal2))
+        let mut intent2 = intent.clone();
+        intent2.full_membership.push(slot(3));
+        write_pair_ledger(&(intent2, terminal2))
             .expect("growing only the full membership keeps selected ⊆ full — the read succeeds");
         // GROW THE SELECTED SIDE ONLY, WITHIN the full membership
         // (selected + outcomes grow to equal full): selected ⊆ full stays —
@@ -1031,9 +1312,83 @@ mod tests_entry {
         terminal3
             .outcomes
             .insert(slot(2), outcome_for(&slot(2), SlotOutcomeKind::Activated));
-        let intent3 = agreeing_intent_with_group(&[slot(1), slot(2)], Some("g1"));
+        let intent3 = agreeing_intent_with_group(&[slot(1), slot(2)], &full, Some("g1"));
         write_pair_ledger(&(intent3, terminal3)).expect(
             "growing the selected membership (and its outcomes) within the full membership keeps selected ⊆ full — the read succeeds",
+        );
+    }
+
+    /// The SIX-SET acceptance path, deterministic: a GROUP-mode pair with an
+    /// INDEPENDENTLY-FROZEN intent (selected = {slot-1} ⊊ frozen full =
+    /// {slot-1, slot-2} — the intent-binding legs tie the terminal to the
+    /// intent's OWN frozen values, which are NOT re-derived from the
+    /// terminal) reads, and its acceptance is a PURE function of the
+    /// persisted sets + mode: re-reading under a DIFFERENT simulated live
+    /// configuration membership yields the SAME verdict. A FULL-mode pair
+    /// (all six sets equal) reads under both configs too, and a tamper of
+    /// exactly one set stays rejected under both — the read/recovery never
+    /// consults the live configuration for the membership equations (the
+    /// frozen intent values are the only source).
+    #[test]
+    fn six_set_accepted_pairs_ignore_arbitrary_config_membership_changes() {
+        // GROUP mode with an INDEPENDENTLY frozen intent: intent-selected =
+        // {slot-1} ⊊ intent-full = {slot-1, slot-2}; the terminal REPRODUCES
+        // them (terminal-selected = {slot-1}, terminal-full = {slot-1,
+        // slot-2}); outcomes == selected; rollback == bindings == full.
+        let intent = agreeing_intent_with_group(&[slot(1)], &[slot(1), slot(2)], Some("g1"));
+        let mut terminal = agreeing_terminal(&[slot(1), slot(2)], 0);
+        terminal.outcomes =
+            BTreeMap::from([(slot(1), outcome_for(&slot(1), SlotOutcomeKind::Activated))]);
+        terminal.selected_membership = vec![slot(1)];
+        let pair = (intent.clone(), terminal.clone());
+        assert!(
+            six_set_equations_hold(&pair),
+            "the group six-set pair is valid"
+        );
+        write_pair_ledger(&pair).expect("the group six-set pair reads");
+        // Config-change independence: accepted under a config whose target
+        // membership EQUALS the intent's frozen full …
+        write_pair_ledger_under_config(&pair, &intent.full_membership.clone())
+            .expect("accepted under a config matching the intent's frozen full membership");
+        // … and accepted under a DIFFERENT membership (slot-9 is outside
+        // every set): acceptance is UNCHANGED — the read never consults the
+        // live configuration.
+        write_pair_ledger_under_config(&pair, &[slot(9)]).expect(
+            "the group pair's acceptance is a PURE function of the persisted sets + mode — a different live configuration membership does not change it",
+        );
+
+        // FULL mode: all six sets equal {slot-1, slot-2}; same independence.
+        let pair = (
+            agreeing_intent(&[slot(1), slot(2)]),
+            agreeing_terminal(&[slot(1), slot(2)], 0),
+        );
+        assert!(
+            six_set_equations_hold(&pair),
+            "the full six-set pair is valid"
+        );
+        write_pair_ledger(&pair).expect("the full six-set pair reads");
+        write_pair_ledger_under_config(&pair, &[slot(1), slot(2)])
+            .expect("accepted under a config matching the frozen full membership");
+        write_pair_ledger_under_config(&pair, &[slot(9)]).expect(
+            "the full pair's acceptance is a PURE function of the persisted sets + mode — a different live configuration membership does not change it",
+        );
+
+        // A tamper of EXACTLY ONE set (terminal-selected grown to {slot-1,
+        // slot-3}): outcomes == selected and the intent-binding leg break —
+        // rejected under BOTH simulated configs (the tampered record is
+        // refused even though a hypothetical config-reading consumer would
+        // see either membership).
+        let mut bad = pair.clone();
+        bad.1.selected_membership.push(slot(3));
+        assert!(
+            !six_set_equations_hold(&bad),
+            "the single-set mutation breaks the equations"
+        );
+        write_pair_ledger_under_config(&bad, &[slot(1), slot(2)]).expect_err(
+            "the tampered pair must stay rejected under a config matching its membership",
+        );
+        write_pair_ledger_under_config(&bad, &[slot(9)]).expect_err(
+            "the tampered pair must stay rejected under a DIFFERENT live configuration membership",
         );
     }
 
@@ -1108,7 +1463,7 @@ mod tests_entry {
         terminal.outcomes =
             BTreeMap::from([(slot(1), outcome_for(&slot(1), SlotOutcomeKind::Activated))]);
         terminal.selected_membership = selected.clone();
-        let intent = agreeing_intent_with_group(&selected, Some("g1"));
+        let intent = agreeing_intent_with_group(&selected, &full, Some("g1"));
         let pair = (intent, terminal);
         assert!(membership_equations_hold(&pair), "the group pair is valid");
         // Accepted under a config whose membership equals the FULL set …

@@ -59,21 +59,24 @@ use std::collections::{BTreeMap, BTreeSet};
 /// BEFORE this attempt; the SELECTED slots (the attempt's `slot_ids`) are
 /// replaced with their actual successful assignments and current physical
 /// bindings, unselected slots are carried forward unchanged, and slots
-/// removed from the current target configuration (`current_slot_ids`) are
-/// omitted.
+/// outside the attempt's FROZEN FULL MEMBERSHIP (`attempt.full_membership()`
+/// — the complete target membership at PLAN TIME) are omitted.
 ///
 /// THE PERSISTED MEMBERSHIPS: the terminal records BOTH memberships so the
 /// record PROVES the membership equations — `selected_membership` = the
 /// outcome keys (the slots this attempt actually deployed; ==
 /// `attempt.membership()` on the happy path — the outcomes are the ground
-/// truth the conversion verifies against) and `full_membership` =
-/// `current_slot_ids` (the COMPLETE target membership at terminal time).
-/// The writer also VERIFIES `build_rollback`'s result key set EQUALS
-/// `current_slot_ids` (fail closed): the read side rejects a mismatch
-/// (rollback slots == full_membership), so the writer must produce
-/// equality — by construction the overlay covers exactly the current slots
-/// (unselected slots carried forward from the base, removed slots omitted,
-/// and the partial-rollout guards in `crate::deploy::plan::validate_partial_rollout`
+/// truth the conversion verifies against) and `full_membership` = the
+/// INTENT'S FROZEN FULL MEMBERSHIP (never recomputed from the live
+/// configuration — recovery finalizes a pending intent whose configuration
+/// may have changed arbitrarily since the intent was written, and the
+/// terminal must REPRODUCE exactly what the intent froze). The writer also
+/// VERIFIES `build_rollback`'s result key set EQUALS the frozen full
+/// membership (fail closed): the read side rejects a mismatch (rollback
+/// slots == full_membership), so the writer must produce equality — by
+/// construction the overlay covers exactly the frozen full slots (unselected
+/// slots carried forward from the base, outside slots omitted, and the
+/// partial-rollout guards in `crate::deploy::plan::validate_partial_rollout`
 /// refuse any current slot without a base entry), and this check pins it.
 pub fn finalize_successful_attempt(
     store: &LocalStore,
@@ -82,7 +85,6 @@ pub fn finalize_successful_attempt(
     actuals: &BTreeMap<SlotId, SlotAttemptState>,
     reason: &str,
     bindings: &BTreeMap<SlotId, PhysicalBinding>,
-    current_slot_ids: &[SlotId],
 ) -> Result<()> {
     let entries = store.read_ledger(attempt.target.as_str())?;
     if let Some(e) = entries
@@ -95,19 +97,25 @@ pub fn finalize_successful_attempt(
     // The base for the complete snapshot: the latest successful snapshot
     // BEFORE this attempt (this attempt's terminal is not yet appended).
     let base = crate::deploy::plan::latest_successful_rollback(store, attempt.target.as_str())?;
-    let rollback = build_rollback(actuals, bindings, base.as_ref(), current_slot_ids)?;
+    // THE FROZEN FULL MEMBERSHIP (the complete snapshot's coverage): the
+    // intent's own frozen value — resolved at PLAN TIME, never recomputed
+    // from the live configuration (which may have changed since the intent
+    // was written, and the terminal must reproduce exactly what the intent
+    // froze).
+    let current_slot_ids: Vec<SlotId> = attempt.full_membership().iter().cloned().collect();
+    let rollback = build_rollback(actuals, bindings, base.as_ref(), &current_slot_ids)?;
     // THE WRITER'S EQUALITY (fail closed): the rollback's key set must
-    // EXACTLY equal the full membership (`current_slot_ids`) — the read
-    // path rejects a mismatch (rollback slots == full_membership), so the
-    // writer must produce equality. By construction the overlay covers
-    // exactly the current slots; this check pins the invariant at the
-    // WRITER so a drift surfaces as a clear error here rather than as a
-    // ledger that can never be read again.
+    // EXACTLY equal the frozen full membership (`attempt.full_membership()`)
+    // — the read path rejects a mismatch (rollback slots ==
+    // full_membership), so the writer must produce equality. By construction
+    // the overlay covers exactly the frozen full slots; this check pins the
+    // invariant at the WRITER so a drift surfaces as a clear error here
+    // rather than as a ledger that can never be read again.
     let rollback_keys: BTreeSet<SlotId> = rollback.slots.keys().cloned().collect();
     let current: BTreeSet<SlotId> = current_slot_ids.iter().cloned().collect();
     if rollback_keys != current {
         return Err(Error::integrity(format!(
-            "finalize {}: the rollback snapshot covers slots {rollback_keys:?} but the current target membership is {current:?} — the complete snapshot must cover exactly the current slots (unselected slots are carried forward from the base; slots removed from the configuration are omitted)",
+            "finalize {}: the rollback snapshot covers slots {rollback_keys:?} but the attempt's frozen full membership is {current:?} — the complete snapshot must cover exactly the frozen full slots (unselected slots are carried forward from the base; slots outside the plan-time membership are omitted)",
             attempt.deployment_id
         )));
     }
@@ -119,10 +127,12 @@ pub fn finalize_successful_attempt(
         // dropped into the key — the domain value carries no slot) AND the
         // TWO PERSISTED MEMBERSHIPS: `selected_membership` = the outcome
         // keys (the slots this attempt actually deployed) and
-        // `full_membership` = `current_slot_ids` (the complete target
-        // membership at terminal time) — the record PROVES the membership
-        // equations (outcomes == selected, rollback == full, selected ⊆
-        // full, full-push selected == full).
+        // `full_membership` = the intent's FROZEN FULL MEMBERSHIP (the
+        // complete target membership at plan time, never the live
+        // configuration) — the record PROVES the membership equations
+        // (outcomes == selected, rollback == full, selected ⊆ full,
+        // full-push selected == full) AND REPRODUCES the intent's frozen
+        // values (the read's intent-binding legs refuse a divergence).
         disposition: TerminalDisposition::Successful {
             rollback,
             outcomes: SlotTable::from_map(
@@ -283,6 +293,7 @@ mod tests {
             attempted_at: "2026-01-01T00:00:00Z".to_string(),
             slots: NonEmptySlotTable::build(slots)
                 .expect("a fixture intent always has at least one slot"),
+            full_membership: BTreeSet::from([SlotId::new("p1".to_string())]),
         }
     }
 
@@ -332,7 +343,6 @@ mod tests {
             &actuals,
             "push completed",
             &bindings,
-            &[SlotId::new("p1".to_string())],
         )
         .unwrap();
         let entries = store.read_ledger(target.as_str()).unwrap();
@@ -354,7 +364,6 @@ mod tests {
             &actuals,
             "push completed",
             &bindings,
-            &[SlotId::new("p1".to_string())],
         )
         .unwrap();
         let entries = store.read_ledger(target.as_str()).unwrap();

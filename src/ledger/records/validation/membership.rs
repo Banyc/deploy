@@ -13,7 +13,9 @@
 //! * **selected ⊆ full** — a group push's selected set is a subset of the
 //!   full target (an unselected slot is carried forward from the base).
 //!
-//! The FULL-push EQUALITY (selected == full) is the CROSS-RECORD leg,
+//! The FULL-push EQUALITY (selected == full) and THE INTENT-BINDING legs
+//! (the terminal's memberships must REPRODUCE the intent's frozen
+//! `selected_membership` / `full_membership`) are the CROSS-RECORD legs,
 //! enforced where the terminal merges into its ledger entry (the mode —
 //! group vs full — lives in the intent's `group`), not here.
 //!

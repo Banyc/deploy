@@ -93,10 +93,11 @@ pub enum TerminalDisposition {
         /// so the record PROVES which slots were selected.
         selected_membership: BTreeSet<SlotId>,
         /// The FULL membership: the COMPLETE target membership at terminal
-        /// time — the rollback's key set (the `current_slot_ids` the
-        /// engine computes). EQUAL to the rollback's slots by construction
-        /// — the conversion refuses a disagreement, so the record PROVES
-        /// the complete membership the rollback snapshot covers.
+        /// time — the rollback's key set (the intent's FROZEN full
+        /// membership the terminal REPRODUCES). EQUAL to the rollback's
+        /// slots by construction — the conversion refuses a disagreement,
+        /// so the record PROVES the complete membership the rollback
+        /// snapshot covers.
         full_membership: BTreeSet<SlotId>,
     },
     /// The attempt failed before any slot mutation: no payload (no
@@ -225,11 +226,11 @@ impl LedgerTerminal {
     }
 
     /// The terminal's FULL MEMBERSHIP — the COMPLETE target membership at
-    /// terminal time (the `current_slot_ids` the engine computed; the
-    /// rollback's key set). PERSISTED in the record and EQUAL to the
-    /// rollback's slots by construction (the wire → domain conversion
-    /// refuses a disagreement), so a consumer can display or prove the
-    /// complete membership the rollback snapshot covers WITHOUT
+    /// terminal time (the intent's FROZEN full membership the terminal
+    /// REPRODUCES; the rollback's key set). PERSISTED in the record and
+    /// EQUAL to the rollback's slots by construction (the wire → domain
+    /// conversion refuses a disagreement), so a consumer can display or
+    /// prove the complete membership the rollback snapshot covers WITHOUT
     /// re-deriving it from the current configuration. `None` for every
     /// non-Successful disposition.
     pub fn full_membership(&self) -> Option<&BTreeSet<SlotId>> {
@@ -279,11 +280,12 @@ pub struct LedgerTerminalWire {
     /// slots were selected.
     pub selected_membership: Vec<SlotId>,
     /// The FULL membership — the COMPLETE target membership at terminal
-    /// time (the `current_slot_ids` the engine computes). REQUIRED since
-    /// schema v3 (no serde default): the wire → domain conversion requires
-    /// it DUPLICATE-FREE and — for a `Successful` status — NON-EMPTY and
-    /// EXACTLY EQUAL to the rollback's slots, so the record PROVES the
-    /// complete membership the rollback snapshot covers.
+    /// time (the intent's FROZEN full membership the terminal REPRODUCES).
+    /// REQUIRED since schema v3 (no serde default): the wire → domain
+    /// conversion requires it DUPLICATE-FREE and — for a `Successful`
+    /// status — NON-EMPTY and EXACTLY EQUAL to the rollback's slots, so
+    /// the record PROVES the complete membership the rollback snapshot
+    /// covers.
     pub full_membership: Vec<SlotId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,

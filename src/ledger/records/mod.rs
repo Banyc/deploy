@@ -864,13 +864,19 @@ mod tests {
     // closed on EVERY tamper while accepting the untampered record.
 
     fn agreeing_intent(keys: &[SlotId]) -> LedgerIntentWire {
-        agreeing_intent_with_group(keys, None)
+        agreeing_intent_with_group(keys, keys, None)
     }
 
-    /// [`agreeing_intent`] with an explicit GROUP MODE: `Some(g)` selects a
-    /// group push (the intent's `slot_ids` are the group's slots), `None` a
-    /// full push (the intent's `slot_ids` are every target slot).
-    fn agreeing_intent_with_group(keys: &[SlotId], group: Option<&str>) -> LedgerIntentWire {
+    /// [`agreeing_intent`] with an explicit GROUP MODE and FROZEN FULL
+    /// MEMBERSHIP: `Some(g)` selects a group push (the intent's `slot_ids`
+    /// are the group's slots), `None` a full push (the intent's `slot_ids`
+    /// are every target slot); `full` is the COMPLETE target membership the
+    /// intent FREEZES (⊇ `keys`).
+    fn agreeing_intent_with_group(
+        keys: &[SlotId],
+        full: &[SlotId],
+        group: Option<&str>,
+    ) -> LedgerIntentWire {
         let desired: BTreeMap<SlotId, GenerationRef> =
             keys.iter().map(|k| (k.clone(), gen_ref_for(k))).collect();
         let pre_push: BTreeMap<SlotId, Option<SlotAttemptState>> =
@@ -881,6 +887,8 @@ mod tests {
             target: TargetName::new("t1".to_string()),
             group: group.map(str::to_string),
             slot_ids: keys.to_vec(),
+            selected_membership: keys.to_vec(),
+            full_membership: full.to_vec(),
             behavior_sha256: "sha256-w".to_string(),
             attempted_at: "2026-01-01T00:00:00Z".to_string(),
             desired,
@@ -1031,23 +1039,44 @@ mod tests {
         let membership: BTreeSet<&SlotId> = intent.slots.keys().collect();
         match terminal.status() {
             DeploymentStatus::Successful => {
-                if intent.group.is_none() {
-                    let (selected, full) = match &terminal.disposition {
-                        TerminalDisposition::Successful {
-                            selected_membership,
-                            full_membership,
-                            ..
-                        } => (selected_membership, full_membership),
-                        _ => {
-                            unreachable!("a Successful terminal carries its rollback + memberships")
-                        }
-                    };
-                    if selected != full {
-                        return Err(Error::integrity(format!(
-                            "terminal {}: Successful records selected membership {selected:?} and full membership {full:?} — a FULL push (no group) selects every target slot, so its selected membership must EXACTLY equal its full membership",
-                            pair.1.deployment_id
-                        )));
+                // THE INTENT-BINDING LEGS (the user's requirement): the
+                // terminal's memberships must REPRODUCE the intent's FROZEN
+                // values — the intent froze selected (its table keys) and
+                // full (the complete target membership at plan time), and a
+                // terminal whose memberships diverge is refused. The
+                // FULL-push equality: a FULL push (no group) selects every
+                // target slot, so selected == full; a GROUP push allows a
+                // proper subset (the ⊆ is already enforced by the
+                // conversion).
+                let (selected, full) = match &terminal.disposition {
+                    TerminalDisposition::Successful {
+                        selected_membership,
+                        full_membership,
+                        ..
+                    } => (selected_membership, full_membership),
+                    _ => {
+                        unreachable!("a Successful terminal carries its rollback + memberships")
                     }
+                };
+                if selected != &intent.selected_membership() {
+                    return Err(Error::integrity(format!(
+                        "terminal {}: Successful records selected membership {selected:?} but the intent froze selected membership {:?} — the terminal must REPRODUCE the immutable intent's frozen selected membership",
+                        pair.1.deployment_id,
+                        intent.selected_membership()
+                    )));
+                }
+                if full != intent.full_membership() {
+                    return Err(Error::integrity(format!(
+                        "terminal {}: Successful records full membership {full:?} but the intent froze full membership {:?} — the terminal must REPRODUCE the immutable intent's frozen full membership (the complete target membership at plan time)",
+                        pair.1.deployment_id,
+                        intent.full_membership()
+                    )));
+                }
+                if intent.group.is_none() && selected != full {
+                    return Err(Error::integrity(format!(
+                        "terminal {}: Successful records selected membership {selected:?} and full membership {full:?} — a FULL push (no group) selects every target slot, so its selected membership must EXACTLY equal its full membership",
+                        pair.1.deployment_id
+                    )));
                 }
             }
             DeploymentStatus::FailedPreflight => {
@@ -1404,7 +1433,7 @@ mod tests {
         group_terminal.outcomes =
             BTreeMap::from([(slot(1), outcome_for(&slot(1), SlotOutcomeKind::Activated))]);
         group_terminal.selected_membership = selected.clone();
-        let group_intent = agreeing_intent_with_group(&selected, Some("g1"));
+        let group_intent = agreeing_intent_with_group(&selected, &keys, Some("g1"));
         pair_to_domain(&(group_intent, group_terminal))
             .expect("a group push with selected ⊊ full converts (the group-proper-subset shape)");
 
@@ -2142,6 +2171,8 @@ mod tests {
             target: TargetName::new("t1".to_string()),
             group: None,
             slot_ids,
+            selected_membership: vec![slot(1), slot(2)],
+            full_membership: vec![slot(1), slot(2)],
             behavior_sha256: crate::identity::DIGEST_TEST_HEX_1.to_string(),
             attempted_at: "2026-01-01T00:00:00Z".to_string(),
             desired,

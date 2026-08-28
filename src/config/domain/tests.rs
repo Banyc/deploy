@@ -18,7 +18,7 @@ use crate::ledger::{
 use crate::store::local::LocalStore;
 use proptest::prelude::*;
 use proptest::test_runner::RngSeed;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -1300,6 +1300,7 @@ fn intended_intent(dep: &str) -> DeploymentIntent {
         attempted_at: "2026-01-01T00:00:00Z".to_string(),
         slots: NonEmptySlotTable::build(slots)
             .expect("a fixture intent always has at least one slot"),
+        full_membership: BTreeSet::from([SlotId::new("p1".to_string())]),
     }
 }
 

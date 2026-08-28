@@ -364,6 +364,8 @@ mod tests {
             target: TargetName::new("t1".to_string()),
             group: None,
             slot_ids: keys.to_vec(),
+            selected_membership: keys.to_vec(),
+            full_membership: keys.to_vec(),
             behavior_sha256: "sha256-w".to_string(),
             attempted_at: "2026-01-01T00:00:00Z".to_string(),
             desired,

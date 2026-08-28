@@ -36,9 +36,11 @@ use super::super::{LedgerRollback, PhysicalBinding, SlotAttemptState};
 /// latest successful snapshot (`base`) with the SELECTED slots (the attempt's
 /// actual per-slot results) replaced by their actual assignments and current
 /// bindings, unselected slots carried forward unchanged, and slots absent
-/// from `current_slot_ids` (removed from the current target configuration)
-/// omitted. A full-target attempt replaces every slot, so the base is
-/// irrelevant. There is NO snapshot-wide release/behavior: each slot's
+/// from `current_slot_ids` (the caller's coverage set — the FROZEN FULL
+/// membership of the finalizing attempt, the complete target membership at
+/// PLAN TIME, never the live configuration) omitted. A full-target attempt
+/// replaces every slot, so the base is irrelevant. There is NO snapshot-wide
+/// release/behavior: each slot's
 /// `GenerationRef` carries its OWN artifact (release/variant/tree), so a
 /// partial snapshot can span several releases (group pushes over time) and
 /// the referenced releases are the set derived from the per-slot bindings.
