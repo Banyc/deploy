@@ -472,8 +472,8 @@ mod tests {
     use super::*;
     use crate::config::SlotConfig;
     use crate::identity::{
-        ArtifactRef, GenerationRef, PlacementSlotAssignment, SlotId, TargetName, TreeDigest,
-        VariantName, test_deployment_id, test_generation_id, test_tree_digest,
+        ArtifactRef, GenerationRef, PlacementSlotAssignment, ServerId, SlotId, TargetName,
+        TreeDigest, VariantName, test_deployment_id, test_generation_id, test_tree_digest,
     };
     use crate::ledger::{
         DeploymentIntent, DesiredGeneration, IntentSlot, LedgerRollback, LedgerTerminal,
@@ -594,6 +594,13 @@ interval_seconds = 0
                     },
                 },
                 pre_push: None,
+                // The FROZEN plan-time physical binding (schema v6): the
+                // fixture's single slot is bound to server s1 at
+                // /srv/deploy/p1.
+                binding: crate::ledger::PhysicalBinding {
+                    server: ServerId::new("s1".to_string()),
+                    deploy_dir: "/srv/deploy/p1".to_string(),
+                },
             },
         )]);
         DeploymentIntent {
@@ -657,6 +664,13 @@ interval_seconds = 0
                     artifact,
                     generation: Some(test_generation_id("gen-pre")),
                 }),
+                // The FROZEN plan-time physical binding (schema v6): the
+                // fixture's single slot is bound to server s1 at
+                // /srv/deploy/p1.
+                binding: crate::ledger::PhysicalBinding {
+                    server: ServerId::new("s1".to_string()),
+                    deploy_dir: "/srv/deploy/p1".to_string(),
+                },
             },
         )]);
         DeploymentIntent {

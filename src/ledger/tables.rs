@@ -316,11 +316,11 @@ impl<T> Index<&SlotId> for NonEmptySlotTable<T> {
 mod tests {
     use super::*;
     use crate::identity::{
-        ArtifactRef, GenerationRef, PlacementSlotAssignment, TargetName, VariantName,
+        ArtifactRef, GenerationRef, PlacementSlotAssignment, ServerId, TargetName, VariantName,
         test_deployment_id, test_generation_id, test_release_id, test_tree_digest,
     };
     use crate::ledger::records::LedgerIntentWire;
-    use crate::ledger::records::SlotAttemptStateWire;
+    use crate::ledger::records::{PhysicalBinding, SlotAttemptStateWire};
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
 
@@ -328,6 +328,15 @@ mod tests {
 
     fn slot(i: u32) -> SlotId {
         SlotId::new(format!("slot-{i}"))
+    }
+
+    /// The agreeing intent's frozen per-slot physical binding (schema v6):
+    /// server `s1` at the canonical deploy dir for the slot.
+    fn binding(sid: &SlotId) -> PhysicalBinding {
+        PhysicalBinding {
+            server: ServerId::new("s1".to_string()),
+            deploy_dir: format!("/srv/deploy/{}", sid.as_str()),
+        }
     }
 
     fn slot_strategy() -> impl Strategy<Value = SlotId> {
@@ -358,6 +367,11 @@ mod tests {
             keys.iter().map(|k| (k.clone(), gen_ref_for(k))).collect();
         let pre_push: BTreeMap<SlotId, Option<SlotAttemptStateWire>> =
             keys.iter().map(|k| (k.clone(), None)).collect();
+        // The agreeing intent FREEZES each member's physical binding (schema
+        // v6): the binding keys follow the membership so the intent stays
+        // internally agreeing.
+        let bindings: BTreeMap<SlotId, PhysicalBinding> =
+            keys.iter().map(|k| (k.clone(), binding(k))).collect();
         LedgerIntentWire {
             deployment_schema_version: crate::ledger::LEDGER_SCHEMA_VERSION,
             deployment_id: test_deployment_id("deploy-w"),
@@ -370,6 +384,7 @@ mod tests {
             attempted_at: "2026-01-01T00:00:00Z".to_string(),
             desired,
             pre_push,
+            bindings,
             slots: BTreeMap::new(),
         }
     }

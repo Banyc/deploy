@@ -79,10 +79,19 @@ pub(crate) fn run_commit(
         // (`{server, deploy_dir}`) so an exact rollback can verify a slot
         // still lives at the exact on-host location it was deployed onto (a
         // rebound slot OR a slot whose deploy_dir moved must refuse rather
-        // than deploy to the wrong host/location). The binding comes from
-        // the CURRENT configuration: it is the live placement this attempt
-        // actually used.
-        let slot_bindings = config.target_slot_bindings(target_name)?;
+        // than deploy to the wrong host/location). The bindings come from
+        // the INTENT'S FROZEN per-slot values (schema v6) — the plan-time
+        // `{server, deploy_dir}` the attempt was planned against, NEVER a
+        // re-read of the current configuration: the frozen bindings are the
+        // HISTORICAL fact an exact rollback must verify against, and the
+        // finalize and recovery paths must stamp the SAME values into the
+        // rollback (recovery degrades an attempt whose live binding drifted
+        // instead of recording the live value as history).
+        let slot_bindings: BTreeMap<SlotId, crate::ledger::PhysicalBinding> = attempt_intent
+            .slots
+            .iter()
+            .map(|(sid, slot)| (sid.clone(), slot.binding.clone()))
+            .collect();
         // The terminal's FULL MEMBERSHIP is the INTENT'S FROZEN value — the
         // finalizer reads `attempt.full_membership()` (the complete target
         // membership resolved AT PLAN TIME, when the immutable intent was
@@ -221,13 +230,15 @@ pub(crate) mod commit_tests {
     //! [`crate::deploy::testsupport`].
 
     use crate::deploy::testsupport::*;
-    use crate::identity::test_deployment_id;
+    use crate::identity::{OperationId, ServerId, test_deployment_id};
     use crate::ledger::SlotOutcomeKind;
+    use crate::ledger::recovery::reconcile_pending_commits;
     use crate::remote::helper::{GenerationAssignment, RemoteHelper};
-    use crate::remote::transport::LocalTransport;
+    use crate::remote::transport::{LocalTransport, Remote};
     use crate::testutil::test_remotes::FailOnceMarkerRemote;
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
@@ -763,6 +774,15 @@ pub(crate) mod commit_tests {
                         artifact: desired_ref.assignment.artifact.clone(),
                     },
                     pre_push: None,
+                    // The plan-time binding the harness config froze (server
+                    // s1, deploy_dir /srv/eng): the crafted intent must
+                    // agree with the LIVE binding so the degrade is the
+                    // generation divergence this test arms, not binding
+                    // drift.
+                    binding: crate::ledger::PhysicalBinding {
+                        server: ServerId::new("s1".to_string()),
+                        deploy_dir: "/srv/eng".to_string(),
+                    },
                 },
             )]))
             .expect("one member slot"),
@@ -833,6 +853,14 @@ pub(crate) mod commit_tests {
                         artifact: desired_ref.assignment.artifact.clone(),
                     },
                     pre_push: None,
+                    // The plan-time binding the harness config froze
+                    // ({s1, /srv/eng}): equal to the LIVE binding, so this
+                    // crafted intent reconciles on the generation match (as
+                    // it did before the frozen-binding check).
+                    binding: crate::ledger::PhysicalBinding {
+                        server: ServerId::new("s1".to_string()),
+                        deploy_dir: "/srv/eng".to_string(),
+                    },
                 },
             )]))
             .expect("one member slot"),
@@ -907,6 +935,14 @@ pub(crate) mod commit_tests {
                         artifact: desired_ref.assignment.artifact.clone(),
                     },
                     pre_push: None,
+                    // The plan-time binding the harness config froze
+                    // ({s1, /srv/eng}): equal to the LIVE binding, so both
+                    // crafted pending attempts reconcile on the generation
+                    // match.
+                    binding: crate::ledger::PhysicalBinding {
+                        server: ServerId::new("s1".to_string()),
+                        deploy_dir: "/srv/eng".to_string(),
+                    },
                 },
             )]))
             .expect("one member slot"),
@@ -1505,5 +1541,238 @@ pub(crate) mod commit_tests {
             full_membership,
             "the full push's rollback bindings equal the membership"
         );
+    }
+
+    // ---- Pending-recovery vs the FROZEN bindings (schema v6) -------------
+    //
+    // The intent FREEZES each selected slot's plan-time `{server,
+    // deploy_dir}` ([`crate::ledger::IntentSlot::binding`]); recovery
+    // compares each selected slot's LIVE binding against that frozen value
+    // and finalizes from the FROZEN bindings on equality or marks the
+    // attempt Degraded on drift — a server rebound or a moved `deploy_dir`
+    // between the intent's write and recovery can never be recorded as the
+    // historical location the attempt was planned against.
+
+    /// The generated LIVE-CONFIGURATION mutation (applied by rewriting the
+    /// harness's variant + deploy.toml and reloading): how the recovery-time
+    /// configuration may differ from the plan-time configuration the intent
+    /// froze. `None` keeps live == frozen (the positive control).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ConfigMutation {
+        /// No mutation: the live bindings equal the frozen intent.
+        None,
+        /// Rebind the attempt's slot to a different server (server drift).
+        RebindServer,
+        /// Move the attempt's slot's `deploy_dir` (deploy_dir drift).
+        MoveDeployDir,
+        /// ADD a slot to the target (membership growth — the selected slot
+        /// stays bound as frozen, so no drift).
+        AddSlot,
+        /// REMOVE the attempt's slot from the target (membership loss — the
+        /// membership check degrades it).
+        RemoveSlot,
+    }
+
+    /// Apply the generated mutation to the harness's configuration files
+    /// (the variant file declares the target's slots; `deploy.toml` declares
+    /// the servers), reloading and returning the MUTATED (live) config the
+    /// recovery runs against.
+    fn mutated_config(h: &RecoveryHarness, mutation: ConfigMutation) -> ProjectConfig {
+        let project = h.cfg_path.parent().unwrap();
+        let variant_path = project.join("releases").join("v1").join("standard.toml");
+        let (variant, toml) = match mutation {
+            ConfigMutation::None => (NONE_VARIANT.to_string(), NONE_TOML.to_string()),
+            ConfigMutation::RebindServer => (
+                NONE_VARIANT.replace("server = \"s1\"", "server = \"s2\""),
+                NONE_TOML.replace(
+                    "[targets.t1]",
+                    "[[servers]]\nid = \"s2\"\naddress = \"b\"\nuser = \"u\"\nhost_key_fingerprint = \"SHA256:test\"\n\n[targets.t1]",
+                ),
+            ),
+            ConfigMutation::MoveDeployDir => (
+                NONE_VARIANT.replace(
+                    "deploy_dir = \"/srv/eng\"",
+                    "deploy_dir = \"/srv/eng-moved\"",
+                ),
+                NONE_TOML.to_string(),
+            ),
+            ConfigMutation::AddSlot => (
+                format!(
+                    "{NONE_VARIANT}\n[[slots]]\nid = \"p2\"\nserver = \"s2\"\ntarget = \"t1\"\ndeploy_dir = \"/srv/eng-b\"\n"
+                ),
+                NONE_TOML.replace(
+                    "[targets.t1]",
+                    "[[servers]]\nid = \"s2\"\naddress = \"b\"\nuser = \"u\"\nhost_key_fingerprint = \"SHA256:test\"\n\n[targets.t1]",
+                ),
+            ),
+            ConfigMutation::RemoveSlot => (
+                NONE_VARIANT
+                    .replace(
+                        "[[slots]]\nid = \"p1\"\nserver = \"s1\"\ntarget = \"t1\"\ndeploy_dir = \"/srv/eng\"\n",
+                        "[[slots]]\nid = \"p2\"\nserver = \"s1\"\ntarget = \"t1\"\ndeploy_dir = \"/srv/eng-b\"\n",
+                    )
+                    .to_string(),
+                NONE_TOML.to_string(),
+            ),
+        };
+        std::fs::write(&variant_path, &variant).unwrap();
+        std::fs::write(&h.cfg_path, toml).unwrap();
+        ProjectConfig::load(&h.cfg_path).unwrap()
+    }
+
+    proptest! {
+        // THE PENDING-RECOVERY FROZEN-BINDING PROPERTY: persist a pending
+        // intent, arbitrarily MUTATE the live configuration (server rebind /
+        // deploy_dir move / membership add / membership remove — plus the
+        // unchanged positive control), OPTIONALLY copy the generation state
+        // (the remote may or may not hold the frozen desired generation),
+        // then recover against the mutated config. A SUCCESSFUL terminal is
+        // permitted IFF every selected slot's LIVE binding equals the FROZEN
+        // intent binding AND the membership still covers the selected slots
+        // AND every selected slot's live generation equals the frozen
+        // desired generation; otherwise NO SUCCESSFUL TERMINAL MAY APPEAR
+        // (the attempt must end Degraded or stay pending — the property
+        // asserts the actual disposition). On success, the rollback's
+        // bindings/generations EXACTLY equal the frozen intent's values
+        // (finalize-from-frozen — never the live config re-read).
+        //
+        // Bounded `proptest_cases(16)` (full 16 with `DEPLOY_FULL_TESTS=1`,
+        // fast default), fixed seed 0x5EED_5EED (house style), no failure
+        // persistence — the identical vectors on every run.
+        #![proptest_config(ProptestConfig {
+            cases: crate::testutil::proptest_cases(16),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn pending_recovery_finalizes_from_the_frozen_binding_or_degrades_on_drift(
+            mutation in prop_oneof![
+                Just(ConfigMutation::None),
+                Just(ConfigMutation::RebindServer),
+                Just(ConfigMutation::MoveDeployDir),
+                Just(ConfigMutation::AddSlot),
+                Just(ConfigMutation::RemoveSlot),
+            ],
+            generation_copied in prop::bool::ANY,
+        ) {
+            // Persist a PENDING (intent-only) attempt: the remote advanced
+            // to the desired generation, the commit-marker write failed, so
+            // the intent is durable and the terminal never appended — the
+            // recoverable state the next push reconciles. The ENGINE froze
+            // the plan-time binding ({s1, /srv/eng}) into the intent.
+            let h = RecoveryHarness::new();
+            let pending = push_pending_attempt(&h);
+            let attempts = h.store.read_attempts("t1").unwrap();
+            assert_eq!(attempts.len(), 1, "the pending intent is the only attempt");
+            let intent = &attempts[0].intent;
+
+            // The MUTATED live config at recovery time.
+            let live = mutated_config(&h, mutation);
+            let live_bindings = live.target_slot_bindings("t1").unwrap();
+
+            // Per-slot helpers over the mutated config's servers. The remote
+            // base is the harness's (the s1 remote carries the pending
+            // attempt's desired generation — the "generation state copied"
+            // arm) or a FRESH dir (the "generation state absent" arm — a
+            // remote that never saw the deployment).
+            let members = live.target_slots("t1").unwrap();
+            let fresh_base = h._dir.path().join("fresh-remotes");
+            let mut remotes: Vec<Box<dyn Remote>> = Vec::new();
+            for (_slot, server) in &members {
+                let base = if generation_copied {
+                    h.remotes_base.join(server.id.as_str())
+                } else {
+                    fresh_base.join(server.id.as_str())
+                };
+                remotes.push(Box::new(
+                    LocalTransport::new(&crate::testutil::fixture_env(), base).unwrap(),
+                ));
+            }
+            let mut helpers: HashMap<SlotId, RemoteHelper> = HashMap::new();
+            for (i, (slot, _)) in members.iter().enumerate() {
+                let sid = SlotId::parse(slot.id.as_str()).unwrap();
+                helpers.insert(sid, RemoteHelper::new(remotes[i].as_ref()));
+            }
+
+            // THE SUCCESS-PERMITTED PREDICATE: the live state EXACTLY
+            // matches the frozen intent (selected bindings equal, selected
+            // membership covered, live generations equal the desired ones).
+            let membership_ok = intent
+                .slots
+                .keys()
+                .all(|sid| live_bindings.contains_key(sid));
+            let bindings_equal = intent.slots.iter().all(|(sid, slot)| {
+                live_bindings.get(sid) == Some(&slot.binding)
+            });
+            let gens_match = intent.slots.iter().all(|(sid, slot)| {
+                helpers
+                    .get(sid)
+                    .and_then(|helper| helper.status().ok())
+                    .is_some_and(|st| {
+                        st.current_generation.as_ref() == Some(&slot.desired.generation)
+                    })
+            });
+            let success_permitted = membership_ok && bindings_equal && gens_match;
+
+            // RECOVER against the mutated config.
+            let op_id = OperationId::new("op-frozen-binding-prop".to_string());
+            reconcile_pending_commits(&h.store, &live, "t1", &op_id, &helpers).unwrap();
+
+            let status = h
+                .store
+                .latest_status(pending.deployment_id.as_str())
+                .unwrap()
+                .expect("the recovered attempt has a status");
+            match status {
+                DeploymentStatus::Successful => {
+                    // SUCCESS IS PERMITTED ONLY when bindings + membership +
+                    // generations all match the frozen intent.
+                    assert!(
+                        success_permitted,
+                        "success is permitted iff the live bindings equal the frozen intent (mutation {mutation:?}, generation_copied {generation_copied}): success appeared for a drifted/diverged attempt"
+                    );
+                    // FINALIZE-FROM-FROZEN: the rollback's bindings and
+                    // generations EXACTLY equal the frozen intent's values
+                    // (never the live config re-read at recovery time).
+                    let snapshots = h.store.read_snapshots("t1").unwrap();
+                    assert_eq!(snapshots.len(), 1, "exactly one successful snapshot");
+                    assert_eq!(snapshots[0].deployment_id, intent.deployment_id);
+                    let rb = rollback_of(&snapshots[0]);
+                    for (sid, slot) in intent.slots.iter() {
+                        assert_eq!(
+                            rb.bindings.get(sid),
+                            Some(&slot.binding),
+                            "the rollback binding for {sid} must come from the FROZEN intent, not the live config"
+                        );
+                        assert_eq!(
+                            rb.slots.get(sid).map(|g| &g.generation),
+                            Some(&slot.desired.generation),
+                            "the rollback generation for {sid} must equal the frozen desired generation"
+                        );
+                    }
+                }
+                other => {
+                    // NO SUCCESSFUL TERMINAL MAY APPEAR for a drifted /
+                    // diverged / membership-lost attempt — it must end
+                    // Degraded (or stay pending on a transient failure, which
+                    // this fixture never produces).
+                    assert!(
+                        !success_permitted,
+                        "an attempt whose live state matches the frozen intent must succeed, got {other:?} (mutation {mutation:?}, generation_copied {generation_copied})"
+                    );
+                    assert_eq!(
+                        other,
+                        DeploymentStatus::Degraded,
+                        "a drifted/diverged pending attempt must end Degraded — no Successful terminal may appear (mutation {mutation:?}, generation_copied {generation_copied})"
+                    );
+                    assert!(
+                        h.store.read_snapshots("t1").unwrap().is_empty(),
+                        "a degraded attempt records no snapshot"
+                    );
+                }
+            }
+        }
     }
 }

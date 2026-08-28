@@ -334,6 +334,15 @@ pub(crate) fn seed_snapshot(
                         artifact: g.assignment.artifact.clone(),
                     },
                     pre_push: None,
+                    // The intent FREEZES each slot's plan-time physical
+                    // binding (schema v6) — seed it from the same bindings
+                    // the terminal's rollback records (the seeded
+                    // Successful terminal requires bindings to cover the
+                    // slotted generations exactly).
+                    binding: bindings
+                        .get(k)
+                        .cloned()
+                        .expect("a seeded snapshot binds every slotted slot"),
                 },
             )
         })

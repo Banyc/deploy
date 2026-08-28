@@ -106,6 +106,8 @@ mod tests_entry {
             keys.iter().map(|k| (k.clone(), gen_ref_for(k))).collect();
         let pre_push: BTreeMap<SlotId, Option<SlotAttemptStateWire>> =
             keys.iter().map(|k| (k.clone(), None)).collect();
+        let bindings: BTreeMap<SlotId, PhysicalBinding> =
+            keys.iter().map(|k| (k.clone(), binding(k))).collect();
         LedgerIntentWire {
             deployment_schema_version: crate::ledger::LEDGER_SCHEMA_VERSION,
             deployment_id: test_deployment_id("deploy-w"),
@@ -118,6 +120,7 @@ mod tests_entry {
             attempted_at: "2026-01-01T00:00:00Z".to_string(),
             desired,
             pre_push,
+            bindings,
             slots: BTreeMap::new(),
         }
     }
@@ -797,6 +800,11 @@ mod tests_entry {
             keys.iter().map(|k| (k.clone(), gen_ref_for(k))).collect();
         let pre_push: BTreeMap<SlotId, Option<SlotAttemptStateWire>> =
             keys.iter().map(|k| (k.clone(), None)).collect();
+        // The rebuilt intent FREEZES each member's physical binding (schema
+        // v6): the binding keys follow the membership so the intent stays
+        // internally agreeing (the tamper focus is the TERMINAL).
+        let bindings: BTreeMap<SlotId, PhysicalBinding> =
+            keys.iter().map(|k| (k.clone(), binding(k))).collect();
         LedgerIntentWire {
             deployment_schema_version: intent.deployment_schema_version,
             deployment_id: intent.deployment_id.clone(),
@@ -809,6 +817,7 @@ mod tests_entry {
             attempted_at: intent.attempted_at.clone(),
             desired,
             pre_push,
+            bindings,
             slots: BTreeMap::new(),
         }
     }
@@ -1264,6 +1273,10 @@ mod tests_entry {
         intent.full_membership.push(slot(9));
         intent.desired.insert(slot(9), gen_ref_for(&slot(9)));
         intent.pre_push.insert(slot(9), None);
+        // The FROZEN PHYSICAL BINDINGS follow the membership (schema v6):
+        // the intent's new member also freezes its plan-time binding, so
+        // the binding keys keep agreeing with the slot table keys.
+        intent.bindings.insert(slot(9), binding(&slot(9)));
         let mut terminal = terminal;
         terminal
             .outcomes

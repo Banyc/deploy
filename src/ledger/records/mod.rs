@@ -882,6 +882,11 @@ mod tests {
             keys.iter().map(|k| (k.clone(), gen_ref_for(k))).collect();
         let pre_push: BTreeMap<SlotId, Option<SlotAttemptStateWire>> =
             keys.iter().map(|k| (k.clone(), None)).collect();
+        // The agreeing intent FREEZES each member's physical binding (schema
+        // v6): the binding keys follow the membership so the intent stays
+        // internally agreeing (the property mutates ONE field at a time).
+        let bindings: BTreeMap<SlotId, PhysicalBinding> =
+            keys.iter().map(|k| (k.clone(), binding(k))).collect();
         LedgerIntentWire {
             deployment_schema_version: crate::ledger::LEDGER_SCHEMA_VERSION,
             deployment_id: test_deployment_id("deploy-w"),
@@ -894,6 +899,7 @@ mod tests {
             attempted_at: "2026-01-01T00:00:00Z".to_string(),
             desired,
             pre_push,
+            bindings,
             slots: BTreeMap::new(),
         }
     }
@@ -2168,6 +2174,8 @@ mod tests {
             .collect();
         let pre_push: BTreeMap<SlotId, Option<SlotAttemptStateWire>> =
             slot_ids.iter().map(|k| (k.clone(), None)).collect();
+        let bindings: BTreeMap<SlotId, PhysicalBinding> =
+            slot_ids.iter().map(|k| (k.clone(), binding(k))).collect();
         LedgerIntentWire {
             deployment_schema_version: crate::ledger::LEDGER_SCHEMA_VERSION,
             deployment_id: test_deployment_id("deploy-scalar"),
@@ -2180,6 +2188,7 @@ mod tests {
             attempted_at: "2026-01-01T00:00:00Z".to_string(),
             desired,
             pre_push,
+            bindings,
             slots: BTreeMap::new(),
         }
     }

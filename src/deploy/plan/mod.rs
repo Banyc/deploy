@@ -747,6 +747,18 @@ interval_seconds = 0
                             artifact: g.assignment.artifact.clone(),
                         },
                         pre_push: None,
+                        // The intent FREEZES each slot's plan-time physical
+                        // binding (schema v6) — seed it from the same
+                        // bindings the terminal's rollback records when the
+                        // caller binds the slot; a deliberately UNBOUND seed
+                        // (a legacy-snapshot test whose terminal's rollback
+                        // omits the bindings the conversion must refuse) is
+                        // given the canonical fixture binding so the INTENT
+                        // itself stays a valid schema-v6 record.
+                        binding: bindings.get(k).cloned().unwrap_or(PhysicalBinding {
+                            server: ServerId::new("s1".to_string()),
+                            deploy_dir: "/srv/eng".to_string(),
+                        }),
                     },
                 )
             })

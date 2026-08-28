@@ -612,6 +612,13 @@ mod tests {
                     },
                 },
                 pre_push: None,
+                // The FROZEN plan-time physical binding (schema v6): the
+                // fixture's single slot is bound to server s1 at
+                // /srv/deploy/p1.
+                binding: crate::ledger::PhysicalBinding {
+                    server: ServerId::new("s1".to_string()),
+                    deploy_dir: "/srv/deploy/p1".to_string(),
+                },
             },
         )]);
         DeploymentIntent {
@@ -862,7 +869,11 @@ mod tests {
                 },
             },
         );
-        wire.pre_push.insert(extra, None);
+        wire.pre_push.insert(extra.clone(), None);
+        // The FROZEN PHYSICAL BINDINGS follow the membership (schema v6):
+        // the extra member also freezes its plan-time binding, so the
+        // binding keys keep agreeing with the slot table keys.
+        wire.bindings.insert(extra.clone(), binding_for(&extra));
         let line = serde_json::to_string(&LedgerLine::Intent(wire)).unwrap();
         std::fs::write(&p, format!("{line}\n")).unwrap();
         let entries = store.read_ledger(target).unwrap();
@@ -2146,6 +2157,9 @@ mod tests {
                             }),
                             generation: Some(test_generation_id("0")),
                         }),
+                        // The FROZEN plan-time physical binding (schema v6)
+                        // — the fixture's canonical binding for the slot.
+                        binding: binding_for(k),
                     },
                 )
             })

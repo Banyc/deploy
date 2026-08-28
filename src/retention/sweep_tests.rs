@@ -220,6 +220,12 @@ fn intent(id: &str, target: &str) -> DeploymentIntent {
                 },
             },
             pre_push: None,
+            // The FROZEN plan-time physical binding (schema v6): the
+            // fixture's single slot is bound to server s1 at /srv/deploy/p1.
+            binding: crate::ledger::PhysicalBinding {
+                server: ServerId::new("s1".to_string()),
+                deploy_dir: "/srv/deploy/p1".to_string(),
+            },
         },
     )]);
     DeploymentIntent {

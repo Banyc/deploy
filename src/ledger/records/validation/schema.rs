@@ -14,12 +14,13 @@
 /// version themselves separately from the configuration format, so bumping
 /// one never invalidates the other.
 ///
-/// The current format is version 5: deployment records use the canonical
+/// The current format is version 6: deployment records use the canonical
 /// placement-slot-keyed shape (`BTreeMap<SlotId, _>` maps, nested
 /// artifact/generation refs), carry the exclusive owning target + the
 /// optional rollout group of the attempt, the PERSISTED MEMBERSHIPS
 /// (since version 3 the terminal half, since version 4 the intent half),
-/// and — since version 5 — the STRICT WIRE OBSERVATIONS: the pre-push
+/// the FROZEN PHYSICAL BINDINGS (since version 6 the intent half), and —
+/// since version 5 — the STRICT WIRE OBSERVATIONS: the pre-push
 /// assignments' artifact and the per-slot outcomes' post-mutation
 /// observation serialize as the ADJACENTLY-TAGGED
 /// [`crate::ledger::records::ObservationWire`]
@@ -55,8 +56,18 @@
 ///   into a half-known state (the in-memory
 ///   [`crate::ledger::Observation<T>`] domain type
 ///   is unchanged and stays permissive).
+/// * version 6: the INTENT record FREEZES each selected slot's PHYSICAL
+///   BINDING — a required `bindings: BTreeMap<SlotId, PhysicalBinding>`
+///   projection whose key set must EQUAL the selected membership EXACTLY.
+///   The plan-time `{server, deploy_dir}` is now a durable historical
+///   fact: recovery compares each slot's LIVE binding against the frozen
+///   value and finalizes from the FROZEN binding on equality or marks the
+///   attempt Degraded on drift (a server rebound or a moved `deploy_dir`
+///   can never be recorded as the historical location the attempt was
+///   planned against).
 ///
-/// Version 4 records (the raw-artifact `pre_push`, the outcome rows with
+/// Version 5 and earlier records (the intent WITHOUT the frozen bindings),
+/// version 4 records (the raw-artifact `pre_push`, the outcome rows with
 /// flat `generation` / `observation_error` fields), version 3 records (the
 /// intent shape WITHOUT the frozen memberships), version 2 records (the
 /// terminal shape without persisted memberships) — and version 1 records,
@@ -67,7 +78,7 @@
 /// serde default). A hypothetical pre-rekeying shape that keyed these maps
 /// by server ID with flat artifact fields is NOT the current schema and
 /// never loads.
-pub(crate) const LEDGER_SCHEMA_VERSION: u32 = 5;
+pub(crate) const LEDGER_SCHEMA_VERSION: u32 = 6;
 
 /// The `pins.json` record format version (`Pins.schema_version`). Pins are
 /// durable, store-global retention anchors for artifact CONTENT ONLY (see

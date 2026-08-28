@@ -11,6 +11,7 @@ use crate::identity::{
     ArtifactRef, BehaviorDigest, DeploymentId, GenerationId, GenerationRef,
     PlacementSlotAssignment, ReleaseId, RolloutGroupName, SlotId, TargetName, Timestamp,
 };
+use crate::ledger::records::PhysicalBinding;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -64,6 +65,22 @@ pub struct LedgerIntentWire {
     /// live configuration, which may have changed arbitrarily since the
     /// intent was written.
     pub full_membership: Vec<SlotId>,
+    /// THE FROZEN PHYSICAL BINDINGS: each SELECTED slot's COMPLETE physical
+    /// binding (`{server, deploy_dir}` — [`PhysicalBinding`]) resolved AT
+    /// PLAN TIME, when the immutable intent was written. REQUIRED since
+    /// schema v6 (no serde default — an old-shape intent line fails
+    /// deserialization fail closed, alongside the version gate): the
+    /// conversion requires the key set to EQUAL the selected membership
+    /// EXACTLY (every member slot has exactly one frozen binding). This is
+    /// the HISTORICAL fact recovery must finalize from: the live
+    /// configuration may have changed arbitrarily since the intent was
+    /// written (a server rebound, a `deploy_dir` moved), and recording the
+    /// LIVE bindings as if they were the plan-time bindings would be a
+    /// false record — exact rollback would later verify against the wrong
+    /// host/location. Recovery compares each selected slot's live binding
+    /// against this frozen value and finalizes from the FROZEN binding on
+    /// equality or marks the attempt Degraded on drift.
+    pub bindings: BTreeMap<SlotId, PhysicalBinding>,
     pub behavior_sha256: String,
     pub attempted_at: String,
     /// Desired per-slot assignments (what the plan intended): each slot's
@@ -221,6 +238,21 @@ impl LedgerIntentWire {
                 self.deployment_id, membership, pre_push_keys
             )));
         }
+        // THE FROZEN PHYSICAL BINDINGS (schema v6) are a THIRD exact-key
+        // projection: the `bindings` key set must EQUAL the selected
+        // membership EXACTLY — every member slot was planned against exactly
+        // one physical location (server + deploy_dir), and a binding for a
+        // non-member (or a member without a binding) is a hand-constructed
+        // record refused fail-closed. The binding is a NEW FROZEN FACT: it
+        // must stay CONSISTENT with the assignment/desired facts (they name
+        // the same member set), and it is what recovery finalizes from.
+        let binding_keys: BTreeSet<&SlotId> = self.bindings.keys().collect();
+        if membership != binding_keys {
+            return Err(Error::integrity(format!(
+                "intent {}: slot_ids {:?} disagrees with the bindings key set {:?} — every member slot has exactly one frozen physical binding (server + deploy_dir), no more, no fewer",
+                self.deployment_id, membership, binding_keys
+            )));
+        }
         // An EMPTY membership is refused here: the domain intent's slots are
         // a [`NonEmptySlotTable`], so a deployment that selects no slot is
         // unrepresentable in the domain (and meaningless — a push always
@@ -285,6 +317,10 @@ impl LedgerIntentWire {
                             artifact: desired.assignment.artifact.clone(),
                         },
                         pre_push,
+                        // THE FROZEN PHYSICAL BINDING: the wire's per-member
+                        // `bindings` entry, re-checked above to exist for
+                        // exactly this key (membership == bindings keys).
+                        binding: self.bindings[key].clone(),
                     },
                 ))
             })
@@ -305,9 +341,12 @@ impl LedgerIntentWire {
 }
 
 /// ONE member slot's slot-table entry: the DESIRED assignment (the
-/// generation the plan minted for the slot's planned artifact) plus the
+/// generation the plan minted for the slot's planned artifact), the
 /// OPTIONAL PRE-PUSH state (what the slot ran before the attempt — `None`
-/// for a first deployment). The slot id itself is the enclosing
+/// for a first deployment), and the FROZEN PHYSICAL BINDING (the
+/// `{server, deploy_dir}` the plan resolved at PLAN TIME — recovery
+/// finalizes from it or marks the attempt Degraded on drift, never from the
+/// live configuration). The slot id itself is the enclosing
 /// [`NonEmptySlotTable`] key — the enclosing object owns identity, so
 /// neither payload re-declares it (the wire's redundant projections are
 /// verified and dropped by the conversion).
@@ -315,6 +354,12 @@ impl LedgerIntentWire {
 pub struct IntentSlot {
     pub desired: DesiredGeneration,
     pub pre_push: Option<PreviousGeneration>,
+    /// THE FROZEN PHYSICAL BINDING of this slot at PLAN TIME: the actual
+    /// server (`ServerId`) AND the absolute on-server `deploy_dir` the plan
+    /// resolved for this member — a single frozen fact the wire persists in
+    /// [`LedgerIntentWire::bindings`] and the conversion re-checks against
+    /// the table keys.
+    pub binding: PhysicalBinding,
 }
 
 /// One slot's DESIRED generation: the generation the plan minted for the
@@ -535,6 +580,14 @@ impl From<&DeploymentIntent> for LedgerIntentWire {
             attempted_at: i.attempted_at.clone(),
             desired,
             pre_push,
+            // Re-expand each member's frozen physical binding from the ONE
+            // slot table (the wire's split `bindings` projection; the reader
+            // re-collapses it and re-checks the keys equal the membership).
+            bindings: i
+                .slots
+                .iter()
+                .map(|(key, s)| (key.clone(), s.binding.clone()))
+                .collect(),
             // The persisted intent carries NO outcomes: the wire keeps the
             // `slots` member EMPTY (outcomes live in the terminal event's
             // `outcomes` map; the in-memory report [`LedgerIntentReport`]

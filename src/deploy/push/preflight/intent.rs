@@ -41,11 +41,26 @@ pub(crate) fn persist_intent(
     store.write_plan(deployment_id.as_str(), &outcome.plan)?;
     let desired_behavior_sha =
         crate::verify::release::behavior_index_digest(&outcome.behavior_index);
+    // THE FROZEN PHYSICAL BINDINGS (schema v6): the plan-time `{server,
+    // deploy_dir}` per target slot — resolved ONCE here, from the SAME
+    // plan-time configuration the assignments were resolved against, and
+    // frozen into the intent. Recovery finalizes from these frozen values
+    // (never the live config re-read at finalize/recovery time), so a
+    // server rebound or a moved `deploy_dir` between the intent's write and
+    // recovery can never be recorded as the historical location the attempt
+    // was planned against.
+    let slot_bindings = ctx.config.target_slot_bindings(target_name)?;
     let intent_slots: Vec<(SlotId, IntentSlot)> = outcome
         .assignments
         .iter()
         .map(|a| {
-            (
+            let binding = slot_bindings.get(&a.placement_slot).cloned().ok_or_else(|| {
+                crate::error::Error::integrity(format!(
+                    "intent {}: no physical binding for planned slot '{}' — the plan resolved it against a config that does not bind it",
+                    deployment_id, a.placement_slot
+                ))
+            })?;
+            Ok((
                 a.placement_slot.clone(),
                 IntentSlot {
                     desired: DesiredGeneration {
@@ -60,10 +75,16 @@ pub(crate) fn persist_intent(
                             artifact: p.artifact,
                             generation: p.generation,
                         }),
+                    // The slot's plan-time physical binding — the value the
+                    // plan actually resolved (the assignments are exactly
+                    // the SELECTED slots, every one a member of the target,
+                    // so the binding exists by construction; a missing entry
+                    // would be an internal inconsistency and fails closed).
+                    binding,
                 },
-            )
+            ))
         })
-        .collect();
+        .collect::<Result<Vec<(SlotId, IntentSlot)>>>()?;
     let attempt_intent = DeploymentIntent {
         deployment_id: deployment_id.clone(),
         target: TargetName::parse(target_name).expect("target name is a safe segment"),

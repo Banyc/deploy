@@ -19,7 +19,7 @@ use crate::ledger::records::DeploymentIntent;
 use crate::ledger::records::SlotTable;
 use crate::ledger::records::{LedgerTerminal, TerminalDisposition};
 use crate::ledger::records::{Observation, ObservedGeneration};
-use crate::ledger::records::{SlotOutcome, SlotOutcomeKind, SlotTransition};
+use crate::ledger::records::{PhysicalBinding, SlotOutcome, SlotOutcomeKind, SlotTransition};
 use crate::remote::helper::RemoteHelper;
 use crate::store::local::LocalStore;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -89,10 +89,13 @@ pub(crate) fn reconcile_pending_commits(
         .iter()
         .map(|(slot, _)| slot.id.clone())
         .collect();
-    // The slot→physical-binding map recorded into rollbacks finalized by
-    // recovery (identical to the map the original commit would have
-    // recorded: the current config's `{server, deploy_dir}` per slot).
-    let slot_bindings = config.target_slot_bindings(target_name)?;
+    // The slot→physical-binding map of the CURRENT configuration (the LIVE
+    // bindings at recovery time). These are compared per pending attempt
+    // against the intent's FROZEN bindings — the rollback's bindings are
+    // NEVER taken from this live map: a server rebound or a moved
+    // `deploy_dir` since the intent was written must be recorded as a
+    // DEGRADED attempt, not as a false historical fact.
+    let live_bindings = config.target_slot_bindings(target_name)?;
 
     'pending: for attempt in pending {
         // 1. Membership check.
@@ -105,7 +108,37 @@ pub(crate) fn reconcile_pending_commits(
             continue;
         }
 
-        // 2. Generation verification against fresh remote status reads.
+        // 2. BINDING-DRIFT CHECK (schema v6): the intent FROZE each selected
+        // slot's physical binding (`{server, deploy_dir}`) at plan time;
+        // recovery compares each selected slot's LIVE binding against that
+        // frozen value. ALL equal → the attempt is still on the exact
+        // physical placement it was planned against (finalization below uses
+        // the FROZEN values — equal to the live map's then, by construction).
+        // ANY selected slot's live binding DRIFTS (server or deploy_dir
+        // differs from the frozen value) → the attempt can no longer be
+        // completed as the historical commit it was planned to be: mark it
+        // DEGRADED (terminal only, no rollback) — recording the LIVE
+        // bindings as if they were the plan-time bindings would make exact
+        // rollback verify against the wrong host/location. A slot REMOVED
+        // from the target has no live binding at all — already handled by
+        // the membership check above (a missing live binding is also drift,
+        // fail closed).
+        let mut bindings_equal = true;
+        let frozen_bindings: BTreeMap<SlotId, PhysicalBinding> = attempt
+            .slots
+            .iter()
+            .map(|(sid, slot)| {
+                let equal = live_bindings.get(sid) == Some(&slot.binding);
+                bindings_equal &= equal;
+                (sid.clone(), slot.binding.clone())
+            })
+            .collect();
+        if !bindings_equal {
+            append_degraded(store, target_name, &attempt, "binding drift")?;
+            continue;
+        }
+
+        // 3. Generation verification against fresh remote status reads.
         let mut recorded: BTreeMap<SlotId, GenerationId> = BTreeMap::new();
         let mut all_match = true;
         let mut unverifiable = false;
@@ -150,7 +183,7 @@ pub(crate) fn reconcile_pending_commits(
             continue;
         }
 
-        // 3. Write the missing markers under each slot's mutation lock
+        // 4. Write the missing markers under each slot's mutation lock
         // (mirroring step 15's lock discipline: the guard is held for the
         // whole write and released on drop). The marker payload carries the
         // full participating slot set; already-present markers are an
@@ -202,7 +235,7 @@ pub(crate) fn reconcile_pending_commits(
             continue;
         }
 
-        // 4. Finalize REPLAY-SAFELY through the SAME shared finalizer as the
+        // 5. Finalize REPLAY-SAFELY through the SAME shared finalizer as the
         //    main success path ([`crate::ledger::finalize::finalize_successful_attempt`]):
         //    ONE atomic terminal append (status `Successful`, the per-slot
         //    outcomes, and the rollback state built from the VERIFIED DESIRED
@@ -215,7 +248,13 @@ pub(crate) fn reconcile_pending_commits(
         //    configuration may have changed arbitrarily since the intent was
         //    written, and recovery must reproduce exactly what the intent
         //    froze — never derive the memberships from the current
-        //    configuration.
+        //    configuration. The rollback's PHYSICAL BINDINGS are likewise the
+        //    intent's FROZEN per-slot bindings ([`frozen_bindings`], built
+        //    above from `attempt.slots[sid].binding` — the values the
+        //    binding-drift check just verified EQUAL the live map's):
+        //    recovery never stamps the live configuration's bindings into a
+        //    rollback, because a drifted configuration is degraded, never
+        //    recorded as history.
         let (outcomes, actuals) = recovery_outcomes(&attempt);
         finalize_successful_attempt(
             store,
@@ -223,7 +262,7 @@ pub(crate) fn reconcile_pending_commits(
             &outcomes,
             &actuals,
             "recovery finalized",
-            &slot_bindings,
+            &frozen_bindings,
         )?;
     }
     Ok(())
