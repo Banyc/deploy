@@ -122,26 +122,26 @@ pub fn finalize_successful_attempt(
     let terminal = LedgerTerminal {
         recorded_at: crate::remote::helper::now_rfc3339(),
         // The Successful disposition ALWAYS carries the complete rollback
-        // payload (the truth table is structural in the domain) AND its OWN
-        // outcomes table (the wire-shaped outcomes' redundant `slot_id` is
-        // dropped into the key — the domain value carries no slot) AND the
-        // TWO PERSISTED MEMBERSHIPS: `selected_membership` = the outcome
-        // keys (the slots this attempt actually deployed) and
-        // `full_membership` = the intent's FROZEN FULL MEMBERSHIP (the
-        // complete target membership at plan time, never the live
-        // configuration) — the record PROVES the membership equations
-        // (outcomes == selected, rollback == full, selected ⊆ full,
-        // full-push selected == full) AND REPRODUCES the intent's frozen
-        // values (the read's intent-binding legs refuse a divergence).
+        // payload (the truth table is structural in the domain — the
+        // rollback is the single source of truth for each slot's
+        // generation/artifact facts) AND THE ACTIVATED SLOT-ID SET (the
+        // slots this attempt actually deployed — the per-slot facts are
+        // DERIVED from the rollback, never stored/trusted separately) AND
+        // THE PERSISTED FULL MEMBERSHIP = the intent's FROZEN FULL
+        // MEMBERSHIP (the complete target membership at plan time, never
+        // the live configuration) — the record PROVES the membership
+        // equations (activated == selected == the outcome keys, rollback ==
+        // full, selected ⊆ full, full-push selected == full) AND
+        // REPRODUCES the intent's frozen values (the read's intent-binding
+        // legs refuse a divergence).
         disposition: TerminalDisposition::Successful {
             rollback,
-            outcomes: SlotTable::from_map(
-                outcomes
-                    .iter()
-                    .map(|(k, r)| Ok((k.clone(), SlotOutcome::from_wire(r.clone())?)))
-                    .collect::<Result<BTreeMap<_, _>>>()?,
-            ),
-            selected_membership: outcomes.keys().cloned().collect(),
+            // SUCCESS IS THE ACTIVATED SLOT-ID SET: the wire outcomes'
+            // per-slot claims were validated against the rollback and then
+            // DISCARDED (the wire → domain conversion enforces the complete
+            // equality predicate); the per-slot generation/artifact facts
+            // are DERIVED from the rollback — the single source of truth.
+            activated: outcomes.keys().cloned().collect(),
             full_membership: current,
         },
         reason: Some(reason.to_string()),

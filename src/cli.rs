@@ -579,8 +579,7 @@ mod tests {
     };
     use crate::ledger::{
         DeploymentIntent, DeploymentStatus, DesiredGeneration, IntentSlot, LedgerRollback,
-        LedgerTerminal, NonEmptySlotTable, ObservationWire, ObservedGenerationWire, ObservedSlot,
-        SlotOutcome, SlotOutcomeKind, SlotResult, SlotTable, TerminalDisposition,
+        LedgerTerminal, NonEmptySlotTable, ObservedSlot, TerminalDisposition,
     };
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
@@ -670,23 +669,13 @@ mod tests {
                         },
                     )]),
                 },
-                outcomes: SlotTable::from_map(BTreeMap::from([(
-                    p1.clone(),
-                    SlotOutcome::from_wire(SlotResult {
-                        slot_id: p1.clone(),
-                        outcome: SlotOutcomeKind::Activated,
-                        observation: ObservationWire::Known(ObservedGenerationWire {
-                            generation: test_generation_id("gen-1"),
-                        }),
-                        compensated: false,
-                        error: None,
-                    })
-                    .unwrap(),
-                )])),
-                // THE EXACT-EQUAL MEMBERSHIPS: selected == full == the
-                // one-slot membership (the rollback's slots / the outcomes'
-                // keys) — the proven shape the conversion + read require.
-                selected_membership: BTreeSet::from([p1.clone()]),
+                // SUCCESS IS THE ACTIVATED SLOT-ID SET: the per-slot
+                // generation/artifact facts are DERIVED from the rollback
+                // (never stored/trusted separately).
+                activated: BTreeSet::from([p1.clone()]),
+                // THE EXACT-EQUAL MEMBERSHIPS: activated == full == the
+                // one-slot membership (the rollback's slots) — the proven
+                // shape the conversion + read require.
                 full_membership: BTreeSet::from([p1.clone()]),
             },
             reason: Some(reason.to_string()),

@@ -532,28 +532,17 @@ mod tests {
     fn terminal_for(release: &str) -> LedgerTerminal {
         LedgerTerminal {
             recorded_at: "2026-01-01T00:00:00Z".to_string(),
-            // The EXACT-EQUAL shape: one Activated outcome per slotted
-            // generation (the membership equations — outcomes == selected ==
-            // full == rollback slots — are enforced by the conversion).
+            // THE EXACT-EQUAL shape: one ACTIVATED SLOT per slotted
+            // generation (the membership equations — activated == full ==
+            // the rollback slots — are enforced by the conversion; the
+            // per-slot generation/artifact facts are DERIVED from the
+            // rollback, never stored/trusted separately).
             disposition: TerminalDisposition::Successful {
                 rollback: rollback_for(release),
-                outcomes: SlotTable::from_map(BTreeMap::from([(
-                    SlotId::new("p1".to_string()),
-                    SlotOutcome::from_wire(SlotResult {
-                        slot_id: SlotId::new("p1".to_string()),
-                        outcome: SlotOutcomeKind::Activated,
-                        observation: ObservationWire::Known(ObservedGenerationWire {
-                            generation: test_generation_id("gen-1"),
-                        }),
-                        compensated: false,
-                        error: None,
-                    })
-                    .unwrap(),
-                )])),
-                // THE EXACT-EQUAL MEMBERSHIPS: selected == full == the
-                // one-slot membership (the rollback's slots / the outcomes'
-                // keys) — the proven shape the conversion + read require.
-                selected_membership: BTreeSet::from([SlotId::new("p1".to_string())]),
+                activated: BTreeSet::from([SlotId::new("p1".to_string())]),
+                // THE EXACT-EQUAL MEMBERSHIPS: activated == full == the
+                // one-slot membership (the rollback's slots) — the proven
+                // shape the conversion + read require.
                 full_membership: BTreeSet::from([SlotId::new("p1".to_string())]),
             },
             reason: None,

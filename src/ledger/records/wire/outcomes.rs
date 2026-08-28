@@ -236,11 +236,13 @@ impl LedgerTerminal {
         &self,
         intent: &DeploymentIntent,
     ) -> Option<SlotTable<Observation<ObservedGeneration>>> {
-        if !matches!(self.disposition, TerminalDisposition::Degraded { .. }) {
+        // The derivation reads the Degraded disposition's OWN outcome table
+        // directly (never the materialized [`LedgerTerminal::outcomes`]
+        // accessor — a Degraded terminal stores its table).
+        let TerminalDisposition::Degraded { outcomes } = &self.disposition else {
             return None;
-        }
-        let remaining: BTreeMap<SlotId, Observation<ObservedGeneration>> = self
-            .outcomes()
+        };
+        let remaining: BTreeMap<SlotId, Observation<ObservedGeneration>> = outcomes
             .iter()
             .filter(|(sid, r)| match r.transition {
                 SlotTransition::NeverAdvanced | SlotTransition::Restored => false,
@@ -286,13 +288,13 @@ impl LedgerTerminal {
     /// were restored and which compensation failed), never a stored
     /// duplicate. `None` for any other disposition.
     pub fn compensation(&self) -> Option<&CompensationReport> {
-        if matches!(
-            self.disposition,
-            TerminalDisposition::FailedRolledBack { .. }
-        ) {
-            Some(self.outcomes())
-        } else {
-            None
+        // The report IS the FailedRolledBack disposition's OWN outcome
+        // table — read directly (never the materialized
+        // [`LedgerTerminal::outcomes`] accessor — a FailedRolledBack
+        // terminal stores its table).
+        match &self.disposition {
+            TerminalDisposition::FailedRolledBack { outcomes } => Some(outcomes),
+            _ => None,
         }
     }
 }

@@ -3215,9 +3215,11 @@ fn run_failure_position_case(policy: FailurePolicy, position: usize) {
             Some(live),
             "slot {sid}: the observed record mirrors the live generation"
         );
-        // The ledger outcome for this slot (the disposition's OWN table).
-        let out = terminal
-            .outcomes()
+        // The ledger outcome for this slot (the disposition's OWN table;
+        // the accessor materializes the disposition's table — for a
+        // non-Successful terminal here — by value).
+        let outcomes = terminal.outcomes();
+        let out = outcomes
             .get(&SlotId::new(sid.to_string()))
             .unwrap_or_else(|| panic!("slot {sid} must appear in the terminal outcomes"));
 

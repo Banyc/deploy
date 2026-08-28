@@ -340,8 +340,13 @@ impl LocalStore {
                     //   Degraded): the outcomes EXACTLY COVER the
                     //   membership — every member slot has one outcome, no
                     //   extras, no missing.
-                    let outcome_keys: BTreeSet<&SlotId> = terminal.outcomes().keys().collect();
-                    let membership: BTreeSet<&SlotId> = entry.intent.slots.keys().collect();
+                    // THE MATERIALIZED DERIVED VIEW: for a Successful
+                    // terminal [`LedgerTerminal::outcomes`] re-derives the
+                    // per-slot facts from the rollback (the accessor is
+                    // owned), so the key set is copied out by value here.
+                    let outcome_keys: BTreeSet<SlotId> =
+                        terminal.outcomes().keys().cloned().collect();
+                    let membership: BTreeSet<SlotId> = entry.intent.slots.keys().cloned().collect();
                     match terminal.status() {
                         DeploymentStatus::Successful => {
                             // THE SUCCESSFUL SNAPSHOT RULE (membership leg),
@@ -358,19 +363,29 @@ impl LocalStore {
                             // terminal whose memberships diverge from it is
                             // refused (integrity error), so the terminal can
                             // never be re-derived from the live configuration.
+                            // THE INTENT-BINDING LEGS (the user's
+                            // requirement): the terminal's memberships must
+                            // REPRODUCE the intent's FROZEN values — the
+                            // intent is the IMMUTABLE record that froze
+                            // selected (its table keys) and full (the
+                            // complete target membership at plan time), and a
+                            // terminal whose memberships diverge from it is
+                            // refused (integrity error), so the terminal can
+                            // never be re-derived from the live configuration.
                             // The FULL-push EQUALITY: a FULL push (no group)
-                            // selects every target slot, so selected_membership
-                            // must EQUAL full_membership. A GROUP push allows
-                            // a proper subset (selected ⊆ full is already
-                            // enforced by the conversion).
+                            // selects every target slot, so the ACTIVATED set
+                            // (== the wire's selected_membership, the
+                            // outcomes' keys) must EQUAL full_membership. A
+                            // GROUP push allows a proper subset (activated ⊆
+                            // full is already enforced by the conversion).
                             let (selected, full) = match &terminal.disposition {
                                 TerminalDisposition::Successful {
-                                    selected_membership,
+                                    activated,
                                     full_membership,
                                     ..
-                                } => (selected_membership, full_membership),
+                                } => (activated, full_membership),
                                 _ => unreachable!(
-                                    "a Successful terminal carries its rollback + memberships"
+                                    "a Successful terminal carries its rollback + activated set + memberships"
                                 ),
                             };
                             if selected != &entry.intent.selected_membership() {
@@ -664,22 +679,13 @@ mod tests {
                         },
                     )]),
                 },
-                outcomes: SlotTable::from_map(BTreeMap::from([(
-                    SlotId::new("p1".to_string()),
-                    SlotOutcome {
-                        outcome: SlotOutcomeKind::Activated,
-                        observation: Observation::Known(ObservedGeneration {
-                            generation: test_generation_id("1"),
-                        }),
-                        compensated: false,
-                        error: None,
-                        transition: SlotTransition::Advanced,
-                    },
-                )])),
-                // THE EXACT-EQUAL MEMBERSHIPS: selected == full == the
-                // one-slot membership (the rollback's slots / the outcomes'
-                // keys) — the proven shape the conversion + read require.
-                selected_membership: BTreeSet::from([SlotId::new("p1".to_string())]),
+                // SUCCESS IS THE ACTIVATED SLOT-ID SET: the per-slot
+                // generation/artifact facts are DERIVED from the rollback
+                // (never stored/trusted separately).
+                activated: BTreeSet::from([SlotId::new("p1".to_string())]),
+                // THE EXACT-EQUAL MEMBERSHIPS: activated == full == the
+                // one-slot membership (the rollback's slots) — the proven
+                // shape the conversion + read require.
                 full_membership: BTreeSet::from([SlotId::new("p1".to_string())]),
             },
             reason: None,
@@ -2178,8 +2184,10 @@ mod tests {
 
     /// The terminal for an attempt: FULL per-slot outcomes (every member
     /// slot has one outcome, each value naming its own key) and — when
-    /// `successful` — a `Successful` disposition whose rollback bindings key
-    /// its slotted generations EXACTLY; otherwise a `FailedRolledBack`
+    /// `successful` — a `Successful` disposition carrying the ACTIVATED
+    /// SLOT-ID SET (the per-slot facts are DERIVED from the rollback, never
+    /// stored/trusted separately) and a rollback whose bindings key its
+    /// slotted generations EXACTLY; otherwise a `FailedRolledBack`
     /// disposition carrying the outcome table as its compensation report.
     fn terminal_for_intent(
         intent: &DeploymentIntent,
@@ -2206,10 +2214,10 @@ mod tests {
             })
             .collect();
         let outcomes = SlotTable::from_map(outcomes);
-        // THE EXACT-EQUAL MEMBERSHIPS: selected == full == the intent's
-        // membership (the rollback's slots / the outcomes' keys) — the
-        // proven shape the conversion + read require (valid in BOTH modes:
-        // a group intent's selected == full is a legal subset).
+        // THE EXACT-EQUAL MEMBERSHIPS: activated == full == the intent's
+        // membership (the rollback's slots) — the proven shape the
+        // conversion + read require (valid in BOTH modes: a group intent's
+        // activated == full is a legal subset).
         let membership: BTreeSet<SlotId> = intent.slots.keys().cloned().collect();
         let disposition = if successful {
             TerminalDisposition::Successful {
@@ -2225,8 +2233,7 @@ mod tests {
                         .map(|k| (k.clone(), binding_for(k)))
                         .collect(),
                 },
-                outcomes,
-                selected_membership: membership.clone(),
+                activated: membership.clone(),
                 full_membership: membership,
             }
         } else {
@@ -2382,17 +2389,38 @@ mod tests {
         // carries no slot (the table key owns identity), so the renamed key
         // is re-attached as the wire outcome's `slot_id` on serialization;
         // the refusal comes from the CROSS-RECORD agreement — the renamed
-        // key is no longer a member of the intent's membership.
+        // key is no longer a member of the intent's membership. For a
+        // Successful terminal the per-slot facts are DERIVED from the
+        // rollback (the disposition stores only the activated slot-id set),
+        // so the rename is expressed ACROSS the success facts — the
+        // activated set AND the rollback's slots + bindings (the derived
+        // view must stay consistent): the renamed slot is then outside the
+        // intent's membership, and every consumer refuses.
         if let Some((key, _)) = terminal.outcomes().iter().next() {
             let mut t = terminal.clone();
-            let mut map = t.outcomes().clone().into_map();
-            let result = map.remove(key).unwrap();
-            map.insert(SlotId::new("renamed-outcome".to_string()), result);
-            let outcomes = SlotTable::from_map(map);
+            let renamed = SlotId::new("renamed-outcome".to_string());
             match &mut t.disposition {
-                TerminalDisposition::Successful { outcomes: o, .. } => *o = outcomes,
-                TerminalDisposition::FailedRolledBack { outcomes: o } => *o = outcomes,
-                TerminalDisposition::Degraded { outcomes: o } => *o = outcomes,
+                TerminalDisposition::Successful {
+                    rollback,
+                    activated,
+                    ..
+                } => {
+                    activated.remove(key);
+                    activated.insert(renamed.clone());
+                    if let Some(g) = rollback.slots.remove(key) {
+                        rollback.slots.insert(renamed.clone(), g);
+                    }
+                    if let Some(b) = rollback.bindings.remove(key) {
+                        rollback.bindings.insert(renamed.clone(), b);
+                    }
+                }
+                TerminalDisposition::FailedRolledBack { outcomes: o }
+                | TerminalDisposition::Degraded { outcomes: o } => {
+                    let mut map = o.clone().into_map();
+                    let result = map.remove(key).unwrap();
+                    map.insert(renamed, result);
+                    *o = SlotTable::from_map(map);
+                }
                 TerminalDisposition::FailedPreflight => {
                     unreachable!("a preflight terminal carries no outcomes to rename")
                 }
@@ -2552,42 +2580,64 @@ mod tests {
         rollback.bindings.remove(&first);
         assert_terminal_refused(&tmp, target, &intent, &bad, "d");
         // (e) OUTCOME KEY SET == membership: an outcome for a non-member
-        // slot (extra — the domain value carries no slot, so only the
-        // cross-record equality fails).
+        // slot (extra). The Successful disposition stores ONLY the
+        // activated slot-id set (the per-slot facts are DERIVED from the
+        // rollback), so the extra slot is expressed ACROSS the success
+        // facts — activated + rollback slots + bindings + full (the derived
+        // view must stay consistent): the extra slot is outside the
+        // intent's membership, and the read refuses (every outcome must
+        // name a member slot).
         let mut bad = terminal.clone();
-        let mut outcomes = bad.outcomes().clone().into_map();
-        outcomes.insert(
-            SlotId::new("extra-slot".to_string()),
-            SlotOutcome {
-                outcome: SlotOutcomeKind::Activated,
-                observation: Observation::Known(ObservedGeneration {
-                    generation: test_generation_id("x"),
-                }),
-                compensated: false,
-                error: None,
-                transition: SlotTransition::Advanced,
-            },
-        );
-        let TerminalDisposition::Successful { outcomes: o, .. } = &mut bad.disposition else {
+        let extra = SlotId::new("extra-slot".to_string());
+        let TerminalDisposition::Successful {
+            rollback,
+            activated,
+            full_membership,
+        } = &mut bad.disposition
+        else {
             unreachable!("the fixture terminal is Successful");
         };
-        *o = SlotTable::from_map(outcomes);
+        activated.insert(extra.clone());
+        rollback.slots.insert(extra.clone(), gen_ref(&extra));
+        rollback.bindings.insert(extra.clone(), binding_for(&extra));
+        full_membership.insert(extra);
         assert_terminal_refused(&tmp, target, &intent, &bad, "e");
         // (f) OUTCOME KEY RENAMED: the domain value carries no slot (the
         // table key owns identity), so an own-key violation is
         // UNREPRESENTABLE in the domain — the renamed key is re-attached as
         // the wire outcome's `slot_id` on serialization, and the refusal
         // comes from the cross-record agreement (the renamed key is no
-        // longer a member of the intent's membership).
+        // longer a member of the intent's membership). For a Successful
+        // terminal the rename is expressed ACROSS the success facts
+        // (activated + rollback slots + bindings + full — the derived view
+        // must stay consistent).
         let mut bad = terminal.clone();
-        let mut map = bad.outcomes().clone().into_map();
-        let first = map.keys().next().cloned().unwrap();
-        let result = map.remove(&first).unwrap();
-        map.insert(SlotId::new("renamed-outcome".to_string()), result);
-        let TerminalDisposition::Successful { outcomes: o, .. } = &mut bad.disposition else {
+        let first = bad
+            .selected_membership()
+            .expect("Successful")
+            .iter()
+            .next()
+            .cloned()
+            .unwrap();
+        let renamed = SlotId::new("renamed-outcome".to_string());
+        let TerminalDisposition::Successful {
+            rollback,
+            activated,
+            full_membership,
+        } = &mut bad.disposition
+        else {
             unreachable!("the fixture terminal is Successful");
         };
-        *o = SlotTable::from_map(map);
+        activated.remove(&first);
+        activated.insert(renamed.clone());
+        if let Some(g) = rollback.slots.remove(&first) {
+            rollback.slots.insert(renamed.clone(), g);
+        }
+        if let Some(b) = rollback.bindings.remove(&first) {
+            rollback.bindings.insert(renamed.clone(), b);
+        }
+        full_membership.remove(&first);
+        full_membership.insert(renamed);
         assert_terminal_refused(&tmp, target, &intent, &bad, "f");
         // (g) TARGET EQUALITY, intent leg: the intent names a different
         // target than the path.

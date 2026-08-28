@@ -1043,8 +1043,8 @@ mod tests {
         // conversion). The intent's `slot_ids` is NOT compared to either
         // membership (it is the historical selected set written before the
         // push; the terminal's memberships are proven at terminal time).
-        let outcome_keys: BTreeSet<&SlotId> = terminal.outcomes().keys().collect();
-        let membership: BTreeSet<&SlotId> = intent.slots.keys().collect();
+        let outcome_keys: BTreeSet<SlotId> = terminal.outcomes().keys().cloned().collect();
+        let membership: BTreeSet<SlotId> = intent.slots.keys().cloned().collect();
         match terminal.status() {
             DeploymentStatus::Successful => {
                 // THE INTENT-BINDING LEGS (the user's requirement): the
@@ -1058,12 +1058,14 @@ mod tests {
                 // conversion).
                 let (selected, full) = match &terminal.disposition {
                     TerminalDisposition::Successful {
-                        selected_membership,
+                        activated,
                         full_membership,
                         ..
-                    } => (selected_membership, full_membership),
+                    } => (activated, full_membership),
                     _ => {
-                        unreachable!("a Successful terminal carries its rollback + memberships")
+                        unreachable!(
+                            "a Successful terminal carries its rollback + activated set + memberships"
+                        )
                     }
                 };
                 if selected != &intent.selected_membership() {
@@ -1274,21 +1276,23 @@ mod tests {
     #[test]
     fn terminal_status_maps_to_exactly_one_disposition() {
         let keys = vec![slot(1), slot(2)];
-        // Successful + complete rollback → Successful { rollback, outcomes }.
+        // Successful + complete rollback → Successful { rollback, activated }.
         let wire = agreeing_terminal(&keys, 0);
         let d = wire.into_domain().unwrap();
         assert_eq!(d.status(), DeploymentStatus::Successful);
         let TerminalDisposition::Successful {
-            rollback, outcomes, ..
+            rollback,
+            activated,
+            ..
         } = d.disposition
         else {
-            panic!("Successful maps to Successful {{ rollback, outcomes, memberships }}");
+            panic!("Successful maps to Successful {{ rollback, activated, full_membership }}");
         };
         assert_eq!(rollback.slots.len(), 2, "the complete rollback payload");
         assert_eq!(
-            outcomes.len(),
+            activated.len(),
             2,
-            "the Successful disposition owns its outcome table"
+            "the Successful disposition owns the activated slot-id set"
         );
 
         // FailedPreflight + no outcomes → FailedPreflight (nothing).
@@ -1663,7 +1667,12 @@ mod tests {
             slot_id: slot(1),
             outcome: SlotOutcomeKind::Activated,
             observation: ObservationWire::Known(ObservedGenerationWire {
-                generation: test_generation_id("gen-1"),
+                // The outcome's observed generation must EQUAL the
+                // rollback's authoritative generation for the slot
+                // (`gen_ref_for` names `test_generation_id(key.as_str())`
+                // = "slot-1"): the complete equality predicate refuses a
+                // successful outcome that contradicts its rollback.
+                generation: test_generation_id("slot-1"),
             }),
             compensated: false,
             error: None,
@@ -1766,25 +1775,28 @@ mod tests {
     /// inside the disposition — the accessor returns the disposition's OWN
     /// table (no separate `LedgerTerminal.outcomes` field exists to disagree
     /// with), and a FailedPreflight terminal carries none (the accessor
-    /// yields an empty table).
+    /// yields an empty table). For a Successful terminal the accessor
+    /// MATERIALIZES the DERIVED VIEW over the rollback (the per-slot facts
+    /// are never stored separately).
     #[test]
     fn each_disposition_owns_its_outcome_table() {
         let keys = vec![slot(1), slot(2)];
         let intent = agreeing_intent(&keys).into_domain().unwrap();
-        // Successful: the disposition owns its outcomes next to the rollback.
+        // Successful: the disposition owns its activated set next to the
+        // rollback; the accessor materializes the DERIVED view (every
+        // activated slot's facts ARE the rollback's generation).
         let d = agreeing_terminal(&keys, 0).into_domain().unwrap();
         let TerminalDisposition::Successful {
-            rollback, outcomes, ..
+            rollback,
+            activated,
+            ..
         } = &d.disposition
         else {
-            panic!("Successful carries rollback + outcomes + memberships");
+            panic!("Successful carries rollback + activated set + memberships");
         };
-        assert_eq!(
-            d.outcomes(),
-            outcomes,
-            "the accessor reads the disposition's OWN table"
-        );
-        assert_eq!(outcomes.len(), 2);
+        let outcomes = d.outcomes();
+        assert_eq!(outcomes.len(), activated.len());
+        assert!(outcomes.len() == 2);
         assert!(
             outcomes
                 .values()
@@ -1793,7 +1805,14 @@ mod tests {
         for key in outcomes.keys() {
             assert!(
                 rollback.slots.contains_key(key),
-                "every outcome key is covered by the rollback"
+                "every activated slot is covered by the rollback (the facts source)"
+            );
+            assert_eq!(
+                outcomes[key].observation,
+                Observation::Known(ObservedGeneration {
+                    generation: rollback.slots[key].generation.clone(),
+                }),
+                "the derived view's generation EQUALS the rollback's authoritative generation"
             );
         }
         // FailedPreflight: no outcomes — the accessor yields an empty table.
@@ -1812,7 +1831,7 @@ mod tests {
             panic!("FailedRolledBack carries its outcomes");
         };
         assert_eq!(
-            d.outcomes(),
+            &d.outcomes(),
             outcomes,
             "the accessor reads the disposition's OWN table"
         );
@@ -1827,7 +1846,7 @@ mod tests {
             panic!("Degraded carries its outcomes");
         };
         assert_eq!(
-            d.outcomes(),
+            &d.outcomes(),
             outcomes,
             "the accessor reads the disposition's OWN table"
         );
@@ -1970,41 +1989,24 @@ mod tests {
     }
 
     /// An arbitrary SUCCESSFUL domain terminal: an arbitrary rollback plus
-    /// the disposition's OWN outcomes — every outcome Activated, each key
-    /// covered by the rollback's slots — AND the PERSISTED MEMBERSHIPS
-    /// (selected == full == the rollback's slots — the exact-equal proven
-    /// shape; the mode is a separate record's concern).
+    /// THE ACTIVATED SLOT-ID SET (the exact-equal shape — every rollback
+    /// slot activated — AND the PERSISTED MEMBERSHIPS (activated == full ==
+    /// the rollback's slots; the mode is a separate record's concern). The
+    /// per-slot generation/artifact facts are NOT stored: they are DERIVED
+    /// from the rollback ([`LedgerTerminal::outcomes`]) — the single source
+    /// of truth.
     fn arbitrary_successful() -> impl Strategy<Value = LedgerTerminal> {
         arbitrary_rollback().prop_map(|rollback| {
-            // The exact-equal shape: the Successful disposition's outcomes
-            // EXACTLY cover the rollback's slots (one Activated outcome per
-            // slotted generation), and both memberships equal that set — the
-            // proven shape the round trip preserves.
-            let outcomes: BTreeMap<SlotId, SlotOutcome> = rollback
-                .slots
-                .keys()
-                .map(|k| {
-                    (
-                        k.clone(),
-                        SlotOutcome {
-                            outcome: SlotOutcomeKind::Activated,
-                            observation: Observation::Known(ObservedGeneration {
-                                generation: GenerationId::new(format!("gen-{}", k.as_str())),
-                            }),
-                            compensated: false,
-                            error: None,
-                            transition: SlotTransition::Advanced,
-                        },
-                    )
-                })
-                .collect();
+            // The exact-equal shape: the activation set EXACTLY covers the
+            // rollback's slots (one activated slot per slotted generation),
+            // and the memberships equal that set — the proven shape the
+            // round trip preserves.
             let membership: BTreeSet<SlotId> = rollback.slots.keys().cloned().collect();
             LedgerTerminal {
                 recorded_at: "2026-01-01T00:00:00Z".to_string(),
                 disposition: TerminalDisposition::Successful {
                     rollback,
-                    outcomes: SlotTable::from_map(outcomes),
-                    selected_membership: membership.clone(),
+                    activated: membership.clone(),
                     full_membership: membership,
                 },
                 reason: None,
@@ -3060,8 +3062,9 @@ mod tests {
             let (intent, terminal) = degraded_terminal_with(results, pre_push);
 
             // The terminal's per-slot outcomes preserve Unknown for every slot.
+            let outcomes = terminal.outcomes();
             for sid in &slots {
-                let outcome = terminal.outcomes().get(sid).expect("every slot has an outcome");
+                let outcome = outcomes.get(sid).expect("every slot has an outcome");
                 assert_eq!(
                     outcome.observation,
                     Observation::Unknown(ObservationError {
@@ -3100,7 +3103,7 @@ mod tests {
             // and reads back as `Unknown`, never as `KnownAbsent`; the
             // operation error survives via `error` untouched.
             for sid in &slots {
-                let outcome = terminal.outcomes().get(sid).unwrap();
+                let outcome = outcomes.get(sid).unwrap();
                 let wire = SlotResult::from_outcome(sid, outcome);
                 assert_eq!(
                     wire.observation,

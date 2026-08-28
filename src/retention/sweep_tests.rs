@@ -273,23 +273,13 @@ fn terminal_for(release: &str, tree: &str) -> LedgerTerminal {
                     },
                 )]),
             },
-            outcomes: SlotTable::from_map(BTreeMap::from([(
-                SlotId::new("p1".to_string()),
-                SlotOutcome::from_wire(SlotResult {
-                    slot_id: SlotId::new("p1".to_string()),
-                    outcome: SlotOutcomeKind::Activated,
-                    observation: ObservationWire::Known(ObservedGenerationWire {
-                        generation: test_generation_id("gen-1"),
-                    }),
-                    compensated: false,
-                    error: None,
-                })
-                .unwrap(),
-            )])),
-            // THE EXACT-EQUAL MEMBERSHIPS: selected == full == the
-            // one-slot membership (the rollback's slots / the outcomes'
-            // keys) — the proven shape the conversion + read require.
-            selected_membership: BTreeSet::from([SlotId::new("p1".to_string())]),
+            // SUCCESS IS THE ACTIVATED SLOT-ID SET: the per-slot
+            // generation/artifact facts are DERIVED from the rollback
+            // (never stored/trusted separately).
+            activated: BTreeSet::from([SlotId::new("p1".to_string())]),
+            // THE EXACT-EQUAL MEMBERSHIPS: activated == full == the
+            // one-slot membership (the rollback's slots) — the proven
+            // shape the conversion + read require.
             full_membership: BTreeSet::from([SlotId::new("p1".to_string())]),
         },
         reason: None,

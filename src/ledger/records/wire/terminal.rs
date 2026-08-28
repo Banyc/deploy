@@ -13,8 +13,9 @@ use crate::identity::{DeploymentId, SlotId, TargetName, Timestamp};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::super::observation::{Observation, ObservedGeneration};
 use super::super::{CompleteRollback, DeploymentStatus, LedgerRollbackWire, SlotTable};
-use super::outcomes::{SlotOutcome, SlotOutcomeKind, SlotResult};
+use super::outcomes::{SlotOutcome, SlotOutcomeKind, SlotResult, SlotTransition};
 /// The DISPOSITION of a deployment's terminal event — the DOMAIN replaces
 /// the wire's `status: String` + optional rollback TAG-PLUS-OPTIONAL-PAYLOAD
 /// shape with an ENUM whose variants carry exactly the payload their
@@ -23,19 +24,22 @@ use super::outcomes::{SlotOutcome, SlotOutcomeKind, SlotResult};
 ///
 /// * [`TerminalDisposition::Successful`] ALWAYS carries its complete
 ///   rollback payload (a successful deployment always records its rollback
-///   state — the generation refs + physical bindings, the ONE fact the
-///   per-slot outcomes cannot express) AND its OWN per-slot outcomes table
-///   (every outcome Activated) AND the TWO PERSISTED MEMBERSHIPS —
-///   `selected_membership` (the slots the push actually deployed, EQUAL to
-///   the outcomes' keys) and `full_membership` (the COMPLETE target
-///   membership at terminal time, EQUAL to the rollback's slots) — so the
-///   record PROVES the membership equations instead of implying them. The
-///   rollback is the COMPLETE resulting target snapshot: for a GROUP push
-///   the base-overlay carries the unselected slots forward, so the
-///   rollback's slots ⊇ the outcomes' keys (the outcomes cover the
-///   SELECTED slots; for a FULL push the terminal's own memberships satisfy
-///   selected == full — enforced where the terminal merges into its entry,
-///   via the intent's `group`).
+///   state — the generation refs + physical bindings, THE single source of
+///   truth for each slot's generation/artifact facts) AND THE ACTIVATED
+///   SLOT-ID SET (the non-empty set of slots the push activated — the
+///   per-slot generation/artifact facts are NOT stored again: the wire's
+///   per-slot outcome claims are validated against the rollback and then
+///   DISCARDED, and every consumer derives each slot's facts from the
+///   rollback) AND THE TWO PERSISTED MEMBERSHIPS — `activated` (the slots
+///   the push actually deployed, EQUAL to the wire's selected_membership)
+///   and `full_membership` (the COMPLETE target membership at terminal
+///   time, EQUAL to the rollback's slots) — so the record PROVES the
+///   membership equations instead of implying them. The rollback is the
+///   COMPLETE resulting target snapshot: for a GROUP push the base-overlay
+///   carries the unselected slots forward, so the rollback's slots ⊇ the
+///   activated set (the outcomes cover the SELECTED slots; for a FULL push
+///   the terminal's own memberships satisfy selected == full — enforced
+///   where the terminal merges into its entry, via the intent's `group`).
 /// * [`TerminalDisposition::FailedPreflight`] carries NOTHING — a
 ///   pre-mutation failure cannot carry a rollback, and no slot was touched
 ///   (the conversion refuses outcomes).
@@ -53,45 +57,60 @@ use super::outcomes::{SlotOutcome, SlotOutcomeKind, SlotResult};
 /// LET EACH DISPOSITION OWN ITS OUTCOME TABLE: the per-slot OUTCOMES are
 /// the authoritative per-slot facts and they live ONCE, INSIDE the
 /// disposition — there is no separate `LedgerTerminal.outcomes` field to
-/// disagree with. The disposition carries ONLY what the outcomes cannot
-/// express (the Successful rollback payload). The WIRE keeps the current
-/// `status` + `rollback` shape; the wire → domain conversion maps every
-/// status to EXACTLY ONE disposition and refuses a status whose payload does
-/// not match its disposition (a `Successful` with no rollback, a failed
-/// status carrying a rollback, a `Degraded` whose outcomes show all-restored,
-/// a `Successful` whose outcomes disagree with the rollback's slots, an
-/// `InProgress`/`PendingCommit` terminal — all are conversion errors, fail
-/// closed).
+/// disagree with. For a SUCCESSFUL terminal the per-slot facts live ONCE in
+/// the ROLLBACK (the single source of truth): the disposition keeps only
+/// the ACTIVATED SLOT-ID SET, and the per-slot outcome view is DERIVED from
+/// the rollback ([`LedgerTerminal::outcomes`]) — never stored/trusted
+/// separately, so a successful terminal can never contradict its rollback.
+/// The disposition carries ONLY what the activated set + rollback cannot
+/// express (the memberships). The WIRE keeps the current `status` +
+/// `rollback` + per-slot `outcomes` shape; the wire → domain conversion maps
+/// every status to EXACTLY ONE disposition and refuses a status whose
+/// payload does not match its disposition (a `Successful` with no rollback,
+/// a failed status carrying a rollback, a `Degraded` whose outcomes show
+/// all-restored, a `Successful` whose outcome contradicts the rollback — a
+/// non-Known observation, a mismatched generation, an operation error, or a
+/// compensated slot — an `InProgress`/`PendingCommit` terminal — all are
+/// conversion errors, fail closed).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerminalDisposition {
     /// The deployment succeeded: the complete rollback payload (the full
-    /// snapshot: per-slot generations + physical bindings — the ONE fact
-    /// the per-slot outcomes cannot express), the disposition's OWN
-    /// per-slot outcomes table (every outcome Activated — enforced by the
-    /// conversion), and the TWO PERSISTED MEMBERSHIPS that PROVE the
-    /// membership equations: `selected_membership` (the slots the push
-    /// actually deployed — EQUAL to the outcomes' keys, enforced by the
-    /// conversion) and `full_membership` (the COMPLETE target membership
-    /// at terminal time — EQUAL to the rollback's slots, enforced by the
-    /// conversion). `selected_membership ⊆ full_membership` is enforced by
-    /// the conversion; the FULL-push equality `selected_membership ==
+    /// snapshot: per-slot generations + physical bindings — THE single
+    /// source of truth for each slot's generation/artifact facts), THE
+    /// ACTIVATED SLOT-ID SET (the non-empty set of slots the push
+    /// activated — the per-slot generation/artifact facts are NOT stored
+    /// again; every consumer derives them from the rollback via
+    /// [`LedgerTerminal::outcomes`]), and the TWO PERSISTED MEMBERSHIPS
+    /// that PROVE the membership equations: `activated` (the slots the push
+    /// actually deployed — EQUAL to the wire's `selected_membership`,
+    /// enforced by the conversion) and `full_membership` (the COMPLETE
+    /// target membership at terminal time — EQUAL to the rollback's slots,
+    /// enforced by the conversion). `activated ⊆ full_membership` is
+    /// enforced by the conversion; the FULL-push equality `activated ==
     /// full_membership` is enforced where the terminal merges into its
     /// entry (the mode — group vs full — lives in the intent's `group`).
     /// The rollback is the COMPLETE resulting target snapshot: for a GROUP
     /// push the base-overlay carries the unselected slots forward, so the
-    /// rollback's slots ⊇ the outcomes' keys (the outcomes cover the
-    /// SELECTED slots; the full-push EQUALITY selected == full applies only
-    /// to a FULL push, enforced where the terminal merges into its entry
-    /// (the mode lives in the intent's `group`).
+    /// rollback's slots ⊇ the activated set (the outcomes cover the
+    /// SELECTED slots; the full-push EQUALITY activated == full applies
+    /// only to a FULL push, enforced where the terminal merges into its
+    /// entry (the mode lives in the intent's `group`).
     Successful {
         rollback: CompleteRollback,
-        outcomes: SlotTable<SlotOutcome>,
-        /// The SELECTED membership: the slots this deployment actually
-        /// selected / deployed — the outcomes' keys (a group push's group
-        /// slots; a full push's every target slot). EQUAL to the outcomes'
-        /// keys by construction — the conversion refuses a disagreement,
-        /// so the record PROVES which slots were selected.
-        selected_membership: BTreeSet<SlotId>,
+        /// THE ACTIVATED SLOTS — the NON-EMPTY set of slot ids this push
+        /// activated (the outcomes' keys; a group push's group slots; a
+        /// full push's every target slot). THE SUCCESS REPRESENTATION: the
+        /// per-slot GENERATION/ARTIFACT facts are NOT stored here — they
+        /// are DERIVED from the rollback (the single source of truth,
+        /// [`LedgerTerminal::outcomes`]): the wire → domain conversion
+        /// enforces the COMPLETE EQUALITY PREDICATE per activated slot
+        /// (Known(g), g == the rollback's generation, error == None,
+        /// compensated == false) and then DISCARDS the wire's per-slot
+        /// claims. EQUAL to the wire's `selected_membership` by
+        /// construction — the conversion refuses a disagreement, so the
+        /// record PROVES which slots were selected (every selected slot was
+        /// activated).
+        activated: BTreeSet<SlotId>,
         /// The FULL membership: the COMPLETE target membership at terminal
         /// time — the rollback's key set (the intent's FROZEN full
         /// membership the terminal REPRODUCES). EQUAL to the rollback's
@@ -171,19 +190,17 @@ pub struct LedgerTerminal {
     /// HOW the attempt ended — the enum whose variants carry exactly their
     /// payload: each disposition OWNS its per-slot outcomes table (the
     /// truth table is structural; the per-slot projections are derived from
-    /// the disposition's OWN table).
+    /// the disposition's OWN table). A [`TerminalDisposition::Successful`]
+    /// terminal instead owns THE ACTIVATED SLOT-ID SET + the rollback: its
+    /// per-slot outcome facts are the DERIVED VIEW over the rollback (the
+    /// single source of truth), so the disposition's payload never carries
+    /// duplicated per-slot state that could contradict the rollback.
     pub disposition: TerminalDisposition,
     /// Optional human context: why this terminal event happened. A
     /// free-form NOTE, not a fact — it never participates in invariants
     /// (the disposition is the machine fact).
     pub reason: Option<String>,
 }
-
-/// The empty outcomes table a [`TerminalDisposition::FailedPreflight`]
-/// terminal yields through [`LedgerTerminal::outcomes`] — the disposition
-/// carries NO outcomes (a pre-mutation failure touched no slot), so the
-/// accessor yields an empty table rather than `None`.
-static EMPTY_OUTCOMES: SlotTable<SlotOutcome> = SlotTable::new();
 
 impl LedgerTerminal {
     /// The terminal's status, DERIVED from its disposition (never stored
@@ -192,35 +209,71 @@ impl LedgerTerminal {
         self.disposition.status()
     }
 
-    /// The terminal's per-slot outcomes — the disposition's OWN table (each
-    /// disposition carries its outcomes; a
-    /// [`TerminalDisposition::FailedPreflight`] terminal carries none, so
-    /// the accessor yields an empty table). THE AUTHORITATIVE per-slot
-    /// facts live ONCE, inside the disposition — there is no separate
-    /// outcomes field to disagree with.
-    pub fn outcomes(&self) -> &SlotTable<SlotOutcome> {
+    /// The terminal's per-slot outcomes — the disposition's OWN table
+    /// ([`TerminalDisposition::FailedPreflight`] carries none, so the
+    /// accessor yields an empty table). For a SUCCESSFUL terminal the
+    /// per-slot facts are the DERIVED VIEW over the rollback — the single
+    /// source of truth (each activated slot's outcome IS the rollback's
+    /// authoritative generation for that slot; the wire → domain conversion
+    /// enforced the complete equality predicate and then DISCARDED the
+    /// wire's per-slot claims): the per-slot generation/artifact facts are
+    /// never stored/trusted separately, so a successful terminal can never
+    /// contradict its rollback. The table is MATERIALIZED on demand (the
+    /// value is owned); the successful view is deterministic — Activated /
+    /// Known(rollback generation) / error None / compensated false.
+    pub fn outcomes(&self) -> SlotTable<SlotOutcome> {
         match &self.disposition {
-            TerminalDisposition::Successful { outcomes, .. } => outcomes,
-            TerminalDisposition::FailedPreflight => &EMPTY_OUTCOMES,
-            TerminalDisposition::FailedRolledBack { outcomes } => outcomes,
-            TerminalDisposition::Degraded { outcomes } => outcomes,
+            TerminalDisposition::Successful {
+                rollback,
+                activated,
+                ..
+            } => {
+                // THE DERIVED VIEW: every activated slot's per-slot outcome
+                // facts ARE the rollback's authoritative generation — never
+                // stored/trusted separately. Every activated slot is a
+                // rollback slot (the conversion enforced activated ==
+                // selected ⊆ full == the rollback's slots).
+                let map: BTreeMap<SlotId, SlotOutcome> = activated
+                    .iter()
+                    .map(|sid| {
+                        let rb = rollback.slots.get(sid).expect(
+                            "a Successful terminal's activated slots are always covered by its rollback — the conversion enforces activated ⊆ rollback == full",
+                        );
+                        (
+                            sid.clone(),
+                            SlotOutcome {
+                                outcome: SlotOutcomeKind::Activated,
+                                observation: Observation::Known(ObservedGeneration {
+                                    generation: rb.generation.clone(),
+                                }),
+                                compensated: false,
+                                error: None,
+                                transition: SlotTransition::Advanced,
+                            },
+                        )
+                    })
+                    .collect();
+                SlotTable::from_map(map)
+            }
+            TerminalDisposition::FailedPreflight => SlotTable::new(),
+            TerminalDisposition::FailedRolledBack { outcomes }
+            | TerminalDisposition::Degraded { outcomes } => outcomes.clone(),
         }
     }
 
     /// The terminal's SELECTED MEMBERSHIP — the slots this deployment
-    /// actually selected / deployed (the outcomes' keys; for a group push
-    /// the group's slots; for a full push every target slot). PERSISTED in
-    /// the record and EQUAL to the outcomes' keys by construction (the
-    /// wire → domain conversion refuses a disagreement), so a consumer can
-    /// display or prove which slots the push selected WITHOUT re-deriving
-    /// it from the intent. `None` for every non-Successful disposition
-    /// (a failed attempt never proves a membership).
+    /// actually selected / deployed, i.e. THE ACTIVATED SET (for a group
+    /// push the group's slots; for a full push every target slot; every
+    /// selected slot was activated — the conversion enforces the equality).
+    /// PERSISTED in the record and EQUAL to the wire's
+    /// `selected_membership` by construction (the wire → domain conversion
+    /// refuses a disagreement), so a consumer can display or prove which
+    /// slots the push selected WITHOUT re-deriving it from the intent.
+    /// `None` for every non-Successful disposition (a failed attempt never
+    /// proves a membership).
     pub fn selected_membership(&self) -> Option<&BTreeSet<SlotId>> {
         match &self.disposition {
-            TerminalDisposition::Successful {
-                selected_membership,
-                ..
-            } => Some(selected_membership),
+            TerminalDisposition::Successful { activated, .. } => Some(activated),
             _ => None,
         }
     }
@@ -459,10 +512,67 @@ impl LedgerTerminalWire {
                         self.deployment_id, r.outcome
                     )));
                 }
+                // THE COMPLETE EQUALITY PREDICATE (the user's requirement):
+                // a successful slot's wire outcome must AGREE with the
+                // rollback — the rollback is the AUTHORITATIVE per-slot
+                // fact, and an outcome that contradicts it is a
+                // SELF-CONTRADICTING SUCCESS, refused (fail closed). Each
+                // selected slot must carry:
+                //   * Known(g) — a successful slot's state is Known, never
+                //     KnownAbsent/Unknown (a successful slot was deployed);
+                //   * g == rollback.slots[slot].generation — the OBSERVED
+                //     generation EQUALS the rollback's authoritative
+                //     generation for that slot (the outcome can never claim
+                //     a generation the rollback did not actually advance);
+                //   * error == None — a successful outcome carries no
+                //     operation error;
+                //   * compensated == false — a successful slot was not
+                //     compensated.
+                // Any violation → `Error::integrity` naming the slot and the
+                // offending leg. The wire's per-slot claims are then
+                // DISCARDED — the domain stores only the ACTIVATED SLOT-ID
+                // SET, deriving each slot's generation/artifact facts from
+                // the rollback (the single source of truth) via
+                // [`LedgerTerminal::outcomes`].
+                for (key, r) in outcomes.iter() {
+                    // Every outcome key is a rollback slot (rollback == full
+                    // ⊇ outcomes == selected — enforced above).
+                    let rb_gen = &rollback.slots[key].generation;
+                    let mut violations: Vec<String> = Vec::new();
+                    match &r.observation {
+                        Observation::Known(og) => {
+                            if &og.generation != rb_gen {
+                                violations.push(format!(
+                                    "observed generation {:?} != the rollback's generation {rb_gen:?}",
+                                    og.generation
+                                ));
+                            }
+                        }
+                        other => violations.push(format!(
+                            "observation {other:?} is not Known(g) — a successful slot's state must be Known"
+                        )),
+                    }
+                    if r.error.is_some() {
+                        violations.push("carries an operation error".to_string());
+                    }
+                    if r.compensated {
+                        violations.push("is compensated".to_string());
+                    }
+                    if !violations.is_empty() {
+                        return Err(Error::integrity(format!(
+                            "terminal {}: status Successful outcome for slot '{key}' contradicts the rollback — the outcome's per-slot facts must EQUAL the rollback's (Known(g), g == rollback.slots['{key}'].generation, error == None, compensated == false); violated: {}",
+                            self.deployment_id,
+                            violations.join("; ")
+                        )));
+                    }
+                }
+                // SUCCESS IS A NON-EMPTY SET OF ACTIVATED SLOT IDS: the
+                // per-slot wire claims have been validated against the
+                // rollback and DISCARDED — the domain keeps the activated
+                // set + the rollback (the facts source) + the memberships.
                 TerminalDisposition::Successful {
                     rollback,
-                    outcomes,
-                    selected_membership,
+                    activated: outcome_keys,
                     full_membership,
                 }
             }
@@ -550,9 +660,15 @@ impl LedgerTerminalWire {
     /// target) identity — the enclosing [`crate::ledger::finalize::LedgerEntry`] owns the identity,
     /// so the wire's `deployment_id` / `target` come from the CALLER (the
     /// append path), never from the domain terminal. A Successful terminal's
-    /// two memberships are emitted from the disposition; every other
+    /// two memberships are emitted from the disposition (the activated set
+    /// re-expands as the wire's `selected_membership`); every other
     /// disposition emits EMPTY memberships (only a Successful terminal
     /// records them — the conversion refuses a failed status carrying any).
+    /// The Successful wire OUTCOMES are DERIVED from the rollback (via
+    /// [`LedgerTerminal::outcomes`] — the per-slot facts are never stored
+    /// separately), reproducing the exact consistent shape the engine
+    /// writes; the next read's complete equality predicate accepts it
+    /// unchanged.
     pub fn from_domain(
         deployment_id: &DeploymentId,
         target: &TargetName,
@@ -566,11 +682,11 @@ impl LedgerTerminalWire {
         };
         let (selected_membership, full_membership) = match &t.disposition {
             TerminalDisposition::Successful {
-                selected_membership,
+                activated,
                 full_membership,
                 ..
             } => (
-                selected_membership.iter().cloned().collect(),
+                activated.iter().cloned().collect(),
                 full_membership.iter().cloned().collect(),
             ),
             _ => (Vec::new(), Vec::new()),

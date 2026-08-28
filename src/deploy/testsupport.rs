@@ -23,7 +23,7 @@ pub(crate) use crate::ledger::{
     self, DeploymentIntent, DeploymentPlan, DeploymentStatus, DesiredGeneration, IntentSlot,
     LedgerEntry, LedgerIntentReport, LedgerTerminal, NonEmptySlotTable, Observation,
     ObservationWire, ObservedAssignment, ObservedGenerationWire, RefExpr, SlotAttemptState,
-    SlotOutcome, SlotOutcomeKind, SlotResult, SlotTable, TerminalDisposition,
+    TerminalDisposition,
 };
 pub(crate) use crate::remote::transport::{FsBytes, LocalTransport, Remote};
 pub(crate) use crate::store::local::LocalStore;
@@ -368,44 +368,23 @@ pub(crate) fn seed_snapshot(
             &test_deployment_id(deployment_id),
             &LedgerTerminal {
                 recorded_at: "2026-01-01T00:00:00Z".to_string(),
-                // The EXACT-EQUAL shape: the outcomes keys equal the
-                // rollback's slots keys (and bindings keys), and the
-                // memberships PROVE the equations (outcomes == selected
-                // == full == the rollback's slots — the read enforces
-                // them, so a seeded Successful terminal must carry one
-                // Activated outcome per slotted generation).
+                // THE EXACT-EQUAL shape: every slotted generation is
+                // ACTIVATED (the memberships PROVE the equations —
+                // activated == full == the rollback's slots — and the
+                // per-slot generation/artifact facts are DERIVED from the
+                // rollback, the single source of truth; a seeded
+                // Successful terminal must carry one activated slot per
+                // slotted generation).
                 disposition: TerminalDisposition::Successful {
                     rollback: crate::ledger::LedgerRollback {
                         slots: slots.clone(),
                         bindings,
                     },
-                    outcomes: SlotTable::from_map(
-                        slots
-                            .iter()
-                            .map(|(k, g)| {
-                                (
-                                    k.clone(),
-                                    SlotOutcome::from_wire(SlotResult {
-                                        slot_id: k.clone(),
-                                        outcome: SlotOutcomeKind::Activated,
-                                        observation: ObservationWire::Known(
-                                            ObservedGenerationWire {
-                                                generation: g.generation.clone(),
-                                            },
-                                        ),
-                                        compensated: false,
-                                        error: None,
-                                    })
-                                    .unwrap(),
-                                )
-                            })
-                            .collect(),
-                    ),
-                    // THE EXACT-EQUAL MEMBERSHIPS: selected == full ==
+                    activated: slots.keys().cloned().collect(),
+                    // THE EXACT-EQUAL MEMBERSHIPS: activated == full ==
                     // the slotted generations' keys (the rollback's
-                    // slots / the outcomes' keys) — the proven shape the
-                    // conversion + read require.
-                    selected_membership: slots.keys().cloned().collect(),
+                    // slots) — the proven shape the conversion + read
+                    // require.
                     full_membership: slots.keys().cloned().collect(),
                 },
                 reason: None,

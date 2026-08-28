@@ -40,15 +40,17 @@ mod tests_entry {
     // wire shapes + their conversions live with the records.
     use crate::error::{Error, Result};
     use crate::identity::{
-        ArtifactRef, GenerationRef, PlacementSlotAssignment, ServerId, SlotId, TargetName,
-        VariantName, test_deployment_id, test_generation_id, test_release_id, test_tree_digest,
+        ArtifactRef, GenerationId, GenerationRef, PlacementSlotAssignment, ServerId, SlotId,
+        TargetName, VariantName, test_deployment_id, test_generation_id, test_release_id,
+        test_tree_digest,
     };
     use crate::ledger::finalize::LedgerLine;
     use crate::ledger::records::SlotOutcomeKind;
     use crate::ledger::records::{DeploymentIntent, LedgerIntentWire};
     use crate::ledger::records::{
-        DeploymentStatus, LedgerRollbackWire, ObservationWire, ObservedGenerationWire,
-        PhysicalBinding, SlotAttemptStateWire, SlotResult,
+        DeploymentStatus, LedgerRollbackWire, Observation, ObservationError, ObservationWire,
+        ObservedGeneration, ObservedGenerationWire, PhysicalBinding, SlotAttemptStateWire,
+        SlotResult,
     };
     use crate::ledger::records::{LedgerTerminal, LedgerTerminalWire, TerminalDisposition};
     use crate::store::local::LocalStore;
@@ -288,8 +290,8 @@ mod tests_entry {
         // conversion). The intent's `slot_ids` is NOT compared to either
         // membership (it is the historical selected set written before the
         // push; the terminal's memberships are proven at terminal time).
-        let outcome_keys: BTreeSet<&SlotId> = terminal.outcomes().keys().collect();
-        let membership: BTreeSet<&SlotId> = intent.slots.keys().collect();
+        let outcome_keys: BTreeSet<SlotId> = terminal.outcomes().keys().cloned().collect();
+        let membership: BTreeSet<SlotId> = intent.slots.keys().cloned().collect();
         match terminal.status() {
             DeploymentStatus::Successful => {
                 // THE INTENT-BINDING LEGS (the user's requirement): the
@@ -303,12 +305,14 @@ mod tests_entry {
                 // conversion).
                 let (selected, full) = match &terminal.disposition {
                     TerminalDisposition::Successful {
-                        selected_membership,
+                        activated,
                         full_membership,
                         ..
-                    } => (selected_membership, full_membership),
+                    } => (activated, full_membership),
                     _ => {
-                        unreachable!("a Successful terminal carries its rollback + memberships")
+                        unreachable!(
+                            "a Successful terminal carries its rollback + activated set + memberships"
+                        )
                     }
                 };
                 if selected != &intent.selected_membership() {
@@ -409,7 +413,9 @@ mod tests_entry {
         match (&terminal.disposition, status_idx) {
             (
                 TerminalDisposition::Successful {
-                    rollback, outcomes, ..
+                    rollback,
+                    activated,
+                    ..
                 },
                 0,
             ) => {
@@ -423,33 +429,39 @@ mod tests_entry {
                     keys.len(),
                     "every slotted generation carries its physical binding"
                 );
-                // The Successful disposition OWNS its outcome table: the
-                // accessor returns the disposition's OWN table, and every
-                // outcome is Activated (the conversion's agreement).
-                assert_eq!(
-                    terminal.outcomes(),
-                    outcomes,
-                    "the accessor reads the disposition's OWN table"
-                );
+                // The Successful disposition OWNS its ACTIVATED SET; the
+                // accessor MATERIALIZES the DERIVED VIEW over the rollback
+                // (every activated slot's facts ARE the rollback's
+                // generation — never stored/trusted separately).
+                assert_eq!(activated.len(), keys.len(), "one activated slot per member");
+                let outcomes = terminal.outcomes();
                 assert_eq!(
                     outcomes.len(),
                     keys.len(),
-                    "the Successful disposition owns one outcome per member"
+                    "the derived view covers every activated slot"
                 );
                 assert!(
                     outcomes
                         .values()
                         .all(|o| o.outcome == SlotOutcomeKind::Activated),
-                    "a Successful disposition's outcomes are all Activated"
+                    "a Successful disposition's derived outcomes are all Activated"
                 );
+                for key in outcomes.keys() {
+                    assert_eq!(
+                        outcomes[key].observation,
+                        Observation::Known(ObservedGeneration {
+                            generation: rollback.slots[key].generation.clone(),
+                        }),
+                        "the derived view's generation EQUALS the rollback's authoritative generation"
+                    );
+                }
                 // THE PERSISTED MEMBERSHIPS: the domain exposes both, equal
                 // to the membership (the exact-equal proven shape) — the
-                // record PROVES selected == full == the outcome/rollback key
-                // set.
+                // record PROVES activated == full == the rollback's key set.
                 assert_eq!(
                     terminal.selected_membership(),
                     Some(&BTreeSet::from_iter(keys.iter().cloned())),
-                    "the Successful disposition exposes its selected membership (== the outcomes' keys)"
+                    "the Successful disposition exposes its selected membership (== the activated set)"
                 );
                 assert_eq!(
                     terminal.full_membership(),
@@ -499,7 +511,7 @@ mod tests_entry {
                     unreachable!("matched above");
                 };
                 assert_eq!(
-                    terminal.outcomes(),
+                    &terminal.outcomes(),
                     outcomes,
                     "the accessor reads the disposition's OWN table"
                 );
@@ -1250,6 +1262,386 @@ mod tests_entry {
             assert!(
                 write_pair_ledger(&pair).is_err(),
                 "mutating exactly one of the six sets (set {set_idx}, op {op:?}) must be rejected by read_ledger — the durable write → re-read is the crash-recovery read"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // THE COMPLETE EQUALITY PREDICATE PROPERTY (Successful vs the rollback)
+    // ---------------------------------------------------------------------
+    //
+    // THE USER'S REQUIREMENT: a successful terminal can never contradict
+    // its rollback. The wire keeps the per-slot `outcomes` shape, so the
+    // wire → domain conversion enforces THE COMPLETE EQUALITY PREDICATE
+    // per selected slot: the observation is `Known(g)`, `g ==
+    // rollback.slots[slot].generation`, `error == None`, and
+    // `compensated == false` — and then DISCARDS the wire's per-slot
+    // claims (the domain stores only the ACTIVATED SLOT-ID SET; the per-slot
+    // facts are DERIVED from the rollback).
+
+    /// The per-slot legs of the SUCCESSFUL-WIRE product: the outcome kind,
+    /// the THREE-STATE observation, the operation error, the compensation
+    /// flag, and whether the rollback's generation for the slot EQUALS the
+    /// observation's Known generation (the pair builder makes the rollback
+    /// generation EQUAL when `rb_match` and DIFFERENT otherwise). Generated
+    /// INDEPENDENTLY per slot.
+    #[derive(Debug, Clone)]
+    struct SuccessfulLegs {
+        kind: SlotOutcomeKind,
+        observation: Observation<ObservedGeneration>,
+        error: Option<String>,
+        compensated: bool,
+        rb_match: bool,
+    }
+
+    /// THE PRODUCT generator (the user's requirement): outcome kind x
+    /// observation (Known / KnownAbsent / Unknown) x operation error x
+    /// compensation x rollback-generation agreement — every leg generated
+    /// independently.
+    fn successful_legs() -> impl Strategy<Value = SuccessfulLegs> {
+        (
+            prop_oneof![
+                Just(SlotOutcomeKind::Activated),
+                Just(SlotOutcomeKind::Failed),
+                Just(SlotOutcomeKind::Skipped),
+                Just(SlotOutcomeKind::Restored),
+                Just(SlotOutcomeKind::Compensated),
+            ],
+            prop_oneof![
+                (0u32..6).prop_map(|i| Observation::Known(ObservedGeneration {
+                    generation: test_generation_id(&format!("obs-{i}")),
+                })),
+                Just(Observation::KnownAbsent),
+                prop::sample::select(vec![
+                    "status read failed: boom".to_string(),
+                    "assignment read failed: boom".to_string(),
+                ])
+                .prop_map(|e| Observation::Unknown(ObservationError { message: e })),
+            ],
+            prop::option::of(prop::sample::select(vec![
+                "swap failed: boom".to_string(),
+                "verification failed".to_string(),
+            ])),
+            any::<bool>(),
+            any::<bool>(),
+        )
+            .prop_map(
+                |(kind, observation, error, compensated, rb_match)| SuccessfulLegs {
+                    kind,
+                    observation,
+                    error,
+                    compensated,
+                    rb_match,
+                },
+            )
+    }
+
+    /// A generation ref whose assignment names its own key, with the given
+    /// generation (the rollback's per-slot generation is built per leg).
+    fn gen_ref_with_gen(key: &SlotId, generation: GenerationId) -> GenerationRef {
+        GenerationRef {
+            generation,
+            assignment: PlacementSlotAssignment {
+                placement_slot: key.clone(),
+                artifact: ArtifactRef {
+                    release: test_release_id(key.as_str()),
+                    variant: VariantName::new("standard".to_string()),
+                    tree: test_tree_digest(key.as_str()),
+                },
+            },
+        }
+    }
+
+    /// Build a wire pair from the generated legs: the STATUS (Successful vs
+    /// FailedRolledBack — the other product dimension), the per-slot legs,
+    /// and the slot set. The intent is a FULL push over the slot set
+    /// (selected == full == the set, non-empty — the membership equations
+    /// hold by construction). For a Successful terminal the rollback covers
+    /// the SAME set: each slot's generation EQUALS the observation's Known
+    /// generation when `rb_match` (else a DIFFERENT generation — the
+    /// mismatch leg), with exact bindings. For a FailedRolledBack terminal
+    /// the outcomes are the compensation report (no rollback, no
+    /// memberships) — judged by ITS OWN rules, never the predicate.
+    fn pair_from_legs(
+        status: DeploymentStatus,
+        slots: &BTreeSet<SlotId>,
+        legs: &BTreeMap<SlotId, SuccessfulLegs>,
+    ) -> (LedgerIntentWire, LedgerTerminalWire) {
+        let keys: Vec<SlotId> = slots.iter().cloned().collect();
+        let intent = agreeing_intent(&keys);
+        let outcomes: BTreeMap<SlotId, SlotResult> = keys
+            .iter()
+            .map(|k| {
+                let l = &legs[k];
+                (
+                    k.clone(),
+                    SlotResult {
+                        slot_id: k.clone(),
+                        outcome: l.kind.clone(),
+                        observation: ObservationWire::from(&l.observation),
+                        compensated: l.compensated,
+                        error: l.error.clone(),
+                    },
+                )
+            })
+            .collect();
+        let terminal = match status {
+            DeploymentStatus::Successful => {
+                let rb_slots: BTreeMap<SlotId, GenerationRef> = keys
+                    .iter()
+                    .map(|k| {
+                        let l = &legs[k];
+                        let gen_id = match &l.observation {
+                            Observation::Known(og) if l.rb_match => og.generation.clone(),
+                            _ => test_generation_id(&format!("rb-{}", k.as_str())),
+                        };
+                        (k.clone(), gen_ref_with_gen(k, gen_id))
+                    })
+                    .collect();
+                let bindings: BTreeMap<SlotId, PhysicalBinding> =
+                    keys.iter().map(|k| (k.clone(), binding(k))).collect();
+                LedgerTerminalWire {
+                    deployment_id: intent.deployment_id.clone(),
+                    target: intent.target.clone(),
+                    status: DeploymentStatus::Successful,
+                    recorded_at: "2026-01-01T00:00:00Z".to_string(),
+                    outcomes,
+                    rollback: Some(LedgerRollbackWire {
+                        slots: rb_slots,
+                        bindings,
+                        behavior_sha256: None,
+                        release: None,
+                    }),
+                    selected_membership: keys.clone(),
+                    full_membership: keys.clone(),
+                    reason: Some("push completed".to_string()),
+                }
+            }
+            _ => LedgerTerminalWire {
+                deployment_id: intent.deployment_id.clone(),
+                target: intent.target.clone(),
+                status: DeploymentStatus::FailedRolledBack,
+                recorded_at: "2026-01-01T00:00:00Z".to_string(),
+                outcomes,
+                rollback: None,
+                selected_membership: vec![],
+                full_membership: vec![],
+                reason: Some("rolled back".to_string()),
+            },
+        };
+        (intent, terminal)
+    }
+
+    /// THE COMPLETE EQUALITY PREDICATE over every selected slot (the
+    /// user's requirement): Known(g) AND g == the rollback's generation AND
+    /// error == None AND compensated == false — plus the Successful
+    /// disposition's own rules (every outcome Activated, non-empty
+    /// memberships, the membership equations — all held by construction in
+    /// [`pair_from_legs`]). `rb_match` encodes "the rollback's generation
+    /// equals the observation's Known generation" (the builder makes them
+    /// EQUAL when `rb_match` and DIFFERENT otherwise), so the predicate is a
+    /// pure function of the generated legs.
+    fn complete_equality_holds(legs: &BTreeMap<SlotId, SuccessfulLegs>) -> bool {
+        legs.values().all(|l| {
+            l.kind == SlotOutcomeKind::Activated
+                && l.rb_match
+                && matches!(&l.observation, Observation::Known(_))
+                && l.error.is_none()
+                && !l.compensated
+        })
+    }
+
+    proptest! {
+        // THE USER'S PROPERTY (acceptance equivalence): generate THE
+        // PRODUCT of the per-slot legs — outcome kind, observation
+        // (Known(g) / KnownAbsent / Unknown(error)), operation error,
+        // compensation, and the rollback-generation agreement — over EVERY
+        // selected slot of a non-empty membership, crossed with the STATUS
+        // (Successful vs FailedRolledBack). `read_ledger` (the real durable
+        // write → re-read path) SUCCEEDS for a Successful pair EXACTLY WHEN
+        // EVERY selected slot satisfies THE COMPLETE EQUALITY PREDICATE:
+        // Known(g) AND g == rollback.slots[slot].generation AND error ==
+        // None AND compensated == false (plus the existing Successful rules
+        // — non-empty, all Activated, outcomes == selected, rollback ==
+        // full, selected ⊆ full, full-push selected == full — all held by
+        // construction). A non-Successful status is judged by ITS OWN rules
+        // (the compensation report), never the predicate. Bounded 64 cases
+        // (the product space is large), fixed seed 0x5EED_5EED (house
+        // style), no persistence.
+        #![proptest_config(ProptestConfig {
+            cases: 64,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn successful_acceptance_is_exactly_the_complete_equality_predicate(
+            status in prop_oneof![
+                Just(DeploymentStatus::Successful),
+                Just(DeploymentStatus::FailedRolledBack),
+            ],
+            slots_and_legs in prop::collection::btree_set(slot_strategy(), 1..4).prop_flat_map(
+                |slots| {
+                    let n = slots.len();
+                    (
+                        Just(slots),
+                        prop::collection::vec(successful_legs(), n..=n),
+                    )
+                },
+            ),
+        ) {
+            // The legs are generated EXACTLY ONE PER selected slot and
+            // zipped onto the slot set.
+            let (slots, legs_vec) = slots_and_legs;
+            let legs: BTreeMap<SlotId, SuccessfulLegs> = slots
+                .iter()
+                .cloned()
+                .zip(legs_vec)
+                .collect();
+            let pair = pair_from_legs(status.clone(), &slots, &legs);
+            let expect_ok = match status {
+                DeploymentStatus::Successful => complete_equality_holds(&legs),
+                _ => true, // FailedRolledBack: the compensation report
+                // exactly covers the membership by construction — its own
+                // rules hold, never the Successful predicate.
+            };
+            let read = write_pair_ledger(&pair);
+            assert_eq!(
+                read.is_ok(),
+                expect_ok,
+                "read_ledger must succeed for status {status:?} iff {}; legs {:?}; read: {:?}",
+                if status == DeploymentStatus::Successful {
+                    "every selected slot satisfies the complete equality predicate (Known(g), g == the rollback's generation, error == None, compensated == false)"
+                } else {
+                    "the status's own rules hold"
+                },
+                legs,
+                read
+            );
+        }
+    }
+
+    // ---- THE SINGLE-LEG MUTATION REJECTION (Successful) ------------------
+
+    /// Apply EXACTLY ONE leg mutation to a CANONICAL ACCEPTED Successful
+    /// pair (every slot: Activated, Known(g), rollback generation == g,
+    /// error None, compensated false): (0) the OBSERVATION leg → Unknown,
+    /// (1) the GENERATION leg → the rollback's generation now MISMATCHES
+    /// the outcome's observed Known generation, (2) the ERROR leg → Some,
+    /// (3) the COMPENSATION leg → true, (4) the KIND leg → Failed, (5) an
+    /// outcome DROPPED (the outcomes no longer equal the selected
+    /// membership).
+    fn apply_single_leg_mutation(pair: &mut (LedgerIntentWire, LedgerTerminalWire), leg: u32) {
+        let terminal = &mut pair.1;
+        match leg {
+            0 => {
+                let r = terminal
+                    .outcomes
+                    .values_mut()
+                    .next()
+                    .expect("non-empty outcomes");
+                r.observation = ObservationWire::Unknown(ObservationError {
+                    message: "status read failed: boom".to_string(),
+                });
+            }
+            1 => {
+                let rb = terminal
+                    .rollback
+                    .as_mut()
+                    .expect("a Successful terminal carries a rollback");
+                let first = rb.slots.keys().next().cloned().expect("non-empty rollback");
+                rb.slots
+                    .get_mut(&first)
+                    .expect("the slot is slotted")
+                    .generation = test_generation_id("rb-mismatch");
+            }
+            2 => {
+                let r = terminal
+                    .outcomes
+                    .values_mut()
+                    .next()
+                    .expect("non-empty outcomes");
+                r.error = Some("swap failed: boom".to_string());
+            }
+            3 => {
+                let r = terminal
+                    .outcomes
+                    .values_mut()
+                    .next()
+                    .expect("non-empty outcomes");
+                r.compensated = true;
+            }
+            4 => {
+                let r = terminal
+                    .outcomes
+                    .values_mut()
+                    .next()
+                    .expect("non-empty outcomes");
+                r.outcome = SlotOutcomeKind::Failed;
+            }
+            _ => {
+                // Drop ONE outcome: the outcomes no longer equal the
+                // selected membership (the existing Successful equation).
+                let first = terminal
+                    .outcomes
+                    .keys()
+                    .next()
+                    .cloned()
+                    .expect("non-empty outcomes");
+                terminal.outcomes.remove(&first);
+            }
+        }
+    }
+
+    proptest! {
+        // THE USER'S SINGLE-LEG REJECTION PROPERTY: from a CANONICAL
+        // ACCEPTED Successful pair (every slot satisfies the complete
+        // equality predicate), MUTATE EXACTLY ONE LEG — the observation
+        // (→ Unknown), the generation (→ mismatching the rollback), the
+        // error (→ Some), the compensation (→ true), the outcome kind (→
+        // Failed), or drop an outcome — and assert `read_ledger` REJECTS
+        // with an INTEGRITY error (fail closed), through the real durable
+        // write → re-read crash-recovery path. Bounded 64 cases, fixed seed
+        // 0x5EED_5EED (house style), no persistence.
+        #![proptest_config(ProptestConfig {
+            cases: 64,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn mutating_any_single_leg_is_an_integrity_rejection(
+            slots in prop::collection::btree_set(slot_strategy(), 1..4),
+            leg in 0u32..6,
+        ) {
+            let legs: BTreeMap<SlotId, SuccessfulLegs> = slots
+                .iter()
+                .map(|k| {
+                    (
+                        k.clone(),
+                        SuccessfulLegs {
+                            kind: SlotOutcomeKind::Activated,
+                            observation: Observation::Known(ObservedGeneration {
+                                generation: test_generation_id(&format!("obs-{}", k.as_str())),
+                            }),
+                            error: None,
+                            compensated: false,
+                            rb_match: true,
+                        },
+                    )
+                })
+                .collect();
+            let mut pair = pair_from_legs(DeploymentStatus::Successful, &slots, &legs);
+            write_pair_ledger(&pair).expect("the canonical pair reads");
+            apply_single_leg_mutation(&mut pair, leg);
+            let err = write_pair_ledger(&pair).expect_err(
+                "mutating any single leg (observation / generation / error / compensation / kind / dropped outcome) must be rejected",
+            );
+            assert!(
+                matches!(err, Error::Integrity(_)),
+                "the rejection must be an integrity error, got: {err}"
             );
         }
     }
