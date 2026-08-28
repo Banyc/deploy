@@ -23,9 +23,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::{
-    ContentEquivalence, CreateNewVerdict, FsBytes, IMMUTABLE_RECORD_MODE, Remote, RemoteEntry,
-    RemoteMeta, RemoveIfVerdict, has_normal_component_below_root, verified_to_verdict,
-    verify_existing,
+    ContentEquivalence, CreateNewVerdict, FsBytes, IMMUTABLE_RECORD_MODE, OpenedEntry,
+    OpenedExisting, Remote, RemoteEntry, RemoteMeta, RemoveIfVerdict,
+    has_normal_component_below_root, verified_to_verdict, verify_existing,
 };
 use hostkey::pin_known_hosts;
 use runner::{OpKind, RunError, SSH_CONNECT_TIMEOUT_SECS, SshRunner};
@@ -621,6 +621,197 @@ impl SshTransport {
         )
     }
 
+    /// Build the remote DESCRIPTOR-BOUND verification helper for `rel`: ONE
+    /// remote exec whose SINGLE stdout payload performs the open→fstat→read
+    /// sequence on ONE opened inode — `sysopen` with `O_NOFOLLOW` (a symlink
+    /// → ELOOP, NEVER followed — even one pointing at a matching regular
+    /// file; `O_NONBLOCK` so a fifo/device open cannot block the helper),
+    /// `stat` on the SAME handle (fstat), and `sysread` THROUGH the same
+    /// handle — closing the client-side TOCTOU the old
+    /// lstat-then-separate-read left open (there is NO client round-trip
+    /// between the steps: one frame carries the fd-derived mode AND content,
+    /// or the errno). The remote-side race between the helper's OWN steps is
+    /// out of scope — the guarantee is that metadata and content come from
+    /// the SAME opened inode. Frame (stdout bytes):
+    ///
+    /// * `O\t<rawmode_hex>\n<content>` — a REGULAR file: the raw mode from
+    ///   the opened fd's fstat, then the content read through the SAME fd
+    ///   (raw bytes, possibly empty);
+    /// * `N\t<rawmode_hex>` — opened + fstat'd but NOT a regular file (the
+    ///   mode bits classify dir/symlink/other);
+    /// * `E\t<errno>` — the open/fstat/read failed (ELOOP → symlink,
+    ///   ENOENT/ENOTDIR → absent, EISDIR → directory, EACCES/... →
+    ///   unreadable; the errno numbers are POSIX, identical on Linux and
+    ///   macOS).
+    ///
+    /// The path is a positional argument after `--` (single-quoted); the
+    /// perl is multi-line inside the single-quoted `-e` argument (shell
+    /// single quotes span newlines). TEST-ONLY SWAP HOOK: when the child env
+    /// sets `DEPLOY_VERIFY_SWAP` (a [`VerifySwapKind`] name:
+    /// `symlink`/`directory`/`inode`) and `DEPLOY_VERIFY_SWAP_BOUNDARY`
+    /// (`before_open`/`after_open`/`after_fstat`), the helper replaces the
+    /// destination at that boundary (the pre-staged `$path.swap-target` file
+    /// is the symlink target or the different-inode file) — the deterministic
+    /// swap-at-every-boundary property injects this; production never sets
+    /// the variables.
+    fn verify_open_script(&self, rel: &Path) -> String {
+        let p = shell_quote(&self.root.join(rel).to_string_lossy());
+        format!(
+            "perl -e 'use Fcntl qw(O_RDONLY O_NOFOLLOW O_NONBLOCK);\n\
+             my $p = $ARGV[0];\n\
+             my $swap = $ENV{{DEPLOY_VERIFY_SWAP}};\n\
+             my $boundary = $ENV{{DEPLOY_VERIFY_SWAP_BOUNDARY}};\n\
+             my $swap_at = sub {{\n\
+               my $orig = $p . \".swap-orig\";\n\
+               my $t = $p . \".swap-target\";\n\
+               rename($p, $orig);\n\
+               if ($swap eq \"symlink\") {{ symlink($t, $p); }}\n\
+               elsif ($swap eq \"directory\") {{ mkdir($p); }}\n\
+               elsif ($swap eq \"inode\") {{ rename($t, $p); }}\n\
+             }};\n\
+             if ($swap && $boundary eq \"before_open\") {{ $swap_at->(); }}\n\
+             if (!sysopen(FH, $p, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)) {{ printf \"E\\t%d\\n\", $! + 0; exit 0; }}\n\
+             if ($swap && $boundary eq \"after_open\") {{ $swap_at->(); }}\n\
+             my @s = stat(FH);\n\
+             if (!@s) {{ printf \"E\\t%d\\n\", $! + 0; exit 0; }}\n\
+             if ($swap && $boundary eq \"after_fstat\") {{ $swap_at->(); }}\n\
+             my $type = $s[2] & 0170000;\n\
+             if ($type == 0100000) {{\n\
+               my $content = \"\";\n\
+               while (1) {{\n\
+                 my $n = sysread(FH, my $buf, 65536);\n\
+                 if (!defined $n) {{ printf \"E\\t%d\\n\", $! + 0; exit 0; }}\n\
+                 last if $n == 0;\n\
+                 $content .= $buf;\n\
+               }}\n\
+               printf \"O\\t%x\\n%s\", $s[2] & 0xffff, $content;\n\
+               exit 0;\n\
+             }}\n\
+             printf \"N\\t%x\\n\", $s[2] & 0xffff;\n\
+             ' -- {p}"
+        )
+    }
+
+    /// Classify a raw mode (`stat -c '%f'`-equivalent, the `S_IFMT` type
+    /// bits) into a [`RemoteMeta`] — the shared classification of the framed
+    /// lstat protocol AND the descriptor-bound verify-open protocol.
+    fn meta_from_raw_mode(raw: u32) -> RemoteMeta {
+        let mode = raw & 0o7777;
+        let is_symlink = (raw & 0o170000) == 0o120000;
+        let is_dir = (raw & 0o170000) == 0o040000;
+        RemoteMeta {
+            is_dir,
+            is_symlink,
+            is_file: !is_symlink && !is_dir,
+            size: 0,
+            mode,
+        }
+    }
+
+    /// The [`NotRegularFileKind`] of a [`RemoteMeta`] (directory / symlink /
+    /// other) — the verify-open parser's type classification.
+    fn kind_of(meta: &RemoteMeta) -> crate::remote::transport::NotRegularFileKind {
+        use crate::remote::transport::NotRegularFileKind;
+        if meta.is_dir {
+            NotRegularFileKind::Directory
+        } else if meta.is_symlink {
+            NotRegularFileKind::Symlink
+        } else {
+            NotRegularFileKind::Other
+        }
+    }
+
+    /// Parse the SINGLE-frame stdout produced by
+    /// [`SshTransport::verify_open_script`] into the descriptor-bound
+    /// [`OpenedExisting`] the shared verification maps: `O` (a regular file
+    /// opened with `O_NOFOLLOW` and fstat'd+read through the SAME
+    /// descriptor — mode from the raw mode bits, content the raw bytes after
+    /// the header line), `N` (opened+fstat'd non-regular entry — dir/symlink/
+    /// other by the mode bits), or `E` (open/fstat/read failed —
+    /// ENOENT/ENOTDIR → NotFound, ELOOP → NotRegularFile{Symlink} (the
+    /// `O_NOFOLLOW` open, never followed), EISDIR → NotRegularFile{Directory},
+    /// every other errno → Unreadable). Anything malformed — garbage, wrong
+    /// prefix, extra fields, missing newline — is an error, never a silent
+    /// default.
+    fn parse_verify_open_frame(stdout: &[u8]) -> Result<OpenedExisting> {
+        let malformed = |detail: &str| {
+            Error::transport(format!(
+                "ssh verify-open: malformed frame: {detail} (stdout {:?})",
+                String::from_utf8_lossy(stdout)
+            ))
+        };
+        let nl = stdout
+            .iter()
+            .position(|&b| b == b'\n')
+            .ok_or_else(|| malformed("no newline"))?;
+        let header =
+            std::str::from_utf8(&stdout[..nl]).map_err(|_| malformed("non-utf8 header"))?;
+        let content = stdout[nl + 1..].to_vec();
+        let mut it = header.split('\t');
+        match it.next() {
+            // A REGULAR file: fd-derived mode + fd-derived content.
+            Some("O") => {
+                let raw = it
+                    .next()
+                    .and_then(|s| u32::from_str_radix(s, 16).ok())
+                    .ok_or_else(|| malformed(header))?;
+                if it.next().is_some() {
+                    return Err(malformed(header));
+                }
+                let meta = Self::meta_from_raw_mode(raw);
+                if !meta.is_file {
+                    // Defense in depth: the helper only emits O for a regular
+                    // file; a non-regular mode is still classified.
+                    return Ok(OpenedExisting::NotRegular {
+                        kind: Self::kind_of(&meta),
+                    });
+                }
+                Ok(OpenedExisting::Entry(OpenedEntry { meta, content }))
+            }
+            // Opened + fstat'd, NOT a regular file: the mode bits classify.
+            Some("N") => {
+                let raw = it
+                    .next()
+                    .and_then(|s| u32::from_str_radix(s, 16).ok())
+                    .ok_or_else(|| malformed(header))?;
+                if it.next().is_some() {
+                    return Err(malformed(header));
+                }
+                let meta = Self::meta_from_raw_mode(raw);
+                Ok(OpenedExisting::NotRegular {
+                    kind: Self::kind_of(&meta),
+                })
+            }
+            // The open/fstat/read failed: the errno maps to the typed reason.
+            Some("E") => {
+                let errno = it
+                    .next()
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .ok_or_else(|| malformed(header))?;
+                if it.next().is_some() {
+                    return Err(malformed(header));
+                }
+                // POSIX errnos: ENOENT=2, ENOTDIR=20, EISDIR=21 on both
+                // Linux and macOS; ELOOP differs (40 on Linux, 62 on macOS)
+                // — both mean the O_NOFOLLOW open hit a symlink (EACCES=13 /
+                // EPERM=1 / EIO=... → Unreadable).
+                Ok(match errno {
+                    LSTAT_ERRNO_ENOENT | LSTAT_ERRNO_ENOTDIR => OpenedExisting::NotFound,
+                    40 | 62 => OpenedExisting::NotRegular {
+                        kind: crate::remote::transport::NotRegularFileKind::Symlink,
+                    },
+                    21 => OpenedExisting::NotRegular {
+                        kind: crate::remote::transport::NotRegularFileKind::Directory,
+                    },
+                    other => OpenedExisting::Unreadable(format!(
+                        "ssh verify-open failed (errno {other})"
+                    )),
+                })
+            }
+            _ => Err(malformed(header)),
+        }
+    }
+
     /// Parse the ONE-LINE framed record produced by [`SshTransport::lstat_script`]
     /// (see the module doc): a `P` frame parses strictly into a [`RemoteMeta`]
     /// (exactly two TAB-separated payload fields — decimal size, hex raw
@@ -657,17 +848,9 @@ impl SshTransport {
                         "ssh lstat: malformed present frame: {line:?}"
                     )));
                 }
-                let mode = raw & 0o7777;
-                let is_symlink = (raw & 0o170000) == 0o120000;
-                let is_dir = (raw & 0o170000) == 0o040000;
-                let is_file = !is_symlink && !is_dir;
-                Ok(Some(RemoteMeta {
-                    is_dir,
-                    is_symlink,
-                    is_file,
-                    size,
-                    mode,
-                }))
+                let mut meta = Self::meta_from_raw_mode(raw);
+                meta.size = size;
+                Ok(Some(meta))
             }
             // Absent: ONLY ENOENT/ENOTDIR are confirmed absence; an `A` frame
             // carrying any other errno is a helper bug/mismatch -> error.
@@ -1055,11 +1238,17 @@ impl Remote for SshTransport {
         // CONFIRMED EEXIST: the no-clobber publish (perl `link(2)`) found
         // the destination already present — the verdict decision point. The
         // winner is NEVER replaced.
-        // VERIFY the existing entry through THE ONE CENTRALIZED lstat-based
-        // verification ([`crate::remote::transport::verify_existing`] — the
-        // `metadata_opt` perl-lstat protocol is the symlink-safe `lstat` form,
-        // so a symlink is never followed): a regular file with the EXACT
-        // required mode and the caller's accepted content equivalence →
+        // VERIFY the existing entry through THE ONE CENTRALIZED
+        // DESCRIPTOR-BOUND verification
+        // ([`crate::remote::transport::verify_existing`]): ONE remote helper
+        // operation ([`SshTransport::verify_open_script`]) performs the
+        // open-with-O_NOFOLLOW → fstat-the-same-fd → read-through-the-same-fd
+        // sequence and emits ONE frame carrying the fd-derived mode + content
+        // (or the errno) — there is NO client round-trip between the metadata
+        // check and the read (the old lstat-then-separate-read left a
+        // client-side TOCTOU window open; a symlink is never followed — the
+        // `O_NOFOLLOW` open fails it with ELOOP). A regular file with the
+        // EXACT required mode and the caller's accepted content equivalence →
         // AlreadyPresent (and the PARENT DIRECTORY is synced here, so the
         // convergent retry returns with a durable entry — the same
         // parent-sync guarantee a fresh Created install gets); every other
@@ -1067,8 +1256,16 @@ impl Remote for SshTransport {
         // winner, a mode mismatch, a directory/symlink/other entry, an
         // unreadable entry — never an undifferentiated conflict).
         let verified = verify_existing(
-            || self.metadata_opt(rel),
-            || self.read(rel),
+            || {
+                let out = self.run_remote(&self.verify_open_script(rel))?;
+                if !out.status.success() {
+                    return Err(Error::transport(format!(
+                        "ssh verify-open failed: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    )));
+                }
+                Self::parse_verify_open_frame(&out.stdout)
+            },
             data,
             IMMUTABLE_RECORD_MODE,
             equivalence,
@@ -1841,7 +2038,9 @@ mod tests_ssh {
 mod fingerprint_ssh_tests {
     use super::*;
     use crate::remote::helper::{ExpectedCurrent, RemoteHelper};
-    use crate::remote::transport::{NotRegularFileKind, VerifiedExisting};
+    use crate::remote::transport::{
+        NotRegularFileKind, VerifiedExisting, VerifySwapBoundary, VerifySwapKind,
+    };
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
     use std::ffi::OsString;
@@ -2084,6 +2283,19 @@ exec /bin/mv "$@"
     /// transport's children receive exactly these variables — the process
     /// env is never mutated, so no two tests (in any binary) can interfere.
     fn fake_env(bin: &Path, cache: &Path, root: &Path, prefix: &str) -> SysEnv {
+        fake_env_with(bin, cache, root, prefix, &[])
+    }
+
+    /// [`fake_env`] with EXTRA snapshot variables (e.g. the descriptor-bound
+    /// verification helper's test-only swap hook: `DEPLOY_VERIFY_SWAP` +
+    /// `DEPLOY_VERIFY_SWAP_BOUNDARY`).
+    fn fake_env_with(
+        bin: &Path,
+        cache: &Path,
+        root: &Path,
+        prefix: &str,
+        extra: &[(&str, &str)],
+    ) -> SysEnv {
         let base = crate::testutil::fixture_env();
         let mut vars: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> =
             base.child_env().into_iter().collect();
@@ -2105,6 +2317,9 @@ exec /bin/mv "$@"
                 OsString::from(prefix),
             ),
         ]));
+        for (k, v) in extra {
+            vars.insert(OsString::from(k), OsString::from(*v));
+        }
         SysEnv::from_map(vars)
     }
 
@@ -3545,6 +3760,210 @@ exec /bin/mv "$@"
                 content,
                 readability,
                 equivalence
+            );
+        }
+    }
+
+    /// The swap-at-every-boundary property of the descriptor-bound
+    /// verification over the SSH transport: the destination (a REGULAR file
+    /// matching the intent) is swapped at EVERY boundary of the ONE remote
+    /// helper's open→fstat→read sequence — BEFORE the `O_NOFOLLOW` sysopen,
+    /// BETWEEN the open and the fstat, BETWEEN the fstat and the read — by
+    /// the FAKE REMOTE (the helper's test-only env hook
+    /// `DEPLOY_VERIFY_SWAP`/`DEPLOY_VERIFY_SWAP_BOUNDARY` replaces the
+    /// destination at the named boundary). The verdict must NEVER mix two
+    /// inodes' observations:
+    ///
+    /// * a swap BEFORE the open changes WHAT is opened: a symlink →
+    ///   NotRegularFile{Symlink} (the `O_NOFOLLOW` open never follows, even a
+    ///   symlink pointing at a regular file whose bytes+mode match), a
+    ///   directory → NotRegularFile{Directory}, a different-inode regular
+    ///   file (mode AND content both differing from the intent) →
+    ///   ModeMismatch naming the SWAPPED inode's mode — a REJECTION;
+    /// * a swap AFTER the open is HARMLESS: the opened fd pins the ORIGINAL
+    ///   inode, so the helper's fstat + read observe it and the verdict is
+    ///   AlreadyPresent (the swapped-in observations differ from the
+    ///   original's, so a metadata/content mix — or a path re-open — would
+    ///   NOT yield AlreadyPresent and the assertion would catch it).
+    ///
+    /// Structural TOCTOU closure: the verification is ONE remote exec — the
+    /// recorded ssh invocation log contains EXACTLY ONE `sysopen` helper
+    /// invocation (write + verify-open [+ parent sync on AlreadyPresent]),
+    /// never the old lstat-then-separate-read pair. Bounded cases, fixed
+    /// seed 0x5EED_5EED (house style), no persistence.
+    fn ssh_swap_case() -> impl Strategy<Value = (VerifySwapBoundary, VerifySwapKind)> {
+        prop_oneof![
+            Just((VerifySwapBoundary::BeforeOpen, VerifySwapKind::Symlink)),
+            Just((VerifySwapBoundary::BeforeOpen, VerifySwapKind::Directory)),
+            Just((
+                VerifySwapBoundary::BeforeOpen,
+                VerifySwapKind::DifferentInode
+            )),
+            Just((VerifySwapBoundary::AfterOpen, VerifySwapKind::Symlink)),
+            Just((VerifySwapBoundary::AfterOpen, VerifySwapKind::Directory)),
+            Just((
+                VerifySwapBoundary::AfterOpen,
+                VerifySwapKind::DifferentInode
+            )),
+            Just((VerifySwapBoundary::AfterFstat, VerifySwapKind::Symlink)),
+            Just((VerifySwapBoundary::AfterFstat, VerifySwapKind::Directory)),
+            Just((
+                VerifySwapBoundary::AfterFstat,
+                VerifySwapKind::DifferentInode
+            )),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: crate::testutil::proptest_cases(64),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn verify_existing_swap_at_every_boundary_ssh(
+            (boundary, kind) in ssh_swap_case(),
+        ) {
+            use std::os::unix::fs::PermissionsExt;
+
+            let (boundary_str, kind_str) = match (boundary, kind) {
+                (VerifySwapBoundary::BeforeOpen, VerifySwapKind::Symlink) => {
+                    ("before_open", "symlink")
+                }
+                (VerifySwapBoundary::BeforeOpen, VerifySwapKind::Directory) => {
+                    ("before_open", "directory")
+                }
+                (VerifySwapBoundary::BeforeOpen, VerifySwapKind::DifferentInode) => {
+                    ("before_open", "inode")
+                }
+                (VerifySwapBoundary::AfterOpen, VerifySwapKind::Symlink) => {
+                    ("after_open", "symlink")
+                }
+                (VerifySwapBoundary::AfterOpen, VerifySwapKind::Directory) => {
+                    ("after_open", "directory")
+                }
+                (VerifySwapBoundary::AfterOpen, VerifySwapKind::DifferentInode) => {
+                    ("after_open", "inode")
+                }
+                (VerifySwapBoundary::AfterFstat, VerifySwapKind::Symlink) => {
+                    ("after_fstat", "symlink")
+                }
+                (VerifySwapBoundary::AfterFstat, VerifySwapKind::Directory) => {
+                    ("after_fstat", "directory")
+                }
+                (VerifySwapBoundary::AfterFstat, VerifySwapKind::DifferentInode) => {
+                    ("after_fstat", "inode")
+                }
+            };
+
+            let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+            let fake = FakeSsh::new(
+                tmp.path().join("bin"),
+                tmp.path().join("remote"),
+                "swap-ssh.test",
+                Path::new("/srv/deploy/swap-ssh"),
+            );
+            let cache = tmp.path().join("knownhosts");
+            let env = fake_env_with(
+                &fake.bin,
+                &cache,
+                &fake.remote_root,
+                "/srv/deploy/swap-ssh",
+                &[
+                    ("DEPLOY_VERIFY_SWAP", kind_str),
+                    ("DEPLOY_VERIFY_SWAP_BOUNDARY", boundary_str),
+                ],
+            );
+            let t = fake.transport(&cache, &env);
+            t.prepare_identity().unwrap();
+            // The remote script fsyncs its temp (`sync "$tmp"`) before the
+            // publish; a no-op fake keeps the emulated host quiet.
+            write_fake_bin(&fake.bin, "sync", "#!/bin/sh\nexit 0\n");
+
+            let required = IMMUTABLE_RECORD_MODE & 0o7777;
+            let wrong_mode = if required == 0o600 { 0o640 } else { 0o600 };
+            let intended: &[u8] = br#"{"a":1,"b":2}"#;
+            let swapped_content: &[u8] = br#"{"a":9,"b":9}"#;
+            let rel = Path::new("state/record.json");
+            let remote_deploy = fake.remote_root.join("srv/deploy/swap-ssh");
+            let dest = remote_deploy.join(rel);
+            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            // The ORIGINAL entry: a regular file matching the intent.
+            std::fs::write(&dest, intended).unwrap();
+            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(required)).unwrap();
+            // The pre-staged swap entry (`$path.swap-target` — the helper's
+            // env hook derives the name from the destination): the symlink
+            // target AND the different-inode file, with mode + content both
+            // differing from the original's (any mix is detectable).
+            let target = dest.with_file_name("record.json.swap-target");
+            std::fs::write(&target, swapped_content).unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(wrong_mode)).unwrap();
+
+            let verdict = t
+                .try_write_new(rel, intended)
+                .expect("a create-new attempt must return a verdict, never hang");
+
+            match boundary {
+                VerifySwapBoundary::BeforeOpen => match kind {
+                    VerifySwapKind::Symlink => prop_assert_eq!(
+                        verdict,
+                        CreateNewVerdict::Conflict(VerifiedExisting::NotRegularFile {
+                            kind: NotRegularFileKind::Symlink,
+                        }),
+                        "a pre-open symlink swap must be rejected — the remote O_NOFOLLOW open never follows"
+                    ),
+                    VerifySwapKind::Directory => prop_assert_eq!(
+                        verdict,
+                        CreateNewVerdict::Conflict(VerifiedExisting::NotRegularFile {
+                            kind: NotRegularFileKind::Directory,
+                        }),
+                        "a pre-open directory swap must be rejected"
+                    ),
+                    VerifySwapKind::DifferentInode => prop_assert_eq!(
+                        verdict,
+                        CreateNewVerdict::Conflict(VerifiedExisting::ModeMismatch {
+                            actual: wrong_mode & 0o7777,
+                            required,
+                        }),
+                        "a pre-open different-inode swap must be rejected with the SWAPPED inode's mode"
+                    ),
+                },
+                VerifySwapBoundary::AfterOpen | VerifySwapBoundary::AfterFstat => prop_assert_eq!(
+                    verdict,
+                    CreateNewVerdict::AlreadyPresent,
+                    "a post-open swap is harmless: the helper's fd pins the ORIGINAL inode, so the verdict must reflect ITS metadata AND content — never a mix"
+                ),
+            }
+
+            // Structural TOCTOU closure: the verification is ONE remote
+            // helper exec — the recorded ssh invocation log holds EXACTLY ONE
+            // `sysopen` invocation, and the total is write + verify-open
+            // (+ the parent sync only for AlreadyPresent), never the old
+            // lstat-then-separate-read pair.
+            let invocations = read_ssh_argv_log(&fake.argv_log);
+            let verify_invs = invocations
+                .iter()
+                .filter(|inv| inv.iter().any(|a| a.contains("sysopen")))
+                .count();
+            prop_assert_eq!(
+                verify_invs,
+                1,
+                "the verification must be ONE remote helper operation, got invocations: {:?}",
+                invocations
+            );
+            let expected_total = match boundary {
+                // write + verify-open: a rejection runs no parent sync.
+                VerifySwapBoundary::BeforeOpen => 2,
+                // write + verify-open + the AlreadyPresent parent sync.
+                VerifySwapBoundary::AfterOpen | VerifySwapBoundary::AfterFstat => 3,
+            };
+            prop_assert_eq!(
+                invocations.len(),
+                expected_total,
+                "unexpected ssh invocation count (write + verify-open [+ parent sync]): {:?}",
+                invocations
             );
         }
     }

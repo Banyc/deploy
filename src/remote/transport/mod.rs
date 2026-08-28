@@ -137,8 +137,11 @@ pub trait Remote {
     /// propagates. Returns the TYPED [`CreateNewVerdict`]: `Created` when the
     /// record was durably installed by this call; `AlreadyPresent` ONLY when
     /// the destination already existed and VERIFIED as an identical entry —
-    /// an `lstat`, a REGULAR FILE, the EXACT final mode, and byte-identical
-    /// content (the identical retry converges — the parent directory is
+    /// a DESCRIPTOR-BOUND verification (the entry is OPENED with `O_NOFOLLOW`
+    /// and fstat'd + read through the SAME descriptor): a REGULAR FILE with
+    /// the EXACT final mode and byte-identical
+    /// content, all from the ONE opened inode (the identical retry converges —
+    /// the parent directory is
     /// synced here too, so the retry returns with a durable entry);
     /// `Conflict` carrying the TYPED [`VerifiedExisting`] reason when it
     /// existed but did NOT verify (different bytes, a MODE MISMATCH, a
@@ -433,28 +436,33 @@ pub enum ContentEquivalence {
 pub enum NotRegularFileKind {
     /// A directory occupies the destination path.
     Directory,
-    /// A symlink occupies the destination path — reported from the `lstat`
-    /// itself, NEVER followed (a symlink pointing at a matching regular file
-    /// is still a conflict, never an accepted retry).
+    /// A symlink occupies the destination path — reported from the
+    /// `O_NOFOLLOW` open's ELOOP (never followed — a symlink pointing at a
+    /// matching regular file is still a conflict, never an accepted retry).
     Symlink,
     /// Any other non-regular kind: a fifo, socket, device, ...
     Other,
 }
 
 /// The TYPED result of verifying an EXISTING create-new destination against
-/// the intended content — the single lstat-based verification shared by BOTH
-/// transports (the local [`durable_create_new`] verify-on-retry and the SSH
-/// transport's EEXIST verification). `Ok` is reached ONLY when the `lstat`
-/// succeeded AND the entry is a REGULAR FILE AND its content was read; every
-/// other outcome is one of the explicit reasons below. The verdict
-/// [`CreateNewVerdict::AlreadyPresent`] is produced ONLY when this is
-/// [`VerifiedExisting::Ok`] with `mode_ok` true (the mode matched EXACTLY)
-/// and the content matched per the caller's requested equivalence; EVERY
-/// other variant is [`CreateNewVerdict::Conflict`] carrying this reason.
+/// the intended content — the single DESCRIPTOR-BOUND verification shared by
+/// BOTH transports (the local [`durable_create_new`] verify-on-retry and the
+/// SSH transport's EEXIST verification): the entry is opened with `O_NOFOLLOW`
+/// and the type/mode AND the content all come from the ONE opened inode
+/// (fstat + read through the SAME descriptor — never an lstat followed by a
+/// separate, symlink-following path re-open). `Ok` is reached ONLY when the
+/// open succeeded AND the OPENED inode is a REGULAR FILE AND its content was
+/// read through the same descriptor; every other outcome is one of the
+/// explicit reasons below. The verdict [`CreateNewVerdict::AlreadyPresent`]
+/// is produced ONLY when this is [`VerifiedExisting::Ok`] with `mode_ok` true
+/// (the mode matched EXACTLY) and the content matched per the caller's
+/// requested equivalence; EVERY other variant is
+/// [`CreateNewVerdict::Conflict`] carrying this reason.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VerifiedExisting {
-    /// The `lstat` succeeded, the entry is a REGULAR FILE, and its content
-    /// was read. `mode_ok` records whether the entry's mode matched the
+    /// The descriptor-bound open succeeded, the OPENED inode is a REGULAR
+    /// FILE, and its content was read THROUGH THE SAME opened descriptor.
+    /// `mode_ok` records whether the entry's mode matched the
     /// required mode EXACTLY (a mismatch is reported as
     /// [`VerifiedExisting::ModeMismatch`]; `mode_ok` stays a first-class
     /// dimension so the verdict constructor must consult it — an entry is
@@ -465,11 +473,12 @@ pub enum VerifiedExisting {
         mode_ok: bool,
         content: ContentEquivalence,
     },
-    /// The `lstat` reported the destination absent. Should not happen on the
+    /// The `O_NOFOLLOW` open reported the destination absent (ENOENT/ENOTDIR).
+    /// Should not happen on the
     /// EEXIST-confirmed path (the no-clobber publish observed the
     /// destination), but typed rather than assumed.
     NotFound,
-    /// The `lstat` succeeded but the entry is NOT a regular file: a
+    /// The opened (fstat'd) inode is NOT a regular file: a
     /// directory, a symlink (never followed), or another kind.
     NotRegularFile { kind: NotRegularFileKind },
     /// The entry is a regular file whose mode does NOT match the required
@@ -522,8 +531,11 @@ pub(crate) struct CreateNewOptions<'a> {
 /// Every state failure in every step PROPAGATES as an error — `Ok(Created)`
 /// therefore implies exact bytes (the fully-written inode), the final mode,
 /// and a DURABLE directory entry. On a conflict (step 5's `EEXIST`) the
-/// existing entry is VERIFIED through the ONE centralized lstat-based
-/// verification ([`verify_existing`]): only a regular file whose mode matched
+/// existing entry is VERIFIED through the ONE centralized DESCRIPTOR-BOUND
+/// verification ([`verify_existing`] — the local [`open_verify_local`]
+/// opens with `O_NOFOLLOW` and fstats + reads through the SAME opened
+/// descriptor, so the metadata and the content provably come from the same
+/// opened inode): only a regular file whose mode matched
 /// EXACTLY and whose content matched per the caller's requested equivalence
 /// → [`CreateNewVerdict::AlreadyPresent`] (the identical retry converges —
 /// no error, no replace); EVERY other outcome →
@@ -622,23 +634,22 @@ pub(crate) fn durable_create_new(
     let verdict = match std::fs::hard_link(&tmp, &p) {
         Ok(()) => CreateNewVerdict::Created,
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // The lstat-based verification (the LOCAL side MUST use the
-            // symlink-safe `symlink_metadata` form — never `metadata`, which
-            // follows a symlink — so a symlink is never mistaken for a
-            // regular file) and the shared verdict construction.
+            // The DESCRIPTOR-BOUND verification (the LOCAL side opens with
+            // `O_NOFOLLOW` — a symlink at the destination makes the open
+            // fail with ELOOP → NotRegularFile{Symlink}, so a symlink is
+            // NEVER followed, even when it points at a matching regular
+            // file — then fstats and reads through the SAME opened
+            // descriptor, so the metadata and the content provably come
+            // from the same opened inode) and the shared verdict
+            // construction.
             let p2 = p.clone();
             let verified = verify_existing(
-                || match std::fs::symlink_metadata(&p2) {
-                    Ok(m) => Ok(Some(meta_to_remote(&m))),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                    Err(e) => Err(Error::transport(format!(
-                        "verify stat {}: {e}",
-                        p2.display()
-                    ))),
-                },
                 || {
-                    std::fs::read(&p2)
-                        .map_err(|e| Error::transport(format!("verify read {}: {e}", p2.display())))
+                    open_verify_local(
+                        &p2,
+                        #[cfg(test)]
+                        None,
+                    )
                 },
                 data,
                 options.mode,
@@ -719,21 +730,34 @@ pub(crate) fn content_equivalent(a: &[u8], b: &[u8], equivalence: ContentEquival
 /// THE ONE CENTRALIZED verification of an EXISTING create-new destination —
 /// used by BOTH transports (the local [`durable_create_new`] verify-on-retry
 /// and the SSH transport's EEXIST verification), so the two can never drift.
-/// The checks run IN ORDER and the FIRST APPLICABLE class WINS — this
-/// first-failure precedence IS the source of truth the create-new
-/// verification ORACLE mirrors (the cross-product proptest in the ssh test
-/// module computes its expected [`VerifiedExisting`] class from THIS order,
-/// never from ad-hoc per-cell logic):
+/// The verification is DESCRIPTOR-BOUND: the single `open` closure performs
+/// the ONE open→fstat→read sequence on a SINGLE opened inode
+/// ([`OpenedExisting::Entry`] carries the metadata from the fstat of the
+/// OPENED descriptor AND the content read THROUGH THE SAME descriptor), so a
+/// concurrent actor that swaps the entry at the path between the checks can
+/// never mix two inodes' observations — a swap AFTER the open is irrelevant
+/// (the descriptor pins the inode; the checks observe the pinned inode
+/// consistently), and a swap BEFORE the open merely changes WHAT was opened
+/// (the checks then run on the swapped inode consistently). The checks run
+/// IN ORDER and the FIRST APPLICABLE class WINS — this first-failure
+/// precedence IS the source of truth the create-new verification ORACLE
+/// mirrors (the cross-product proptest in the ssh test module computes its
+/// expected [`VerifiedExisting`] class from THIS order, never from ad-hoc
+/// per-cell logic):
 ///
-/// 1. **lstat absence** — [`VerifiedExisting::NotFound`] when `meta_opt`
-///    reports the destination absent (`meta_opt` MUST be the symlink-safe
-///    `lstat` form — the local `symlink_metadata` / the ssh `metadata_opt`
-///    perl-lstat protocol — so a symlink is NEVER followed and mistaken for
-///    a regular file);
-/// 2. **regular-file type** — a directory/symlink/other is
-///    [`VerifiedExisting::NotRegularFile`]. The type check runs BEFORE
-///    readability, mode, and content: an unreadable or wrong-mode DIRECTORY
-///    is still `NotRegularFile`, never `Unreadable` or `ModeMismatch`;
+/// 1. **open** — the transport's `O_NOFOLLOW` open (the local
+///    [`open_verify_local`] / the ssh framed helper), the FIRST check: an
+///    ABSENT destination (ENOENT/ENOTDIR) → [`VerifiedExisting::NotFound`];
+///    a SYMLINK → `NotRegularFile`{Symlink} (the `O_NOFOLLOW` open's ELOOP —
+///    NEVER followed, even a symlink pointing at a matching regular file);
+///    an UNREADABLE entry (EACCES/EPERM/EIO on the open/fstat/read) →
+///    [`VerifiedExisting::Unreadable`]; a DIRECTORY → `NotRegularFile`
+///    {Directory};
+/// 2. **regular-file type** — from the OPENED descriptor's fstat: a
+///    directory/symlink/other is [`VerifiedExisting::NotRegularFile`]. The
+///    type check runs BEFORE readability, mode, and content: an unreadable or
+///    wrong-mode DIRECTORY is still `NotRegularFile`, never `Unreadable` or
+///    `ModeMismatch`;
 /// 3. **readability** — the content read happens BEFORE the mode check: a
 ///    regular file whose content cannot be read is
 ///    [`VerifiedExisting::Unreadable`] (never a fabricated verdict) even
@@ -747,52 +771,271 @@ pub(crate) fn content_equivalent(a: &[u8], b: &[u8], equivalence: ContentEquival
 ///    a failed comparison is [`VerifiedExisting::ContentMismatch`].
 ///
 /// `Ok` — and therefore [`CreateNewVerdict::AlreadyPresent`] via
-/// [`verified_to_verdict`] — is produced ONLY when EVERY check held.
+/// [`verified_to_verdict`] — is produced ONLY when EVERY check held on the
+/// ONE opened inode.
 pub(crate) fn verify_existing(
-    meta_opt: impl FnOnce() -> Result<Option<RemoteMeta>>,
-    read: impl FnOnce() -> Result<Vec<u8>>,
+    open: impl FnOnce() -> Result<OpenedExisting>,
     intended: &[u8],
     required_mode: u32,
     equivalence: ContentEquivalence,
 ) -> Result<VerifiedExisting> {
-    // 1. lstat — the symlink-safe stat, so a symlink is never followed.
-    let Some(meta) = meta_opt()? else {
-        return Ok(VerifiedExisting::NotFound);
+    // 1. open — the descriptor-bound open→fstat→read sequence (one inode).
+    let opened = open()?;
+    let OpenedExisting::Entry(entry) = opened else {
+        return Ok(match opened {
+            OpenedExisting::NotFound => VerifiedExisting::NotFound,
+            OpenedExisting::NotRegular { kind } => VerifiedExisting::NotRegularFile { kind },
+            OpenedExisting::Unreadable(m) => VerifiedExisting::Unreadable(m),
+            OpenedExisting::Entry(_) => unreachable!(),
+        });
     };
-    // 2. regular-file type. The lstat already settled the kind: a symlink is
-    //    reported as a symlink with its OWN metadata — the lstat guarantee.
+    let meta = entry.meta;
+    // 2. regular-file type — from the OPENED descriptor's fstat (a symlink
+    //    is unrepresentable here — the `O_NOFOLLOW` open never opened one —
+    //    but kept for defense in depth).
     let kind = if meta.is_dir {
         NotRegularFileKind::Directory
     } else if meta.is_symlink {
         NotRegularFileKind::Symlink
     } else if meta.is_file {
-        // 3. read — a read failure is the Unreadable reason, never a
-        //    fabricated verdict.
-        match read() {
-            Ok(existing) => {
-                // 4. exact mode — the mode is part of the immutable record.
-                let actual = meta.mode & 0o7777;
-                let required = required_mode & 0o7777;
-                if actual != required {
-                    return Ok(VerifiedExisting::ModeMismatch { actual, required });
-                }
-                // 5. the caller's content equivalence.
-                if content_equivalent(&existing, intended, equivalence) {
-                    return Ok(VerifiedExisting::Ok {
-                        mode_ok: true,
-                        content: equivalence,
-                    });
-                }
-                return Ok(VerifiedExisting::ContentMismatch);
-            }
-            Err(e) => {
-                return Ok(VerifiedExisting::Unreadable(format!("verify read: {e}")));
-            }
+        // 3. exact mode — the mode is part of the immutable record.
+        let actual = meta.mode & 0o7777;
+        let required = required_mode & 0o7777;
+        if actual != required {
+            return Ok(VerifiedExisting::ModeMismatch { actual, required });
         }
+        // 4. the caller's content equivalence.
+        if content_equivalent(&entry.content, intended, equivalence) {
+            return Ok(VerifiedExisting::Ok {
+                mode_ok: true,
+                content: equivalence,
+            });
+        }
+        return Ok(VerifiedExisting::ContentMismatch);
     } else {
         NotRegularFileKind::Other
     };
     Ok(VerifiedExisting::NotRegularFile { kind })
+}
+
+/// The descriptor-bound observation of an EXISTING create-new destination:
+/// the type/mode (from `fstat` on the OPENED descriptor) and the content
+/// (read THROUGH THE SAME descriptor). Metadata and content provably come
+/// from the SAME OPENED INODE — the property that closes the
+/// check-then-use (TOCTOU) hole: a concurrent actor that swaps the entry at
+/// the path AFTER the open is irrelevant, because the descriptor pins the
+/// inode.
+#[derive(Clone, Debug)]
+pub(crate) struct OpenedEntry {
+    pub(crate) meta: RemoteMeta,
+    pub(crate) content: Vec<u8>,
+}
+
+/// The OUTCOME of the descriptor-bound open — [`verify_existing`]'s single
+/// `open` step (the LOCAL [`open_verify_local`] / the ssh framed helper):
+/// the entry was opened with `O_NOFOLLOW` and its metadata + content were
+/// observed through the SAME opened descriptor ([`OpenedExisting::Entry`]),
+/// or the open/fstat/read failed with a TYPED reason — absent
+/// (ENOENT/ENOTDIR → [`OpenedExisting::NotFound`]), a symlink (the
+/// `O_NOFOLLOW` open's ELOOP — NEVER followed, even when the symlink points
+/// at a matching regular file), a directory (EISDIR from the open, or the
+/// opened inode's own type), or unreadable (EACCES/EPERM/EIO/... — a real
+/// failure, never a fabricated verdict).
+#[derive(Clone, Debug)]
+pub(crate) enum OpenedExisting {
+    /// The opened inode's metadata (fstat) AND content (read through the
+    /// same descriptor): the checks run on ONE consistent inode.
+    Entry(OpenedEntry),
+    /// The `O_NOFOLLOW` open reported the destination absent (ENOENT/ENOTDIR).
+    NotFound,
+    /// The opened (or fstat'd) inode is NOT a regular file: a directory, a
+    /// symlink (never followed), or another kind.
+    NotRegular { kind: NotRegularFileKind },
+    /// The entry could not be opened/fstat'd/read (EACCES/EPERM/EIO/...): a
+    /// real failure, never a fabricated verdict.
+    Unreadable(String),
+}
+
+/// The boundary of [`verify_existing`]'s descriptor-bound sequence at which a
+/// one-shot test swap fires: BEFORE the `O_NOFOLLOW` open (the swap changes
+/// WHAT is opened), or AFTER the open / AFTER the fstat (the swap changes the
+/// PATH while the descriptor keeps pinning the ORIGINAL inode — the
+/// fd-bound property under test).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VerifySwapBoundary {
+    BeforeOpen,
+    AfterOpen,
+    AfterFstat,
+}
+
+/// The one-shot test-only entry a [`VerifySwap`] places at the destination
+/// (originally a REGULAR file): a SYMLINK (pointing at the pre-staged
+/// `swap_target` regular file — a following open would ACCEPT it, the
+/// `O_NOFOLLOW` open must reject it), a DIRECTORY, or a DIFFERENT-INODE
+/// regular file (the pre-staged `swap_target`, moved onto the destination).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VerifySwapKind {
+    Symlink,
+    Directory,
+    DifferentInode,
+}
+
+/// One-shot swap injection for [`verify_existing`]'s descriptor-bound
+/// sequence: at the chosen [`VerifySwapBoundary`], replaces the destination
+/// with a [`VerifySwapKind`] entry (the original is moved aside, so the
+/// fd-pinned inode stays observable). Fires EXACTLY ONCE, per fixture
+/// (never a process-global slot — two fixtures' swaps can never consume each
+/// other). Test-only (production never arms one); the swap-at-every-boundary
+/// proptest arms exactly one.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct VerifySwap {
+    boundary: VerifySwapBoundary,
+    kind: VerifySwapKind,
+    /// The pre-staged SWAP entry: the symlink target (a regular file) or the
+    /// different-inode regular file (the directory swap ignores it).
+    swap_target: PathBuf,
+    armed: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+impl VerifySwap {
+    pub(crate) fn new(
+        boundary: VerifySwapBoundary,
+        kind: VerifySwapKind,
+        swap_target: &Path,
+    ) -> Self {
+        Self {
+            boundary,
+            kind,
+            swap_target: swap_target.to_path_buf(),
+            armed: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+
+    /// Fire the swap exactly once when the boundary matches; `true` when it
+    /// fired (the destination was replaced with the swap entry).
+    pub(crate) fn fire(&self, boundary: VerifySwapBoundary, p: &Path) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.boundary != boundary || !self.armed.swap(false, Ordering::SeqCst) {
+            return false;
+        }
+        self.swap(p);
+        true
+    }
+
+    fn swap(&self, p: &Path) {
+        // Move the ORIGINAL entry aside (its inode survives for identity
+        // checks — and for the post-open boundaries, the opened descriptor
+        // keeps pinning it), then place the swap entry at the destination.
+        let name = p
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let backup = p.with_file_name(format!(".{name}.swap-orig"));
+        let _ = std::fs::rename(p, &backup);
+        match self.kind {
+            VerifySwapKind::Symlink => {
+                let _ = std::os::unix::fs::symlink(&self.swap_target, p);
+            }
+            VerifySwapKind::Directory => {
+                let _ = std::fs::create_dir(p);
+            }
+            VerifySwapKind::DifferentInode => {
+                let _ = std::fs::rename(&self.swap_target, p);
+            }
+        }
+    }
+}
+
+/// Open `p` with `O_NOFOLLOW` (a symlink at the path → ELOOP →
+/// [`OpenedExisting::NotRegular`]{Symlink} — NEVER followed, even when it
+/// points at a matching regular file), `fstat` the SAME descriptor, and read
+/// THROUGH THE SAME descriptor — the LOCAL realization of the descriptor-
+/// bound sequence [`verify_existing`] requires (the ssh transport's framed
+/// helper performs the SAME sequence in ONE remote exec). `O_NONBLOCK`
+/// keeps the open from blocking on a fifo/device (the entry is then
+/// classified by its `fstat` type, never read). A swap at the path AFTER the
+/// open is irrelevant — the descriptor pins the inode.
+fn open_verify_local(p: &Path, #[cfg(test)] swap: Option<&VerifySwap>) -> Result<OpenedExisting> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    #[cfg(test)]
+    if swap.is_some_and(|s| s.fire(VerifySwapBoundary::BeforeOpen, p)) {
+        // The swap consumed: the destination was replaced BEFORE the open,
+        // so the open observes the SWAPPED entry.
+    }
+    let mut f = match opts.open(p) {
+        Ok(f) => f,
+        Err(e) => return Ok(local_open_err(p, e)),
+    };
+    #[cfg(test)]
+    if swap.is_some_and(|s| s.fire(VerifySwapBoundary::AfterOpen, p)) {
+        // The swap consumed: the PATH was replaced AFTER the open — the fd
+        // pins the ORIGINAL inode, so the fstat and read below still
+        // observe it (the swap is harmless).
+    }
+    let meta = match f.metadata() {
+        Ok(m) => meta_to_remote(&m),
+        Err(e) => {
+            return Ok(OpenedExisting::Unreadable(format!(
+                "verify fstat {}: {e}",
+                p.display()
+            )));
+        }
+    };
+    #[cfg(test)]
+    if swap.is_some_and(|s| s.fire(VerifySwapBoundary::AfterFstat, p)) {
+        // The swap consumed: the PATH was replaced AFTER the fstat — the fd
+        // still pins the ORIGINAL inode, so the read below observes it.
+    }
+    if meta.is_dir {
+        return Ok(OpenedExisting::NotRegular {
+            kind: NotRegularFileKind::Directory,
+        });
+    }
+    if meta.is_symlink {
+        return Ok(OpenedExisting::NotRegular {
+            kind: NotRegularFileKind::Symlink,
+        });
+    }
+    if !meta.is_file {
+        return Ok(OpenedExisting::NotRegular {
+            kind: NotRegularFileKind::Other,
+        });
+    }
+    let mut content = Vec::new();
+    if let Err(e) = f.read_to_end(&mut content) {
+        return Ok(OpenedExisting::Unreadable(format!(
+            "verify read {}: {e}",
+            p.display()
+        )));
+    }
+    Ok(OpenedExisting::Entry(OpenedEntry { meta, content }))
+}
+
+/// Map a failed `O_NOFOLLOW` open to the TYPED reason in the
+/// [`VerifiedExisting`] first-failure order: ENOENT/ENOTDIR → NotFound; ELOOP
+/// → NotRegularFile{Symlink} (the open NEVER follows a symlink — even one
+/// pointing at a matching regular file); EISDIR → NotRegularFile{Directory};
+/// every other errno (EACCES/EPERM/EIO/...) → Unreadable (a real failure,
+/// never a fabricated verdict).
+fn local_open_err(p: &Path, e: std::io::Error) -> OpenedExisting {
+    match e.raw_os_error() {
+        Some(libc::ENOENT) | Some(libc::ENOTDIR) => OpenedExisting::NotFound,
+        Some(libc::ELOOP) => OpenedExisting::NotRegular {
+            kind: NotRegularFileKind::Symlink,
+        },
+        Some(libc::EISDIR) => OpenedExisting::NotRegular {
+            kind: NotRegularFileKind::Directory,
+        },
+        _ => OpenedExisting::Unreadable(format!("verify open {}: {e}", p.display())),
+    }
 }
 
 /// The ONE verdict-construction path: [`CreateNewVerdict::AlreadyPresent`]
@@ -2052,6 +2295,140 @@ mod tests {
                             "the destination must be the fully-written identical content, never partial"
                         );
                     }
+                }
+            }
+        }
+    }
+
+    /// The swap-at-every-boundary property of the descriptor-bound
+    /// verification (the LOCAL leg): a REGULAR→SYMLINK / REGULAR→DIRECTORY /
+    /// REGULAR→DIFFERENT-INODE swap is injected at EVERY boundary of the
+    /// open→fstat→read sequence — BEFORE the `O_NOFOLLOW` open, BETWEEN the
+    /// open and the fstat, BETWEEN the fstat and the read — and the verdict
+    /// must NEVER mix two inodes' observations:
+    ///
+    /// * a swap BEFORE the open changes WHAT is opened: the verdict reflects
+    ///   the SWAPPED entry consistently — a symlink →
+    ///   NotRegularFile{Symlink} (the `O_NOFOLLOW` open NEVER follows, even
+    ///   a symlink pointing at a regular file whose bytes+mode match the
+    ///   intent), a directory → NotRegularFile{Directory}, a different-inode
+    ///   regular file (mode AND content both differing from the intent) →
+    ///   ModeMismatch naming the SWAPPED inode's mode — a REJECTION;
+    /// * a swap AFTER the open (between open/fstat or fstat/read) is
+    ///   HARMLESS: the descriptor pins the ORIGINAL inode, so the verdict is
+    ///   AlreadyPresent with the ORIGINAL inode's mode AND content (the
+    ///   symlink target / the different inode carry DIFFERENT content and
+    ///   the directory is unreadable as a file — a path-following read or a
+    ///   re-open would NOT yield AlreadyPresent, so the assertion catches
+    ///   any metadata/content mix).
+    ///
+    /// Bounded cases, fixed seed 0x5EED_5EED (house style), no persistence.
+    fn swap_case() -> impl Strategy<Value = (VerifySwapBoundary, VerifySwapKind)> {
+        prop_oneof![
+            Just((VerifySwapBoundary::BeforeOpen, VerifySwapKind::Symlink)),
+            Just((VerifySwapBoundary::BeforeOpen, VerifySwapKind::Directory)),
+            Just((
+                VerifySwapBoundary::BeforeOpen,
+                VerifySwapKind::DifferentInode
+            )),
+            Just((VerifySwapBoundary::AfterOpen, VerifySwapKind::Symlink)),
+            Just((VerifySwapBoundary::AfterOpen, VerifySwapKind::Directory)),
+            Just((
+                VerifySwapBoundary::AfterOpen,
+                VerifySwapKind::DifferentInode
+            )),
+            Just((VerifySwapBoundary::AfterFstat, VerifySwapKind::Symlink)),
+            Just((VerifySwapBoundary::AfterFstat, VerifySwapKind::Directory)),
+            Just((
+                VerifySwapBoundary::AfterFstat,
+                VerifySwapKind::DifferentInode
+            )),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: crate::testutil::proptest_cases(64),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn verify_existing_swap_at_every_boundary(
+            (boundary, kind) in swap_case(),
+        ) {
+            use std::os::unix::fs::PermissionsExt;
+
+            let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+            let root = dir.path().to_path_buf();
+            let rel = Path::new("state/record.json");
+            let dest = root.join(rel);
+            let required = IMMUTABLE_RECORD_MODE & 0o7777;
+            let wrong_mode = if required == 0o600 { 0o640 } else { 0o600 };
+            let intended: &[u8] = br#"{"a":1,"b":2}"#;
+            // The swapped-in observations differ from the original's: a
+            // path-following read (or a metadata/content mix) is therefore
+            // detectable — only the SAME-inode verdict passes the table.
+            let swapped_content: &[u8] = br#"{"a":9,"b":9}"#;
+
+            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            // The ORIGINAL entry: a regular file matching the intent (bytes
+            // AND mode) — a no-swap verification would accept it.
+            std::fs::write(&dest, intended).unwrap();
+            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(required)).unwrap();
+            // The pre-staged swap entry: the symlink target AND the
+            // different-inode regular file (a fresh inode with mode + content
+            // both differing from the intent).
+            let target = dest.with_file_name("record.json.swap-target");
+            std::fs::write(&target, swapped_content).unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(wrong_mode)).unwrap();
+
+            let swap = VerifySwap::new(boundary, kind, &target);
+            let verified = verify_existing(
+                || open_verify_local(&dest, Some(&swap)),
+                intended,
+                required,
+                ContentEquivalence::Exact,
+            )
+            .expect("the descriptor-bound verification is a verdict, not an I/O error");
+            let verdict = verified_to_verdict(verified);
+
+            // THE INVARIANT: success (AlreadyPresent) ONLY when the metadata
+            // AND the content came from the SAME OPENED INODE — the
+            // fd-pinned ORIGINAL for a post-open swap, the SWAPPED entry
+            // (consistently, as a rejection) for a pre-open swap.
+            match boundary {
+                VerifySwapBoundary::BeforeOpen => match kind {
+                    VerifySwapKind::Symlink => prop_assert_eq!(
+                        verdict,
+                        CreateNewVerdict::Conflict(VerifiedExisting::NotRegularFile {
+                            kind: NotRegularFileKind::Symlink,
+                        }),
+                        "a pre-open symlink swap must be rejected — the O_NOFOLLOW open never follows"
+                    ),
+                    VerifySwapKind::Directory => prop_assert_eq!(
+                        verdict,
+                        CreateNewVerdict::Conflict(VerifiedExisting::NotRegularFile {
+                            kind: NotRegularFileKind::Directory,
+                        }),
+                        "a pre-open directory swap must be rejected"
+                    ),
+                    VerifySwapKind::DifferentInode => prop_assert_eq!(
+                        verdict,
+                        CreateNewVerdict::Conflict(VerifiedExisting::ModeMismatch {
+                            actual: wrong_mode & 0o7777,
+                            required,
+                        }),
+                        "a pre-open different-inode swap must be rejected with the SWAPPED inode's mode"
+                    ),
+                },
+                VerifySwapBoundary::AfterOpen | VerifySwapBoundary::AfterFstat => {
+                    prop_assert_eq!(
+                        verdict,
+                        CreateNewVerdict::AlreadyPresent,
+                        "a post-open swap is harmless: the descriptor pins the ORIGINAL inode, so the verdict must reflect ITS metadata AND content — never a mix"
+                    );
                 }
             }
         }
