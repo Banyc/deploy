@@ -382,18 +382,24 @@ The local store contains the exact immutable trees sent to servers, immutable re
 ### ONE history ledger per target
 
 A target's ENTIRE deployment history lives in ONE ordered, append-only JSONL
-file: `targets/<target>/ledger.jsonl`. Each line is either the DURABLE
-INTENT of a deployment (a `{"kind":"intent", ...}` record: deployment_id,
-target, membership, behavior digest, `desired` / `pre_push` per-slot maps —
-appended BEFORE any remote mutation, the append-attempt contract) or its
-TERMINAL EVENT (a `{"kind":"terminal", ...}` record: the status, the
-per-slot outcomes, and — when the deployment was SUCCESSFUL — the ROLLBACK
-STATE: the snapshot payload of per-slot generation refs, the behavior
-digest, the physical bindings (`{server, deploy_dir}`), and the release the
-generations came from). A merged entry (intent + optional terminal) is the
-deployment's full record, keyed by its deployment_id; the ledger's append
-order IS the history order, and a successful entry's position in the
-successful chain is its `sN`. An entry WITHOUT a terminal event is the
+file: `targets/<target>/ledger.jsonl`. Each line is exactly ONE OF TWO LINE
+KINDS:
+
+* the DURABLE INTENT of a deployment (a `{"kind":"intent", ...}` record:
+  deployment_id, target, the membership, the frozen physical bindings
+  (`bindings`), the behavior digest, and the `desired` / `pre_push` per-slot
+  maps — appended BEFORE any remote mutation, the append-attempt contract), or
+* its TERMINAL EVENT (a `{"kind":"terminal", ...}` record: the status, the
+  per-slot outcomes, and — when the deployment was SUCCESSFUL — the ROLLBACK
+  STATE, the complete per-slot generation refs + physical bindings
+  (`{server, deploy_dir}`) that ARE the deployment's snapshot).
+
+A merged entry (intent + optional terminal) is the deployment's full record,
+keyed by its deployment_id; the ledger's append order IS the history order.
+Snapshots are KEYED BY DEPLOYMENT ID — a successful terminal's rollback
+payload IS the snapshot — and there is no stored index and no separate
+`refs/last-successful`: a successful entry's position in the successful chain
+is DERIVED from the append order. An entry WITHOUT a terminal event is the
 CURRENT/INCOMPLETE state — the recoverable pending (in-flight) deployment
 that the next push reconciles.
 
@@ -675,13 +681,13 @@ excluded: it is per-server live configuration, not a release property.
 5. **Commit marker** — remote `state/commits/<deployment-id>.json`.
    *Semantic*: a recorded commit is a durable fact of that deployment.
    *Guarantee*: the marker is write-once: `helper.write_commit_marker` installs it by exclusive create, and if a marker already exists it must match byte-for-byte (the payload is deterministic in the deployment ID, generation, and participating placement-slot set) or the rewrite fails integrity. A retried or concurrent commit can therefore never alter a recorded fact; a `pending_commit` recovery reusing the original deployment ID either creates the missing marker or confirms the recorded one byte-for-byte.
-6. **Deployment plan and results** — local `deployments/<id>/plan.json`, `results.json`.
-   *Semantic*: what an attempt intended and produced is fixed once recorded.
-   *Guarantee*: written once per unique deployment ID through `write_atomic_cas`; a same-ID conflicting rewrite fails instead of silently rewriting history (`store.write_plan`, `store.write_results`). The deployment's status is not part of these immutable records: it is an append-only transition stream (`deployments/<id>/transitions.jsonl`), deliberately NOT a mutable progress marker file, so status history is never rewritten. The attempt INTENT (`attempts.jsonl`, step 7) is persisted BEFORE any server mutation; `results.json` is the separate outcomes store written after the mutation loop.
-7. **Attempt history and rollback snapshots** — `targets/<target>/attempts.jsonl`, `refs/snapshots.jsonl`.
-   *Semantic*: recorded attempts (immutable intent, no status, no outcomes) and successful snapshots are append-only facts; entries are never edited or reordered.
-   *Guarantee*: append-mode-only writers under the target lock (`store.append_attempt`, `store.append_snapshot`); snapshot indices are assigned monotonically from the current entry count. Each deployment's status is a per-deployment append-only transition stream (`store.append_transition`), one event per line; the LATEST transition is the deployment's current status (`store.latest_status`).
-Mutable by design (excluded from these guarantees): observed target state, per-server records, the `last-successful` ref, the per-deployment transition stream, incoming staging areas, transaction records, and all declarative configuration (`deploy.toml`, variant files), which are versioned through the release identity rather than frozen.
+6. **Deployment plan** — local `deployments/<id>/plan.json`.
+   *Semantic*: what an attempt intended is fixed once recorded.
+   *Guarantee*: written once per unique deployment ID through `write_atomic_cas`; a same-ID conflicting rewrite fails instead of silently rewriting history (`store.write_plan`). The deployment's status is NOT part of this record and has NO separate transition stream: it is carried by the ledger's TERMINAL EVENT line, appended once per deployment — the terminal IS the status record, so there is no `results.json` and no `transitions.jsonl`. The attempt INTENT (the ledger's intent line, step 7) is persisted BEFORE any server mutation; the per-slot OUTCOMES live in the terminal event's `outcomes` map, never in a separate outcomes file.
+7. **Deployment history and rollback snapshots** — `targets/<target>/ledger.jsonl`.
+   *Semantic*: recorded attempts (immutable intent lines, no status, no outcomes) and terminal events (the status, the per-slot outcomes, and — when successful — the complete rollback snapshot) are append-only facts; entries are never edited or reordered.
+   *Guarantee*: crash-atomic whole-ledger appends under the target lock (`store.append_intent`, `store.append_terminal` — one atomic line per deployment, temp + fsync + rename). The terminal event carries the deployment's status (there is no separate status-transition stream); the LATEST status is the terminal's status (`store.latest_status`, DERIVED from the ledger — never a mutable marker file). Snapshots are KEYED BY DEPLOYMENT ID: a successful terminal's rollback payload IS the snapshot, and `deploy push <target> <deployment-id>` resolves it from the ledger. There is no `refs/last-successful` (the latest successful entry is DERIVED from the ledger) and no separate snapshot log.
+Mutable by design (excluded from these guarantees): observed target state, per-server records, incoming staging areas, transaction records, and all declarative configuration (`deploy.toml`, variant files), which are versioned through the release identity rather than frozen.
 
 Publishing renames a verified incoming directory into `objects/` on the same filesystem. A generation binds a deployment ID, an artifact (release ID + `variant` + tree digest) for a placement slot, the behavior snapshot, and the prior generation. After its files and a durable transaction record have been written and synced, activation creates a temporary symlink beside `current`, atomically renames it over `current`, and syncs the parent directory. This single durable pointer replacement is the per-slot commit point.
 
@@ -705,12 +711,12 @@ verification.
 11. On per-server activation or verification failure, atomically restore the prior generation, reconcile the prior activation contract, verify the restored service, and record both the failure and compensation result. Compensation renders the restored contract with the PRIOR assignment's identity — the prior artifact's `release`/`variant`/`tree` AND the prior deployment's `deployment_id`/`generation` move together — so a restored unit/argv never mixes the prior artifact with the failed generation's identities. On a first deployment with no prior generation, compensation removes `current` and reverses only adapter resources created by that attempt.
 12. If `stop_on_failure` is enabled, do not start another batch after any failure.
 13. Under the default `failure_policy: rollback_changed`, compensate every server already advanced by this deployment. Compensation uses a compare-and-swap and restores a server only if `current` still names the generation created by this attempt. If all compensation succeeds, mark the attempt `failed_rolled_back`; otherwise mark it `degraded` and retain the actual mixed per-server state. An optional `leave_changed` policy may retain successful advances deliberately; any attempt with failures under that policy is `degraded`.
-14. Record every attempt, not just successful attempts, in `attempts.jsonl` — the immutable INTENT (deployment id, membership, desired assignments, pre-push state; no status, no outcomes) — and refresh `observed.json` from the actual slot generations. The intent is persisted BEFORE any server mutation (right after the plan and the initial `in_progress` transition are written), so a crash after servers advanced to new generations can never lose the deployment: without the durable intent the next push would see every server already at the desired generation and report "Everything up to date" with no attempt/snapshot/ref ever recorded. The actual per-slot OUTCOMES are recorded separately in `deployments/<id>/results.json` after the mutation loop (the outcomes store the snapshot and `observed.json` are built from — never from the intent record). The attempt's status is recorded as an append-only transition on the deployment (`deployments/<id>/transitions.jsonl`): an initial `in_progress` transition, then the final status transition (with a reason when the metadata phase demoted it). A slot may be a member of SEVERAL targets (its on-server `deploy_dir` state is shared). Observed state is stored ONCE PER SLOT (`slots/<slot-id>/observed.json` — the slot's ONE physical record, never replicated per target); the engine's observed refresh writes each advanced slot's record EXACTLY ONCE, and targets are SELECTION VIEWS over the global slot map: `read_observed(target)` returns the physical records of the target's member slots, so every member target's view of a shared slot always agrees with the single physical record (e.g. `deploy status <other>` after a push to a sibling target shows the current generation/artifact for the shared slot).
-15. After every slot's server verifies, write an idempotent, write-once commit marker under each participating server's mutation lock (exclusive create; an existing marker must match byte-for-byte). The marker carries the deployment ID, the generation, and the full placement-slot set of the commit. If this metadata phase is interrupted by a transient failure, mark the attempt `pending_commit`; the next push reconciles it before its own no-op check. Reconciliation also covers attempts whose latest transition is `InProgress` — intent durable (persisted before mutation, step 14) but finalization never completed (a crash between `append_attempt` and the finalize marker, or a faulted `write_results`). It loads the eligible attempts (oldest first, latest transition `PendingCommit` OR `InProgress`), verifies that every recorded participant slot still belongs to the target and that each slot's current generation still equals the generation the attempt recorded (fresh status reads), and only then writes the missing markers (under each server's mutation lock, with the original deployment ID) and finalizes the attempt as `successful` through the SAME replay-safe finalizer the normal success path uses (step 16): first persist the recoverable `pending_commit` marker when the latest transition is not already `pending_commit`, then the snapshot entry and `refs/last-successful` (idempotent — a replay never duplicates the snapshot and repairs the ref), and the terminal `Successful` transition LAST, so a crash mid-finalization leaves the attempt's latest transition still `pending_commit` and therefore re-eligible. The verification is read-only; recovery never reactivates or restarts healthy servers. Any membership or generation mismatch changes the attempt to `degraded` (no snapshot entry). An existing marker whose content differs (an integrity conflict — a concurrent controller recorded a different fact, or the remote state diverged) is likewise NOT transient: the conflicting marker is left untouched and the attempt is finalized `degraded` (transition only, no snapshot entry), never stranded `pending_commit` forever. Only transient failures — lock acquisition, status reads, or transport-level marker writes — leave the attempt `pending_commit` for a later retry rather than falsely reporting `successful` or `degraded`.
-16. Only an attempt whose commit markers are complete becomes `successful`. Both the normal success path and recovery finalize through ONE replay-safe finalizer that writes the recoverable `pending_commit` marker, then the snapshot entry and `refs/last-successful`, and appends the terminal `Successful` transition LAST (snapshot and ref first, status last, so the attempt is never recorded `successful` while its snapshot is missing); the snapshot log (KEYED BY DEPLOYMENT ID — `deploy push <target> <deployment-id>` restores that deployment's stored state) and `refs/last-successful` advance only for such fully finalized attempts. The snapshot is built from the attempt's OUTCOMES — the per-slot actuals the engine observed on the main path, or `deployments/<id>/results.json` (falling back to the verified desired state when the outcomes were never persisted, e.g. a faulted `write_results`) during recovery — never from the intent record (`attempts.jsonl`), which carries no outcomes.
+14. Append the attempt's INTENT LINE to the target's ONE ledger (`targets/<target>/ledger.jsonl`, `store.append_intent`) — the immutable INTENT (deployment id, membership, the frozen physical bindings, desired assignments, pre-push state; no status, no outcomes) — and refresh `observed.json` from the actual slot generations. The intent is persisted BEFORE any server mutation (right after the plan is written), so a crash after servers advanced to new generations can never lose the deployment: without the durable intent the next push would see every server already at the desired generation and report "Everything up to date" with no attempt ever recorded. There is no separate outcomes file (`results.json` is GONE) and no status-transition stream (`transitions.jsonl` is GONE): the per-slot OUTCOMES and the final STATUS are carried by the TERMINAL EVENT line appended when the deployment completes (steps 15-16), never by the intent record. A slot may be a member of SEVERAL targets (its on-server `deploy_dir` state is shared). Observed state is stored ONCE PER SLOT (`slots/<slot-id>/observed.json` — the slot's ONE physical record, never replicated per target); the engine's observed refresh writes each advanced slot's record EXACTLY ONCE, and targets are SELECTION VIEWS over the global slot map: `read_observed(target)` returns the physical records of the target's member slots, so every member target's view of a shared slot always agrees with the single physical record (e.g. `deploy status <other>` after a push to a sibling target shows the current generation/artifact for the shared slot).
+15. After every slot's server verifies, write an idempotent, write-once commit marker under each participating server's mutation lock (exclusive create; an existing marker must match byte-for-byte). The marker carries the deployment ID, the generation, and the full placement-slot set of the commit. If this metadata phase is interrupted by a transient failure, mark the attempt `pending_commit`; the next push reconciles it before its own no-op check. Reconciliation also covers INTENT-ONLY ledger entries — the intent durable (persisted before mutation, step 14) but the terminal event never appended (a crash between `append_intent` and the finalize marker). It loads the eligible entries (oldest first — an entry with NO terminal event is the recoverable `InProgress`/`PendingCommit` state), verifies that every recorded participant slot still belongs to the target and that each slot's current generation still equals the generation the attempt recorded (fresh status reads), and only then writes the missing markers (under each server's mutation lock, with the original deployment ID) and finalizes the attempt as `successful` through the SAME replay-safe finalizer the normal success path uses (step 16): APPEND THE TERMINAL `Successful` EVENT LAST, so a crash mid-finalization leaves the entry terminal-less and therefore re-eligible. The verification is read-only; recovery never reactivates or restarts healthy servers. Any membership or generation mismatch changes the attempt to `degraded` (a `Degraded` terminal). An existing marker whose content differs (an integrity conflict — a concurrent controller recorded a different fact, or the remote state diverged) is likewise NOT transient: the conflicting marker is left untouched and the attempt is finalized `degraded` (terminal only), never stranded `pending_commit` forever. Only transient failures — lock acquisition, status reads, or transport-level marker writes — leave the attempt `pending_commit` for a later retry rather than falsely reporting `successful` or `degraded`.
+16. Only an attempt whose commit markers are complete becomes `successful`. Both the normal success path and recovery finalize through ONE replay-safe finalizer that APPENDS THE TERMINAL `Successful` EVENT to the target's ledger (one atomic line, `store.append_terminal`; replay-idempotent — a repeated finalize for the same deployment id is a no-op). The terminal event carries the status, the per-slot outcomes, AND the COMPLETE ROLLBACK STATE — that rollback payload IS the deployment's snapshot, KEYED BY ITS DEPLOYMENT ID: `deploy push <target> <deployment-id>` restores exactly that deployment's stored state, and there is no separate snapshot log and no `refs/last-successful` ref (the latest successful entry is DERIVED from the ledger). The snapshot is built from the attempt's OUTCOMES — the per-slot actuals the engine observed on the main path, or the verified desired state during recovery — never from the intent record, which carries no outcomes.
 17. Apply retention under each server's mutation lock using the protection set defined below. The lock is held by an RAII guard for the whole per-slot retention block (retained-set computation plus mark-and-sweep) and released on drop, so an error mid-retention can never leak the lock and block later operations on that slot. Retention is POST-COMMIT MAINTENANCE: by this point the deployment has already committed (servers advanced, snapshot and attempt recorded), so a per-slot retention failure must NOT change the reported outcome — the push still succeeds. Instead the failure is recorded as a persistent debt marker (per target+slot, under the local store) and surfaced as a warning on the push report; later pushes — including no-ops — retry the maintenance under the same lock-guarded retention block and clear the marker once the retention succeeds. The same rule covers a CONTENDED slot lock: if another operation holds the slot's mutation lock when step 17 runs, the retention cannot run now, and the maintenance is deferred exactly like a retention failure — best-effort debt marker (persistence faults are warning-only) plus a warning naming the slot — never silently skipped, never an `Err`. The deferral's debt read/write is NON-FALLIBLE post-commit maintenance: if the marker cannot be read or persisted (a debt-file fault coinciding with the contention), the failure is an explicit warning — "retention debt maintenance deferred: failed to read/write retention debt" — that says the marker was NOT persisted, so no automatic retryability is claimed and a later push re-deferrals; the committed outcome is unchanged either way. After a successful push every slot is therefore either rotated, or carries debt plus a warning, or the deferral is explicitly warned as unpersisted, and the next unlocked push services any marker. The capacity-preflight retention (step 8) is likewise best-effort; only a real capacity shortage fails the push.
 
-The tool never claims target-wide atomicity. It reports `successful`, `pending_commit`, `failed_preflight`, `failed_rolled_back`, or `degraded`, including the actual generation on every server. An attempt that fails before any `current` change is `failed_preflight`: a preflight failure AFTER the attempt intent was persisted (capacity, staging) appends the terminal `FailedPreflight` transition to that attempt (never a stranded `in_progress`); a failure BEFORE the intent could be computed (plan resolution, historical behavior snapshot, handshake) surfaces as the push error with no attempt record at all. A later push always reconciles first and can finish an incomplete commit (see step 15) or repair an incomplete target.
+The tool never claims target-wide atomicity. It reports `successful`, `pending_commit`, `failed_preflight`, `failed_rolled_back`, or `degraded`, including the actual generation on every server. An attempt that fails before any `current` change is `failed_preflight`: a preflight failure AFTER the attempt intent was persisted (capacity, staging) appends the terminal `FailedPreflight` EVENT to that attempt's ledger entry (never a stranded `in_progress`); a failure BEFORE the intent could be computed (plan resolution, historical behavior snapshot, handshake) surfaces as the push error with no attempt record at all. A later push always reconciles first and can finish an incomplete commit (see step 15) or repair an incomplete target.
 
 The local target lock prevents competing pushes from the same local store. Expected-generation and compensation compare-and-swap checks prevent a second controller from being silently overwritten. Concurrent controllers can still cause a visible failed or degraded attempt, but cannot create a lost update on an individual server.
 
@@ -720,65 +726,205 @@ content never suppresses required remote repair.
 `--dry-run` materializes and inspects local content and performs read-only remote status queries in disposable staging. It does not publish local objects, recover remote transactions, upload, publish remotely, activate, execute application verification, write history, or rotate. Instead, it reports any recovery that a real push would have to perform.
 
 ## Snapshot history and rollback
-Every deployment attempt records its immutable intent: target snapshot, behavior contract, pre-push state, desired state, and actual result — carrying NO status (the status lives in the deployment's transition stream). Assignment relationships are expressed through the canonical model types (`ArtifactRef` = release+variant+tree, `GenerationRef` = generation + placement-slot assignment); every per-location map is keyed by the deployment slot ID. Every record carries `deployment_schema_version = SCHEMA_VERSION` and readers accept ONLY that version: a record with any other `deployment_schema_version` is refused at read time with an error naming the version (fail closed — a record from a different schema is never silently interpreted). A successful example is:
+Every deployment attempt records TWO lines in the target's ONE ledger: its immutable INTENT (target, the membership, the frozen physical bindings, behavior contract, desired and pre-push state — carrying NO status and NO outcomes) and its TERMINAL EVENT (the status, the per-slot outcomes, and — when SUCCESSFUL — the COMPLETE ROLLBACK STATE, the deployment's snapshot). The status lives in the terminal event, not in a separate transition stream: there is no `transitions.jsonl` and no mutable progress marker file. Assignment relationships are expressed through the canonical model types (`ArtifactRef` = release+variant+tree, `GenerationRef` = generation + placement-slot assignment); every per-location map is keyed by the deployment slot ID. Every INTENT line carries `deployment_schema_version = LEDGER_SCHEMA_VERSION` and readers accept ONLY that version: an intent line with any other `deployment_schema_version` is refused at read time with an error naming the version (fail closed — a record from a different schema is never silently interpreted; a terminal line whose status/rollback shape cannot be converted is refused the same way). The wire examples below are RENDERED from the real wire records by the doc-example generator (`src/ledger/records/example.rs`) — they are byte-equal to the generator's output (pinned by `tests::docs_examples_match_generated_wire`), so they can never drift from the current wire: the intent's `deployment_schema_version` IS the current `LEDGER_SCHEMA_VERSION`, the strict wire observations are adjacently tagged (`state` + `value`, `deny_unknown_fields`), the frozen memberships and the schema-v6 frozen `bindings` are present, and the successful terminal's rollback payload is the snapshot keyed by the deployment id.
+
+<!-- LEDGER WIRE EXAMPLES: generated by src/ledger/records/example.rs (the
+     docs-match test byte-compares these blocks against the generator — do
+     not edit by hand; a schema change must re-render them). -->
 
 ```json
 {
-  "deployment_schema_version": 5,
+  "kind": "intent",
+  "deployment_schema_version": 6,
   "deployment_id": "deploy-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b",
   "target": "production",
-  "slot_ids": ["p1", "p2", "p3"],
-  "behavior_sha256": "03df...",
-  "attempted_at": "2026-08-21T10:20:00Z",
-  "slots": {
+  "slot_ids": [
+    "p1",
+    "p2",
+    "p3"
+  ],
+  "selected_membership": [
+    "p1",
+    "p2",
+    "p3"
+  ],
+  "full_membership": [
+    "p1",
+    "p2",
+    "p3"
+  ],
+  "bindings": {
     "p1": {
-      "artifact": {
-        "release": "rel-sha256-41da2f63a950c8494c3c0f1663cf15aacf35b209293b36d3d5c59f8f022805f1",
-        "variant": "standard",
-        "tree": "8cc1..."
-      },
-      "generation": "gen-01..."
+      "server": "server-01",
+      "deploy_dir": "/srv/deploy/p1"
     },
     "p2": {
-      "artifact": {
-        "release": "rel-sha256-41da2f63a950c8494c3c0f1663cf15aacf35b209293b36d3d5c59f8f022805f1",
-        "variant": "standard",
-        "tree": "8cc1..."
-      },
-      "generation": "gen-02..."
+      "server": "server-02",
+      "deploy_dir": "/srv/deploy/p2"
     },
     "p3": {
-      "artifact": {
-        "release": "rel-sha256-41da2f63a950c8494c3c0f1663cf15aacf35b209293b36d3d5c59f8f022805f1",
-        "variant": "high-capacity",
-        "tree": "197b..."
-      },
-      "generation": "gen-03..."
+      "server": "server-03",
+      "deploy_dir": "/srv/deploy/p3"
     }
-  }
+  },
+  "behavior_sha256": "70e91105dab5197be955fb4a57416e3c70e91105dab5197be955fb4a57416e3c",
+  "attempted_at": "2026-08-21T10:20:00Z",
+  "desired": {
+    "p1": {
+      "generation": "gen-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b",
+      "assignment": {
+        "placement_slot": "p1",
+        "artifact": {
+          "release": "rel-sha256-41da2f63a950c8494c3c0f1663cf15aacf35b209293b36d3d5c59f8f022805f1",
+          "variant": "standard",
+          "tree": "4325b42072048fcfadfc32e0ca6ce0404325b42072048fcfadfc32e0ca6ce040"
+        }
+      }
+    },
+    "p2": {
+      "generation": "gen-0290a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b",
+      "assignment": {
+        "placement_slot": "p2",
+        "artifact": {
+          "release": "rel-sha256-41da2f63a950c8494c3c0f1663cf15aacf35b209293b36d3d5c59f8f022805f1",
+          "variant": "standard",
+          "tree": "256f3a3952ec78031c924ac35af4e591256f3a3952ec78031c924ac35af4e591"
+        }
+      }
+    },
+    "p3": {
+      "generation": "gen-0390a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b",
+      "assignment": {
+        "placement_slot": "p3",
+        "artifact": {
+          "release": "rel-sha256-41da2f63a950c8494c3c0f1663cf15aacf35b209293b36d3d5c59f8f022805f1",
+          "variant": "high-capacity",
+          "tree": "a097975d638a3e06b90b6f7c5515c95aa097975d638a3e06b90b6f7c5515c95a"
+        }
+      }
+    }
+  },
+  "pre_push": {
+    "p1": null,
+    "p2": null,
+    "p3": null
+  },
+  "slots": {}
 }
 ```
 
-(The example omits the parallel `desired` and `pre_push` maps for brevity; the
-stored record contains both alongside `slots`. `desired` holds each slot's
-minted `GenerationRef` — `{generation, assignment: {placement_slot, artifact}}`
-— while `pre_push` holds the pre-push `SlotAttemptState` per slot, `None` when the
-slot was never deployed before. Schema version 1 keyed these maps by server ID
-and stored the artifact triple as flat fields; version 2 rekeys to placement
-slots and nests the artifact.)
-
-The deployment's status is an append-only transition stream
-(`deployments/<id>/transitions.jsonl`), one event per line; the current status
-is the LATEST transition. For example:
-
-```jsonl
-{"deployment_id": "deploy-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b", "status": "in_progress", "recorded_at": "2026-08-21T10:20:00Z", "reason": "attempt started"}
-{"deployment_id": "deploy-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b", "status": "successful", "recorded_at": "2026-08-21T10:25:00Z"}
+```json
+{
+  "kind": "terminal",
+  "deployment_id": "deploy-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b",
+  "target": "production",
+  "status": "successful",
+  "recorded_at": "2026-08-21T10:25:00Z",
+  "outcomes": {
+    "p1": {
+      "slot_id": "p1",
+      "outcome": "activated",
+      "observation": {
+        "state": "known",
+        "value": {
+          "generation": "gen-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b"
+        }
+      },
+      "compensated": false
+    },
+    "p2": {
+      "slot_id": "p2",
+      "outcome": "activated",
+      "observation": {
+        "state": "known",
+        "value": {
+          "generation": "gen-0290a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b"
+        }
+      },
+      "compensated": false
+    },
+    "p3": {
+      "slot_id": "p3",
+      "outcome": "activated",
+      "observation": {
+        "state": "known",
+        "value": {
+          "generation": "gen-0390a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b"
+        }
+      },
+      "compensated": false
+    }
+  },
+  "rollback": {
+    "slots": {
+      "p1": {
+        "generation": "gen-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b",
+        "assignment": {
+          "placement_slot": "p1",
+          "artifact": {
+            "release": "rel-sha256-41da2f63a950c8494c3c0f1663cf15aacf35b209293b36d3d5c59f8f022805f1",
+            "variant": "standard",
+            "tree": "4325b42072048fcfadfc32e0ca6ce0404325b42072048fcfadfc32e0ca6ce040"
+          }
+        }
+      },
+      "p2": {
+        "generation": "gen-0290a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b",
+        "assignment": {
+          "placement_slot": "p2",
+          "artifact": {
+            "release": "rel-sha256-41da2f63a950c8494c3c0f1663cf15aacf35b209293b36d3d5c59f8f022805f1",
+            "variant": "standard",
+            "tree": "256f3a3952ec78031c924ac35af4e591256f3a3952ec78031c924ac35af4e591"
+          }
+        }
+      },
+      "p3": {
+        "generation": "gen-0390a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b",
+        "assignment": {
+          "placement_slot": "p3",
+          "artifact": {
+            "release": "rel-sha256-41da2f63a950c8494c3c0f1663cf15aacf35b209293b36d3d5c59f8f022805f1",
+            "variant": "high-capacity",
+            "tree": "a097975d638a3e06b90b6f7c5515c95aa097975d638a3e06b90b6f7c5515c95a"
+          }
+        }
+      }
+    },
+    "bindings": {
+      "p1": {
+        "server": "server-01",
+        "deploy_dir": "/srv/deploy/p1"
+      },
+      "p2": {
+        "server": "server-02",
+        "deploy_dir": "/srv/deploy/p2"
+      },
+      "p3": {
+        "server": "server-03",
+        "deploy_dir": "/srv/deploy/p3"
+      }
+    }
+  },
+  "selected_membership": [
+    "p1",
+    "p2",
+    "p3"
+  ],
+  "full_membership": [
+    "p1",
+    "p2",
+    "p3"
+  ],
+  "reason": "push completed"
+}
 ```
 
-The target snapshot log contains only fully successful snapshots, KEYED BY THE DEPLOYMENT ID that produced them (`deploy push production <deployment-id>` restores exactly that deployment's stored state). Failed and degraded attempts remain visible through `deploy log production` and `attempts.jsonl`, but are not valid rollback sources (a failed deployment id never resolves). Each snapshot entry records every slot's advanced generation AND the complete physical binding it had (`bindings`, keyed by slot ID — the slot's `{server, deploy_dir}` pair at deployment time): exact rollback maps generations to slots by slot ID, so the recorded binding is what proves a slot still lives at the exact on-host location it was deployed onto.
+<!-- END LEDGER WIRE EXAMPLES -->
 
-A commit is authoritative only when the same deployment ID and placement-slot set are committed on every member. This lets a fresh or repaired local store reconstruct successful snapshot history from the servers instead of trusting a stale local ref.
+The successful chain contains only fully successful terminal events, KEYED BY THE DEPLOYMENT ID that produced them (`deploy push production <deployment-id>` restores exactly that deployment's stored state). Failed and degraded attempts remain visible through `deploy log production` (their ledger entries carry their terminals), but are not valid rollback sources (a failed deployment id never resolves). Each successful terminal's rollback payload records every slot's advanced generation AND the complete physical binding it had (`bindings`, keyed by slot ID — the slot's `{server, deploy_dir}` pair at deployment time): exact rollback maps generations to slots by slot ID, so the recorded binding is what proves a slot still lives at the exact on-host location it was deployed onto.
+
+A commit is authoritative only when the same deployment ID and placement-slot set are committed on every member. This lets a fresh or repaired local store re-verify its snapshot history against the servers instead of trusting an unverified local ledger.
 
 The target's successful chain is derived from its ONE ledger (the retained
 suffix after a checkpoint). ALL reference resolution resolves against that

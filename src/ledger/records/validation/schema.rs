@@ -14,70 +14,85 @@
 /// version themselves separately from the configuration format, so bumping
 /// one never invalidates the other.
 ///
-/// The current format is version 6: deployment records use the canonical
+/// The current format is version 6 (the ONLY version writers emit and
+/// readers accept): deployment records use the canonical
 /// placement-slot-keyed shape (`BTreeMap<SlotId, _>` maps, nested
 /// artifact/generation refs), carry the exclusive owning target + the
 /// optional rollout group of the attempt, the PERSISTED MEMBERSHIPS
-/// (since version 3 the terminal half, since version 4 the intent half),
-/// the FROZEN PHYSICAL BINDINGS (since version 6 the intent half), and —
-/// since version 5 — the STRICT WIRE OBSERVATIONS: the pre-push
-/// assignments' artifact and the per-slot outcomes' post-mutation
-/// observation serialize as the ADJACENTLY-TAGGED
-/// [`crate::ledger::records::ObservationWire`]
+/// (`selected_membership` / `full_membership` on the intent AND the
+/// terminal), the FROZEN PHYSICAL BINDINGS (the intent half), and the
+/// STRICT WIRE OBSERVATIONS — the pre-push assignments' artifact and the
+/// per-slot outcomes' post-mutation observation serialize as the
+/// ADJACENTLY-TAGGED [`crate::ledger::records::ObservationWire`]
 /// (`state` + `value`, `deny_unknown_fields`) with the STRICT payload
 /// structs [`crate::ledger::records::ArtifactRefWire`] /
 /// [`crate::ledger::records::ObservedGenerationWire`] (also
-/// `deny_unknown_fields`), so a persisted document rejects any field that
-/// is not exactly one variant's own — never the permissive
-/// internally-tagged in-memory [`crate::ledger::Observation<T>`]:
+/// `deny_unknown_fields`) — so a persisted document rejects any field that
+/// is not exactly one variant's own, never the permissive
+/// internally-tagged in-memory [`crate::ledger::Observation<T>`].
 ///
-/// * version 3: a SUCCESSFUL terminal event persists BOTH memberships —
-///   `selected_membership` (the slots the push actually deployed) and
-///   `full_membership` (the complete target membership at terminal time) —
-///   so the terminal record PROVES the membership equations (outcomes ==
-///   selected, rollback == full, selected ⊆ full) instead of implying them;
-/// * version 4: the INTENT record persists BOTH FROZEN memberships too —
+/// THE VERSION HISTORY — what each version added. Every version BEFORE the
+/// current one is REJECTED on read (no compatibility fallback), so a
+/// record is interpreted only under exactly the schema that wrote it:
+///
+/// * version 6 (CURRENT): the INTENT record FREEZES each selected slot's
+///   PHYSICAL BINDING — a required `bindings: BTreeMap<SlotId,
+///   PhysicalBinding>` projection whose key set must EQUAL the selected
+///   membership EXACTLY. The plan-time `{server, deploy_dir}` is now a
+///   durable historical fact: recovery compares each slot's LIVE binding
+///   against the frozen value and finalizes from the FROZEN binding on
+///   equality or marks the attempt Degraded on drift (a server rebound or
+///   a moved `deploy_dir` can never be recorded as the historical location
+///   the attempt was planned against).
+/// * version 5: the LEDGER WIRE OBSERVATION became STRICT — the intent's
+///   `pre_push` artifact and the terminal's per-slot outcomes carry their
+///   THREE-STATE observation as the adjacently tagged
+///   [`crate::ledger::records::ObservationWire`] with strict payload
+///   structs ([`crate::ledger::records::ArtifactRefWire`] /
+///   [`crate::ledger::records::ObservedGenerationWire`]), so a persisted
+///   document could no longer smuggle extra fields, split/mix a variant's
+///   payload, or deserialize into a half-known state (the in-memory
+///   [`crate::ledger::Observation<T>`] domain type is unchanged and stays
+///   permissive). REJECTED on read: a version 5 record's intent is
+///   WITHOUT the frozen bindings, its `pre_push` keeps the raw artifact,
+///   and its outcome rows keep the flat `generation` /
+///   `observation_error` fields.
+/// * version 4: the INTENT record persisted BOTH FROZEN memberships —
 ///   `selected_membership` (== the intent's `slot_ids` table keys, the
 ///   AUTHORITATIVE selected set) and `full_membership` (the COMPLETE target
 ///   membership resolved AT PLAN TIME, when the immutable intent was
-///   written). The intent is now SELF-PROVING: the terminal must REPRODUCE
+///   written). The intent became SELF-PROVING: the terminal must REPRODUCE
 ///   the intent's frozen values (the ledger read refuses a terminal whose
 ///   memberships diverge), and RECOVERY finalizes from the frozen values —
 ///   never from the live configuration, which may have changed arbitrarily
-///   since the intent was written;
-/// * version 5: the LEDGER WIRE OBSERVATION becomes STRICT — the intent's
-///   `pre_push` artifact and the terminal's per-slot outcomes carry their
-///   THREE-STATE observation as the adjacently tagged
-///   [`crate::ledger::records::ObservationWire`]
-///   with strict payload structs ([`crate::ledger::records::ArtifactRefWire`] /
-///   [`crate::ledger::records::ObservedGenerationWire`]), so a persisted
-///   document can no longer
-///   smuggle extra fields, split/mix a variant's payload, or deserialize
-///   into a half-known state (the in-memory
-///   [`crate::ledger::Observation<T>`] domain type
-///   is unchanged and stays permissive).
-/// * version 6: the INTENT record FREEZES each selected slot's PHYSICAL
-///   BINDING — a required `bindings: BTreeMap<SlotId, PhysicalBinding>`
-///   projection whose key set must EQUAL the selected membership EXACTLY.
-///   The plan-time `{server, deploy_dir}` is now a durable historical
-///   fact: recovery compares each slot's LIVE binding against the frozen
-///   value and finalizes from the FROZEN binding on equality or marks the
-///   attempt Degraded on drift (a server rebound or a moved `deploy_dir`
-///   can never be recorded as the historical location the attempt was
-///   planned against).
+///   since the intent was written. REJECTED on read: a version 4 record's
+///   intent is WITHOUT the frozen memberships (and predates the strict
+///   observations + frozen bindings of versions 5/6).
+/// * version 3: a SUCCESSFUL terminal event persisted BOTH memberships —
+///   `selected_membership` (the slots the push actually deployed) and
+///   `full_membership` (the complete target membership at terminal time) —
+///   so the terminal record PROVED the membership equations (outcomes ==
+///   selected, rollback == full, selected ⊆ full) instead of implying
+///   them. REJECTED on read: a version 3 record's intent is WITHOUT the
+///   frozen memberships, and its terminal's membership fields are not yet
+///   REQUIRED.
+/// * version 2: the per-location maps were REKEYED to PLACEMENT SLOTS with
+///   the NESTED artifact triple (`release` / `variant` / `tree`) — the
+///   canonical placement-slot-keyed shape. REJECTED on read: a version 2
+///   record's terminal carries NO persisted memberships (required since
+///   version 3, no serde default).
+/// * version 1: the multi-target `targets` membership shape — the maps
+///   keyed by SERVER ID with the artifact triple as FLAT fields (the
+///   pre-rekeying shape). REJECTED on read: a record of that shape is NOT
+///   the current schema and never loads.
 ///
-/// Version 5 and earlier records (the intent WITHOUT the frozen bindings),
-/// version 4 records (the raw-artifact `pre_push`, the outcome rows with
-/// flat `generation` / `observation_error` fields), version 3 records (the
-/// intent shape WITHOUT the frozen memberships), version 2 records (the
-/// terminal shape without persisted memberships) — and version 1 records,
-/// the multi-target `targets` membership shape — are REJECTED on read —
-/// no compatibility fallback: the intent-line version check refuses a
-/// foreign `deployment_schema_version`, and an old-shape intent/terminal
-/// line fails deserialization (the membership fields are REQUIRED, no
-/// serde default). A hypothetical pre-rekeying shape that keyed these maps
-/// by server ID with flat artifact fields is NOT the current schema and
-/// never loads.
+/// Every non-current version is REJECTED on read — no compatibility
+/// fallback: the intent-line version check refuses a foreign
+/// `deployment_schema_version` with an error naming it, and an old-shape
+/// intent/terminal line fails deserialization (the memberships and the
+/// frozen bindings are REQUIRED, no serde default). A hypothetical
+/// pre-rekeying shape that keyed these maps by server ID with flat
+/// artifact fields is NOT the current schema and never loads.
 pub(crate) const LEDGER_SCHEMA_VERSION: u32 = 6;
 
 /// The `pins.json` record format version (`Pins.schema_version`). Pins are
