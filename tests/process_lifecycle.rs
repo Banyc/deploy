@@ -18,7 +18,23 @@
 //! write a `ready` file once their setup (the `setsid` escape, the fd close)
 //! is COMPLETE and the parent waits for the file; pid-gone probes poll
 //! `kill(pid, 0)` to a deadline; the no-post-return-fs probes sleep a wide
-//! LOAD-TOLERANT window past the cleanup kill.
+//! LOAD-TOLERANT window past the runner's return.
+//!
+//! The property observes the PRODUCTION outcome — what the runner actually
+//! left behind — BEFORE any test cleanup: the containment assertions (process
+//! liveness + marker behavior) run on the state AS THE RUNNER RETURNED IT,
+//! and only afterwards does the emergency cleanup fire (the group kill + the
+//! escaped-grandchild pid kill, for the cases the runner could not contain).
+//! The containment invariant is satisfied by the RUNNER's own termination,
+//! never by the harness. The setsid-ESCAPE cases (SetsidInherit/
+//! SetsidClose) are EXPLICITLY EXCLUDED from the foreground containment
+//! invariant — a descendant that `setsid`'d is outside the guarantee (the
+//! runner can DETECT a pipe-holding escapee and error, but cannot TERMINATE
+//! an escaped process without cgroups/subreaper or a remote supervisor) — so
+//! the property asserts the escaped grandchild is STILL ALIVE after the
+//! runner returned (unsupported daemonization cases never satisfy the
+//! invariant), never a false zero-live claim; the emergency cleanup then
+//! kills the escapee by pid so the test leaks nothing.
 
 use deploy::env::SysEnv;
 use deploy::remote::transport::{
@@ -88,21 +104,26 @@ enum ChildKind {
     DetachedGrandchild,
     /// Exits ZERO immediately after forking a grandchild that CALLS `setsid`
     /// (escaping the process group — a `killpg` can never reach it) but KEEPS
-    /// the inherited stdio pipes open, sleeps 0.4s, then would write a
+    /// the inherited stdio pipes open, sleeps 0.9s, then would write a
     /// marker: the group enumeration finds nothing (it escaped), so the
     /// PIPE-EOF containment must catch the pipe-holding escapee at the drain
     /// bound and return the "left processes holding its output pipes" error —
-    /// never a successful outcome. The test's cleanup kills the escapee by
-    /// pid (the runner cannot reach it).
+    /// never a successful outcome. EXCLUDED from the foreground containment
+    /// invariant: the runner DETECTS the escapee but cannot TERMINATE an
+    /// escaped process, so the property asserts the escapee is STILL ALIVE
+    /// after the runner returned (never a false zero-live claim) and the
+    /// test's own cleanup kills it by pid.
     SetsidInherit,
     /// Exits ZERO immediately after forking a grandchild that FULLY
     /// DAEMONIZES: `setsid` AND closes every inherited descriptor (the
-    /// canonical daemon recipe), sleeps 0.4s, then writes a marker. This is
+    /// canonical daemon recipe), sleeps 0.9s, then writes a marker. This is
     /// the ONE documented contract exclusion — no portable detection exists
     /// without cgroups/subreaper (Linux) or a remote supervisor (ssh) — so
     /// the runner returns SUCCESS (the narrowed contract: commands must not
-    /// daemonize). The test pins that boundary and enforces the
-    /// no-post-return-fs property with its own cleanup kill.
+    /// daemonize). EXCLUDED from the foreground containment invariant like
+    /// every setsid escape: the property asserts the escapee is STILL ALIVE
+    /// after the runner returned (the invariant does not hold for it) and
+    /// the test's own cleanup kills it by pid.
     SetsidClose,
     /// Sleeps 0.25s then would write a marker file: the probe for
     /// post-return filesystem effects.
@@ -221,10 +242,11 @@ fn script_for(kind: ChildKind, dir: &Path) -> Vec<String> {
         // before the parent exits, and the ready-poll busy-waits with shell
         // BUILTINS ONLY (`:` — no external `sleep` subprocess, which would
         // be a transient GROUP MEMBER the runner would legitimately flag).
-        // The delayed marker is at 0.9s — far past the test's cleanup kill
-        // (issued right after the runner returns) — so the no-post-return-fs
-        // assertion measures the CONTRACT boundary, not a cleanup race under
-        // parallel load.
+        // The delayed marker is at 0.9s — the property does NOT assert it
+        // absent for this excluded case (an escaped process may write it
+        // later — the documented exclusion); the test's emergency cleanup
+        // kills the escapee by pid right after the production observations,
+        // so no process leaks.
         ChildKind::SetsidClose => vec![
             "sh".into(),
             "-c".into(),
@@ -261,6 +283,22 @@ fn assert_pid_gone(pid: u32, label: &str) {
         );
         std::thread::sleep(Duration::from_millis(2));
     }
+}
+
+/// Assert the process STILL EXISTS: `kill(pid, 0)` SUCCEEDS (the process is
+/// live, not merely a zombie). This is the HONEST production observation for
+/// the EXCLUDED setsid-escape cases (and the injected-fault survivors): the
+/// process the runner could not terminate is still alive after the return —
+/// the containment invariant does NOT hold for it, and the property asserts
+/// exactly that, never a false zero-live claim.
+fn assert_pid_alive(pid: u32, label: &str) {
+    // SAFETY: `kill(pid, 0)` only probes existence; it sends no signal.
+    let rc = unsafe { libc::kill(pid as i32, 0) };
+    assert!(
+        rc == 0,
+        "{label}: pid {pid} must still be alive (the containment exclusion / injected-fault survivor), kill-0 rc {rc}, errno {}",
+        std::io::Error::last_os_error()
+    );
 }
 
 /// The grandchild pid, from the pidfile the child writes IMMEDIATELY at
@@ -359,8 +397,9 @@ fn run_one_case(kind: ChildKind, fault: KillFault) {
         }
         // SetsidInherit: the grandchild escaped the group but KEEPS the
         // inherited pipes — the PIPE-EOF containment must error (never
-        // success), even though the runner cannot kill the escapee (the
-        // test's cleanup does, by pid).
+        // success), even though the runner cannot TERMINATE the escapee
+        // (excluded from the containment invariant — the production phase
+        // asserts it still-alive and the test's cleanup kills it by pid).
         (Err(e), false, _) if kind == ChildKind::SetsidInherit => {
             assert!(
                 e.to_string().contains("foreground-only"),
@@ -376,8 +415,9 @@ fn run_one_case(kind: ChildKind, fault: KillFault) {
         // descriptors) is the ONE documented contract exclusion — undetectable
         // without cgroups/subreaper or a remote supervisor. The runner returns
         // SUCCESS per the narrowed contract (commands must not daemonize); the
-        // test pins that boundary and its own cleanup enforces zero-live +
-        // no-post-return-fs below.
+        // test pins that boundary, asserts the escapee STILL ALIVE in the
+        // production phase (the invariant does not hold for it), and its own
+        // cleanup kills it by pid.
         (Ok(RunOutcome::Exited { exit_code, .. }), false, _) if kind == ChildKind::SetsidClose => {
             assert_eq!(
                 *exit_code, 0,
@@ -470,15 +510,121 @@ fn run_one_case(kind: ChildKind, fault: KillFault) {
         ),
     }
 
-    // ---- cleanup under an injected kill/reap failure OR an escaped
-    // grandchild ----
+    // The setsid-escape cases are EXPLICITLY EXCLUDED from the foreground
+    // containment invariant: a descendant that `setsid`'d is outside the
+    // guarantee (the runner can DETECT a pipe-holding escapee and error, but
+    // it cannot TERMINATE an escaped process — no portable way exists without
+    // cgroups/subreaper or a remote supervisor). Their production
+    // observations differ from the contained cases' — handled separately
+    // below.
+    let escaped = matches!(kind, ChildKind::SetsidInherit | ChildKind::SetsidClose);
+
+    // ---- (c) PRODUCTION-STATE assertions: what the RUNNER left behind,
+    // BEFORE any test kill ----
+    // The property observes the production outcome — process liveness and
+    // marker behavior AS THE RUNNER RETURNED THEM — and only afterwards runs
+    // the emergency cleanup. The containment invariant is satisfied by the
+    // RUNNER's own termination, never by the harness.
+    if escaped {
+        // EXCLUDED cases: the escaped grandchild is STILL ALIVE after the
+        // runner returned (`kill(gc, 0)` SUCCEEDS — the honest production
+        // observation). Unsupported daemonization cases NEVER satisfy the
+        // foreground containment invariant; the property asserts exactly
+        // that, never a false "zero live processes" claim. The direct child
+        // is gone (the runner reaped it). The marker is NOT asserted absent —
+        // the escaped process may write it later (that is the documented
+        // exclusion).
+        if let Some(gc) = gc_pid {
+            assert_pid_alive(gc, &format!("{kind:?} × {fault:?} escaped grandchild"));
+        }
+        assert_pid_gone(child_pid, &format!("{kind:?} × {fault:?} child"));
+    } else {
+        // The runner's own termination CONTAINS only where the kill was
+        // effective: the real seam for every contained kind; the
+        // owned-handle SIGKILL for a timed-out direct child under
+        // Missing/Denied/Esrch (which still dies); and the self-exiting
+        // children (Quick/NonZero) under every fault. An injected INERT kill
+        // is the kill not working — the runner honestly reports a reap
+        // failure and the survivors are asserted below, never a zero-live
+        // claim.
+        let termination_contained = match fault {
+            KillFault::Real => true,
+            KillFault::Missing | KillFault::Denied | KillFault::Esrch => matches!(
+                kind,
+                ChildKind::Quick
+                    | ChildKind::NonZero
+                    | ChildKind::Slow
+                    | ChildKind::IgnoreTerm
+                    | ChildKind::LateMarker
+            ),
+            KillFault::Inert => matches!(kind, ChildKind::Quick | ChildKind::NonZero),
+        };
+        if termination_contained {
+            // CONTAINED cases: ZERO LIVE PROCESSES and NO POST-RETURN
+            // FILESYSTEM EFFECTS as the runner left them — WITHOUT any test
+            // kill. The runner's own termination (the timeout group kill,
+            // the foreground-only group termination, the clean exit) already
+            // left zero live processes; this is what the property actually
+            // proves.
+            assert_pid_gone(child_pid, &format!("{kind:?} × {fault:?} child"));
+            if let Some(gc) = gc_pid {
+                assert_pid_gone(gc, &format!("{kind:?} × {fault:?} grandchild"));
+            }
+            // The no-post-return-fs probe runs BEFORE any cleanup: the window
+            // lets any write a (buggy) still-alive descendant would attempt
+            // after the outcome land and be caught — the marker scripts write
+            // 1.2s in (LateMarker/Grandchild — killed by the 1s deadline) or
+            // 0.4s in (DetachedGrandchild — terminated by the foreground-only
+            // group kill), and the probe outlives each with a wide
+            // LOAD-TOLERANT margin. A contained case's marker must never
+            // appear because the runner killed everything before returning.
+            if matches!(kind, ChildKind::LateMarker | ChildKind::Grandchild) {
+                std::thread::sleep(Duration::from_millis(300));
+            } else if kind == ChildKind::DetachedGrandchild {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            assert!(
+                !dir.path().join("marker").exists(),
+                "{kind:?} × {fault:?}: the child wrote a file after the runner returned"
+            );
+            assert!(
+                !dir.path().join("gc-marker").exists(),
+                "{kind:?} × {fault:?}: the grandchild wrote a file after the runner returned"
+            );
+        } else {
+            // HONEST-FAILURE cases: the injected kill fault IS the kill not
+            // working, so the runner could not contain — and honestly
+            // surfaced an error (asserted in the outcome classification,
+            // never a fake success). The production observation mirrors the
+            // error: the SURVIVOR is still alive — the direct child under an
+            // inert timeout kill, the background grandchild under a failed or
+            // inert group kill. The marker is NOT asserted absent for these
+            // cases (the survivor may write it before the cleanup).
+            if matches!(fault, KillFault::Inert) && times_out {
+                assert_pid_alive(
+                    child_pid,
+                    &format!("{kind:?} × {fault:?} child (reap-failure survivor)"),
+                );
+            }
+            if let Some(gc) = gc_pid {
+                assert_pid_alive(
+                    gc,
+                    &format!("{kind:?} × {fault:?} grandchild (group-kill-failure survivor)"),
+                );
+            }
+        }
+    }
+
+    // ---- (d) EMERGENCY cleanup: only now, AFTER the production
+    // observations ----
     // The injected fault IS the kill not working: the runner surfaced an
     // error (never a fake timeout success) and cleaned up what it could; the
     // test now kills the leftover group and reaps the direct child — the
-    // single cleanup reap — so the zero-live assertion is meaningful. A
-    // setsid-ESCAPED grandchild (SetsidInherit/SetsidClose) is outside the
-    // group — the runner could not reach it — so the test kills it BY PID
-    // (its pid is live, so the kill is safe from pid reuse).
+    // single cleanup reap — so the test leaks nothing. A setsid-ESCAPED
+    // grandchild (SetsidInherit/SetsidClose) is outside the group — the
+    // runner could not reach it — so the test kills it BY PID (its pid is
+    // live, so the kill is safe from pid reuse). For the contained cases the
+    // cleanup is a no-op (nothing left to kill).
     if outcome.is_err() {
         // SAFETY: kill(-pgid) == killpg on the group THIS test spawned (the
         // child is the group leader, pgid == its pid).
@@ -495,41 +641,14 @@ fn run_one_case(kind: ChildKind, fault: KillFault) {
         unsafe { libc::kill(gc as i32, libc::SIGKILL) };
     }
 
-    // ---- ZERO LIVE PROCESSES ----
+    // ---- NO LEAK after the cleanup: the test itself leaves nothing behind.
+    // For the contained cases this re-verifies what the production phase
+    // already proved; for the excluded and honest-failure cases it proves
+    // the emergency cleanup landed. ----
     assert_pid_gone(child_pid, &format!("{kind:?} × {fault:?} child"));
     if let Some(gc) = gc_pid {
         assert_pid_gone(gc, &format!("{kind:?} × {fault:?} grandchild"));
     }
-
-    // ---- NO POST-RETURN FILESYSTEM EFFECTS ----
-    // The probe window lets any write that a (buggy) still-alive child or
-    // grandchild would attempt after the outcome land and be caught: the
-    // marker scripts write 1.2s in (LateMarker/Grandchild — killed by the 1s
-    // deadline), 0.4s in (DetachedGrandchild), or 0.9s in (the setsid
-    // escapees — killed by the TEST's cleanup kill, since a setsid'd escapee
-    // is outside the runner's reach by contract), and the probe outlives
-    // each — a buggy runner that returned while the descendant still lived
-    // would be caught writing AFTER the outcome. The windows are wide
-    // LOAD-TOLERANT margins (the cleanup kill lands ~150ms after the runner
-    // returned), never "must finish within N ms" coordination.
-    if matches!(kind, ChildKind::LateMarker | ChildKind::Grandchild) {
-        std::thread::sleep(Duration::from_millis(300));
-    } else if kind == ChildKind::DetachedGrandchild {
-        std::thread::sleep(Duration::from_millis(500));
-    } else if matches!(kind, ChildKind::SetsidInherit | ChildKind::SetsidClose) {
-        // The setsid escapees' markers fire at 0.9s — far past the cleanup
-        // kill — so the probe window outlives the marker delay with a wide
-        // margin, even under heavy parallel load.
-        std::thread::sleep(Duration::from_millis(1000));
-    }
-    assert!(
-        !dir.path().join("marker").exists(),
-        "{kind:?} × {fault:?}: the child wrote a file after the runner returned"
-    );
-    assert!(
-        !dir.path().join("gc-marker").exists(),
-        "{kind:?} × {fault:?}: the grandchild wrote a file after the runner returned"
-    );
 }
 
 fn child_strategy() -> impl Strategy<Value = ChildKind> {
@@ -571,13 +690,27 @@ proptest! {
     // by the PIPE-EOF containment — an error, never success. A FULLY
     // daemonized grandchild (`setsid` AND closed descriptors, SetsidClose) is
     // the ONE documented contract exclusion — no portable detection exists —
-    // and the runner returns success (commands must not daemonize); the test
-    // pins the boundary and its own cleanup enforces zero-live and
-    // no-post-return-fs. A kill failure (missing binary, EPERM, unreachable
-    // group) or an ineffective kill surfaces as an ERROR — never a successful
-    // `timed out` outcome — and a TERM-ignoring child is escalated to a group
-    // KILL. No child or grandchild ever writes a file after the runner
-    // returned. FIXED SEED 0x5EED_5EED (repo style) + bounded cases keep the
+    // and the runner returns success (commands must not daemonize). BOTH
+    // setsid-escape cases are EXPLICITLY EXCLUDED from the foreground
+    // containment invariant — a setsid-escaped descendant is outside the
+    // guarantee (the runner can DETECT a pipe-holding escapee and error, but
+    // cannot TERMINATE an escaped process) — so the property asserts the
+    // escapee is STILL ALIVE after the runner returned (unsupported
+    // daemonization cases never satisfy the invariant), never a false
+    // zero-live claim. The property observes the PRODUCTION outcome — process
+    // liveness and marker behavior AS THE RUNNER LEFT THEM — BEFORE any test
+    // cleanup: the containment invariant is satisfied by the RUNNER's own
+    // termination, never by the harness; the emergency cleanup (the group
+    // kill + the escaped-grandchild pid kill) runs only afterwards, for the
+    // excluded escapees and the injected-fault survivors. A kill failure
+    // (missing binary, EPERM, unreachable group) or an ineffective kill
+    // surfaces as an ERROR — never a successful `timed out` outcome — and a
+    // TERM-ignoring child is escalated to a group KILL. A CONTAINED case's
+    // child or grandchild never writes a file after the runner returned (the
+    // marker-absence probe runs before any cleanup); for the excluded
+    // escapees and the injected-fault survivors the marker is NOT asserted
+    // absent (documented). FIXED SEED 0x5EED_5EED (repo style) + bounded cases
+    // keep the
     // suite deterministic. This target is SERIALIZED by `nextest.toml`
     // (`test-threads = 1`): the real-process lifecycle never runs
     // concurrently with the deterministic deployment/state-machine

@@ -36,14 +36,19 @@
 //!   our own zombie excluded, and any LIVE leftover member triggers the
 //!   termination (TERM, grace, KILL — the timeout path's escalation) plus an
 //!   ERROR — a command that leaves background processes is a contract
-//!   violation, NEVER a successful outcome. Containment ALSO covers a
-//!   descendant that ESCAPED the group via `setsid` but kept the inherited
-//!   stdio pipes: the pipes EOF exactly when the last holder dies, so a pipe
-//!   still open at the drain bound is a provable violation → error. The ONE
-//!   documented exclusion: a FULLY daemonized descendant (`setsid` AND
-//!   closed descriptors) is outside the contract — no portable detection
-//!   exists without cgroups/subreaper support (Linux) or a remote supervisor
-//!   (ssh); commands must not daemonize. A CLEAN command (no live members —
+//!   violation, NEVER a successful outcome. The foreground containment
+//!   INVARIANT (no live process after the return) covers IN-GROUP descendants
+//!   only. A descendant that ESCAPED the group via `setsid` is OUTSIDE the
+//!   guarantee: the runner can DETECT a pipe-holding escapee — the inherited
+//!   stdio pipes EOF exactly when the last holder dies, so a pipe still open
+//!   at the drain bound is a provable violation → error — but it CANNOT
+//!   TERMINATE an escaped process, because no portable way to signal a
+//!   process outside its group exists without cgroups/subreaper support
+//!   (Linux) or a remote supervisor (ssh). The ONE documented exclusion
+//!   covers BOTH setsid flavors: the pipe-holding escapee (detected →
+//!   error, but not terminated) and the FULLY daemonized descendant
+//!   (`setsid` AND closed descriptors — not even detectable); commands must
+//!   not daemonize. A CLEAN command (no live members —
 //!   the common case) pays one enumeration and its exit code and captured
 //!   output are exactly as before.
 //! * **A timeout-kill failure is an ERROR** — if the group kill fails (a real
@@ -469,7 +474,9 @@ impl ChildRunner {
     /// kill, or the reap failed — a failed timeout kill never yields a
     /// successful timeout outcome, and a command that exited but left
     /// background processes in its group is a violation, never a successful
-    /// outcome.
+    /// outcome. A setsid-escaped descendant is OUTSIDE the containment
+    /// guarantee: the runner can DETECT a pipe-holding escapee and error,
+    /// but cannot TERMINATE an escaped process (see the module doc).
     pub fn exec(
         &self,
         argv: &[String],
