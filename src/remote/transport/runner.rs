@@ -24,16 +24,28 @@
 //!   (success, timeout, error) happens only after the child was REAPED: the
 //!   runner waits synchronously on its owned handle, `try_wait` consumes the
 //!   exit status exactly once, and "proven dead" means the wait returned.
-//! * **Foreground-only** — after the direct child exits, the runner probes
-//!   its process group (`killpg(pgid, 0)` — the pure-detection real
-//!   syscall, never the fault-injected seam): if ANY member remains (a
-//!   background descendant the command left behind), the runner terminates
-//!   the WHOLE group (TERM, grace, KILL — the timeout path's escalation),
-//!   waits for the group to be gone (bounded), and returns an ERROR — a
-//!   command that leaves background processes is a contract violation, NEVER
-//!   a successful outcome. A CLEAN command (the group empty after the child
-//!   exits — the common case) pays only that single probe and its exit code
-//!   and captured output are exactly as before.
+//! * **Foreground-only** — commands must not daemonize. After the direct
+//!   child exits, the runner checks its process group for LIVE leftover
+//!   members (a background descendant the command left behind). The check is
+//!   race-free by construction: the child is held as an UNREAPED ZOMBIE for
+//!   its duration (`waitid(2)` with `WNOWAIT` — a zombie holds its pid, and
+//!   therefore its process-group id (the child is the group leader, pgid ==
+//!   pid), allocated until reaped, so a `killpg` in that window can never
+//!   hit a pid the OS recycled for an unrelated process), the group is
+//!   ENUMERATED (Linux: a `/proc/*/stat` scan; macOS: `proc_listpgrp`) with
+//!   our own zombie excluded, and any LIVE leftover member triggers the
+//!   termination (TERM, grace, KILL — the timeout path's escalation) plus an
+//!   ERROR — a command that leaves background processes is a contract
+//!   violation, NEVER a successful outcome. Containment ALSO covers a
+//!   descendant that ESCAPED the group via `setsid` but kept the inherited
+//!   stdio pipes: the pipes EOF exactly when the last holder dies, so a pipe
+//!   still open at the drain bound is a provable violation → error. The ONE
+//!   documented exclusion: a FULLY daemonized descendant (`setsid` AND
+//!   closed descriptors) is outside the contract — no portable detection
+//!   exists without cgroups/subreaper support (Linux) or a remote supervisor
+//!   (ssh); commands must not daemonize. A CLEAN command (no live members —
+//!   the common case) pays one enumeration and its exit code and captured
+//!   output are exactly as before.
 //! * **A timeout-kill failure is an ERROR** — if the group kill fails (a real
 //!   failure, not the benign ESRCH of a group that is already gone), or the
 //!   escalated kill fails, or the reap cannot be confirmed within the bound,
@@ -97,22 +109,155 @@ pub(crate) fn kill_process_group(pgid: i32, sig: i32) -> std::io::Result<()> {
     }
 }
 
-/// True when the process group `pgid` still has at least one member:
-/// `killpg(pgid, 0)` (the standard existence probe — signal 0 performs all
-/// error checking but sends nothing) succeeds iff a member remains, ESRCH iff
-/// the group is empty. This is the FOREGROUND-ONLY detection: after the
-/// direct child exits the runner asks this before producing an outcome, and a
-/// leftover member is a contract violation. The probe uses the REAL `killpg`
-/// directly — it is a pure detection primitive, never the fault-injected
-/// [`KillSeam`], so an injected kill fault cannot turn a clean group into a
-/// false "leftover". A non-ESRCH probe error (EPERM, ...) is treated
-/// conservatively as "members may remain": the termination path then re-probes
-/// until the group is confirmed gone or the reap bound expires.
-fn process_group_has_members(pgid: i32) -> bool {
-    match kill_process_group(pgid, 0) {
-        Ok(()) => true,
-        Err(e) => e.raw_os_error() != Some(libc::ESRCH),
+/// True when the direct child has EXITED but has NOT been reaped yet
+/// (`waitid(2)` with `WNOHANG | WNOWAIT | WEXITED`): the child remains a
+/// ZOMBIE, and a zombie holds its pid — and therefore its process-group id
+/// (the child is the group leader, pgid == pid) — allocated until reaped.
+/// The foreground-only check runs between this peek and the reap, so a
+/// `killpg(pgid, ...)` in that window can never race a pid the OS recycled
+/// for an unrelated process: the group being signalled is provably ours.
+/// ECHILD (the child is gone — reaped or never ours) is treated as exited so
+/// the caller proceeds to the reap instead of spinning.
+fn child_exited_unreaped(pid: u32) -> std::io::Result<bool> {
+    let mut si: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `waitid` on our own child (a positive pid, the direct child of
+    // this process); `WNOWAIT` leaves it waitable for the subsequent reap;
+    // `WNOHANG` never blocks; `WEXITED` reports the exited transition; the
+    // zero-initialized siginfo is written by the kernel only on success.
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as _,
+            &mut si,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if rc != 0 {
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::ECHILD) {
+            return Ok(true);
+        }
+        return Err(e);
     }
+    Ok(si.si_pid != 0)
+}
+
+/// The LIVE (non-zombie) members of the process group `pgid`, excluding the
+/// runner's own child `exclude_pid`. This is the FOREGROUND-ONLY detection:
+/// after the direct child exits (held as a zombie), any remaining live member
+/// is a background descendant the command left behind. The enumeration never
+/// uses the fault-injected [`KillSeam`] — it is a pure detection primitive,
+/// so an injected kill fault cannot turn a clean group into a false
+/// "leftover". A scan error (a vanished/EPERM process mid-scan) skips that
+/// entry; only a fully failed scan degrades to an empty list.
+#[cfg(target_os = "linux")]
+fn live_group_members(pgid: i32, exclude_pid: u32) -> Vec<i32> {
+    let mut members = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return members;
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str() else {
+            continue;
+        };
+        let Ok(pid) = name.parse::<i32>() else {
+            continue;
+        };
+        if pid == exclude_pid as i32 {
+            continue;
+        }
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        // Format: `pid (comm) state ppid pgrp session ...` — `comm` may
+        // contain spaces AND ')' — anchor on the LAST ')'.
+        let Some(rest) = stat.rsplit_once(')') else {
+            continue;
+        };
+        let mut fields = rest.1.split_whitespace();
+        let state = fields.next().unwrap_or("");
+        let _ppid = fields.next();
+        let pgrp: i32 = fields.next().and_then(|s| s.parse().ok()).unwrap_or(-1);
+        if pgrp == pgid && !state.starts_with('Z') {
+            members.push(pid);
+        }
+    }
+    members
+}
+
+#[cfg(target_os = "macos")]
+fn live_group_members(pgid: i32, exclude_pid: u32) -> Vec<i32> {
+    // `proc_listpgrppids(3)`: the pids of every process in the group —
+    // ZOMBIES INCLUDED (a killed descendant that launchd has not yet reaped
+    // is still listed). A zombie is NOT live, so every member's state is
+    // read via `proc_pidinfo(PROC_PIDTBSDINFO)` (the `pbi_status` field at
+    // byte offset 4; `SZOMB` = 5) and zombies are excluded — otherwise a
+    // command whose descendants were killed would be falsely reported as
+    // having left background processes. Our own zombie child is excluded by
+    // pid (it is the group leader, still waitable until we reap it). A
+    // member whose state cannot be read has vanished (reaped) in the window
+    // between the enumeration and the read — it is not live, so it is
+    // excluded too.
+    let mut buf = [0i32; 4096]; // room for up to 4096 group members
+    let n = unsafe { proc_listpgrppids(pgid, buf.as_mut_ptr().cast(), (buf.len() * 4) as i32) };
+    if n <= 0 {
+        return Vec::new();
+    }
+    let n = (n as usize).min(buf.len());
+    buf[..n]
+        .iter()
+        .copied()
+        .filter(|p| *p != exclude_pid as i32 && !macos_is_not_live(*p))
+        .collect()
+}
+
+/// Whether the member is NOT live — a zombie (`SZOMB` = 5) or already
+/// vanished (reaped in the window between the enumeration and the read,
+/// which makes `proc_pidinfo` fail): either way it must be EXCLUDED from
+/// the live-members list, or a command whose descendants were killed would
+/// be falsely reported as having left background processes.
+#[cfg(target_os = "macos")]
+fn macos_is_not_live(pid: i32) -> bool {
+    // The first 8 bytes of `struct proc_bsdinfo` are `pbi_flags` (offset 0)
+    // and `pbi_status` (offset 4, a uint32 copy of the process state); the
+    // full struct (with rusage) is ~136 bytes on modern macOS, so the buffer
+    // must be at least that large for `proc_pidinfo` to write anything. A
+    // zombie (`SZOMB` = 5 from sys/proc.h) is not live. A failed read means
+    // the process has vanished — not live either.
+    const PROC_PIDTBSDINFO: i32 = 3;
+    const SZOMB: u32 = 5;
+    let mut bsd = [0u8; 256];
+    let n = unsafe {
+        proc_pidinfo(
+            pid,
+            PROC_PIDTBSDINFO,
+            0,
+            bsd.as_mut_ptr().cast(),
+            bsd.len() as i32,
+        )
+    };
+    if n < 8 {
+        return true; // gone (or unreadable) — not a live member
+    }
+    u32::from_le_bytes([bsd[4], bsd[5], bsd[6], bsd[7]]) == SZOMB
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "proc")]
+unsafe extern "C" {
+    fn proc_listpgrppids(pid: i32, buffer: *mut std::ffi::c_void, buffersize: i32) -> i32;
+    fn proc_pidinfo(
+        pid: i32,
+        flavor: i32,
+        arg: u64,
+        buffer: *mut std::ffi::c_void,
+        buffersize: i32,
+    ) -> i32;
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn live_group_members(_pgid: i32, _exclude_pid: u32) -> Vec<i32> {
+    compile_error!("live group-member enumeration is implemented for Linux and macOS only");
 }
 
 /// The kill seam behind [`ChildRunner`]: the syscall-level termination
@@ -248,14 +393,13 @@ struct OwnedChild {
 }
 
 impl OwnedChild {
-    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
-        match self.child.try_wait()? {
-            Some(st) => {
-                self.reaped = true;
-                Ok(Some(st))
-            }
-            None => Ok(None),
-        }
+    /// Reap the child (a blocking wait on an already-exited zombie returns
+    /// immediately with its status) and mark the handle reaped: from here on
+    /// nothing may signal anything — the pid is released by this call.
+    fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        let st = self.child.wait()?;
+        self.reaped = true;
+        Ok(st)
     }
 }
 
@@ -374,17 +518,20 @@ impl ChildRunner {
         let mut sent_owned = false;
         let mut kill_error: Option<String> = None;
 
-        let status = loop {
+        // Wait loop: detect the child's exit WITHOUT reaping it (`waitid`
+        // WNOWAIT peek — the child becomes a ZOMBIE and stays waitable,
+        // holding its pid/pgid allocated for the foreground-only check
+        // that follows the loop). On timeout, terminate the group and
+        // escalate exactly as before; every kill failure is recorded.
+        loop {
             drain_available(&mut owned.child.stdout, &mut stdout)
                 .map_err(|e| RunError::Wait(e.to_string()))?;
             drain_available(&mut owned.child.stderr, &mut stderr)
                 .map_err(|e| RunError::Wait(e.to_string()))?;
-            match owned.try_wait() {
-                Ok(Some(st)) => break st,
-                Ok(None) => {}
-                Err(e) => {
-                    return Err(RunError::Wait(format!("wait {argv:?}: {e}")));
-                }
+            if child_exited_unreaped(pid)
+                .map_err(|e| RunError::Wait(format!("wait {argv:?}: {e}")))?
+            {
+                break;
             }
             let now = Instant::now();
             if !timed_out && now >= deadline {
@@ -393,10 +540,14 @@ impl ChildRunner {
                 // Graceful TERM of the WHOLE process group.
                 if let Err(e) = self.config.kill.kill_group(pgid, libc::SIGTERM) {
                     // ESRCH is benign only when the child itself is already
-                    // gone (it exited as the deadline fired — the wait reaps
-                    // it next); a live child behind an unreachable group is a
-                    // real termination failure.
-                    let alive = matches!(owned.try_wait(), Ok(None));
+                    // gone (it exited as the deadline fired — the peek
+                    // reports it next); a live child behind an unreachable
+                    // group is a real termination failure. The liveness
+                    // check must NOT reap: the child stays a zombie until
+                    // the post-loop foreground check.
+                    let alive = child_exited_unreaped(pid)
+                        .map(|exited| !exited)
+                        .unwrap_or(false);
                     if alive {
                         kill_error = Some(format!("TERM group {pgid}: {e}"));
                     }
@@ -409,7 +560,9 @@ impl ChildRunner {
                     // Escalate to KILL on the whole group: a child that
                     // ignores TERM must still die.
                     if let Err(e) = self.config.kill.kill_group(pgid, libc::SIGKILL) {
-                        let alive = matches!(owned.try_wait(), Ok(None));
+                        let alive = child_exited_unreaped(pid)
+                            .map(|exited| !exited)
+                            .unwrap_or(false);
                         if alive {
                             kill_error = Some(format!("KILL group {pgid}: {e}"));
                         }
@@ -434,24 +587,27 @@ impl ChildRunner {
                 }
             }
             std::thread::sleep(Duration::from_millis(1));
-        };
-
-        // REAPED: `try_wait` consumed the exit status exactly once (a second
-        // wait would ECHILD). From here on nothing signals anything.
-        #[cfg(test)]
-        if let Some(observer) = &self.config.reap_observer {
-            observer(pid);
         }
-        // FOREGROUND-ONLY: after the direct child exits, probe its process
-        // group — if ANY member remains, the command left a background
-        // descendant. Terminate the WHOLE group (TERM → grace → KILL, the
-        // timeout path's escalation) and report the violation as an ERROR,
-        // never a successful outcome; the essential contract — no live
-        // process of the group after the return — is enforced BEFORE the
-        // outcome escapes. A CLEAN command (the group empty after the child
-        // exits — the common case) pays only this single `killpg(pgid, 0)`
-        // probe and proceeds exactly as before.
-        if process_group_has_members(pgid) {
+
+        // The child has EXITED but is still a ZOMBIE: the `waitid` WNOWAIT
+        // peek above left it waitable, so its pid — and therefore its
+        // process-group id (the child is the group leader, pgid == pid) — is
+        // still allocated. Every foreground-only check and group termination
+        // below happens while the zombie holds the pgid, so a `killpg` can
+        // NEVER race a pid the OS recycled for an unrelated process (the
+        // failure mode that made a probe-after-reap racy under parallel
+        // execution).
+        //
+        // FOREGROUND-ONLY: enumerate the LIVE members of the child's process
+        // group (our zombie excluded). If any remain, the command left a
+        // background descendant: terminate the WHOLE group (TERM → grace →
+        // KILL, the timeout path's escalation) and report the violation as
+        // an ERROR, never a successful outcome; the essential contract — no
+        // live process of the group after the return — is enforced BEFORE
+        // the outcome escapes. A CLEAN command (no live members — the common
+        // case) pays one enumeration and proceeds exactly as before.
+        let live = live_group_members(pgid, pid);
+        if !live.is_empty() {
             // Terminate the whole group; a kill failure is surfaced inside
             // the violation error (the leftover member must not survive even
             // when a kill fails — the fault-injected paths that cannot land
@@ -473,23 +629,70 @@ impl ChildRunner {
             // error still names the violation — the fault IS the kill not
             // working.
             let verify_deadline = Instant::now() + self.config.reap_bound;
-            while process_group_has_members(pgid) && Instant::now() < verify_deadline {
+            while !live_group_members(pgid, pid).is_empty() && Instant::now() < verify_deadline {
                 std::thread::sleep(Duration::from_millis(1));
             }
+            // Reap the direct child (a zombie — the wait returns immediately,
+            // releasing the pid) BEFORE the error escapes.
+            owned
+                .wait()
+                .map_err(|e| RunError::Wait(format!("wait {argv:?}: {e}")))?;
+            #[cfg(test)]
+            if let Some(observer) = &self.config.reap_observer {
+                observer(pid);
+            }
             let detail = term_error.map(|e| format!(" ({e})")).unwrap_or_default();
+            let leftover = live
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
             return Err(RunError::Background(format!(
-                "command {argv:?} left background processes in its process group; \
-                 commands are foreground-only{detail}"
+                "command {argv:?} left background processes in its process group \
+                 (live members: {leftover}); commands are foreground-only{detail}"
             )));
+        }
+
+        // The direct child is the only group member: reap it — the SINGLE
+        // reap, releasing the pid. From here on nothing signals anything.
+        let status = owned
+            .wait()
+            .map_err(|e| RunError::Wait(format!("wait {argv:?}: {e}")))?;
+        #[cfg(test)]
+        if let Some(observer) = &self.config.reap_observer {
+            observer(pid);
         }
         // Bounded drain to EOF: the child is dead and its pipes hold the
         // remaining output. A grandchild that keeps a pipe open cannot hang
         // the outcome — the drain gives up after the reap bound.
+        // PIPE-EOF CONTAINMENT: the direct child is reaped (its descriptors
+        // closed by the kernel); the inherited stdout/stderr write ends EOF
+        // exactly when the LAST holder — the child or any descendant that
+        // kept the pipes — dies. EOF within the bound proves no pipe-holding
+        // descendant lives (the clean path stays clean); a pipe still open
+        // at the bound proves a live descendant HOLDS it — a descendant that
+        // escaped the group via `setsid` but kept the inherited pipes is
+        // still DETECTED here, and the violation is reported as an ERROR,
+        // never a successful outcome. Only a FULLY daemonized descendant
+        // (`setsid` AND closed descriptors) is outside the contract (see the
+        // module doc) — commands must not daemonize.
         let drain_bound = self.config.reap_bound;
-        drain_to_eof(&mut owned.child.stdout, &mut stdout, drain_bound)
+        let stdout_drain = drain_to_eof(&mut owned.child.stdout, &mut stdout, drain_bound)
             .map_err(|e| RunError::Wait(e.to_string()))?;
-        drain_to_eof(&mut owned.child.stderr, &mut stderr, drain_bound)
+        if matches!(stdout_drain, DrainState::BoundExpired) {
+            return Err(RunError::Background(format!(
+                "command {argv:?} left processes holding its output pipes open; \
+                 commands are foreground-only"
+            )));
+        }
+        let stderr_drain = drain_to_eof(&mut owned.child.stderr, &mut stderr, drain_bound)
             .map_err(|e| RunError::Wait(e.to_string()))?;
+        if matches!(stderr_drain, DrainState::BoundExpired) {
+            return Err(RunError::Background(format!(
+                "command {argv:?} left processes holding its error pipes open; \
+                 commands are foreground-only"
+            )));
+        }
 
         if timed_out {
             // A timeout outcome is legitimate ONLY when the termination was
@@ -563,31 +766,48 @@ where
     }
 }
 
+/// The outcome of a bounded post-exit drain: EOF proves the pipe's last
+/// writer closed (no live descendant holds it); a bound expiry proves a
+/// live writer STILL holds it (a descendant that escaped the group but kept
+/// the inherited stdio pipes — the pipe-EOF containment signal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainState {
+    /// `read` returned 0: every write end closed — no pipe-holding
+    /// descendant remains.
+    Eof,
+    /// The drain bound expired with the pipe still open (poll timed out or
+    /// the deadline passed between reads): a live writer holds the pipe.
+    BoundExpired,
+}
+
 /// Drain a child pipe to EOF, bounded: reads never block (non-blocking read
 /// ends), and between reads `poll` waits only up to `bound` — a grandchild
 /// that outlives the direct child and keeps a pipe open cannot hang the
-/// outcome; the drain returns what it collected when the bound expires.
+/// outcome. Returns [`DrainState::Eof`] when the pipe reached EOF within the
+/// bound (no live holder remains) and [`DrainState::BoundExpired`] when the
+/// bound expired with the pipe still open (a live holder — a contract
+/// violation the caller reports, never a silent clean outcome).
 fn drain_to_eof<R>(
     stream: &mut Option<R>,
     buf: &mut Vec<u8>,
     bound: Duration,
-) -> std::io::Result<()>
+) -> std::io::Result<DrainState>
 where
     R: Read + AsRawFd,
 {
     let Some(stream) = stream.as_mut() else {
-        return Ok(());
+        return Ok(DrainState::Eof);
     };
     let deadline = Instant::now() + bound;
     let mut chunk = [0u8; 8192];
     loop {
         match stream.read(&mut chunk) {
-            Ok(0) => return Ok(()),
+            Ok(0) => return Ok(DrainState::Eof),
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
-                    return Ok(());
+                    return Ok(DrainState::BoundExpired);
                 }
                 let ms = remaining.as_millis().min(i32::MAX as u128) as i32;
                 let mut pfd = libc::pollfd {
@@ -601,7 +821,7 @@ where
                     return Err(std::io::Error::last_os_error());
                 }
                 if rc == 0 {
-                    return Ok(());
+                    return Ok(DrainState::BoundExpired);
                 }
             }
             Err(e) => return Err(e),
@@ -634,12 +854,16 @@ mod runner_property_tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// The runner deadline for every generated case: long enough that a
-    /// quick-exit child finishes in time, short enough that every timed-out
-    /// case stays fast. The late-marker child writes its marker after 0.25s —
-    /// past this deadline — so a leaked (returned-while-still-alive) child
-    /// would be caught writing AFTER the outcome.
-    const TEST_TIMEOUT: Duration = Duration::from_millis(200);
+    /// The runner deadline for every generated case: LONG enough that a
+    /// quick-exit child — including the setsid cases' READINESS barrier
+    /// (the sh waits for the grandchild's `ready` file, which arrives after
+    /// python3's interpreter startup, ~50-300ms under parallel load) —
+    /// finishes in time, while every genuinely timed-out case stays bounded.
+    /// The late-marker child writes its marker after 1.2s — past this
+    /// deadline — so a leaked (returned-while-still-alive) child would be
+    /// caught writing AFTER the outcome. Coordination is by BARRIER (the
+    /// ready file), never by "must finish within N ms".
+    const TEST_TIMEOUT: Duration = Duration::from_secs(1);
 
     /// The child behaviour each generated case exhibits.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -661,6 +885,24 @@ mod runner_property_tests {
         /// exit-0 outcome — leaving no live process and no post-return fs
         /// effect.
         DetachedGrandchild,
+        /// Exits ZERO immediately after forking a grandchild that CALLS
+        /// `setsid` (escaping the process group — a `killpg` can never reach
+        /// it) but KEEPS the inherited stdio pipes open, sleeps 0.4s, then
+        /// would write a marker: the group enumeration finds nothing (it
+        /// escaped), so the PIPE-EOF containment must catch the pipe-holding
+        /// escapee at the drain bound and return the "left processes holding
+        /// its output pipes" error — never a successful outcome. The test's
+        /// cleanup kills the escapee by pid (the runner cannot reach it).
+        SetsidInherit,
+        /// Exits ZERO immediately after forking a grandchild that FULLY
+        /// DAEMONIZES: `setsid` AND closes every inherited descriptor (the
+        /// canonical daemon recipe), sleeps 0.4s, then writes a marker. This
+        /// is the ONE documented contract exclusion — no portable detection
+        /// exists without cgroups/subreaper (Linux) or a remote supervisor
+        /// (ssh) — so the runner returns SUCCESS (the narrowed contract:
+        /// commands must not daemonize). The test pins that boundary and
+        /// enforces the no-post-return-fs property with its own cleanup kill.
+        SetsidClose,
         /// Sleeps 0.25s then would write a marker file: the probe for
         /// post-return filesystem effects.
         LateMarker,
@@ -751,10 +993,55 @@ mod runner_property_tests {
                     dir.join("gcpid").display()
                 ),
             ],
+            // The grandchild ESCAPES the process group via `setsid` (so the
+            // group enumeration finds nothing and `killpg` cannot reach it)
+            // but KEEPS the inherited stdout/stderr write ends (python3's
+            // fds 1/2) — the pipes stay open after the direct child is
+            // reaped, so the PIPE-EOF containment at the drain bound detects
+            // it and errors. READINESS PROTOCOL: the grandchild writes a
+            // `ready` file AFTER `setsid` and the parent waits for it before
+            // exiting — the escape is COMPLETE before the runner's check, so
+            // the enumeration genuinely sees an empty group (a bare `&` would
+            // race python3's interpreter startup, which delays `setsid` past
+            // the check). `python3` is the portable `setsid` provider on both
+            // macOS (dev) and Linux (CI).
+            ChildKind::SetsidInherit => vec![
+                "sh".into(),
+                "-c".into(),
+                format!(
+                    "python3 -c 'import os,time; os.setsid(); open(\"{}\",\"w\").close(); time.sleep(0.9); open(\"{}\",\"w\").close()' & while [ ! -e {} ]; do :; done; echo $! > {}; exit 0",
+                    dir.join("ready").display(),
+                    dir.join("marker").display(),
+                    dir.join("ready").display(),
+                    dir.join("gcpid").display()
+                ),
+            ],
+            // The grandchild FULLY DAEMONIZES: `setsid` AND closes its
+            // descriptors (0/1/2) — the pipes EOF immediately, no group
+            // member, no pipe-holder: the ONE documented contract exclusion.
+            // Same READINESS PROTOCOL: the escape (setsid + fd close) is
+            // complete before the parent exits, and the ready-poll busy-waits
+            // with shell BUILTINS ONLY (`:` — no external `sleep` subprocess,
+            // which would be a transient GROUP MEMBER the runner would
+            // legitimately flag). The delayed marker is at 0.9s — far past
+            // the test's cleanup kill (issued right after the runner
+            // returns) — so the no-post-return-fs assertion measures the
+            // CONTRACT boundary, not a cleanup race under parallel load.
+            ChildKind::SetsidClose => vec![
+                "sh".into(),
+                "-c".into(),
+                format!(
+                    "python3 -c 'import os,time; os.setsid(); os.close(0); os.close(1); os.close(2); open(\"{}\",\"w\").close(); time.sleep(0.9); open(\"{}\",\"w\").close()' & while [ ! -e {} ]; do :; done; echo $! > {}; exit 0",
+                    dir.join("ready").display(),
+                    dir.join("marker").display(),
+                    dir.join("ready").display(),
+                    dir.join("gcpid").display()
+                ),
+            ],
             ChildKind::LateMarker => vec![
                 "sh".into(),
                 "-c".into(),
-                format!("sleep 0.25; touch {}", dir.join("marker").display()),
+                format!("sleep 1.2; touch {}", dir.join("marker").display()),
             ],
         }
     }
@@ -780,12 +1067,18 @@ mod runner_property_tests {
 
     /// The grandchild pid, from the pidfile the child writes IMMEDIATELY at
     /// spawn (`echo $! > gcpid`) — written ~1ms in, far before the 200ms
-    /// deadline, so no child-written-pidfile race.
+    /// deadline, so no child-written-pidfile race. A read that catches the
+    /// file mid-write (the `>` truncate before the `echo`) or a non-numeric
+    /// parse is RETRIED — never a premature `None` that would skip the
+    /// cleanup kill of an escaped grandchild.
     fn read_gc_pid(path: &Path) -> Option<u32> {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            if let Ok(s) = std::fs::read_to_string(path) {
-                return s.trim().parse::<u32>().ok();
+            if let Some(pid) = std::fs::read_to_string(path)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+            {
+                return Some(pid);
             }
             if Instant::now() >= deadline {
                 return None;
@@ -833,9 +1126,15 @@ mod runner_property_tests {
             .unwrap()
             .first()
             .expect("the spawn observer must record the child pid at spawn time");
-        let gc_pid = matches!(kind, ChildKind::Grandchild | ChildKind::DetachedGrandchild)
-            .then(|| read_gc_pid(&dir.path().join("gcpid")))
-            .flatten();
+        let gc_pid = matches!(
+            kind,
+            ChildKind::Grandchild
+                | ChildKind::DetachedGrandchild
+                | ChildKind::SetsidInherit
+                | ChildKind::SetsidClose
+        )
+        .then(|| read_gc_pid(&dir.path().join("gcpid")))
+        .flatten();
 
         let times_out = matches!(
             kind,
@@ -858,6 +1157,40 @@ mod runner_property_tests {
             (Ok(_), false, _) if kind == ChildKind::DetachedGrandchild => {
                 panic!(
                     "{kind:?} × {fault:?}: a command that left a background grandchild must error, got {outcome:?}"
+                );
+            }
+            // SetsidInherit: the grandchild escaped the group but KEEPS the
+            // inherited pipes — the PIPE-EOF containment must error (never
+            // success), even though the runner cannot kill the escapee (the
+            // test's cleanup does, by pid).
+            (Err(e), false, _) if kind == ChildKind::SetsidInherit => {
+                assert!(
+                    e.to_string().contains("foreground-only"),
+                    "{kind:?} × {fault:?}: the pipe-holding escapee must error as a foreground-only violation, got {e}"
+                );
+            }
+            (Ok(_), false, _) if kind == ChildKind::SetsidInherit => {
+                panic!(
+                    "{kind:?} × {fault:?}: a pipe-holding escaped grandchild must error (never success), got {outcome:?}"
+                );
+            }
+            // SetsidClose: the FULLY daemonized grandchild (`setsid` AND
+            // closed descriptors) is the ONE documented contract exclusion —
+            // undetectable without cgroups/subreaper or a remote supervisor.
+            // The runner returns SUCCESS per the narrowed contract (commands
+            // must not daemonize); the test pins that boundary and its own
+            // cleanup enforces zero-live + no-post-return-fs below.
+            (Ok(RunOutcome::Exited { exit_code, .. }), false, _)
+                if kind == ChildKind::SetsidClose =>
+            {
+                assert_eq!(
+                    *exit_code, 0,
+                    "{kind:?} × {fault:?}: the contract boundary is a clean exit-0 success (the fully daemonized escapee is outside containment)"
+                );
+            }
+            (Err(e), false, _) if kind == ChildKind::SetsidClose => {
+                panic!(
+                    "{kind:?} × {fault:?}: per the narrowed contract the runner must succeed (the daemonizer is outside containment), got {e}"
                 );
             }
             (Ok(RunOutcome::Exited { exit_code, .. }), false, _) => {
@@ -921,12 +1254,18 @@ mod runner_property_tests {
             ),
             Err(_) => assert_eq!(
                 runner_reaps,
-                // DetachedGrandchild exits ZERO on its own (no kill involved),
-                // so even under the inert fault the runner's wait reaps it
+                // DetachedGrandchild and SetsidInherit exit ZERO on their own
+                // (no kill involved — the Inert fault only affects kills), so
+                // even under the inert fault the runner's wait reaps them
                 // exactly once; every other error outcome reaps only when its
                 // kills were effective (the inert fault IS the kill not
                 // working — nothing to reap).
-                if fault == KillFault::Inert && kind != ChildKind::DetachedGrandchild {
+                if fault == KillFault::Inert
+                    && !matches!(
+                        kind,
+                        ChildKind::DetachedGrandchild | ChildKind::SetsidInherit
+                    )
+                {
                     0
                 } else {
                     1
@@ -935,11 +1274,15 @@ mod runner_property_tests {
             ),
         }
 
-        // ---- cleanup under an injected kill/reap failure ----
+        // ---- cleanup under an injected kill/reap failure OR an escaped
+        // grandchild ----
         // The injected fault IS the kill not working: the runner surfaced an
         // error (never a fake timeout success) and cleaned up what it could;
         // the test now kills the leftover group and reaps the direct child —
         // the single cleanup reap — so the zero-live assertion is meaningful.
+        // A setsid-ESCAPED grandchild (SetsidInherit/SetsidClose) is outside
+        // the group — the runner could not reach it — so the test kills it
+        // BY PID (its pid is live, so the kill is safe from pid reuse).
         if outcome.is_err() {
             // SAFETY: kill(-pgid) == killpg on the group THIS test spawned
             // (the child is the group leader, pgid == its pid).
@@ -947,6 +1290,13 @@ mod runner_property_tests {
             // SAFETY: waitpid on our own child; it died on SIGKILL; ECHILD is
             // harmless when the runner already reaped it.
             unsafe { libc::waitpid(child_pid as i32, std::ptr::null_mut(), 0) };
+        }
+        if matches!(kind, ChildKind::SetsidInherit | ChildKind::SetsidClose)
+            && let Some(gc) = gc_pid
+        {
+            // SAFETY: the escaped grandchild is a LIVE process of this test
+            // (its pid is allocated — no reuse); SIGKILL lands.
+            unsafe { libc::kill(gc as i32, libc::SIGKILL) };
         }
 
         // ---- ZERO LIVE PROCESSES ----
@@ -958,14 +1308,22 @@ mod runner_property_tests {
         // ---- NO POST-RETURN FILESYSTEM EFFECTS ----
         // The probe window lets any write that a (buggy) still-alive child or
         // grandchild would attempt after the outcome land and be caught: the
-        // marker scripts write 0.25s in (LateMarker/Grandchild) or 0.4s in
-        // (DetachedGrandchild), and the probe outlives that — a buggy runner
-        // that returned while the descendant still lived would be caught
-        // writing AFTER the outcome.
+        // marker scripts write 1.2s in (LateMarker/Grandchild — killed by the
+        // 1s deadline), 0.4s in (DetachedGrandchild), or 0.9s in (the setsid
+        // escapees — killed by the TEST's cleanup kill, since a setsid'd
+        // escapee is outside the runner's reach by contract), and the probe
+        // outlives each — a buggy runner that returned while the descendant
+        // still lived would be caught writing AFTER the outcome.
         if matches!(kind, ChildKind::LateMarker | ChildKind::Grandchild) {
             std::thread::sleep(Duration::from_millis(300));
         } else if kind == ChildKind::DetachedGrandchild {
             std::thread::sleep(Duration::from_millis(500));
+        } else if matches!(kind, ChildKind::SetsidInherit | ChildKind::SetsidClose) {
+            // The setsid escapees' markers fire at 0.9s — far past the
+            // cleanup kill (~150ms after the runner returned) — so the
+            // probe window outlives the marker delay with a wide margin,
+            // even under heavy parallel load.
+            std::thread::sleep(Duration::from_millis(1000));
         }
         assert!(
             !dir.path().join("marker").exists(),
@@ -985,6 +1343,8 @@ mod runner_property_tests {
             Just(ChildKind::IgnoreTerm),
             Just(ChildKind::Grandchild),
             Just(ChildKind::DetachedGrandchild),
+            Just(ChildKind::SetsidInherit),
+            Just(ChildKind::SetsidClose),
             Just(ChildKind::LateMarker),
         ]
     }
@@ -1009,7 +1369,15 @@ mod runner_property_tests {
         // the child was reaped exactly once. A command that EXITS but leaves
         // a background grandchild in its process group (DetachedGrandchild)
         // is a FOREGROUND-ONLY violation: the runner terminates the group and
-        // errors — never a successful exit-0 outcome. A kill failure (missing
+        // errors — never a successful exit-0 outcome. A grandchild that
+        // ESCAPES the group via `setsid` but keeps the inherited stdio pipes
+        // (SetsidInherit) is caught by the PIPE-EOF containment — an error,
+        // never success. A FULLY daemonized grandchild (`setsid` AND closed
+        // descriptors, SetsidClose) is the ONE documented contract exclusion
+        // — no portable detection exists — and the runner returns success
+        // (commands must not daemonize); the test pins the boundary and its
+        // own cleanup enforces zero-live and no-post-return-fs. A kill
+        // failure (missing
         // binary, EPERM, unreachable group) or an ineffective kill surfaces
         // as an ERROR — never a successful `timed out` outcome — and a TERM-
         // ignoring child is escalated to a group KILL. No child or grandchild
