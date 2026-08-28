@@ -10,14 +10,19 @@
 //! (generation AND artifact: release/variant/tree) to EXACTLY EQUAL the
 //! attempt's FROZEN DESIRED assignment (`attempt.slots[sid].desired` — the
 //! value the intent froze at plan time), writes the commit markers, and
-//! APPENDS the TERMINAL EVENT (status `Successful`, the per-slot
-//! `outcomes`, and the rollback state built from `actuals`) — ONE atomic
+//! APPENDS the TERMINAL EVENT (status `Successful`, the ACTIVATED slot-id
+//! set, and the rollback state) — ONE atomic
 //! line append, the only commit of the finalize — then releases the locks.
 //! Replay idempotency: a crash after the append can never duplicate the
 //! terminal (a repeated finalize for the same deployment id is a no-op; the
 //! store refuses duplicate appends). The rollback payload itself is built
 //! by [`crate::ledger::records::build_rollback`] (the complete-snapshot
-//! overlay + exact-rollback verification semantics).
+//! overlay) EXCLUSIVELY from the VERIFIED LIVE `GenerationRef`s the
+//! lock-verified re-observation RETURNED — the values read under the locks
+//! and proved equal to the frozen desired — NEVER from the engine's earlier
+//! observation records (`actuals`/`outcomes`: the old rollback source a
+//! concurrent controller can make STALE — recorded before the locks, then
+//! diverged on the remote — while the verification still passes).
 //!
 //! ANY SELECTED SLOT whose LIVE `GenerationRef` diverges from the frozen
 //! desired assignment — a concurrent controller swapped the slot's `current`
@@ -28,11 +33,21 @@
 //! shared operation's replacement for recovery's old per-slot generation
 //! check (the "generation diverged" degraded case).
 //!
-//! [`recovery_outcomes`] derives the per-slot outcomes + actuals used to
-//! finalize a PENDING deployment when the engine no longer has the live
-//! outcomes at hand (recovery has already verified each slot's live
-//! generation equals the desired generation, so the outcomes ARE the
-//! desired assignments).
+//! THE STALE-ROLLBACK-SNAPSHOT FIX: the lock-verified re-observation
+//! ([`verify_selected_locked`]) RETURNS the observed live `GenerationRef`
+//! per selected slot (alongside the equality verdict), and the successful
+//! path constructs the selected rollback entries EXCLUSIVELY from those
+//! verified values (the frozen desired is an equally-valid source — the
+//! verification proved the two equal; the observed values are used because
+//! they are the values actually read under the locks). The `actuals` /
+//! `outcomes` inputs (the engine's per-slot observation records) are GONE
+//! from the successful finalizer — a stale observation can no longer leak
+//! into the payload. The ACTIVATED slot-id set is derived from the INTENT
+//! (its selected slots), and a PRE-APPEND GUARD
+//! ([`verify_rollback_matches_desired`]) enforces `rollback[selected] ==
+//! intent.desired` (the complete GenerationRef equality: generation AND
+//! artifact) before the terminal is appended — a mismatched payload aborts
+//! (fail closed), never appends.
 //!
 //! The two PHYSICAL LINE KINDS of the append-only JSONL stream
 //! ([`LedgerLine`] — the WIRE enum) and the MERGED ENTRY re-export
@@ -40,11 +55,10 @@
 //! write path; see the "append / read line kinds" section below.
 
 use crate::error::{Error, Result};
-use crate::identity::{OperationId, SlotId};
+use crate::identity::{DeploymentId, GenerationRef, OperationId, PlacementSlotAssignment, SlotId};
 pub use crate::ledger::records::{
-    DeploymentIntent, LedgerEntry, LedgerIntentWire, LedgerTerminal, LedgerTerminalWire,
-    ObservationWire, ObservedGenerationWire, PhysicalBinding, SlotAttemptState, SlotOutcome,
-    SlotResult, SlotTable, TerminalDisposition, build_rollback,
+    DeploymentIntent, LedgerEntry, LedgerIntentWire, LedgerRollback, LedgerTerminal,
+    LedgerTerminalWire, PhysicalBinding, TerminalDisposition, build_rollback,
 };
 use crate::remote::helper::{LockGuard, RemoteHelper};
 use crate::store::local::LocalStore;
@@ -78,9 +92,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 ///    or right before the terminal append) is caught.
 /// 3. WHILE HOLDING THE LOCKS, write the per-slot COMMIT MARKERS (already-
 ///    present markers are a byte-for-byte idempotent no-op) and APPEND THE
-///    TERMINAL — the `Successful` status, the per-slot `outcomes`, and the
-///    rollback state built from `actuals` — ONE atomic line append, the
-///    only commit of the finalize.
+///    TERMINAL — the `Successful` status, the ACTIVATED slot-id set, and
+///    the rollback state built EXCLUSIVELY from the VERIFIED LIVE
+///    `GenerationRef`s the re-observation RETURNED (the values read under
+///    the locks and proved equal to the frozen desired — never the engine's
+///    earlier observation records, which a concurrent controller can make
+///    STALE) — ONE atomic line append, the only commit of the finalize.
 /// 4. The locks are RELEASED only after the terminal is appended (the RAII
 ///    guards drop on every return path, including the refusals and the
 ///    transient-pending path).
@@ -90,26 +107,36 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 /// the append can never duplicate the terminal
 /// ([`LocalStore::append_terminal`] refuses duplicates).
 ///
-/// The rollback is built from the attempt's OUTCOMES (`actuals`: per-slot
-/// actual state observed by the engine — live actuals on the main path, the
-/// verified desired state during recovery), never from the intent record
-/// itself (the persisted intent is the immutable intent; its `slots` map is
-/// empty).
+/// THE ROLLBACK SOURCE (the stale-snapshot fix): the terminal's rollback
+/// entries are constructed EXCLUSIVELY from the OBSERVED LIVE
+/// `GenerationRef`s the lock-verified re-observation returned (the frozen
+/// desired assignment is an equally-valid source — the verification proved
+/// the two EQUAL; the observed values are used because they are the values
+/// actually read under the locks). The finalizer takes NO `actuals` /
+/// `outcomes` inputs — the engine's per-slot observation records, the old
+/// rollback source, are GONE: a concurrent controller that changed the
+/// remote between the engine's observation and this finalization can no
+/// longer leak a STALE rollback snapshot into the payload. The ACTIVATED
+/// slot-id set is DERIVED from the INTENT (its selected slots), and a
+/// PRE-APPEND GUARD ([`verify_rollback_matches_desired`]) enforces
+/// `rollback[selected] == intent.desired` (the complete GenerationRef
+/// equality: generation AND artifact) for every selected slot BEFORE the
+/// terminal is appended — a mismatch aborts (fail closed), never appends.
 ///
 /// PARTIAL-ROLLOUT SNAPSHOT SEMANTICS: every successful deployment —
 /// including a group deployment — produces a COMPLETE snapshot of the
 /// target's resulting state. The base is the latest successful snapshot
 /// BEFORE this attempt; the SELECTED slots (the attempt's `slot_ids`) are
-/// replaced with their actual successful assignments and current physical
-/// bindings, unselected slots are carried forward unchanged, and slots
+/// replaced with their VERIFIED assignments and current physical bindings,
+/// unselected slots are carried forward unchanged, and slots
 /// outside the attempt's FROZEN FULL MEMBERSHIP (`attempt.full_membership()`
 /// — the complete target membership at PLAN TIME) are omitted.
 ///
 /// THE PERSISTED MEMBERSHIPS: the terminal records BOTH memberships so the
 /// record PROVES the membership equations — `selected_membership` = the
-/// outcome keys (the slots this attempt actually deployed; ==
-/// `attempt.membership()` on the happy path — the outcomes are the ground
-/// truth the conversion verifies against) and `full_membership` = the
+/// ACTIVATED set (the slots this attempt actually deployed; ==
+/// `attempt.membership()` — the selected slot set derived from the INTENT)
+/// and `full_membership` = the
 /// INTENT'S FROZEN FULL MEMBERSHIP (never recomputed from the live
 /// configuration — recovery finalizes a pending intent whose configuration
 /// may have changed arbitrarily since the intent was written, and the
@@ -124,7 +151,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 ///
 /// DATA-THEN-SETTINGS: the positional arguments are the pure inputs the
 /// operation acts on (the store, the attempt intent with its frozen desired
-/// assignments, the per-slot live helpers, the outcomes/actuals, the
+/// assignments, the per-slot live helpers, the
 /// rollback bindings); the LAST argument is the [`FinalizeSettings`] bundle
 /// (the terminal `reason` and the `op_id` the selected-slot mutation locks
 /// are acquired under).
@@ -132,8 +159,6 @@ pub fn finalize_successful_locked(
     store: &LocalStore,
     attempt: &DeploymentIntent,
     helpers: &HashMap<SlotId, RemoteHelper>,
-    outcomes: &BTreeMap<SlotId, SlotResult>,
-    actuals: &BTreeMap<SlotId, SlotAttemptState>,
     bindings: &BTreeMap<SlotId, PhysicalBinding>,
     settings: &FinalizeSettings<'_>,
 ) -> Result<FinalizeOutcome> {
@@ -157,22 +182,6 @@ pub fn finalize_successful_locked(
     // was written, and the terminal must reproduce exactly what the intent
     // froze).
     let current_slot_ids: Vec<SlotId> = attempt.full_membership().iter().cloned().collect();
-    let rollback = build_rollback(actuals, bindings, base.as_ref(), &current_slot_ids)?;
-    // THE WRITER'S EQUALITY (fail closed): the rollback's key set must
-    // EXACTLY equal the frozen full membership (`attempt.full_membership()`)
-    // — the read path rejects a mismatch (rollback slots ==
-    // full_membership), so the writer must produce equality. By construction
-    // the overlay covers exactly the frozen full slots; this check pins the
-    // invariant at the WRITER so a drift surfaces as a clear error here
-    // rather than as a ledger that can never be read again.
-    let rollback_keys: BTreeSet<SlotId> = rollback.slots.keys().cloned().collect();
-    let current: BTreeSet<SlotId> = current_slot_ids.iter().cloned().collect();
-    if rollback_keys != current {
-        return Err(Error::integrity(format!(
-            "finalize {}: the rollback snapshot covers slots {rollback_keys:?} but the attempt's frozen full membership is {current:?} — the complete snapshot must cover exactly the frozen full slots (unselected slots are carried forward from the base; slots outside the plan-time membership are omitted)",
-            attempt.deployment_id
-        )));
-    }
 
     // 1. ACQUIRE ALL SELECTED-SLOT MUTATION LOCKS IN DETERMINISTIC ORDER —
     //    the SELECTED slot ids SORTED (the slot table iterates in
@@ -207,12 +216,18 @@ pub fn finalize_successful_locked(
     // 2. THE LOCK-VERIFIED RE-OBSERVATION (pass 1, before the markers):
     //    re-observe EVERY selected slot's live assignment under the locks
     //    and require the COMPLETE GenerationRef to exactly equal the frozen
-    //    desired assignment; any divergence REFUSES the finalization.
-    if let Some(slot) = verify_selected_locked(helpers, attempt)? {
-        return Ok(FinalizeOutcome::Refused {
-            reason: "state diverged",
-            slot,
-        });
+    //    desired assignment; any divergence REFUSES the finalization. The
+    //    re-observation RETURNS the observed live GenerationRefs (the
+    //    values read under the locks) — pass 2's observed values feed the
+    //    rollback construction below.
+    match verify_selected_locked(helpers, attempt)? {
+        LockedObservation::Diverged(slot) => {
+            return Ok(FinalizeOutcome::Refused {
+                reason: "state diverged",
+                slot,
+            });
+        }
+        LockedObservation::Verified(_) => {}
     }
 
     // 3. WRITE THE COMMIT MARKERS under the locks (already-present markers
@@ -253,15 +268,54 @@ pub fn finalize_successful_locked(
     //    status read, between the status and assignment reads, BETWEEN
     //    MARKER WRITES, or right before the terminal append — is caught
     //    here (and by pass 1), so the terminal is never appended for a
-    //    diverged attempt.
-    if let Some(slot) = verify_selected_locked(helpers, attempt)? {
-        return Ok(FinalizeOutcome::Refused {
-            reason: "state diverged",
-            slot,
-        });
-    }
+    //    diverged attempt. This pass's OBSERVED GenerationRefs are the
+    //    VERIFIED LIVE VALUES the rollback payload is built from (the
+    //    values read under the locks and proved equal to the frozen desired
+    //    — never the engine's earlier observation records).
+    let observed = match verify_selected_locked(helpers, attempt)? {
+        LockedObservation::Verified(observed) => observed,
+        LockedObservation::Diverged(slot) => {
+            return Ok(FinalizeOutcome::Refused {
+                reason: "state diverged",
+                slot,
+            });
+        }
+    };
 
-    // 5. APPEND THE TERMINAL while still holding the locks (the ONLY
+    // 5. BUILD THE ROLLBACK from the VERIFIED LIVE GenerationRefs (the
+    //    values observed under the locks) — the STALE-ROLLBACK-SNAPSHOT
+    //    FIX: the payload's selected entries are constructed EXCLUSIVELY
+    //    from these observed values (the frozen desired is an equally-valid
+    //    source — the verification proved the two EQUAL; the observed
+    //    values are used because they are the values actually read under
+    //    the locks), NEVER from the `actuals`/`outcomes` observation
+    //    records (removed from this finalizer's inputs).
+    let rollback = build_rollback(&observed, bindings, base.as_ref(), &current_slot_ids);
+    // THE WRITER'S EQUALITY (fail closed): the rollback's key set must
+    // EXACTLY equal the frozen full membership (`attempt.full_membership()`)
+    // — the read path rejects a mismatch (rollback slots ==
+    // full_membership), so the writer must produce equality. By construction
+    // the overlay covers exactly the frozen full slots; this check pins the
+    // invariant at the WRITER so a drift surfaces as a clear error here
+    // rather than as a ledger that can never be read again.
+    let rollback_keys: BTreeSet<SlotId> = rollback.slots.keys().cloned().collect();
+    let current: BTreeSet<SlotId> = current_slot_ids.iter().cloned().collect();
+    if rollback_keys != current {
+        return Err(Error::integrity(format!(
+            "finalize {}: the rollback snapshot covers slots {rollback_keys:?} but the attempt's frozen full membership is {current:?} — the complete snapshot must cover exactly the frozen full slots (unselected slots are carried forward from the base; slots outside the plan-time membership are omitted)",
+            attempt.deployment_id
+        )));
+    }
+    // THE PRE-APPEND GUARD (fail closed): every selected slot's constructed
+    // rollback entry must EXACTLY equal the frozen desired assignment (the
+    // complete GenerationRef equality: generation AND artifact). The
+    // verification above proved the observed values equal the desired ones,
+    // so this guard can only fire on an internal construction bug — a
+    // mismatched payload ABORTS (integrity error), the terminal is NEVER
+    // appended for a rollback that does not reproduce the verified state.
+    verify_rollback_matches_desired(&attempt.deployment_id, &rollback, attempt)?;
+
+    // 6. APPEND THE TERMINAL while still holding the locks (the ONLY
     //    commit of the finalize); a failure propagates as an `Err` — the
     //    caller aborts and the next push replays the whole finalize. The
     //    guards drop after this line, releasing every lock.
@@ -271,23 +325,22 @@ pub fn finalize_successful_locked(
         // payload (the truth table is structural in the domain — the
         // rollback is the single source of truth for each slot's
         // generation/artifact facts) AND THE ACTIVATED SLOT-ID SET (the
-        // slots this attempt actually deployed — the per-slot facts are
-        // DERIVED from the rollback, never stored/trusted separately) AND
-        // THE PERSISTED FULL MEMBERSHIP = the intent's FROZEN FULL
-        // MEMBERSHIP (the complete target membership at plan time, never
-        // the live configuration) — the record PROVES the membership
-        // equations (activated == selected == the outcome keys, rollback ==
-        // full, selected ⊆ full, full-push selected == full) AND
-        // REPRODUCES the intent's frozen values (the read's intent-binding
-        // legs refuse a divergence).
+        // slots this attempt actually deployed — DERIVED FROM THE INTENT's
+        // selected slot set; the per-slot facts are DERIVED from the
+        // rollback, never stored/trusted separately) AND THE PERSISTED
+        // FULL MEMBERSHIP = the intent's FROZEN FULL MEMBERSHIP (the
+        // complete target membership at plan time, never the live
+        // configuration) — the record PROVES the membership equations
+        // (activated == selected, rollback == full, selected ⊆ full,
+        // full-push selected == full) AND REPRODUCES the intent's frozen
+        // values (the read's intent-binding legs refuse a divergence).
         disposition: TerminalDisposition::Successful {
             rollback,
-            // SUCCESS IS THE ACTIVATED SLOT-ID SET: the wire outcomes'
-            // per-slot claims were validated against the rollback and then
-            // DISCARDED (the wire → domain conversion enforces the complete
-            // equality predicate); the per-slot generation/artifact facts
-            // are DERIVED from the rollback — the single source of truth.
-            activated: outcomes.keys().cloned().collect(),
+            // SUCCESS IS THE ACTIVATED SLOT-ID SET — DERIVED FROM THE
+            // INTENT: the selected slot set of the attempt (every selected
+            // slot is activated; the per-slot generation/artifact facts
+            // are DERIVED from the rollback — the single source of truth).
+            activated: selected.iter().map(|sid| (*sid).clone()).collect(),
             full_membership: current,
         },
         reason: Some(reason.to_string()),
@@ -338,6 +391,26 @@ pub enum FinalizeOutcome {
     },
 }
 
+/// The result of one lock-verified re-observation pass
+/// ([`verify_selected_locked`]): every selected slot's live `GenerationRef`
+/// was re-observed under the mutation locks and REQUIRED to EXACTLY EQUAL
+/// the frozen desired assignment — the pass either VERIFIES the whole
+/// selected set (returning the OBSERVED live `GenerationRef` per selected
+/// slot, the values read under the locks) or reports the first DIVERGED
+/// slot (the refusal the caller finalizes `Degraded`).
+enum LockedObservation {
+    /// Every selected slot's live `GenerationRef` exactly equals the frozen
+    /// desired assignment; the map is the OBSERVED LIVE `GenerationRef` per
+    /// selected slot — the values actually read under the locks (the
+    /// successful terminal's rollback entries are built EXCLUSIVELY from
+    /// these, never from the engine's earlier observation records).
+    Verified(BTreeMap<SlotId, GenerationRef>),
+    /// The first selected slot whose live `GenerationRef` diverged from the
+    /// frozen desired assignment — the caller refuses the finalization
+    /// (the attempt ends `Degraded`, never `Successful`).
+    Diverged(SlotId),
+}
+
 /// Re-observe EVERY selected slot's LIVE assignment while the mutation
 /// locks are held and require the COMPLETE `GenerationRef` — the live
 /// generation AND its artifact (release/variant/tree) — to EXACTLY EQUAL
@@ -345,13 +418,17 @@ pub enum FinalizeOutcome {
 /// is read as a status read, the live generation's assignment record, and a
 /// SECOND status read: the second read verifies the generation did not
 /// change while the assignment was read, so a swap between the two reads is
-/// never missed. Returns the first diverged slot (`None` = every selected
-/// slot's live `GenerationRef` matches the frozen desired); a transient
+/// never missed. Returns the OBSERVED live `GenerationRef` per selected
+/// slot alongside the verdict ([`LockedObservation::Verified`] = every
+/// selected slot's live `GenerationRef` matches the frozen desired, with
+/// the observed values the terminal's rollback is built from;
+/// [`LockedObservation::Diverged`] = the first diverged slot); a transient
 /// read failure is an `Err` (the caller leaves the attempt pending).
 fn verify_selected_locked(
     helpers: &HashMap<SlotId, RemoteHelper>,
     attempt: &DeploymentIntent,
-) -> Result<Option<SlotId>> {
+) -> Result<LockedObservation> {
+    let mut observed: BTreeMap<SlotId, GenerationRef> = BTreeMap::new();
     let mut selected: Vec<&SlotId> = attempt.slots.keys().collect();
     selected.sort();
     for sid in selected {
@@ -359,13 +436,13 @@ fn verify_selected_locked(
         let Some(helper) = helpers.get(sid) else {
             // No live helper for a selected slot: cannot verify — fail
             // closed (the live state is not provably the frozen desired).
-            return Ok(Some(sid.clone()));
+            return Ok(LockedObservation::Diverged(sid.clone()));
         };
         let st1 = helper.status()?;
         let Some(live_gen) = st1.current_generation else {
             // No `current` at all: the slot's live state diverged from the
             // frozen desired (this attempt deployed a generation).
-            return Ok(Some(sid.clone()));
+            return Ok(LockedObservation::Diverged(sid.clone()));
         };
         let asn = helper.read_assignment(live_gen.as_str())?;
         let st2 = helper.status()?;
@@ -373,52 +450,57 @@ fn verify_selected_locked(
             || live_gen != slot.desired.generation
             || asn.artifact != slot.desired.artifact
         {
-            return Ok(Some(sid.clone()));
+            return Ok(LockedObservation::Diverged(sid.clone()));
+        }
+        // Record the OBSERVED LIVE GenerationRef (the value read under the
+        // locks — the terminal's rollback entries are built from these).
+        observed.insert(
+            sid.clone(),
+            GenerationRef {
+                generation: live_gen,
+                assignment: PlacementSlotAssignment {
+                    placement_slot: sid.clone(),
+                    artifact: asn.artifact,
+                },
+            },
+        );
+    }
+    Ok(LockedObservation::Verified(observed))
+}
+
+/// THE PRE-APPEND GUARD (fail closed): every selected slot's constructed
+/// rollback entry must EXACTLY EQUAL the frozen desired assignment — the
+/// COMPLETE `GenerationRef` equality (generation AND artifact:
+/// release/variant/tree). The lock-verified re-observation proved the
+/// observed values equal the desired ones, so this guard can only fire on
+/// an internal construction bug; a mismatch ABORTS the finalization with an
+/// integrity error — the terminal is NEVER appended for a rollback payload
+/// that does not reproduce the verified desired state (a stale or diverged
+/// snapshot must never be persisted).
+fn verify_rollback_matches_desired(
+    deployment_id: &DeploymentId,
+    rollback: &LedgerRollback,
+    attempt: &DeploymentIntent,
+) -> Result<()> {
+    for (sid, slot) in attempt.slots.iter() {
+        let rb = rollback.slots.get(sid).ok_or_else(|| {
+            Error::integrity(format!(
+                "finalize {deployment_id}: the rollback snapshot has no entry for selected slot '{sid}' — every selected slot's rollback entry must exactly equal the frozen desired assignment"
+            ))
+        })?;
+        if rb.generation != slot.desired.generation
+            || rb.assignment.artifact != slot.desired.artifact
+        {
+            return Err(Error::integrity(format!(
+                "finalize {deployment_id}: the rollback entry for selected slot '{sid}' ({:?}, {:?}) does not exactly equal the frozen desired assignment ({:?}, {:?}) — the rollback must reproduce exactly the verified desired state (generation AND artifact); refusing to append a stale or diverged snapshot",
+                rb.generation,
+                rb.assignment.artifact,
+                slot.desired.generation,
+                slot.desired.artifact
+            )));
         }
     }
-    Ok(None)
-}
-/// Resolve the per-slot OUTCOMES used to finalize a pending deployment when
-/// the engine no longer has the live outcomes at hand (recovery): recovery
-/// already verified each slot's live generation equals the desired
-/// generation, so the outcomes ARE the desired assignments (the old
-/// `deployments/<id>/results.json` outcomes store is GONE — the ledger
-/// terminal carries outcomes, and a terminal-less entry has none by
-/// construction). Returns the per-slot `SlotResult` outcomes AND the
-/// per-slot actuals ([`SlotAttemptState`]) for the rollback, built from the
-/// attempt's desired assignments.
-pub fn recovery_outcomes(
-    attempt: &DeploymentIntent,
-) -> (
-    BTreeMap<SlotId, SlotResult>,
-    BTreeMap<SlotId, SlotAttemptState>,
-) {
-    let mut outcomes = BTreeMap::new();
-    let mut actuals = BTreeMap::new();
-    // Iterate the ONE authoritative slot table (the membership AND the
-    // desired entries are the same table in the domain).
-    for (sid, slot) in attempt.slots.iter() {
-        outcomes.insert(
-            sid.clone(),
-            SlotResult {
-                slot_id: sid.clone(),
-                outcome: crate::ledger::records::SlotOutcomeKind::Activated,
-                observation: ObservationWire::Known(ObservedGenerationWire {
-                    generation: slot.desired.generation.clone(),
-                }),
-                compensated: false,
-                error: None,
-            },
-        );
-        actuals.insert(
-            sid.clone(),
-            SlotAttemptState {
-                artifact: crate::ledger::records::Observation::Known(slot.desired.artifact.clone()),
-                generation: Some(slot.desired.generation.clone()),
-            },
-        );
-    }
-    (outcomes, actuals)
+    Ok(())
 }
 
 // ---- append / read line kinds ----
@@ -492,7 +574,6 @@ mod tests {
         ArtifactRef, ServerId, SlotId, TargetName, VariantName, test_deployment_id,
         test_generation_id, test_tree_digest,
     };
-    use crate::ledger::records::Observation;
     use crate::ledger::records::{DeploymentIntent, DesiredGeneration, IntentSlot};
     use crate::ledger::records::{DeploymentStatus, NonEmptySlotTable};
     use std::collections::BTreeMap;
@@ -561,29 +642,6 @@ mod tests {
         )]);
         let attempt = intent("deploy-idempotent");
         store.append_intent(target.as_str(), &attempt).unwrap();
-        let actuals = BTreeMap::from([(
-            SlotId::new("p1".to_string()),
-            SlotAttemptState {
-                artifact: Observation::Known(ArtifactRef {
-                    release: crate::identity::test_release_id("rel-1"),
-                    variant: VariantName::new("standard".to_string()),
-                    tree: test_tree_digest("tree-1"),
-                }),
-                generation: Some(test_generation_id("gen-1")),
-            },
-        )]);
-        let outcomes = BTreeMap::from([(
-            SlotId::new("p1".to_string()),
-            SlotResult {
-                slot_id: SlotId::new("p1".to_string()),
-                outcome: crate::ledger::SlotOutcomeKind::Activated,
-                observation: ObservationWire::Known(ObservedGenerationWire {
-                    generation: test_generation_id("gen-1"),
-                }),
-                compensated: false,
-                error: None,
-            },
-        )]);
 
         // The LOCK-VERIFIED finalize re-observes the slot's LIVE state under
         // the mutation lock, so the fixture mints the attempt's desired
@@ -631,10 +689,7 @@ mod tests {
         };
 
         assert_eq!(
-            finalize_successful_locked(
-                &store, &attempt, &helpers, &outcomes, &actuals, &bindings, &settings,
-            )
-            .unwrap(),
+            finalize_successful_locked(&store, &attempt, &helpers, &bindings, &settings).unwrap(),
             FinalizeOutcome::Finalized,
             "the live GenerationRef equals the frozen desired, so the lock-verified finalize appends the terminal"
         );
@@ -651,14 +706,204 @@ mod tests {
         // Repeated finalize with the same deployment ID is a no-op: same
         // key, no duplicate terminal.
         assert_eq!(
-            finalize_successful_locked(
-                &store, &attempt, &helpers, &outcomes, &actuals, &bindings, &settings,
-            )
-            .unwrap(),
+            finalize_successful_locked(&store, &attempt, &helpers, &bindings, &settings).unwrap(),
             FinalizeOutcome::Finalized,
             "a replay for a finalized deployment id is a no-op"
         );
         let entries = store.read_ledger(target.as_str()).unwrap();
         assert_eq!(entries.len(), 1, "no duplicate terminal event");
+    }
+
+    /// THE STALE-ROLLBACK-SNAPSHOT REGRESSION TEST: the engine's earlier
+    /// observation records (the old `actuals`/`outcomes` finalizer inputs)
+    /// DIVERGE from the frozen desired while the LIVE state — what the
+    /// lock-verified finalizer re-observes under the locks — EQUALS the
+    /// frozen desired (a concurrent controller changed the remote between
+    /// the engine's observation and this finalization). The finalization
+    /// MUST succeed and the rollback payload MUST equal the frozen desired
+    /// (the verified live values), NEVER the stale observed values. Under
+    /// the pre-fix code the rollback was built from the passed-in
+    /// observation records, so the stale values LEAKED into the persisted
+    /// snapshot (this test then fails); the fix REMOVED those inputs from
+    /// the successful finalizer, so the payload is constructed exclusively
+    /// from the verified live `GenerationRef`s, and the pre-append guard
+    /// ([`verify_rollback_matches_desired`]) pins `rollback[selected] ==
+    /// intent.desired` (generation AND artifact) before the append.
+    #[test]
+    fn finalize_payload_ignores_stale_observed_values() {
+        use crate::identity::OperationId;
+        use crate::remote::helper::{ExpectedCurrent, RemoteHelper};
+        use crate::remote::transport::{LocalTransport, Remote};
+
+        let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
+        let target = TargetName::new("production".to_string());
+        let attempt = intent("deploy-stale-observed");
+        store.append_intent(target.as_str(), &attempt).unwrap();
+        // The STALE OBSERVED VALUES: a DIVERGED generation AND artifact the
+        // engine could have recorded for the slot BEFORE a concurrent
+        // controller changed the remote — under the old code these are the
+        // values the rollback payload was built from (a stale rollback
+        // snapshot persisted even though the verification passed). They are
+        // constructed here to pin the bug scenario; the fix means they are
+        // NEVER consulted (they cannot even be passed to the finalizer).
+        let stale_generation = test_generation_id("gen-stale");
+        let stale_artifact = ArtifactRef {
+            release: crate::identity::test_release_id("rel-stale"),
+            variant: VariantName::new("standard".to_string()),
+            tree: test_tree_digest("tree-stale"),
+        };
+        let desired = &attempt.slots[&SlotId::new("p1")].desired;
+        assert_ne!(
+            stale_generation, desired.generation,
+            "the stale fixture must diverge from the frozen desired generation"
+        );
+        assert_ne!(
+            stale_artifact, desired.artifact,
+            "the stale fixture must diverge from the frozen desired artifact"
+        );
+
+        // The LIVE state equals the frozen desired: mint the desired
+        // generation on a live remote and point `current` at it — the
+        // lock-verified re-observation then reads EXACTLY the frozen
+        // desired and the finalization succeeds.
+        let remote =
+            LocalTransport::new(&crate::testutil::fixture_env(), tmp.path().join("remote"))
+                .unwrap();
+        let helper = RemoteHelper::new(&remote);
+        remote
+            .create_dir_all(&crate::remote::layout::tree_root(
+                test_tree_digest("tree-1").as_str(),
+            ))
+            .unwrap();
+        helper
+            .create_generation(
+                "op-seed",
+                &crate::remote::helper::GenerationAssignment {
+                    deployment_id: attempt.deployment_id.clone(),
+                    generation_id: test_generation_id("gen-1"),
+                    artifact: ArtifactRef {
+                        release: crate::identity::test_release_id("rel-1"),
+                        variant: VariantName::new("standard".to_string()),
+                        tree: test_tree_digest("tree-1"),
+                    },
+                    behavior_sha256: "sha256-aa".to_string(),
+                    prior_generation: None,
+                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                    target: Some(target.clone()),
+                },
+            )
+            .unwrap();
+        helper
+            .swap_current(
+                &ExpectedCurrent::Absent,
+                test_generation_id("gen-1").as_str(),
+                "op-seed",
+            )
+            .unwrap();
+        let helpers = HashMap::from([(SlotId::new("p1"), helper)]);
+        let bindings: BTreeMap<SlotId, PhysicalBinding> = BTreeMap::from([(
+            SlotId::new("p1"),
+            PhysicalBinding {
+                server: ServerId::new("server-01"),
+                deploy_dir: "/srv/deploy/p1".to_string(),
+            },
+        )]);
+        let settings = FinalizeSettings {
+            reason: "push completed",
+            op_id: &OperationId::new("op-stale-test".to_string()),
+        };
+
+        assert_eq!(
+            finalize_successful_locked(&store, &attempt, &helpers, &bindings, &settings).unwrap(),
+            FinalizeOutcome::Finalized,
+            "the live state equals the frozen desired, so the finalization succeeds — the stale observed values are never consulted"
+        );
+        // THE ROLLBACK PAYLOAD EQUALS THE FROZEN DESIRED (the verified
+        // live values) — generation AND artifact — NEVER the stale observed
+        // values. The ACTIVATED set is the INTENT's selected slot set.
+        let entries = store.read_ledger(target.as_str()).unwrap();
+        let terminal = entries[0].terminal.as_ref().expect("terminal appended");
+        let TerminalDisposition::Successful {
+            rollback,
+            activated,
+            ..
+        } = &terminal.disposition
+        else {
+            panic!("the finalization must append a Successful terminal");
+        };
+        assert_eq!(
+            activated,
+            &BTreeSet::from([SlotId::new("p1")]),
+            "the activated slot-id set is derived from the intent's selected slots"
+        );
+        let rb = rollback
+            .slots
+            .get(&SlotId::new("p1"))
+            .expect("the rollback covers the selected slot");
+        assert_eq!(
+            rb.generation, desired.generation,
+            "the rollback generation equals the frozen desired (the verified live value), never the stale observation"
+        );
+        assert_eq!(
+            rb.assignment.artifact, desired.artifact,
+            "the rollback artifact equals the frozen desired (the verified live value), never the stale observation"
+        );
+    }
+
+    /// THE PRE-APPEND GUARD, unit-tested in isolation: a deliberately-
+    /// DIVERGED rollback payload is REFUSED — every selected slot's
+    /// constructed rollback entry must EXACTLY equal the frozen desired
+    /// assignment (the complete `GenerationRef` equality: generation AND
+    /// artifact); a mismatch aborts with an integrity error and the
+    /// terminal is NEVER appended. The matching payload (the healthy case)
+    /// passes.
+    #[test]
+    fn rollback_desired_guard_refuses_diverged_payload() {
+        let attempt = intent("deploy-guard");
+        let sid = SlotId::new("p1".to_string());
+        let desired = &attempt.slots[&sid].desired;
+        // The MATCHING rollback: the selected entry reproduces the frozen
+        // desired assignment exactly (generation AND artifact).
+        let matching = crate::ledger::LedgerRollback {
+            slots: BTreeMap::from([(
+                sid.clone(),
+                GenerationRef {
+                    generation: desired.generation.clone(),
+                    assignment: PlacementSlotAssignment {
+                        placement_slot: sid.clone(),
+                        artifact: desired.artifact.clone(),
+                    },
+                },
+            )]),
+            bindings: BTreeMap::new(),
+        };
+        verify_rollback_matches_desired(&attempt.deployment_id, &matching, &attempt)
+            .expect("the matching rollback passes the pre-append guard");
+        // A DIVERGED rollback: the selected entry carries a DIFFERENT
+        // generation AND a different artifact — refused before any append.
+        let diverged = crate::ledger::LedgerRollback {
+            slots: BTreeMap::from([(
+                sid.clone(),
+                GenerationRef {
+                    generation: test_generation_id("gen-stale"),
+                    assignment: PlacementSlotAssignment {
+                        placement_slot: sid.clone(),
+                        artifact: ArtifactRef {
+                            release: crate::identity::test_release_id("rel-stale"),
+                            variant: VariantName::new("standard".to_string()),
+                            tree: test_tree_digest("tree-stale"),
+                        },
+                    },
+                },
+            )]),
+            bindings: BTreeMap::new(),
+        };
+        let err = verify_rollback_matches_desired(&attempt.deployment_id, &diverged, &attempt)
+            .expect_err("a diverged rollback entry must refuse the finalization before any append");
+        assert!(
+            err.to_string().contains("does not exactly equal"),
+            "the refusal names the divergence from the frozen desired, got: {err}"
+        );
     }
 }

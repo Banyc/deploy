@@ -1,40 +1,47 @@
 //! The ROLLBACK PAYLOAD semantics (feature area A2: Ledger semantics).
 //!
 //! [`build_rollback`] builds the rollback state of a successful deployment
-//! from the attempt's OUTCOMES (`actuals`: per-slot actual state), never
-//! from the intent record. The payload is the COMPLETE target snapshot (a
-//! [`crate::ledger::records::LedgerRollback`]: per-slot generation refs +
-//! COMPLETE physical bindings), so EXACT ROLLBACK is possible: `deploy push
-//! <target> <deployment-id>` restores exactly that deployment's stored
-//! state, verified by the binding map (a missing binding entry is
-//! "unverifiable" and makes exact rollback refuse the slot). The payload
-//! FAILS CLOSED on an unknown assignment: an `Unknown`/`KnownAbsent`
-//! artifact with a recorded generation is a corrupted payload and the
-//! builder refuses it rather than fabricating a `GenerationRef` with a fake
-//! artifact.
+//! from the VERIFIED per-slot [`GenerationRef`]s — the values the
+//! LOCK-VERIFIED finalizer ([`crate::ledger::finalize::finalize_successful_locked`])
+//! re-observed under the selected-slot mutation locks and proved EXACTLY
+//! equal to the frozen desired assignment (never from the engine's earlier
+//! observation records, which a concurrent controller can make stale, and
+//! never from the intent record itself). The payload is the COMPLETE target
+//! snapshot (a [`crate::ledger::records::LedgerRollback`]: per-slot
+//! generation refs + COMPLETE physical bindings), so EXACT ROLLBACK is
+//! possible: `deploy push <target> <deployment-id>` restores exactly that
+//! deployment's stored state, verified by the binding map (a missing
+//! binding entry is "unverifiable" and makes exact rollback refuse the
+//! slot). Every verified ref is COMPLETE by construction (a full
+//! generation + artifact read under the locks), so the builder is
+//! INFALLIBLE — there is no unknown/absent observation an input could
+//! carry.
 //!
 //! The wire/domain RECORDS themselves ([`crate::ledger::records::LedgerRollback`],
 //! [`crate::ledger::records::LedgerRollbackWire`],
 //! [`crate::ledger::records::PhysicalBinding`]) live in the shared core
 //! ([`crate::ledger::records`]).
 
-use crate::error::{Error, Result};
-use crate::identity::{GenerationRef, PlacementSlotAssignment, SlotId};
+use crate::identity::{GenerationRef, SlotId};
 use std::collections::BTreeMap;
 
-use super::super::observation::Observation;
-use super::super::{LedgerRollback, PhysicalBinding, SlotAttemptState};
-/// Build the rollback state of a successful deployment from the attempt's
-/// OUTCOMES (`actuals`: per-slot actual state), never from the intent record.
-/// A successful deployment carries one complete [`GenerationRef`] per slot;
-/// slots without a recorded generation are not part of a coherent rollback
-/// and are dropped. `bindings` records the COMPLETE physical binding
-/// (`{server, deploy_dir}`) each slot had when the deployment ran; a missing
-/// entry is "unverifiable" and makes exact rollback refuse the slot.
+use super::super::{LedgerRollback, PhysicalBinding};
+/// Build the rollback state of a successful deployment from the VERIFIED
+/// per-slot [`GenerationRef`]s (`verified`: the values the lock-verified
+/// finalizer re-observed under the selected-slot mutation locks and proved
+/// EXACTLY equal to the frozen desired assignment — never the engine's
+/// earlier observation records, which a concurrent controller can make
+/// stale, and never the intent record itself). A successful deployment
+/// carries one complete [`GenerationRef`] per selected slot; every verified
+/// ref is COMPLETE by construction (a full generation + artifact read under
+/// the locks), so the builder is INFALLIBLE. `bindings` records the
+/// COMPLETE physical binding (`{server, deploy_dir}`) each slot had when
+/// the deployment ran; a missing entry is "unverifiable" and makes exact
+/// rollback refuse the slot.
 ///
 /// PARTIAL-ROLLOUT OVERLAY: the result is the COMPLETE target snapshot — the
-/// latest successful snapshot (`base`) with the SELECTED slots (the attempt's
-/// actual per-slot results) replaced by their actual assignments and current
+/// latest successful snapshot (`base`) with the SELECTED slots (the
+/// `verified` map's keys) replaced by their verified assignments and current
 /// bindings, unselected slots carried forward unchanged, and slots absent
 /// from `current_slot_ids` (the caller's coverage set — the FROZEN FULL
 /// membership of the finalizing attempt, the complete target membership at
@@ -45,47 +52,23 @@ use super::super::{LedgerRollback, PhysicalBinding, SlotAttemptState};
 /// partial snapshot can span several releases (group pushes over time) and
 /// the referenced releases are the set derived from the per-slot bindings.
 pub fn build_rollback(
-    actuals: &BTreeMap<SlotId, SlotAttemptState>,
+    verified: &BTreeMap<SlotId, GenerationRef>,
     bindings: &BTreeMap<SlotId, PhysicalBinding>,
     base: Option<&LedgerRollback>,
     current_slot_ids: &[SlotId],
-) -> Result<LedgerRollback> {
+) -> LedgerRollback {
     // Start from the base (or empty): unselected slots are carried forward
     // unchanged.
     let mut slots: BTreeMap<SlotId, GenerationRef> =
         base.map(|b| b.slots.clone()).unwrap_or_default();
     let mut out_bindings: BTreeMap<SlotId, PhysicalBinding> =
         base.map(|b| b.bindings.clone()).unwrap_or_default();
-    // Replace the SELECTED slots with their actual successful assignments
-    // and current physical bindings.
-    for (slot, s) in actuals {
-        if let Some(generation) = s.generation.clone() {
-            // FAIL CLOSED on the artifact: the rollback payload must never
-            // carry an unknown assignment. A Successful attempt's actuals are
-            // `Known` in practice (the post-mutation refresh only records
-            // `Unknown` when a live assignment read fails, and the successful
-            // path validates the layout before it ever finalizes); an
-            // `Unknown`/`KnownAbsent` artifact with a recorded generation
-            // would be a corrupted payload, so the finalize REFUSES it rather
-            // than fabricating a `GenerationRef` with a fake artifact.
-            let Observation::Known(artifact) = &s.artifact else {
-                return Err(Error::integrity(format!(
-                    "successful rollback for slot '{slot}' carries an unknown assignment \
-                     (the artifact observation is not Known): the rollback payload must \
-                     never contain an unknown artifact"
-                )));
-            };
-            slots.insert(
-                slot.clone(),
-                GenerationRef {
-                    generation,
-                    assignment: PlacementSlotAssignment {
-                        placement_slot: slot.clone(),
-                        artifact: artifact.clone(),
-                    },
-                },
-            );
-        }
+    // Replace the SELECTED slots with their VERIFIED assignments (the
+    // complete GenerationRefs the lock-verified finalizer re-observed under
+    // the locks and proved equal to the frozen desired) and their current
+    // physical bindings.
+    for (slot, gr) in verified {
+        slots.insert(slot.clone(), gr.clone());
         if let Some(b) = bindings.get(slot) {
             out_bindings.insert(slot.clone(), b.clone());
         }
@@ -95,36 +78,47 @@ pub fn build_rollback(
         current_slot_ids.iter().map(|s| s.as_str()).collect();
     slots.retain(|k, _| current.contains(k.as_str()));
     out_bindings.retain(|k, _| current.contains(k.as_str()));
-    Ok(LedgerRollback {
+    LedgerRollback {
         slots,
         bindings: out_bindings,
-    })
+    }
 }
 
 #[cfg(test)]
 mod tests_rollback {
     use super::*;
     use crate::identity::{
-        ArtifactRef, ServerId, SlotId, VariantName, test_deployment_id, test_generation_id,
-        test_tree_digest,
+        ArtifactRef, GenerationRef, PlacementSlotAssignment, ServerId, SlotId, VariantName,
+        test_deployment_id, test_generation_id, test_tree_digest,
     };
-    use crate::ledger::records::Observation;
     use std::collections::BTreeMap;
 
-    /// `build_rollback` records each slot's complete physical binding.
+    /// A verified generation ref whose assignment names its own slot key (the
+    /// agreeing form the lock-verified finalizer observes under the locks).
+    fn verified_ref_for(key: &SlotId, gen_id: &str, rel: &str, tree: &str) -> GenerationRef {
+        GenerationRef {
+            generation: test_generation_id(gen_id),
+            assignment: PlacementSlotAssignment {
+                placement_slot: key.clone(),
+                artifact: ArtifactRef {
+                    release: crate::identity::test_release_id(rel),
+                    variant: VariantName::new("standard".to_string()),
+                    tree: test_tree_digest(tree),
+                },
+            },
+        }
+    }
+
+    /// `build_rollback` records each slot's complete physical binding AND
+    /// inserts the VERIFIED generation ref intact (generation AND artifact —
+    /// the ref is the complete `GenerationRef` the lock-verified finalizer
+    /// re-observed under the locks, never a rebuilt observation).
     #[test]
     fn build_rollback_records_each_slots_physical_binding() {
         let slot = SlotId::new("p1".to_string());
-        let actuals = BTreeMap::from([(
+        let verified = BTreeMap::from([(
             slot.clone(),
-            SlotAttemptState {
-                artifact: Observation::Known(ArtifactRef {
-                    release: crate::identity::test_release_id("rel-1"),
-                    variant: VariantName::new("standard".to_string()),
-                    tree: test_tree_digest("tree-1"),
-                }),
-                generation: Some(test_generation_id("gen-x")),
-            },
+            verified_ref_for(&slot, "gen-x", "rel-1", "tree-1"),
         )]);
         let bindings: BTreeMap<SlotId, PhysicalBinding> = BTreeMap::from([(
             slot.clone(),
@@ -134,8 +128,7 @@ mod tests_rollback {
             },
         )]);
 
-        let rollback = build_rollback(&actuals, &bindings, None, std::slice::from_ref(&slot))
-            .expect("a Known actual builds the rollback");
+        let rollback = build_rollback(&verified, &bindings, None, std::slice::from_ref(&slot));
         assert_eq!(
             rollback.bindings.get(&slot),
             Some(&PhysicalBinding {
@@ -146,67 +139,95 @@ mod tests_rollback {
         );
         assert_eq!(rollback.slots.len(), 1, "generation refs preserved intact");
         assert_eq!(rollback.bindings.len(), 1);
+        assert_eq!(
+            rollback.slots.get(&slot),
+            Some(&verified_ref_for(&slot, "gen-x", "rel-1", "tree-1")),
+            "the verified GenerationRef (generation AND artifact) is inserted exactly as observed"
+        );
     }
 
-    /// The rollback payload must NEVER carry an unknown assignment: an actual
-    /// whose artifact is `Unknown` (or `KnownAbsent`) with a recorded
-    /// generation is a corrupted payload for a Successful rollback, so
-    /// `build_rollback` FAILS CLOSED with an integrity error rather than
-    /// fabricating a `GenerationRef` with a fake artifact. An actual with
-    /// `generation: None` stays dropped regardless of its artifact (the
-    /// existing "no coherent rollback" rule).
+    /// The PARTIAL-ROLLOUT OVERLAY: the result is the COMPLETE target
+    /// snapshot — the latest successful base with the SELECTED slots (the
+    /// `verified` map's keys) replaced by their verified refs, unselected
+    /// slots carried forward unchanged, and slots outside the caller's
+    /// coverage set (the frozen full membership) omitted. The VERIFIED refs
+    /// are the complete `GenerationRef`s observed under the locks — the
+    /// overlay can never fabricate an entry (every verified ref is complete
+    /// by construction, so the builder is infallible).
     #[test]
-    fn build_rollback_refuses_unknown_actuals() {
-        let slot = SlotId::new("p1".to_string());
-        let bindings: BTreeMap<SlotId, PhysicalBinding> = BTreeMap::from([(
-            slot.clone(),
-            PhysicalBinding {
-                server: ServerId::new("server-01"),
-                deploy_dir: "/srv/deploy/p1".to_string(),
-            },
+    fn build_rollback_overlays_verified_refs_over_the_base() {
+        let selected = SlotId::new("p1".to_string());
+        let unselected = SlotId::new("p2".to_string());
+        let outside = SlotId::new("p3".to_string());
+        let bindings: BTreeMap<SlotId, PhysicalBinding> = BTreeMap::from([
+            (
+                selected.clone(),
+                PhysicalBinding {
+                    server: ServerId::new("s1"),
+                    deploy_dir: "/srv/deploy/p1".to_string(),
+                },
+            ),
+            (
+                unselected.clone(),
+                PhysicalBinding {
+                    server: ServerId::new("s2"),
+                    deploy_dir: "/srv/deploy/p2".to_string(),
+                },
+            ),
+        ]);
+        // The base: a previous successful snapshot covering p1 + p2 + p3.
+        let base = LedgerRollback {
+            slots: BTreeMap::from([
+                (
+                    selected.clone(),
+                    verified_ref_for(&selected, "gen-old-1", "rel-old", "tree-old-1"),
+                ),
+                (
+                    unselected.clone(),
+                    verified_ref_for(&unselected, "gen-old-2", "rel-old", "tree-old-2"),
+                ),
+                (
+                    outside.clone(),
+                    verified_ref_for(&outside, "gen-old-3", "rel-old", "tree-old-3"),
+                ),
+            ]),
+            bindings: bindings.clone(),
+        };
+        // The SELECTED slot's VERIFIED ref (observed under the locks, proved
+        // equal to the frozen desired) replaces the base's old entry; p2 is
+        // carried forward; p3 is omitted (outside the frozen membership).
+        let verified = BTreeMap::from([(
+            selected.clone(),
+            verified_ref_for(&selected, "gen-new", "rel-new", "tree-new"),
         )]);
-        // An UNKNOWN actual with a generation: refused.
-        let actuals = BTreeMap::from([(
-            slot.clone(),
-            SlotAttemptState {
-                artifact: Observation::Unknown(crate::ledger::records::ObservationError {
-                    message: "assignment read failed: fixture".to_string(),
-                }),
-                generation: Some(test_generation_id("gen-x")),
-            },
-        )]);
-        let err = build_rollback(&actuals, &bindings, None, std::slice::from_ref(&slot))
-            .expect_err("an Unknown actual must not build a rollback");
-        assert!(
-            err.to_string().contains("unknown assignment"),
-            "the refusal names the unknown assignment, got: {err}"
+        let coverage = [selected.clone(), unselected.clone()];
+
+        let rollback = build_rollback(&verified, &bindings, Some(&base), &coverage);
+        assert_eq!(
+            rollback.slots.get(&selected),
+            Some(&verified_ref_for(
+                &selected, "gen-new", "rel-new", "tree-new"
+            )),
+            "the selected slot's verified ref replaces the base entry"
         );
-        // A KnownAbsent actual with a generation is equally a corrupted
-        // payload: refused (an advanced slot always has a Known artifact).
-        let actuals = BTreeMap::from([(
-            slot.clone(),
-            SlotAttemptState {
-                artifact: Observation::KnownAbsent,
-                generation: Some(test_generation_id("gen-x")),
-            },
-        )]);
-        build_rollback(&actuals, &bindings, None, std::slice::from_ref(&slot))
-            .expect_err("a KnownAbsent actual with a generation must not build a rollback");
-        // An Unknown actual WITHOUT a generation is dropped (no rollback
-        // entry), never an error: the "no recorded generation" rule applies
-        // regardless of the artifact observation.
-        let actuals = BTreeMap::from([(
-            slot.clone(),
-            SlotAttemptState {
-                artifact: Observation::Unknown(crate::ledger::records::ObservationError {
-                    message: "assignment read failed: fixture".to_string(),
-                }),
-                generation: None,
-            },
-        )]);
-        let rollback = build_rollback(&actuals, &bindings, None, std::slice::from_ref(&slot))
-            .expect("an Unknown actual without a generation is simply dropped");
-        assert_eq!(rollback.slots.len(), 0, "no fake GenerationRef is inserted");
+        assert_eq!(
+            rollback.slots.get(&unselected),
+            Some(&verified_ref_for(
+                &unselected,
+                "gen-old-2",
+                "rel-old",
+                "tree-old-2"
+            )),
+            "an unselected slot is carried forward unchanged from the base"
+        );
+        assert!(
+            !rollback.slots.contains_key(&outside),
+            "a slot outside the frozen membership is omitted from the complete snapshot"
+        );
+        assert!(
+            !rollback.bindings.contains_key(&outside),
+            "a slot outside the frozen membership is omitted from the bindings too"
+        );
     }
 
     /// A legacy LEDGER LINE whose rollback has no `bindings` key must still

@@ -18,9 +18,7 @@
 use crate::config::ProjectConfig;
 use crate::error::{Error, Result};
 use crate::identity::{OperationId, SlotId};
-use crate::ledger::finalize::{
-    FinalizeOutcome, FinalizeSettings, finalize_successful_locked, recovery_outcomes,
-};
+use crate::ledger::finalize::{FinalizeOutcome, FinalizeSettings, finalize_successful_locked};
 use crate::ledger::records::DeploymentIntent;
 use crate::ledger::records::SlotTable;
 use crate::ledger::records::{LedgerTerminal, TerminalDisposition};
@@ -53,10 +51,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 ///    the locks (idempotent: already-written markers are a byte-for-byte
 ///    no-op) using the attempt's ORIGINAL deployment ID, and append the
 ///    terminal REPLAY-SAFELY — ONE atomic terminal append carrying the
-///    `Successful` status, the per-slot outcomes, and the rollback state
-///    (built from the VERIFIED DESIRED state — the old
-///    `deployments/<id>/results.json` outcomes store is GONE, and a
-///    terminal-less entry has no outcomes by construction). The locks are
+///    `Successful` status, the ACTIVATED slot-id set, and the rollback state
+///    (built EXCLUSIVELY from the VERIFIED LIVE `GenerationRef`s the
+///    lock-verified re-observation returns — the values read under the
+///    locks; the old `deployments/<id>/results.json` outcomes store is
+///    GONE, and the successful finalizer no longer accepts observation
+///    records at all). The locks are
 ///    released only after the terminal is appended. This replaces the old
 ///    per-slot lock + generation check: a slot whose live state diverged
 ///    (the old "generation diverged" degraded case) is the shared
@@ -163,9 +163,12 @@ pub(crate) fn reconcile_pending_commits(
         //    require it to EXACTLY equal the frozen desired assignment, write
         //    the missing markers under the locks (already-present markers are
         //    a byte-for-byte idempotent no-op), and append the terminal — ONE
-        //    atomic terminal append (status `Successful`, the per-slot
-        //    outcomes, and the rollback state built from the VERIFIED DESIRED
-        //    state) — then release the locks. This replaces the old per-slot
+        //    atomic terminal append (status `Successful`, the ACTIVATED
+        //    slot-id set, and the rollback state built EXCLUSIVELY from the
+        //    VERIFIED LIVE `GenerationRef`s the re-observation returned —
+        //    never from the engine's observation records, which the
+        //    successful finalizer no longer even accepts) — then release the
+        //    locks. This replaces the old per-slot
         //    lock + generation check: a slot whose live state diverged (the
         //    old "generation diverged" degraded case) is the shared
         //    operation's REFUSAL. A crash or error at the append leaves the
@@ -184,13 +187,10 @@ pub(crate) fn reconcile_pending_commits(
         //    live map's): recovery never stamps the live configuration's
         //    bindings into a rollback, because a drifted configuration is
         //    degraded, never recorded as history.
-        let (outcomes, actuals) = recovery_outcomes(&attempt);
         match finalize_successful_locked(
             store,
             &attempt,
             helpers,
-            &outcomes,
-            &actuals,
             &frozen_bindings,
             &FinalizeSettings {
                 reason: "recovery finalized",

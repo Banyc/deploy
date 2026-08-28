@@ -54,10 +54,11 @@ pub(crate) fn run_commit(
     // intent line (persisted BEFORE the mutation loop) keeps only the
     // immutable intent; the ACTUAL per-slot outcomes and the terminal status
     // are appended as the deployment's TERMINAL EVENT (the ledger's
-    // `{"kind":"terminal"}` line) — the outcomes store the rollback state is
-    // built from. The REPORT's attempt ([`LedgerIntentReport`]) also carries
-    // the actuals (for display); the persisted intent does not — outcomes are
-    // never part of the verified intent object.
+    // `{"kind":"terminal"}` line) — the outcomes feed the non-successful
+    // dispositions (Degraded / FailedRolledBack). The REPORT's attempt
+    // ([`LedgerIntentReport`]) also carries the actuals (for display); the
+    // persisted intent does not — outcomes are never part of the verified
+    // intent object.
     let mut attempt = LedgerIntentReport::from_intent(attempt_intent)?;
     attempt.slots = execution.actual_servers.clone();
     let outcomes_map: BTreeMap<SlotId, SlotResult> = execution.results.clone();
@@ -65,9 +66,11 @@ pub(crate) fn run_commit(
     // Finalize the attempt's terminal event. A SUCCESSFUL attempt goes
     // through the SAME shared finalizer as recovery
     // ([`ledger::finalize_successful_locked`]): ONE atomic terminal append
-    // carrying the `Successful` status, the per-slot outcomes, and the
-    // ROLLBACK STATE (built from the actual per-slot OUTCOMES
-    // (`actual_servers`), never from the intent record). A non-successful
+    // carrying the `Successful` status, the ACTIVATED slot-id set, and the
+    // ROLLBACK STATE (built EXCLUSIVELY from the VERIFIED LIVE
+    // `GenerationRef`s the lock-verified re-observation returns — the
+    // values read under the locks, never the engine's observation records,
+    // which a concurrent controller can make stale). A non-successful
     // final status (`Degraded` / `FailedRolledBack`) is a plain terminal
     // append carrying the status and outcomes, no rollback. A demoted
     // `PendingCommit` status (the commit markers are not all durable) is NOT
@@ -97,16 +100,16 @@ pub(crate) fn run_commit(
         // membership resolved AT PLAN TIME, when the immutable intent was
         // written), never recomputed from the current configuration. The
         // rollback is the COMPLETE resulting target state (the base-overlay
-        // semantics): the SELECTED slots' actuals overlaid on the latest
-        // successful base, unselected slots carried forward — so the
-        // rollback's slots are the frozen FULL membership, never just the
-        // selected slots. The terminal PERSISTS both memberships (selected =
-        // the outcome keys, full = the frozen value) and the read path
-        // enforces the equations: outcomes == selected, rollback == full,
-        // selected ⊆ full, the INTENT-BINDING legs (the terminal must
-        // REPRODUCE the intent's frozen selected/full), and — for a FULL
-        // push (no group, distinguished by the intent's `group`) — selected
-        // == full.
+        // semantics): the SELECTED slots' VERIFIED LIVE assignments overlaid
+        // on the latest successful base, unselected slots carried forward —
+        // so the rollback's slots are the frozen FULL membership, never just
+        // the selected slots. The terminal PERSISTS both memberships
+        // (selected = the intent's selected slots = the activated set, full
+        // = the frozen value) and the read path enforces the equations:
+        // outcomes == selected, rollback == full, selected ⊆ full, the
+        // INTENT-BINDING legs (the terminal must REPRODUCE the intent's
+        // frozen selected/full), and — for a FULL push (no group,
+        // distinguished by the intent's `group`) — selected == full.
         // THE ONE LOCK-VERIFIED FINALIZER — the SAME shared operation as
         // recovery ([`ledger::finalize_successful_locked`]): acquire ALL
         // selected-slot mutation locks (deterministic sorted-slot-id order),
@@ -114,16 +117,18 @@ pub(crate) fn run_commit(
         // AND artifact) under the locks and require it to EXACTLY equal the
         // frozen desired assignment (`attempt_intent.slots[sid].desired`),
         // write the commit markers, append the `Successful` terminal (ONE
-        // atomic line append), and release the locks. A slot whose live
-        // state diverged (a concurrent controller swapped `current`) REFUSES
-        // the finalization: the attempt ends `Degraded` — never
-        // `Successful`, no rollback payload.
+        // atomic line append) with the rollback built EXCLUSIVELY from the
+        // VERIFIED LIVE `GenerationRef`s the re-observation returned (never
+        // from `execution.actual_servers` / `outcomes_map` — the engine's
+        // observation records, which a concurrent controller can make stale
+        // between this push's observation and the finalize), and release the
+        // locks. A slot whose live state diverged (a concurrent controller
+        // swapped `current`) REFUSES the finalization: the attempt ends
+        // `Degraded` — never `Successful`, no rollback payload.
         match ledger::finalize_successful_locked(
             store,
             attempt_intent,
             helpers,
-            &outcomes_map,
-            &execution.actual_servers,
             &slot_bindings,
             &ledger::FinalizeSettings {
                 reason: "push completed",
@@ -2111,6 +2116,247 @@ pub(crate) mod commit_tests {
                     panic!(
                         "unexpected disposition {other:?} for swap stage {swap_stage:?} — the shared operation must finalize Successful (control) or Degraded (refused)"
                     );
+                }
+            }
+        }
+    }
+
+    // ---- THE STALE-ROLLBACK-SNAPSHOT FIX: the payload is built from the
+    // verified live refs, never the engine's observation records ----
+    //
+    // The old successful finalizer built the rollback payload from the
+    // engine's per-slot OBSERVATION records (actuals/outcomes). A
+    // concurrent controller can change the remote AFTER those observations
+    // were recorded: the lock-verified re-observation then sees the frozen
+    // desired LIVE state (verification passes) while the recorded
+    // observations are STALE — and the old code persisted the stale
+    // snapshot. The fix: the finalizer no longer accepts observation
+    // records at all; the verification RETURNS the observed live
+    // GenerationRefs and the payload is built exclusively from them (the
+    // frozen desired, equality proven), with the pre-append guard
+    // `rollback[selected] == intent.desired`.
+
+    /// How the engine's earlier observation records diverge from the frozen
+    /// desired (the stale-observed-value fixture of the property below):
+    /// the stale values differ in the GENERATION leg, the ARTIFACT leg, or
+    /// BOTH — the property holds for every divergence.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum StaleDivergence {
+        /// The stale generation differs; the stale artifact equals the
+        /// frozen desired.
+        Generation,
+        /// The stale artifact differs; the stale generation equals the
+        /// frozen desired.
+        Artifact,
+        /// Both the stale generation and the stale artifact differ.
+        Both,
+    }
+
+    proptest! {
+        // THE STALE-ROLLBACK-SNAPSHOT PROPERTY: the engine's earlier
+        // observation records (the OLD `actuals`/`outcomes` finalizer
+        // inputs — what the pre-fix code built the rollback from) DIVERGE
+        // from the frozen desired while the LIVE state (what the
+        // lock-verified finalizer re-observes under the locks) EQUALS the
+        // frozen desired — a concurrent controller changed the remote
+        // between the engine's observation and this finalization. The
+        // finalization MUST succeed and the rollback payload MUST equal the
+        // frozen desired (the verified live values) — generation AND
+        // artifact — for EVERY stale divergence: the payload is built
+        // exclusively from the VERIFIED LIVE `GenerationRef`s, never from
+        // the engine's observation records (which the successful finalizer
+        // no longer even accepts; the stale fixture is constructed only to
+        // pin the bug scenario). Under the pre-fix code, the stale values
+        // LEAKED into the persisted snapshot and this property fails; under
+        // the fix it holds for every vector.
+        //
+        // Bounded `proptest_cases(16)` (full 16 with `DEPLOY_FULL_TESTS=1`,
+        // fast default), fixed seed 0x5EED_5EED (house style), no failure
+        // persistence — the identical vectors on every run.
+        #![proptest_config(ProptestConfig {
+            cases: crate::testutil::proptest_cases(16),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn successful_finalize_payload_never_uses_stale_observed_values(
+            stale in prop_oneof![
+                Just(StaleDivergence::Generation),
+                Just(StaleDivergence::Artifact),
+                Just(StaleDivergence::Both),
+            ],
+        ) {
+            let h = TwoSlotHarness::new();
+            // The FROZEN DESIRED assignments (a distinct artifact per slot)
+            // and the LIVE state minted to match them exactly.
+            let p1 = SlotId::new("p1".to_string());
+            let p2 = SlotId::new("p2".to_string());
+            let gen_p1 = GenerationId::generate();
+            let gen_p2 = GenerationId::generate();
+            let art_p1 = ArtifactRef {
+                release: crate::identity::test_release_id("rel-1"),
+                variant: VariantName::new("standard".to_string()),
+                tree: test_tree_digest("tree-1"),
+            };
+            let art_p2 = ArtifactRef {
+                release: crate::identity::test_release_id("rel-2"),
+                variant: VariantName::new("standard".to_string()),
+                tree: test_tree_digest("tree-2"),
+            };
+            let deployment_id = test_deployment_id("deploy-stale-prop");
+            mint_live_slot(&h, "s1", &gen_p1, &art_p1, &deployment_id);
+            mint_live_slot(&h, "s2", &gen_p2, &art_p2, &deployment_id);
+
+            // The PENDING intent: durable, no terminal, the frozen desired
+            // assignments + the plan-time physical bindings.
+            let bindings = h.config.target_slot_bindings("t1").unwrap();
+            let intent = DeploymentIntent {
+                deployment_id: deployment_id.clone(),
+                target: TargetName::new("t1".to_string()),
+                group: None,
+                behavior_sha256: "sha256-aa".to_string(),
+                attempted_at: "2026-01-01T00:00:00Z".to_string(),
+                slots: NonEmptySlotTable::build(vec![
+                    (
+                        p1.clone(),
+                        IntentSlot {
+                            desired: DesiredGeneration {
+                                generation: gen_p1.clone(),
+                                artifact: art_p1.clone(),
+                            },
+                            pre_push: None,
+                            binding: bindings
+                                .get(&p1)
+                                .cloned()
+                                .expect("p1 is a target slot"),
+                        },
+                    ),
+                    (
+                        p2.clone(),
+                        IntentSlot {
+                            desired: DesiredGeneration {
+                                generation: gen_p2.clone(),
+                                artifact: art_p2.clone(),
+                            },
+                            pre_push: None,
+                            binding: bindings
+                                .get(&p2)
+                                .cloned()
+                                .expect("p2 is a target slot"),
+                        },
+                    ),
+                ])
+                .expect("two selected slots"),
+                full_membership: BTreeSet::from([p1.clone(), p2.clone()]),
+            };
+            h.store.append_attempt("t1", &intent).unwrap();
+
+            // THE STALE OBSERVED VALUES the engine could have recorded for
+            // each slot BEFORE a concurrent controller changed the remote:
+            // the (generation, artifact) the OLD code would have persisted
+            // into the rollback. Per the strategy, the generation leg, the
+            // artifact leg, or both diverge from the frozen desired.
+            let stale_of = |sid: &SlotId| -> (GenerationId, ArtifactRef) {
+                let generation = match stale {
+                    StaleDivergence::Generation | StaleDivergence::Both => test_generation_id(
+                        &format!("gen-stale-{}", sid.as_str()),
+                    ),
+                    StaleDivergence::Artifact => {
+                        intent.slots.get(sid).expect("a selected slot").desired.generation.clone()
+                    }
+                };
+                let artifact = match stale {
+                    StaleDivergence::Generation => {
+                        intent.slots.get(sid).expect("a selected slot").desired.artifact.clone()
+                    }
+                    StaleDivergence::Artifact | StaleDivergence::Both => ArtifactRef {
+                        release: crate::identity::test_release_id("rel-stale"),
+                        variant: VariantName::new("standard".to_string()),
+                        tree: test_tree_digest("tree-stale"),
+                    },
+                };
+                (generation, artifact)
+            };
+            // The stale fixture genuinely diverges (the bug scenario): at
+            // least one leg differs from the frozen desired per slot.
+            for sid in intent.slots.keys() {
+                let (g, a) = stale_of(sid);
+                let desired = &intent.slots.get(sid).expect("a selected slot").desired;
+                assert!(
+                    g != desired.generation || a != desired.artifact,
+                    "the stale fixture must diverge from the frozen desired"
+                );
+            }
+
+            // THE ONE LOCK-VERIFIED FINALIZATION with the LIVE state == the
+            // frozen desired: the finalizer re-observes both slots under the
+            // locks, verifies the complete GenerationRefs, and appends the
+            // terminal — the stale observed values are NOT inputs anymore.
+            let env = crate::testutil::fixture_env();
+            let p1_remote: Box<dyn Remote> = Box::new(
+                LocalTransport::new(&env, h.remotes_base.join("s1")).unwrap(),
+            );
+            let p2_remote: Box<dyn Remote> = Box::new(
+                LocalTransport::new(&env, h.remotes_base.join("s2")).unwrap(),
+            );
+            let mut helpers: HashMap<SlotId, RemoteHelper> = HashMap::new();
+            helpers.insert(p1.clone(), RemoteHelper::new(p1_remote.as_ref()));
+            helpers.insert(p2.clone(), RemoteHelper::new(p2_remote.as_ref()));
+            let op_id = OperationId::new("op-stale-prop".to_string());
+            let outcome = ledger::finalize_successful_locked(
+                &h.store,
+                &intent,
+                &helpers,
+                &bindings,
+                &ledger::FinalizeSettings {
+                    reason: "push completed",
+                    op_id: &op_id,
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                outcome,
+                ledger::FinalizeOutcome::Finalized,
+                "the live state equals the frozen desired, so the lock-verified finalize appends the terminal — the stale observed values are never consulted (stale {stale:?})"
+            );
+
+            // THE ROLLBACK PAYLOAD EQUALS THE FROZEN DESIRED (the verified
+            // live values) — generation AND artifact — for every selected
+            // slot, NEVER the stale observed values. The ACTIVATED set is
+            // the INTENT's selected slot set.
+            let snapshots = h.store.read_snapshots("t1").unwrap();
+            assert_eq!(snapshots.len(), 1, "exactly one successful snapshot");
+            assert_eq!(snapshots[0].deployment_id, deployment_id);
+            let rb = rollback_of(&snapshots[0]);
+            for (sid, slot) in intent.slots.iter() {
+                let rbs = rb
+                    .slots
+                    .get(sid)
+                    .expect("the rollback covers every selected slot");
+                assert_eq!(
+                    rbs.generation, slot.desired.generation,
+                    "the rollback generation for {sid} equals the frozen desired (the verified live value), never the stale observation (stale {stale:?})"
+                );
+                assert_eq!(
+                    rbs.assignment.artifact, slot.desired.artifact,
+                    "the rollback artifact for {sid} equals the frozen desired (the verified live value), never the stale observation (stale {stale:?})"
+                );
+                let (stale_gen, stale_art) = stale_of(sid);
+                match stale {
+                    StaleDivergence::Generation | StaleDivergence::Both => assert_ne!(
+                        rbs.generation, stale_gen,
+                        "the stale generation for {sid} must never leak into the rollback payload (stale {stale:?})"
+                    ),
+                    StaleDivergence::Artifact => {}
+                }
+                match stale {
+                    StaleDivergence::Artifact | StaleDivergence::Both => assert_ne!(
+                        rbs.assignment.artifact, stale_art,
+                        "the stale artifact for {sid} must never leak into the rollback payload (stale {stale:?})"
+                    ),
+                    StaleDivergence::Generation => {}
                 }
             }
         }
