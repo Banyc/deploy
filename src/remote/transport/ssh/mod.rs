@@ -435,7 +435,13 @@ impl SshTransport {
     ///    truncated. The name is dot-prefixed and lives INSIDE the
     ///    destination's parent directory, so a concurrent reader never sees
     ///    a partial record and listing-based observers skip the temp name.
-    /// 2. Write the payload.
+    /// 2. Write the payload — the RAW BYTES arrive on the command's STDIN
+    ///    (the transport pipes them to the ssh child; the remote `cat`
+    ///    redirects them into the temp with `cat > "$tmp"`). The payload is
+    ///    NEVER embedded in the command string — no shell escaping, no
+    ///    quoting — so ARBITRARY bytes (NULs, non-UTF8, control chars,
+    ///    quotes, shell metacharacters, long payloads) round-trip exactly:
+    ///    this is the byte-preservation contract of [`Remote::try_write_new`].
     /// 3. Apply the FINAL MODE with `chmod` BEFORE the file fsync — the
     ///    published inode carries the caller's mode, never the remote umask.
     /// 4. `sync "$tmp"` — the file is durable.
@@ -475,8 +481,10 @@ impl SshTransport {
     // both GNU and BSD/macOS, provided `XXXXXX` ends the final component
     // (kept here), and `sync FILE` fsyncs the path on Linux (coreutils
     // >= 8.24) and macOS (forces pending writes); the parent-dir sync is the
-    // real `sync <dir>` whose failure propagates.
-    fn write_new_cmd(root: &Path, rel: &Path, payload: &str, mode: u32) -> String {
+    // real `sync <dir>` whose failure propagates. The payload write is a
+    // bare `cat > "$tmp"`: `cat` is POSIX, reads stdin to EOF, and the
+    // redirect opens the temp — no quoting of data anywhere.
+    fn write_new_cmd(root: &Path, rel: &Path, mode: u32) -> String {
         let remote_path = root.join(rel);
         let remote_path_str = remote_path.to_string_lossy().into_owned();
         let parent = Path::new(&remote_path_str)
@@ -507,10 +515,9 @@ impl SshTransport {
         let tmp_template = format!("{}/.{}.tmp.XXXXXX", parent.trim_end_matches('/'), basename,);
         let mode_str = format!("{:o}", mode & 0o7777);
         format!(
-            "mkdir -p {p} && tmp=$(mktemp {tpl}) && printf '%s' {payload} > \"$tmp\" && chmod {mode} \"$tmp\" && sync \"$tmp\"; pre=$?; if [ \"$pre\" -ne 0 ]; then rm -f \"$tmp\"; exit {preinst}; fi; ln \"$tmp\" {d}; rc=$?; rm -f \"$tmp\"; if [ \"$rc\" -eq 0 ]; then sync {parent}; exit $?; fi; if [ -e {d} ] || [ -L {d} ]; then exit {conflict}; fi; exit {preinst}",
+            "mkdir -p {p} && tmp=$(mktemp {tpl}) && cat > \"$tmp\" && chmod {mode} \"$tmp\" && sync \"$tmp\"; pre=$?; if [ \"$pre\" -ne 0 ]; then rm -f \"$tmp\"; exit {preinst}; fi; ln \"$tmp\" {d}; rc=$?; rm -f \"$tmp\"; if [ \"$rc\" -eq 0 ]; then sync {parent}; exit $?; fi; if [ -e {d} ] || [ -L {d} ]; then exit {conflict}; fi; exit {preinst}",
             p = shell_quote(&parent),
             tpl = shell_quote(&tmp_template),
-            payload = shell_quote(payload),
             mode = mode_str,
             d = shell_quote(&remote_path_str),
             conflict = SSH_TWRITE_CONFLICT_EXIT,
@@ -904,9 +911,33 @@ impl Remote for SshTransport {
     }
 
     fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<CreateNewVerdict> {
-        let payload = String::from_utf8_lossy(data).into_owned();
-        let cmd = Self::write_new_cmd(&self.root, rel, &payload, IMMUTABLE_RECORD_MODE);
-        let out = self.run_remote(&cmd)?;
+        let cmd = Self::write_new_cmd(&self.root, rel, IMMUTABLE_RECORD_MODE);
+        let mut argv = vec!["ssh".to_string()];
+        argv.extend(self.ssh_args()?);
+        argv.push("--".into());
+        argv.push(cmd);
+        // The payload travels through the runner's STDIN — never through the
+        // command string (see `write_new_cmd`): the raw `data` bytes are
+        // piped to the remote `cat > "$tmp"` exactly, so arbitrary `Vec<u8>`
+        // (NULs, non-UTF8, quotes, shell metacharacters, long payloads)
+        // round-trips byte-for-byte through the ssh transport — the same
+        // byte-preserving contract the LOCAL transport delivers via
+        // `durable_create_new`. The runner pipes the payload as part of the
+        // bounded wait, so a remote that stops reading stdin is killed at the
+        // command deadline like any other stalled operation.
+        let out = self
+            .runner
+            .run(OpKind::Upload, &argv, Some(data), None)
+            .map_err(|e| match e {
+                RunError::Spawn(m) => Error::transport(format!("ssh try_write_new spawn: {m}")),
+                RunError::StdinWrite(m) => {
+                    Error::transport(format!("ssh try_write_new stdin write: {m}"))
+                }
+                RunError::Wait(m) => Error::transport(format!("ssh try_write_new wait: {m}")),
+                RunError::Timeout { after } => {
+                    Error::transport(format!("ssh try_write_new timed out after {after:?}"))
+                }
+            })?;
         if out.status.success() {
             // All seven steps completed: the record is installed with the
             // final mode and a parent-directory-sync'd durable entry.
@@ -1121,7 +1152,6 @@ mod tests_ssh {
         let cmd = SshTransport::write_new_cmd(
             t.root(),
             &crate::remote::layout::operation_lock(),
-            "op-proc",
             IMMUTABLE_RECORD_MODE,
         );
         assert!(
@@ -1170,7 +1200,6 @@ mod tests_ssh {
         let cmd = SshTransport::write_new_cmd(
             t.root(),
             &crate::remote::layout::operation_lock(),
-            "op-proc",
             IMMUTABLE_RECORD_MODE,
         );
         assert!(
@@ -1197,12 +1226,7 @@ mod tests_ssh {
     #[test]
     fn try_write_new_temp_stays_inside_root_for_root_level_dest() {
         let t = transport();
-        let cmd = SshTransport::write_new_cmd(
-            t.root(),
-            Path::new("files"),
-            "payload-data",
-            IMMUTABLE_RECORD_MODE,
-        );
+        let cmd = SshTransport::write_new_cmd(t.root(), Path::new("files"), IMMUTABLE_RECORD_MODE);
         assert!(
             cmd.contains("mktemp '/srv/app/.files.tmp.XXXXXX'"),
             "temp for a root-level destination must stay inside the root, got: {cmd}"
@@ -1213,16 +1237,27 @@ mod tests_ssh {
         );
     }
 
-    /// Execute a generated `write_new_cmd` string locally with `sh -c`. The
-    /// command is self-contained shell operating on absolute paths, so running
-    /// it against a local temp dir is a faithful execution of the remote
-    /// protocol (the remote login shell would run the same bytes).
-    fn run_sh(cmd: &str) -> std::process::Output {
-        std::process::Command::new("sh")
+    /// Execute `sh -c "$command"` with `stdin` piped to the shell — the
+    /// payload the remote script's `cat > "$tmp"` consumes, exactly as the
+    /// transport pipes it through the ssh child (never embedded in the
+    /// command string).
+    fn run_sh_stdin(command: &str, stdin: &[u8]) -> std::process::Output {
+        use std::io::Write;
+        let mut child = std::process::Command::new("sh")
             .arg("-c")
-            .arg(cmd)
-            .output()
-            .expect("spawn sh -c")
+            .arg(command)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn sh -c");
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(stdin)
+            .expect("write payload");
+        child.wait_with_output().expect("wait sh -c")
     }
 
     // The old temp name derived from the LOCAL pid + a per-process counter, so
@@ -1252,8 +1287,9 @@ mod tests_ssh {
             // the same destination with a different payload.
             let mut writers = Vec::new();
             for payload in &payloads {
-                let cmd = SshTransport::write_new_cmd(&root, rel, payload, IMMUTABLE_RECORD_MODE);
-                writers.push(s.spawn(move || run_sh(&cmd)));
+                let cmd = SshTransport::write_new_cmd(&root, rel, IMMUTABLE_RECORD_MODE);
+                let payload = payload.clone();
+                writers.push(s.spawn(move || run_sh_stdin(&cmd, payload.as_bytes())));
             }
 
             // Readers: while the writers race, any observation of the
@@ -1321,8 +1357,8 @@ mod tests_ssh {
         let parent = dest.parent().unwrap();
 
         // First invocation: installs the record and cleans up its own temp.
-        let cmd1 = SshTransport::write_new_cmd(&root, rel, "gen-1", IMMUTABLE_RECORD_MODE);
-        let out1 = run_sh(&cmd1);
+        let cmd1 = SshTransport::write_new_cmd(&root, rel, IMMUTABLE_RECORD_MODE);
+        let out1 = run_sh_stdin(&cmd1, b"gen-1");
         assert!(
             out1.status.success(),
             "first install failed: {}",
@@ -1356,8 +1392,8 @@ mod tests_ssh {
 
         // Fresh invocation with a different payload: must fail (already
         // exists), leave dest and stale untouched, and clean up its own temp.
-        let cmd2 = SshTransport::write_new_cmd(&root, rel, "gen-2", IMMUTABLE_RECORD_MODE);
-        let out2 = run_sh(&cmd2);
+        let cmd2 = SshTransport::write_new_cmd(&root, rel, IMMUTABLE_RECORD_MODE);
+        let out2 = run_sh_stdin(&cmd2, b"gen-2");
         assert_eq!(
             out2.status.code(),
             Some(SSH_TWRITE_CONFLICT_EXIT),
@@ -1394,12 +1430,8 @@ mod tests_ssh {
     #[test]
     fn try_write_new_cmd_final_chmod_and_real_parent_sync() {
         let t = transport();
-        let cmd = SshTransport::write_new_cmd(
-            t.root(),
-            &crate::remote::layout::operation_lock(),
-            "op-proc",
-            0o640,
-        );
+        let cmd =
+            SshTransport::write_new_cmd(t.root(), &crate::remote::layout::operation_lock(), 0o640);
         // Step 3 (final chmod) BEFORE step 4 (file fsync) BEFORE step 5
         // (no-replace install): the published inode carries the caller's
         // mode, never the remote umask.
@@ -1435,15 +1467,12 @@ mod tests_ssh {
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let root = dir.path().to_path_buf();
         let rel = Path::new("state/op.json");
-        let cmd = SshTransport::write_new_cmd(&root, rel, "payload-data", 0o644);
+        let cmd = SshTransport::write_new_cmd(&root, rel, 0o644);
         // `mktemp` under umask 077 creates the temp 0600; without the chmod
         // step the installed record would keep 0600. The final chmod must
-        // make it 0644 before the install.
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!("umask 077; {cmd}"))
-            .output()
-            .expect("spawn sh -c");
+        // make it 0644 before the install. The payload is piped on stdin,
+        // exactly as the transport delivers it.
+        let out = run_sh_stdin(&format!("umask 077; {cmd}"), b"payload-data");
         assert!(
             out.status.success(),
             "install failed: {}",
@@ -1468,7 +1497,7 @@ mod tests_ssh {
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let root = dir.path().to_path_buf();
         let rel = Path::new("state/op.json");
-        let cmd = SshTransport::write_new_cmd(&root, rel, "payload-data", IMMUTABLE_RECORD_MODE);
+        let cmd = SshTransport::write_new_cmd(&root, rel, IMMUTABLE_RECORD_MODE);
         let fakebin = dir.path().join("fakebin");
         std::fs::create_dir_all(&fakebin).unwrap();
         std::fs::write(
@@ -1479,14 +1508,13 @@ mod tests_ssh {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(fakebin.join("sync"), std::fs::Permissions::from_mode(0o755))
             .unwrap();
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!(
+        let out = run_sh_stdin(
+            &format!(
                 "PATH={fake}:$PATH; {cmd}",
                 fake = shell_quote(&fakebin.to_string_lossy())
-            ))
-            .output()
-            .expect("spawn sh -c");
+            ),
+            b"payload-data",
+        );
         assert_eq!(
             out.status.code(),
             Some(9),
@@ -1509,15 +1537,15 @@ mod tests_ssh {
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let root = dir.path().to_path_buf();
         let rel = Path::new("state/op.json");
-        let cmd1 = SshTransport::write_new_cmd(&root, rel, "gen-1", IMMUTABLE_RECORD_MODE);
-        let out1 = run_sh(&cmd1);
+        let cmd1 = SshTransport::write_new_cmd(&root, rel, IMMUTABLE_RECORD_MODE);
+        let out1 = run_sh_stdin(&cmd1, b"gen-1");
         assert!(
             out1.status.success(),
             "first install failed: {}",
             String::from_utf8_lossy(&out1.stderr)
         );
-        let cmd2 = SshTransport::write_new_cmd(&root, rel, "gen-2", IMMUTABLE_RECORD_MODE);
-        let out2 = run_sh(&cmd2);
+        let cmd2 = SshTransport::write_new_cmd(&root, rel, IMMUTABLE_RECORD_MODE);
+        let out2 = run_sh_stdin(&cmd2, b"gen-2");
         assert_eq!(
             out2.status.code(),
             Some(SSH_TWRITE_CONFLICT_EXIT),
@@ -1543,8 +1571,9 @@ mod tests_ssh {
         /// `mktemp` fails — the temp allocation (step 1).
         CreateTemp,
         /// The payload write fails — a fake `mktemp` hands back an unwritable
-        /// path so the `printf > "$tmp"` redirect fails (step 2; `printf` is
-        /// a shell builtin, so a PATH fake cannot shadow it).
+        /// path so the `cat > "$tmp"` redirect fails to open (step 2; the
+        /// redirect is a shell-level error, so a PATH fake cannot shadow it —
+        /// `cat` never runs).
         Write,
         /// `chmod` fails (step 3).
         Chmod,
@@ -1584,7 +1613,7 @@ mod tests_ssh {
             let root = dir.path().to_path_buf();
             let rel = Path::new("state/op.json");
             let dest = root.join(rel);
-            let cmd = SshTransport::write_new_cmd(&root, rel, "payload-data", IMMUTABLE_RECORD_MODE);
+            let cmd = SshTransport::write_new_cmd(&root, rel, IMMUTABLE_RECORD_MODE);
             let fakebin = dir.path().join("fakebin");
             std::fs::create_dir_all(&fakebin).unwrap();
 
@@ -1607,14 +1636,13 @@ mod tests_ssh {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-            let out = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(format!(
+            let out = run_sh_stdin(
+                &format!(
                     "PATH={fake}:$PATH; {cmd}",
                     fake = shell_quote(&fakebin.to_string_lossy())
-                ))
-                .output()
-                .expect("spawn sh -c");
+                ),
+                b"payload-data",
+            );
             prop_assert_ne!(
                 out.status.code(),
                 Some(0),
@@ -1680,6 +1708,12 @@ mod fingerprint_ssh_tests {
         deploy_dir: PathBuf,
         address: String,
         keyscan_log: PathBuf,
+        /// Every fake-`ssh` invocation's FULL argv (one argument per line, a
+        /// `---` separator between invocations) — recorded so a test can
+        /// prove a given payload never entered the transmitted command (the
+        /// write invocation's argv is byte-for-byte the payload-INDEPENDENT
+        /// command string).
+        argv_log: PathBuf,
     }
 
     impl FakeSsh {
@@ -1717,21 +1751,37 @@ mod fingerprint_ssh_tests {
                 .to_string();
 
             let keyscan_log = bin.join("keyscan.log");
+            let argv_log = bin.join("ssh-argv.log");
 
             // Fake `ssh`: parse `-o`/`-p`/`--` like OpenSSH, remap every
             // occurrence of the configured remote deploy dir to the local
             // emulation root, and run the single (fully shell-quoted) remote
-            // command with `sh -c`.
+            // command with `sh -c`. Every invocation's FULL argv is recorded
+            // to `argv_log` (one argument per line, `---` separator) so a
+            // test can prove the payload never enters the command string —
+            // the recorded argv must be byte-for-byte the payload-INDEPENDENT
+            // reference command. The recording block reads no stdin, so the
+            // piped payload flows through this shim untouched into the remote
+            // `cat > "$tmp"` (the shell execs the command with stdin intact).
             std::fs::write(
                 bin.join("ssh"),
-                r#"#!/bin/sh
+                format!(
+                    r##"#!/bin/sh
 # Fake `ssh` for tests: emulates a remote host whose filesystem is a local
 # directory. `FAKE_SSH_ROOT` is the local dir; `FAKE_SSH_REMOTE_PREFIX` is the
 # configured remote deploy dir (e.g. /srv/deploy/app). Every occurrence of the
 # remote prefix in the (fully shell-quoted) remote command is remapped to
 # $FAKE_SSH_ROOT$FAKE_SSH_REMOTE_PREFIX, then the command runs with `sh -c`.
-FAKE_ROOT="${FAKE_SSH_ROOT:?FAKE_SSH_ROOT not set}"
-REMOTE_PREFIX="${FAKE_SSH_REMOTE_PREFIX:?FAKE_SSH_REMOTE_PREFIX not set}"
+# The piped stdin payload is inherited untouched (no -n, no stdin reads here).
+FAKE_ROOT="${{FAKE_SSH_ROOT:?FAKE_SSH_ROOT not set}}"
+REMOTE_PREFIX="${{FAKE_SSH_REMOTE_PREFIX:?FAKE_SSH_REMOTE_PREFIX not set}}"
+{{
+  printf '%s\n' "$0"
+  for a in "$@"; do
+    printf '%s\n' "$a"
+  done
+  printf '%s\n' '---'
+}} >> '{argv_log}'
 cmd=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -1742,9 +1792,11 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ -n "$cmd" ] || exit 0
-remapped=$(printf '%s' "$cmd" | awk -v old="$REMOTE_PREFIX" -v new="$FAKE_ROOT$REMOTE_PREFIX" '{ gsub(old, new); printf "%s", $0 }')
+remapped=$(printf '%s' "$cmd" | awk -v old="$REMOTE_PREFIX" -v new="$FAKE_ROOT$REMOTE_PREFIX" '{{ gsub(old, new); printf "%s", $0 }}')
 exec sh -c "$remapped"
-"#,
+"##,
+                    argv_log = argv_log.display(),
+                ),
             )
             .unwrap();
 
@@ -1848,6 +1900,7 @@ exec /bin/mv "$@"
                 deploy_dir: deploy_dir.to_path_buf(),
                 address: address.to_string(),
                 keyscan_log,
+                argv_log,
             }
         }
 
@@ -1920,6 +1973,26 @@ exec /bin/mv "$@"
     /// interpreter for metadata reads while every other binary is untouched.
     fn write_fake_lstat(bin: &Path, stdout: &str) {
         write_fake_bin(bin, "perl", &format!("#!/bin/sh\nprintf '{stdout}\n'\n"));
+    }
+
+    /// Read the fake ssh's recorded invocations (see `FakeSsh::new`): each
+    /// invocation is one argv vector (the recorded arguments verbatim, in
+    /// order), separated by the `---` marker line.
+    fn read_ssh_argv_log(log: &Path) -> Vec<Vec<String>> {
+        let text = std::fs::read_to_string(log).unwrap_or_default();
+        let mut invocations = Vec::new();
+        let mut current = Vec::new();
+        for line in text.lines() {
+            if line == "---" {
+                invocations.push(std::mem::take(&mut current));
+            } else {
+                current.push(line.to_string());
+            }
+        }
+        if !current.is_empty() {
+            invocations.push(current);
+        }
+        invocations
     }
 
     // Scenario (a): a fingerprint-only configuration can make a STATUS request
@@ -2826,6 +2899,123 @@ exec /bin/mv "$@"
                     );
                 }
             }
+        }
+    }
+
+    /// Arbitrary bytes for the byte-preservation property: EVERY byte class
+    /// the old lossy stringification mangled — NULs, non-UTF8, control
+    /// chars, quotes, backslashes, shell metacharacters — plus long payloads
+    /// that straddle the pipe buffer (the stdin payload is written by the
+    /// runner's wait closure, so a payload larger than the pipe must still
+    /// flow through the remote `cat` exactly).
+    fn arbitrary_bytes() -> impl Strategy<Value = Vec<u8>> {
+        prop_oneof![
+            prop::collection::vec(any::<u8>(), 0..4096),
+            // A dedicated long-payload leg: 16–64 KiB, around the 16–64 KiB
+            // pipe-buffer boundary, so the write blocks on the pipe and the
+            // remote `cat` must drain it to complete the install.
+            prop::collection::vec(any::<u8>(), 16_384..65_536),
+        ]
+    }
+
+    proptest! {
+        // THE BYTE-PRESERVATION PROPERTY (the create-new fix): `try_write_new`
+        // is a BYTE API, so ARBITRARY `Vec<u8>` must round-trip EXACTLY —
+        // `try_write_new(rel, data)` then `read(rel)` == `data` byte-for-byte
+        // — through the ssh transport (over the fake remote) AND the local
+        // transport. The ssh side proves the payload travels on the runner's
+        // STDIN: the fake ssh recorded every invocation's argv, and the write
+        // invocation's argv equals the payload-INDEPENDENT reference command
+        // built by `write_new_cmd` — the payload never enters the command
+        // string. (A naive "payload is not a substring of the command" check
+        // would be unsound: a payload like `cat` legitimately appears inside
+        // the fixed script text — exact argv equality is the real proof.)
+        // Bounded cases, fixed seed 0x5EED_5EED (house style), no persistence.
+        #![proptest_config(ProptestConfig {
+            cases: crate::testutil::proptest_cases(16),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn try_write_new_arbitrary_bytes_roundtrip(data in arbitrary_bytes()) {
+            let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+            let fake = FakeSsh::new(
+                tmp.path().join("bin"),
+                tmp.path().join("remote"),
+                "bytes-prop.test",
+                Path::new("/srv/deploy/bytes-prop"),
+            );
+            let cache = tmp.path().join("knownhosts");
+            let env = fake_env(
+                &fake.bin,
+                &cache,
+                &fake.remote_root,
+                "/srv/deploy/bytes-prop",
+            );
+            let t = fake.transport(&cache, &env);
+            t.prepare_identity().unwrap();
+
+            let rel = Path::new("state/record.bin");
+            let verdict = t
+                .try_write_new(rel, &data)
+                .expect("the fresh byte install must succeed");
+            prop_assert_eq!(verdict, CreateNewVerdict::Created);
+            let read_back = t.read(rel).expect("read back over ssh");
+            prop_assert_eq!(
+                read_back.as_slice(),
+                data.as_slice(),
+                "arbitrary bytes must round-trip EXACTLY through the ssh transport"
+            );
+
+            // The payload never enters the transmitted command: the fake ssh
+            // recorded the write invocation's argv, and it must equal the
+            // payload-INDEPENDENT reference command (the fixed script text) —
+            // the payload travels via stdin, so no byte of it can be in argv.
+            let mut expected = vec!["ssh".to_string()];
+            expected.extend(t.ssh_args().expect("prepared identity"));
+            expected.push("--".into());
+            expected.push(SshTransport::write_new_cmd(
+                t.root(),
+                rel,
+                IMMUTABLE_RECORD_MODE,
+            ));
+            let invocations = read_ssh_argv_log(&fake.argv_log);
+            let write_inv = invocations
+                .first()
+                .expect("the write ssh invocation must be recorded");
+            // Skip argv[0]: the OS rewrites it to the resolved fake-ssh path
+            // (an exec detail, not the transport's data). The transmitted
+            // ARGS — identity options, `--`, and the payload-INDEPENDENT
+            // command — are what the assertion is about: the payload never
+            // enters the command string.
+            prop_assert_eq!(
+                &write_inv[1..],
+                &expected[1..],
+                "the write invocation's args must be the payload-independent command"
+            );
+
+            // The LOCAL transport is byte-preserving too: the same arbitrary
+            // bytes round-trip exactly through the canonical primitive
+            // (`durable_create_new`), so the byte API is meaningful on both
+            // sides of the transport split.
+            let local = crate::remote::transport::LocalTransport::new(
+                &crate::testutil::fixture_env(),
+                tmp.path().join("local"),
+            )
+            .expect("local transport");
+            let local_rel = Path::new("state/record.bin");
+            let local_verdict = local
+                .try_write_new(local_rel, &data)
+                .expect("the fresh local byte install must succeed");
+            prop_assert_eq!(local_verdict, CreateNewVerdict::Created);
+            let local_read_back = local.read(local_rel).expect("local read back");
+            prop_assert_eq!(
+                local_read_back.as_slice(),
+                data.as_slice(),
+                "arbitrary bytes must round-trip EXACTLY through the local transport"
+            );
         }
     }
 }

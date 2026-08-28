@@ -42,7 +42,12 @@ pub(crate) enum OpKind {
     Remote,
     /// `run_remote_ok`: a remote shell command that must exit 0.
     RemoteOk,
-    /// The upload path (`ssh` with a stdin payload piped to the remote `cat`).
+    /// The stdin-payload path: `ssh` with a payload piped to the remote
+    /// `cat` — used by the raw [`SshTransport::upload_bytes`] write AND by
+    /// `try_write_new`'s no-clobber install. Both ship their bytes on STDIN
+    /// (never embedded in the command string), so arbitrary `Vec<u8>`
+    /// round-trips exactly; a remote that stops reading stdin is covered by
+    /// the same bounded wait as every other operation.
     Upload,
     /// The `ssh-keyscan` key-pin step.
     KeyscanPin,
