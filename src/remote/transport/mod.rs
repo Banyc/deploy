@@ -99,6 +99,18 @@ pub trait Remote {
     fn remove_dir_all(&self, rel: &Path) -> Result<()>;
     fn exists(&self, rel: &Path) -> bool;
     fn metadata(&self, rel: &Path) -> Result<RemoteMeta>;
+    /// The TYPED replacement for the `exists`/`metadata` pair: `Ok(Some(meta))`
+    /// when the entry exists, `Ok(None)` ONLY for a CONFIRMED `NotFound`, and
+    /// `Err` for every other failure (permission, transport fault, ...). A
+    /// failed read is NEVER indistinguishable from absence — callers must
+    /// never consult `exists` (a `bool` that swallows errors) to disambiguate.
+    fn metadata_opt(&self, rel: &Path) -> Result<Option<RemoteMeta>> {
+        match self.metadata(rel) {
+            Ok(m) => Ok(Some(m)),
+            Err(e) if matches!(e, crate::error::Error::NotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
     /// Execute a command vector (no shell). Returns the outcome.
     fn exec(&self, argv: &[String], timeout: Duration) -> Result<ExecOutcome>;
     /// Total and available bytes on the filesystem backing the remote root.
@@ -412,10 +424,17 @@ impl Remote for LocalTransport {
     }
 
     fn metadata(&self, rel: &Path) -> Result<RemoteMeta> {
+        self.metadata_opt(rel)?
+            .ok_or_else(|| Error::transport(format!("stat {}: not found", join(&self.base, rel).display())))
+    }
+
+    fn metadata_opt(&self, rel: &Path) -> Result<Option<RemoteMeta>> {
         let p = join(&self.base, rel);
-        let m = std::fs::symlink_metadata(&p)
-            .map_err(|e| Error::transport(format!("stat {}: {e}", p.display())))?;
-        Ok(meta_to_remote(&m))
+        match std::fs::symlink_metadata(&p) {
+            Ok(m) => Ok(Some(meta_to_remote(&m))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(Error::transport(format!("stat {}: {e}", p.display()))),
+        }
     }
 
     fn exec(&self, argv: &[String], timeout: Duration) -> Result<ExecOutcome> {

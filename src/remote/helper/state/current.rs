@@ -193,13 +193,14 @@ impl<'a> RemoteHelper<'a> {
     /// and `swap_current()` gate on this rule, so the exact-target contract
     /// lives in exactly one place.
     fn canonical_current_target(&self) -> Result<Option<GenerationId>> {
-        let meta = self.remote.metadata(layout::current());
-        let present =
-            self.remote.exists(layout::current()) || matches!(&meta, Ok(m) if m.is_symlink);
-        if !present {
+        // ONE typed read: `metadata_opt` returns `Ok(None)` ONLY for a
+        // confirmed NotFound; every other failure (permission, transport
+        // fault) PROPAGATES as `Err`. The boolean `exists` (which swallows
+        // errors) is NEVER consulted here — a failed metadata read can never
+        // be mistaken for absence.
+        let Some(meta) = self.remote.metadata_opt(layout::current())? else {
             return Ok(None);
-        }
-        let meta = meta?;
+        };
         if !meta.is_symlink {
             // `current` exists but is not a symlink: malformed remote state.
             return Err(Error::integrity("current is not a symlink"));
@@ -1555,4 +1556,204 @@ mod tests_current {
             }
         }
     }
+    /// A fault adapter whose `current`-link `exists()` hint and metadata
+    /// outcome are controlled INDEPENDENTLY (the case the fixed adapter
+    /// missed: `exists == false` together with a metadata ERROR must NOT be
+    /// read as absence).
+    struct HintedCurrentRemote {
+        inner: crate::remote::transport::LocalTransport,
+        exists_hint: bool,
+        meta: MetaOutcome,
+    }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum MetaOutcome {
+        Present,
+        Absent,
+        Err,
+    }
+    impl crate::remote::transport::Remote for HintedCurrentRemote {
+        fn root(&self) -> &std::path::Path {
+            self.inner.root()
+        }
+        fn exists(&self, rel: &std::path::Path) -> bool {
+            if rel == crate::remote::layout::current() {
+                return self.exists_hint;
+            }
+            self.inner.exists(rel)
+        }
+        fn metadata_opt(&self, rel: &std::path::Path) -> crate::error::Result<Option<crate::remote::transport::RemoteMeta>> {
+            if rel == crate::remote::layout::current() {
+                return match self.meta {
+                    MetaOutcome::Present => self.inner.metadata_opt(rel),
+                    MetaOutcome::Absent => Ok(None),
+                    MetaOutcome::Err => Err(crate::error::Error::transport(
+                        "current metadata read failed: injected transport fault",
+                    )),
+                };
+            }
+            self.inner.metadata_opt(rel)
+        }
+        fn metadata(&self, rel: &std::path::Path) -> crate::error::Result<crate::remote::transport::RemoteMeta> {
+            if rel == crate::remote::layout::current() {
+                return match self.meta {
+                    MetaOutcome::Present => self.inner.metadata(rel),
+                    MetaOutcome::Absent => Err(crate::error::Error::transport("current stat: not found")),
+                    MetaOutcome::Err => Err(crate::error::Error::transport(
+                        "current metadata read failed: injected transport fault",
+                    )),
+                };
+            }
+            self.inner.metadata(rel)
+        }
+        fn read_link(&self, rel: &std::path::Path) -> crate::error::Result<std::path::PathBuf> {
+            self.inner.read_link(rel)
+        }
+        fn read(&self, rel: &std::path::Path) -> crate::error::Result<Vec<u8>> {
+            self.inner.read(rel)
+        }
+        fn write(&self, rel: &std::path::Path, data: &[u8], mode: u32) -> crate::error::Result<()> {
+            self.inner.write(rel, data, mode)
+        }
+        fn try_write_new(&self, rel: &std::path::Path, data: &[u8]) -> crate::error::Result<bool> {
+            self.inner.try_write_new(rel, data)
+        }
+        fn create_dir(&self, rel: &std::path::Path) -> crate::error::Result<()> {
+            self.inner.create_dir(rel)
+        }
+        fn create_dir_all(&self, rel: &std::path::Path) -> crate::error::Result<()> {
+            self.inner.create_dir_all(rel)
+        }
+        fn set_mode(&self, rel: &std::path::Path, mode: u32) -> crate::error::Result<()> {
+            self.inner.set_mode(rel, mode)
+        }
+        fn list(&self, rel: &std::path::Path) -> crate::error::Result<Vec<crate::remote::transport::RemoteEntry>> {
+            self.inner.list(rel)
+        }
+        fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> crate::error::Result<()> {
+            self.inner.rename(from, to)
+        }
+        fn symlink(&self, target: &std::path::Path, link: &std::path::Path) -> crate::error::Result<()> {
+            self.inner.symlink(target, link)
+        }
+        fn remove_file(&self, rel: &std::path::Path) -> crate::error::Result<()> {
+            self.inner.remove_file(rel)
+        }
+        fn remove_dir_all(&self, rel: &std::path::Path) -> crate::error::Result<()> {
+            self.inner.remove_dir_all(rel)
+        }
+        fn exec(&self, argv: &[String], timeout: std::time::Duration) -> crate::error::Result<crate::remote::transport::ExecOutcome> {
+            self.inner.exec(argv, timeout)
+        }
+        fn filesystem_bytes(&self) -> crate::error::Result<crate::remote::transport::FsBytes> {
+            self.inner.filesystem_bytes()
+        }
+        fn prepare_identity(&self) -> crate::error::Result<()> {
+            self.inner.prepare_identity()
+        }
+        fn provision_layout(&self) -> crate::error::Result<()> {
+            self.inner.provision_layout()
+        }
+    }
+
+    // THE USER'S METADATA-ERROR PROPERTY: independently generate the
+    // `exists` HINT and the metadata OUTCOME. For EVERY metadata error —
+    // INCLUDING `exists == false` — both swap and removal must return `Err`
+    // and leave `current` byte-identical: a failed metadata read is NEVER
+    // absence, no matter what `exists` claims. Only a confirmed metadata
+    // `Absent` (Ok(None)) is absence, and only a present canonical target
+    // participates in the exact gate.
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 64,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+        #[test]
+        fn metadata_error_is_never_absence(
+            exists_hint in proptest::bool::ANY,
+            meta_outcome in 0u8..3, // 0 present(canonical), 1 absent, 2 err
+            actual_g in "[a-z0-9]{1,8}".prop_map(|tag| crate::identity::test_generation_id(&tag)),
+            expected_kind in 0u8..2,
+            expected_g in "[a-z0-9]{1,8}".prop_map(|tag| crate::identity::test_generation_id(&tag)),
+            new_gen in "[a-z0-9]{1,8}".prop_map(|tag| crate::identity::test_generation_id(&tag)),
+        ) {
+            for name in ["swap", "remove"] {
+                let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+                let base = dir.path().join("remote");
+                std::fs::create_dir_all(&base).unwrap();
+                if meta_outcome == 0 {
+                    std::os::unix::fs::symlink(
+                        layout::generation(actual_g.as_str()).join("root"),
+                        base.join("current"),
+                    )
+                    .unwrap();
+                }
+                let meta = match meta_outcome {
+                    0 => MetaOutcome::Present,
+                    1 => MetaOutcome::Absent,
+                    _ => MetaOutcome::Err,
+                };
+                let link_bytes_before = std::fs::symlink_metadata(base.join("current"))
+                    .map(|_| std::fs::read_link(base.join("current")).unwrap())
+                    .unwrap_or_default();
+                let expected = if expected_kind == 0 {
+                    ExpectedCurrent::Absent
+                } else {
+                    ExpectedCurrent::Generation(expected_g.clone())
+                };
+                let inner = crate::remote::transport::LocalTransport::new(&crate::testutil::fixture_env(), base.clone()).unwrap();
+                let remote = HintedCurrentRemote { inner, exists_hint, meta };
+                let helper = RemoteHelper::new(&remote);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match name {
+                    "swap" => helper.swap_current(&expected, new_gen.as_str(), "op").map(|_| true),
+                    _ => helper.remove_current_if(&expected),
+                }));
+                match result {
+                    Ok(Ok(_)) => {
+                        // The gate may succeed ONLY on a present canonical target
+                        // agreeing exactly, or a confirmed-absent metadata (Ok(None))
+                        // with an Absent expectation. NEVER on a metadata Err.
+                        assert!(
+                            meta_outcome != 2,
+                            "{name}: a metadata ERROR must propagate, never succeed (exists hint {exists_hint})"
+                        );
+                        if meta_outcome == 1 {
+                            assert_eq!(
+                                expected,
+                                ExpectedCurrent::Absent,
+                                "{name}: confirmed absence can only satisfy an Absent expectation"
+                            );
+                        } else {
+                            assert_eq!(
+                                expected,
+                                ExpectedCurrent::Generation(actual_g.clone()),
+                                "{name}: a present canonical target can only satisfy its own generation"
+                            );
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        if meta_outcome == 2 {
+                            // THE CORE ASSERTION: metadata error propagates
+                            // regardless of the exists hint (even false).
+                            assert!(
+                                e.to_string().contains("transport"),
+                                "{name}: a metadata error must propagate as an error, got: {e}"
+                            );
+                        }
+                        // The link is byte-identical after any failed mutation.
+                        let after = std::fs::symlink_metadata(base.join("current"))
+                            .map(|_| std::fs::read_link(base.join("current")).unwrap())
+                            .unwrap_or_default();
+                        assert_eq!(
+                            after, link_bytes_before,
+                            "{name}: a failed mutation must leave the current link byte-identical"
+                        );
+                    }
+                    Err(_) => panic!("{name}: the gate must never panic"),
+                }
+            }
+        }
+    }
+
 }

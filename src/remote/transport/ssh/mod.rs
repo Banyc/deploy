@@ -609,6 +609,15 @@ impl Remote for SshTransport {
     }
 
     fn metadata(&self, rel: &Path) -> Result<RemoteMeta> {
+        self.metadata_opt(rel)?.ok_or_else(|| {
+            Error::transport(format!(
+                "ssh stat {}: no such entry",
+                self.root.join(rel).to_string_lossy()
+            ))
+        })
+    }
+
+    fn metadata_opt(&self, rel: &Path) -> Result<Option<RemoteMeta>> {
         let p = self.root.join(rel).to_string_lossy().into_owned();
         // `%s %f` is a SINGLE format argument; it is single-quoted by
         // `argv_cmd` so the remote shell keeps the space inside one token and
@@ -620,10 +629,13 @@ impl Remote for SshTransport {
             p,
         ]))?;
         if !out.status.success() {
-            return Err(Error::transport(format!(
-                "ssh stat failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            )));
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            // ONLY a confirmed no-such-entry is absence; every other stat
+            // failure (permission, transport fault) propagates.
+            if stderr.contains("No such file") {
+                return Ok(None);
+            }
+            return Err(Error::transport(format!("ssh stat failed: {stderr}")));
         }
         let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
         let mut parts = text.split_whitespace();
@@ -639,13 +651,13 @@ impl Remote for SshTransport {
         let is_symlink = (raw & 0o170000) == 0o120000;
         let is_dir = (raw & 0o170000) == 0o040000;
         let is_file = !is_symlink && !is_dir;
-        Ok(RemoteMeta {
+        Ok(Some(RemoteMeta {
             is_dir,
             is_symlink,
             is_file,
             size,
             mode,
-        })
+        }))
     }
 
     fn exec(
