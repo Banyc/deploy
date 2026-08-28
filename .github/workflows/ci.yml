@@ -41,6 +41,35 @@ jobs:
       - name: Test
         run: cargo nextest run
 
+  # Isolation-regression detector: re-runs the EXACT default Nextest profile
+  # (no DEPLOY_FULL_TESTS, no custom seeds — the same dev/PR profile as the
+  # `test` job) repeatedly. Process-heavy tests (process_lifecycle + ssh
+  # transport) are serialized in one `max-threads = 1` group; the remaining
+  # suite runs parallel. Inter-test interference (stale pids, signal races,
+  # fake-ssh argv collisions) often only surfaces under repetition / load.
+  # Repeating the default run 5× makes a flaky isolation failure likely to
+  # appear. Each matrix arm runs `cargo nextest run` with the default
+  # environment; a failing arm fails the workflow so the regression is
+  # visible. `fail-fast: false` lets every arm finish so all flakes are
+  # observed.
+  isolation-regressions:
+    name: Isolation regressions (repeat ${{ matrix.repeat }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        repeat: [1, 2, 3, 4, 5]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-nextest
+        uses: taiki-e/install-nextest@v2
+      - name: Build
+        run: cargo build --all-targets
+      - name: Test (repeat ${{ matrix.repeat }})
+        run: cargo nextest run
+
   full-proptests:
     name: Full proptest budgets (deterministic regression)
     runs-on: ubuntu-latest

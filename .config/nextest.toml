@@ -1,28 +1,41 @@
 # Nextest configuration.
 #
-# The real-process lifecycle target (`tests/process_lifecycle.rs`) must NEVER
-# run its cases concurrently with each other: it spawns real children, process
-# groups, and grandchildren, and its assertions probe the pid space. The
-# deterministic deployment/state-machine properties drive a scripted fake exec
-# (no real processes), so the only thing left to serialize is THIS binary.
+# Process-heavy isolation — two harnesses share ONE serialized group
+# (`process-heavy`, `max-threads = 1`):
+#   * `tests/process_lifecycle.rs` (binary `process_lifecycle`) — a
+#     REAL-PROCESS target that spawns children/process groups/grandchildren
+#     and probes the pid space. Its cases must never run concurrently with
+#     each other.
+#   * The SSH transport lib tests (`remote::transport::ssh::*` — fingerprint,
+#     runner, and shim modules) — they drive real subprocesses (fake `ssh`
+#     binaries, perl helpers, sh children) via the same host pid/process
+#     machinery.
+# Both harnesses create real OS processes and would spuriously interfere if
+# interleaved (stale pids, signal delivery to the wrong child, fake-ssh
+# argv races), so they are forced into the single serialized group. The
+# deterministic deployment/state-machine properties drive a scripted fake
+# exec (no real processes) and remain parallel.
 #
 # Isolation is expressed with the proper nextest mechanism (default config
 # path: workspace-root/.config/nextest.toml):
-#   * `[test-groups]` defines a named group whose tests may use at most one
-#     worker thread (`max-threads = 1`), so the lifecycle cases run strictly
-#     serially and never concurrently with each other.
-#   * A `[[profile.default.overrides]]` entry assigns the process_lifecycle
-#     binary to that group and gives it the generous slow timeout it needs:
-#     the lifecycle property drives real children under a 1s runner deadline
-#     plus cleanup + load-tolerant no-post-return-fs probe windows (~1-3s per
-#     pair, up to 3 pairs x 16 cases), so it can legitimately take minutes
-#     under heavy load (the default slow timeout is 60s).
+#   * `[test-groups]` defines `process-heavy` with at most one worker thread
+#     so every test assigned to it runs strictly serially.
+#   * `[[profile.default.overrides]]` entries assign the two filters above to
+#     that group.
+#   * The lifecycle binary keeps the generous slow timeout it needs (real
+#     children under a 1s runner deadline plus cleanup + load-tolerant
+#     no-post-return-fs probe windows ~1-3s per pair, up to 3 pairs x 16
+#     cases, so minutes under load — default 60s is insufficient).
 #
-# Everything else runs under nextest defaults.
-[test-groups.process-lifecycle]
+# Everything else runs under nextest defaults (parallel).
+[test-groups.process-heavy]
 max-threads = 1
 
 [[profile.default.overrides]]
 filter = "binary(process_lifecycle)"
-test-group = "process-lifecycle"
+test-group = "process-heavy"
 slow-timeout = { period = "120s", terminate-after = 2 }
+
+[[profile.default.overrides]]
+filter = "test(/remote::transport::ssh::/)"
+test-group = "process-heavy"
