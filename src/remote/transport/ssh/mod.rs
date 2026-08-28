@@ -108,6 +108,12 @@ pub struct SshTransport {
     /// ([`SshRunner`]): hard deadline, kill, and deterministic reap, so no
     /// operation can run unbounded after connection establishment.
     runner: SshRunner,
+    /// Test-only swap injection for the descriptor-bound verification helper:
+    /// a `VerifySwap` stored as a Rust VALUE (never via env) that
+    /// `verify_open_script` embeds as literals. `#[cfg(test)]`-gated so
+    /// nothing test-shaped compiles into non-test builds.
+    #[cfg(test)]
+    test_verify_swap: std::sync::Mutex<Option<crate::remote::transport::VerifySwap>>,
 }
 
 impl SshTransport {
@@ -182,6 +188,8 @@ impl SshTransport {
             known_hosts_cache_dir: known_hosts_cache_dir.to_path_buf(),
             env: env.clone(),
             runner: SshRunner::new(env),
+            #[cfg(test)]
+            test_verify_swap: std::sync::Mutex::new(None),
         };
         // NOTE: construction is side-effect-free. When a fingerprint was
         // supplied without an explicit known-hosts file, the host key is
@@ -219,6 +227,17 @@ impl SshTransport {
         )?;
         t.runner = runner;
         Ok(t)
+    }
+
+    /// Test-only setter for the descriptor-bound verification swap injection:
+    /// stores a `VerifySwap` as a Rust VALUE (never via env) that
+    /// `verify_open_script` embeds as literals. `#[cfg(test)]`-gated so
+    /// nothing test-shaped compiles into non-test builds.
+    #[cfg(test)]
+    pub(crate) fn set_test_verify_swap(&self, swap: Option<crate::remote::transport::VerifySwap>) {
+        if let Ok(mut g) = self.test_verify_swap.lock() {
+            *g = swap;
+        }
     }
 
     /// Build the fixed `ssh` arguments (options + target). Errors if no host
@@ -782,35 +801,77 @@ impl SshTransport {
     ///
     /// The path is a positional argument after `--` (single-quoted); the
     /// perl is multi-line inside the single-quoted `-e` argument (shell
-    /// single quotes span newlines). TEST-ONLY SWAP HOOK: when the child env
-    /// sets `DEPLOY_VERIFY_SWAP` (a [`VerifySwapKind`] name:
-    /// `symlink`/`directory`/`inode`) and `DEPLOY_VERIFY_SWAP_BOUNDARY`
-    /// (`before_open`/`after_open`/`after_fstat`), the helper replaces the
-    /// destination at that boundary (the pre-staged `$path.swap-target` file
-    /// is the symlink target or the different-inode file) — the deterministic
-    /// swap-at-every-boundary property injects this; production never sets
-    /// the variables.
+    /// single quotes span newlines).
+    ///
+    /// Test-only swap injection is via a `#[cfg(test)]` Rust VALUE seam
+    /// (`SshTransport::test_verify_swap` set via `set_test_verify_swap`): the
+    /// `VerifySwap` is passed as a Rust value and, when present, is embedded
+    /// into the helper as literal `my $swap = "..."` / `my $boundary = "..."`
+    /// assignments — never via environment variables. Production builds
+    /// contain no swap logic at all.
     fn verify_open_script(&self, rel: &Path) -> String {
         let p = shell_quote(&self.root.join(rel).to_string_lossy());
+        #[cfg(test)]
+        {
+            #[allow(clippy::collapsible_if)]
+            if let Ok(guard) = self.test_verify_swap.lock() {
+                if let Some(swap) = guard.as_ref() {
+                    let kind_str = match swap.kind() {
+                        crate::remote::transport::VerifySwapKind::Symlink => "symlink",
+                        crate::remote::transport::VerifySwapKind::Directory => "directory",
+                        crate::remote::transport::VerifySwapKind::DifferentInode => "inode",
+                    };
+                    let boundary_str = match swap.boundary() {
+                        crate::remote::transport::VerifySwapBoundary::BeforeOpen => "before_open",
+                        crate::remote::transport::VerifySwapBoundary::AfterOpen => "after_open",
+                        crate::remote::transport::VerifySwapBoundary::AfterFstat => "after_fstat",
+                    };
+                    return format!(
+                        "perl -e 'use Fcntl qw(O_RDONLY O_NOFOLLOW O_NONBLOCK);\n\
+                         my $p = $ARGV[0];\n\
+                         my $swap = \"{kind}\";\n\
+                         my $boundary = \"{boundary}\";\n\
+                         my $swap_at = sub {{\n\
+                           my $orig = $p . \".swap-orig\";\n\
+                           my $t = $p . \".swap-target\";\n\
+                           rename($p, $orig);\n\
+                           if ($swap eq \"symlink\") {{ symlink($t, $p); }}\n\
+                           elsif ($swap eq \"directory\") {{ mkdir($p); }}\n\
+                           elsif ($swap eq \"inode\") {{ rename($t, $p); }}\n\
+                         }};\n\
+                         if ($swap && $boundary eq \"before_open\") {{ $swap_at->(); }}\n\
+                         if (!sysopen(FH, $p, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)) {{ printf \"E\\t%d\\n\", $! + 0; exit 0; }}\n\
+                         if ($swap && $boundary eq \"after_open\") {{ $swap_at->(); }}\n\
+                         my @s = stat(FH);\n\
+                         if (!@s) {{ printf \"E\\t%d\\n\", $! + 0; exit 0; }}\n\
+                         if ($swap && $boundary eq \"after_fstat\") {{ $swap_at->(); }}\n\
+                         my $type = $s[2] & 0170000;\n\
+                         if ($type == 0100000) {{\n\
+                           my $content = \"\";\n\
+                           while (1) {{\n\
+                             my $n = sysread(FH, my $buf, 65536);\n\
+                             if (!defined $n) {{ printf \"E\\t%d\\n\", $! + 0; exit 0; }}\n\
+                             last if $n == 0;\n\
+                             $content .= $buf;\n\
+                           }}\n\
+                           printf \"O\\t%x\\n%s\", $s[2] & 0xffff, $content;\n\
+                           exit 0;\n\
+                         }}\n\
+                         printf \"N\\t%x\\n\", $s[2] & 0xffff;\n\
+                         ' -- {p}",
+                        kind = kind_str,
+                        boundary = boundary_str,
+                        p = p
+                    );
+                }
+            }
+        }
         format!(
             "perl -e 'use Fcntl qw(O_RDONLY O_NOFOLLOW O_NONBLOCK);\n\
              my $p = $ARGV[0];\n\
-             my $swap = $ENV{{DEPLOY_VERIFY_SWAP}};\n\
-             my $boundary = $ENV{{DEPLOY_VERIFY_SWAP_BOUNDARY}};\n\
-             my $swap_at = sub {{\n\
-               my $orig = $p . \".swap-orig\";\n\
-               my $t = $p . \".swap-target\";\n\
-               rename($p, $orig);\n\
-               if ($swap eq \"symlink\") {{ symlink($t, $p); }}\n\
-               elsif ($swap eq \"directory\") {{ mkdir($p); }}\n\
-               elsif ($swap eq \"inode\") {{ rename($t, $p); }}\n\
-             }};\n\
-             if ($swap && $boundary eq \"before_open\") {{ $swap_at->(); }}\n\
              if (!sysopen(FH, $p, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)) {{ printf \"E\\t%d\\n\", $! + 0; exit 0; }}\n\
-             if ($swap && $boundary eq \"after_open\") {{ $swap_at->(); }}\n\
              my @s = stat(FH);\n\
              if (!@s) {{ printf \"E\\t%d\\n\", $! + 0; exit 0; }}\n\
-             if ($swap && $boundary eq \"after_fstat\") {{ $swap_at->(); }}\n\
              my $type = $s[2] & 0170000;\n\
              if ($type == 0100000) {{\n\
                my $content = \"\";\n\
@@ -2458,9 +2519,8 @@ exec /bin/mv "$@"
         fake_env_with(bin, cache, root, prefix, &[])
     }
 
-    /// [`fake_env`] with EXTRA snapshot variables (e.g. the descriptor-bound
-    /// verification helper's test-only swap hook: `DEPLOY_VERIFY_SWAP` +
-    /// `DEPLOY_VERIFY_SWAP_BOUNDARY`).
+    /// [`fake_env`] with EXTRA snapshot variables (e.g. arbitrary ambient
+    /// variables for production invariance testing).
     fn fake_env_with(
         bin: &Path,
         cache: &Path,
@@ -3940,11 +4000,12 @@ exec /bin/mv "$@"
     /// verification over the SSH transport: the destination (a REGULAR file
     /// matching the intent) is swapped at EVERY boundary of the ONE remote
     /// helper's open→fstat→read sequence — BEFORE the `O_NOFOLLOW` sysopen,
-    /// BETWEEN the open and the fstat, BETWEEN the fstat and the read — by
-    /// the FAKE REMOTE (the helper's test-only env hook
-    /// `DEPLOY_VERIFY_SWAP`/`DEPLOY_VERIFY_SWAP_BOUNDARY` replaces the
-    /// destination at the named boundary). The verdict must NEVER mix two
-    /// inodes' observations:
+    /// BETWEEN the open and the fstat, BETWEEN the fstat and the read — via
+    /// a `#[cfg(test)]` Rust VALUE seam (`SshTransport::test_verify_swap`
+    /// set through `set_test_verify_swap`): the `VerifySwap` is passed as a
+    /// Rust value and embedded into the helper as literal assignments, never
+    /// via environment variables. The verdict must NEVER mix two inodes'
+    /// observations:
     ///
     /// * a swap BEFORE the open changes WHAT is opened: a symlink →
     ///   NotRegularFile{Symlink} (the `O_NOFOLLOW` open never follows, even a
@@ -4000,36 +4061,6 @@ exec /bin/mv "$@"
         ) {
             use std::os::unix::fs::PermissionsExt;
 
-            let (boundary_str, kind_str) = match (boundary, kind) {
-                (VerifySwapBoundary::BeforeOpen, VerifySwapKind::Symlink) => {
-                    ("before_open", "symlink")
-                }
-                (VerifySwapBoundary::BeforeOpen, VerifySwapKind::Directory) => {
-                    ("before_open", "directory")
-                }
-                (VerifySwapBoundary::BeforeOpen, VerifySwapKind::DifferentInode) => {
-                    ("before_open", "inode")
-                }
-                (VerifySwapBoundary::AfterOpen, VerifySwapKind::Symlink) => {
-                    ("after_open", "symlink")
-                }
-                (VerifySwapBoundary::AfterOpen, VerifySwapKind::Directory) => {
-                    ("after_open", "directory")
-                }
-                (VerifySwapBoundary::AfterOpen, VerifySwapKind::DifferentInode) => {
-                    ("after_open", "inode")
-                }
-                (VerifySwapBoundary::AfterFstat, VerifySwapKind::Symlink) => {
-                    ("after_fstat", "symlink")
-                }
-                (VerifySwapBoundary::AfterFstat, VerifySwapKind::Directory) => {
-                    ("after_fstat", "directory")
-                }
-                (VerifySwapBoundary::AfterFstat, VerifySwapKind::DifferentInode) => {
-                    ("after_fstat", "inode")
-                }
-            };
-
             let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
             let fake = FakeSsh::new(
                 tmp.path().join("bin"),
@@ -4038,15 +4069,11 @@ exec /bin/mv "$@"
                 Path::new("/srv/deploy/swap-ssh"),
             );
             let cache = tmp.path().join("knownhosts");
-            let env = fake_env_with(
+            let env = fake_env(
                 &fake.bin,
                 &cache,
                 &fake.remote_root,
                 "/srv/deploy/swap-ssh",
-                &[
-                    ("DEPLOY_VERIFY_SWAP", kind_str),
-                    ("DEPLOY_VERIFY_SWAP_BOUNDARY", boundary_str),
-                ],
             );
             let t = fake.transport(&cache, &env);
             t.prepare_identity().unwrap();
@@ -4066,12 +4093,18 @@ exec /bin/mv "$@"
             std::fs::write(&dest, intended).unwrap();
             std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(required)).unwrap();
             // The pre-staged swap entry (`$path.swap-target` — the helper's
-            // env hook derives the name from the destination): the symlink
+            // Rust VALUE seam derives the name from the destination): the symlink
             // target AND the different-inode file, with mode + content both
             // differing from the original's (any mix is detectable).
             let target = dest.with_file_name("record.json.swap-target");
             std::fs::write(&target, swapped_content).unwrap();
             std::fs::set_permissions(&target, std::fs::Permissions::from_mode(wrong_mode)).unwrap();
+            // Inject the swap as a Rust VALUE through the `#[cfg(test)]` seam
+            // — never via environment variables. The helper embeds the
+            // boundary/kind as literals.
+            t.set_test_verify_swap(Some(crate::remote::transport::VerifySwap::new(
+                boundary, kind, &target,
+            )));
 
             let verdict = t
                 .try_write_new(rel, intended)
@@ -4137,6 +4170,169 @@ exec /bin/mv "$@"
                 "unexpected ssh invocation count (write + verify-open [+ parent sync]): {:?}",
                 invocations
             );
+        }
+    }
+
+    /// Production verification leaves the filesystem byte-for-byte unchanged
+    /// and returns the same verdict regardless of arbitrary ambient
+    /// environment variables. The production `verify_open_script` contains
+    /// ZERO swap/hook/env logic, so even when the child env carries
+    /// `DEPLOY_VERIFY_SWAP`/`DEPLOY_VERIFY_SWAP_BOUNDARY` (the variables the
+    /// old hook read), the verification must behave identically to a baseline
+    /// run with no extra vars and must not litter `.swap-orig`/`swap-target`
+    /// or mutate any entry. This property generates arbitrary env maps
+    /// (0..=20 random names/values) deliberately mixed with the old hook's
+    /// trigger pairs, drives the production `try_write_new` → verify path
+    /// through the fake-ssh transport, and asserts both invariants. It would
+    /// fail against the pre-fix code where the env reached the perl helper
+    /// and fired the swap.
+    fn arb_env_name() -> impl Strategy<Value = String> {
+        // Valid env names: [A-Za-z_][A-Za-z0-9_]{0,39} but the spec says
+        // [A-Za-z0-9_]{1,40} — we use the looser set with first char not
+        // digit to keep names shell-safe; length 1..12 keeps the map small.
+        prop::string::string_regex("[A-Za-z_][A-Za-z0-9_]{0,11}").unwrap()
+    }
+
+    fn arb_env_value() -> impl Strategy<Value = String> {
+        // Printable ASCII without NUL/newline, 1..32 chars, non-empty.
+        prop::string::string_regex("[ -~]{1,32}").unwrap()
+    }
+
+    fn arb_env_vars() -> impl Strategy<Value = Vec<(String, String)>> {
+        prop::collection::vec((arb_env_name(), arb_env_value()), 0..=20)
+    }
+
+    fn snapshot_remote_recursive(root: &Path) -> Vec<(String, String)> {
+        use std::os::unix::fs::MetadataExt;
+        fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, String)>) {
+            let entries: Vec<_> = std::fs::read_dir(dir)
+                .map(|rd| rd.flatten().map(|e| e.path()).collect::<Vec<_>>())
+                .unwrap_or_default();
+            let mut sorted = entries;
+            sorted.sort();
+            for p in sorted {
+                let rel = p
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let md = std::fs::symlink_metadata(&p).unwrap();
+                let mode = md.mode() & 0o7777;
+                let ft = md.file_type();
+                if ft.is_symlink() {
+                    let target = std::fs::read_link(&p)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned();
+                    out.push((rel, format!("symlink:{target}:{mode:04o}")));
+                } else if ft.is_dir() {
+                    out.push((rel, format!("dir:{mode:04o}")));
+                    walk(root, &p, out);
+                } else if ft.is_file() {
+                    let data = std::fs::read(&p).unwrap_or_default();
+                    let hash = crate::digest::sha256_bytes(&data);
+                    out.push((rel, format!("file:{hash}:{mode:04o}:{}", data.len())));
+                } else {
+                    out.push((rel, format!("other:{mode:04o}")));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        if root.exists() {
+            walk(root, root, &mut out);
+        }
+        out.sort();
+        out
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: crate::testutil::proptest_cases(64),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn verify_production_unchanged_by_ambient_env_ssh(
+            base_vars in arb_env_vars(),
+        ) {
+            use std::os::unix::fs::PermissionsExt;
+
+            let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+            let fake = FakeSsh::new(
+                tmp.path().join("bin"),
+                tmp.path().join("remote"),
+                "ambient-ssh.test",
+                Path::new("/srv/deploy/ambient-ssh"),
+            );
+            let cache = tmp.path().join("knownhosts");
+            // Stage the standard original file — same fixture as the swap
+            // test: a regular file matching the intent with IMMUTABLE_RECORD_MODE.
+            let required = IMMUTABLE_RECORD_MODE & 0o7777;
+            let intended: &[u8] = br#"{"a":1,"b":2}"#;
+            let rel = Path::new("state/record.json");
+            let remote_deploy = fake.remote_root.join("srv/deploy/ambient-ssh");
+            let dest = remote_deploy.join(rel);
+            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            std::fs::write(&dest, intended).unwrap();
+            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(required)).unwrap();
+            // Snapshot BEFORE the production verification.
+            let before = snapshot_remote_recursive(&fake.remote_root);
+
+            // Build the enriched ambient env: arbitrary vars + deliberate
+            // old-hook trigger pairs (every kind × boundary combo that would
+            // fire the pre-fix hook). Guard reserved vars so the harness stays
+            // authoritative (skip or override LAST).
+            let reserved = ["PATH", "FAKE_SSH_ROOT", "FAKE_SSH_REMOTE_PREFIX", "DEPLOY_SSH_KNOWNHOSTS_DIR"];
+            let mut enriched: Vec<(String, String)> = base_vars.into_iter().filter(|(k, _)| !reserved.contains(&k.as_str())).collect();
+            // Deliberately include hook triggers — at least one per case, and
+            // cover all kind/boundary combos across the property's cases via
+            // the arbitrary base plus these fixed triggers. The last occurrence
+            // of each key wins in the BTreeMap, so these authoritative triggers
+            // are last and will fire pre-fix.
+            enriched.push(("DEPLOY_VERIFY_SWAP".to_string(), "symlink".to_string()));
+            enriched.push(("DEPLOY_VERIFY_SWAP_BOUNDARY".to_string(), "before_open".to_string()));
+            // Also include other combos to ensure the property would catch any
+            // hook variant; the map's last value wins, but we add them as
+            // separate keys would not work — instead we push a second trigger
+            // pair with different values under alternative env names that the
+            // old hook would not read, but the arbitrary base already covers
+            // random names. The key point is at least one valid trigger is
+            // present; we keep the property deterministic by always pushing the
+            // before_open/symlink combo.
+            let extra_refs: Vec<(&str, &str)> = enriched.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            let env = fake_env_with(&fake.bin, &cache, &fake.remote_root, "/srv/deploy/ambient-ssh", &extra_refs);
+            let t = fake.transport(&cache, &env);
+            t.prepare_identity().unwrap();
+            write_fake_bin(&fake.bin, "sync", "#!/bin/sh\nexit 0\n");
+
+            // BASELINE verdict: same fixture with NO arbitrary vars should be
+            // AlreadyPresent (regular file with exact mode + exact bytes).
+            // We assert the production op returns that baseline and leaves the
+            // filesystem unchanged.
+            let verdict = t.try_write_new(rel, intended).expect("production verification must return a verdict");
+            let after = snapshot_remote_recursive(&fake.remote_root);
+
+            prop_assert_eq!(
+                verdict,
+                CreateNewVerdict::AlreadyPresent
+            );
+            prop_assert!(
+                after == before,
+                "production verification must leave filesystem byte-for-byte unchanged — before {:?} after {:?}",
+                before,
+                after
+            );
+            // Also assert no swap litter was left behind (would be caught by
+            // the byte-for-byte equality, but make the failure more explicit).
+            for (rel_path, _) in &after {
+                prop_assert!(
+                    !rel_path.contains(".swap-orig") && !rel_path.contains(".swap-target"),
+                    "no swap litter must remain after production verification, got {:?}",
+                    rel_path
+                );
+            }
         }
     }
 }

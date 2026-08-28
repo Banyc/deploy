@@ -1027,6 +1027,14 @@ pub(crate) struct VerifySwap {
 
 #[cfg(test)]
 impl VerifySwap {
+    pub(crate) fn boundary(&self) -> VerifySwapBoundary {
+        self.boundary
+    }
+
+    pub(crate) fn kind(&self) -> VerifySwapKind {
+        self.kind
+    }
+
     pub(crate) fn new(
         boundary: VerifySwapBoundary,
         kind: VerifySwapKind,
