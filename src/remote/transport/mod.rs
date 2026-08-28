@@ -719,21 +719,35 @@ pub(crate) fn content_equivalent(a: &[u8], b: &[u8], equivalence: ContentEquival
 /// THE ONE CENTRALIZED verification of an EXISTING create-new destination —
 /// used by BOTH transports (the local [`durable_create_new`] verify-on-retry
 /// and the SSH transport's EEXIST verification), so the two can never drift.
-/// The checks run IN ORDER and the FIRST failure is the typed reason:
+/// The checks run IN ORDER and the FIRST APPLICABLE class WINS — this
+/// first-failure precedence IS the source of truth the create-new
+/// verification ORACLE mirrors (the cross-product proptest in the ssh test
+/// module computes its expected [`VerifiedExisting`] class from THIS order,
+/// never from ad-hoc per-cell logic):
 ///
-/// 1. **lstat** (`meta_opt` must be the symlink-safe `lstat` form — the
-///    local `symlink_metadata` / the ssh `metadata_opt` perl-lstat protocol —
-///    so a symlink is NEVER followed and mistaken for a regular file);
-/// 2. **regular-file type** (a directory/symlink/other is
-///    [`VerifiedExisting::NotRegularFile`]);
-/// 3. **read** the existing content (a read failure is
-///    [`VerifiedExisting::Unreadable`] — never a fabricated verdict);
-/// 4. **exact mode** (the required mode, masked to `0o7777`);
+/// 1. **lstat absence** — [`VerifiedExisting::NotFound`] when `meta_opt`
+///    reports the destination absent (`meta_opt` MUST be the symlink-safe
+///    `lstat` form — the local `symlink_metadata` / the ssh `metadata_opt`
+///    perl-lstat protocol — so a symlink is NEVER followed and mistaken for
+///    a regular file);
+/// 2. **regular-file type** — a directory/symlink/other is
+///    [`VerifiedExisting::NotRegularFile`]. The type check runs BEFORE
+///    readability, mode, and content: an unreadable or wrong-mode DIRECTORY
+///    is still `NotRegularFile`, never `Unreadable` or `ModeMismatch`;
+/// 3. **readability** — the content read happens BEFORE the mode check: a
+///    regular file whose content cannot be read is
+///    [`VerifiedExisting::Unreadable`] (never a fabricated verdict) even
+///    when its mode is wrong;
+/// 4. **exact mode** — a regular file whose mode (masked to `0o7777`) does
+///    not match the required mode is [`VerifiedExisting::ModeMismatch`],
+///    decided BEFORE the content comparison;
 /// 5. **the caller's content equivalence** ([`ContentEquivalence`]: exact
-///    bytes or semantic JSON equality, per the caller's request).
+///    bytes or semantic JSON equality, per the caller's request) — the LAST
+///    check: only a readable, mode-exact regular file is ever compared, and
+///    a failed comparison is [`VerifiedExisting::ContentMismatch`].
 ///
 /// `Ok` — and therefore [`CreateNewVerdict::AlreadyPresent`] via
-/// [`verified_to_verdict`] — is produced ONLY when every check held.
+/// [`verified_to_verdict`] — is produced ONLY when EVERY check held.
 pub(crate) fn verify_existing(
     meta_opt: impl FnOnce() -> Result<Option<RemoteMeta>>,
     read: impl FnOnce() -> Result<Vec<u8>>,
@@ -1591,7 +1605,14 @@ mod tests {
                 CreateNewScenario::PreExistingDifferent => {
                     // A concurrent winner with DIFFERENT content: a genuine
                     // conflict — the verdict, never a replace, and the
-                    // winner's bytes stay intact.
+                    // winner's bytes stay intact. The winner is pre-created
+                    // WITH THE INTENDED MODE: the verification's
+                    // first-failure precedence checks the mode BEFORE the
+                    // content (see [`verify_existing`] step 4 before step 5),
+                    // so a winner left at `std::fs::write`'s umask-default
+                    // mode would be reported as a MODE mismatch — this cell
+                    // tests a CONTENT-only mismatch, where content must be
+                    // the ONLY difference.
                     std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
                     let other: Vec<u8> = if content.is_empty() {
                         vec![0u8]
@@ -1600,6 +1621,11 @@ mod tests {
                     };
                     prop_assert_ne!(&other, &content, "the winner must differ from the intent");
                     std::fs::write(&dest, &other).unwrap();
+                    std::fs::set_permissions(
+                        &dest,
+                        std::fs::Permissions::from_mode(mode & 0o7777),
+                    )
+                    .unwrap();
                     let verdict = durable_create_new(
                         &root,
                         rel,

@@ -3181,21 +3181,34 @@ exec /bin/mv "$@"
     }
 
     // The cross-product create-new verification matrix — the central
-    // verification contract, property-tested over the FULL product:
-    // TRANSPORT (Local + Ssh-with-fake) × ENTRY TYPE (absent / regular /
-    // DIRECTORY / SYMLINK / other-fifo) × MODE (exact / wrong) × CONTENT
-    // (exact / semantically-equal / different) × the caller's CONTENT
-    // EQUIVALENCE (Exact / Semantic). `Created` ONLY for absent;
+    // verification contract, property-tested over the FULL product of FOUR
+    // INDEPENDENTLY generated mismatch dimensions — ENTRY TYPE (absent /
+    // regular / DIRECTORY / SYMLINK / other-fifo) × CONTENT (exact /
+    // semantically-equal / different) × READABILITY (readable / unreadable)
+    // × MODE (exact / wrong) — over TRANSPORT (Local + Ssh-with-fake) × the
+    // caller's CONTENT EQUIVALENCE (Exact / Semantic). The expected verdict
+    // is NEVER computed per cell: the ORACLE ([`oracle_expected`]) resolves
+    // EVERY generated combination through the DOCUMENTED first-failure
+    // precedence of [`verify_existing`] (lstat absence → regular-file type →
+    // readability → exact mode → content equivalence), and the fixture
+    // pre-creates each cell so the DOMINANT mismatch is the ONLY constructed
+    // difference: a CONTENT-only mismatch cell pre-creates WITH THE INTENDED
+    // MODE (content is the only difference); a MODE-only cell uses the
+    // intended content with a wrong mode; a TYPE cell uses whatever mode
+    // such an entry naturally has (its class is the type class per the
+    // precedence); a READABILITY cell is a regular file stripped of ALL
+    // permissions (the read — precedence step 3, before the mode check —
+    // fails even when its mode is wrong). `Created` ONLY for absent;
     // `AlreadyPresent` ONLY for a REGULAR FILE with the REQUIRED MODE and an
     // ACCEPTED content equivalence; every other combination is `Conflict`
-    // carrying the CORRECT typed reason — a directory → NotRegularFile, a
-    // SYMLINK → NotRegularFile and NEVER FOLLOWED (the symlink points at a
-    // matching regular file, so a following stat would wrongly accept it), a
-    // wrong mode → ModeMismatch, different content → ContentMismatch. The
-    // `Other` (fifo) kind is generated only for the LOCAL leg: the ssh
-    // perl-lstat's THREE-way classification (dir/symlink/file) cannot
-    // express a fifo — it reports as a file, and reading it with `cat`
-    // would block the transport.
+    // carrying the oracle's first applicable class — a directory →
+    // NotRegularFile, a SYMLINK → NotRegularFile and NEVER FOLLOWED (the
+    // symlink points at a matching regular file, so a following stat would
+    // wrongly accept it), an unreadable file → Unreadable, a wrong mode →
+    // ModeMismatch, different content → ContentMismatch. The `Other` (fifo)
+    // kind is generated only for the LOCAL leg: the ssh perl-lstat's
+    // THREE-way classification (dir/symlink/file) cannot express a fifo — it
+    // reports as a file, and reading it with `cat` would block the transport.
     #[derive(Clone, Copy, Debug, PartialEq)]
     enum XTransport {
         Local,
@@ -3224,6 +3237,20 @@ exec /bin/mv "$@"
         Different,
     }
 
+    /// The READABILITY dimension — generated independently of
+    /// type/content/mode: an UNREADABLE cell is a regular file stripped of
+    /// ALL permissions (chmod 0o000), so the verification's READ — precedence
+    /// step 3, before the mode check — fails with EACCES and the verdict is
+    /// [`VerifiedExisting::Unreadable`] even when the file's mode is wrong.
+    /// Only a regular file is ever constructed unreadable: a non-regular
+    /// entry's class is decided by the TYPE check (step 2, before any read),
+    /// and the oracle resolves such a combination to the type class.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum XReadability {
+        Readable,
+        Unreadable,
+    }
+
     fn x_entry_strategy(transport: XTransport) -> BoxedStrategy<XEntry> {
         let all = prop_oneof![
             Just(XEntry::Absent),
@@ -3247,6 +3274,97 @@ exec /bin/mv "$@"
         }
     }
 
+    /// Compare the implementation's verdict with the oracle's expected
+    /// verdict. [`VerifiedExisting::Unreadable`] is compared BY CLASS: its
+    /// message carries the errno text of the underlying read failure, which
+    /// differs between the LOCAL `std::fs::read` and the ssh `cat` — the
+    /// class is the contract, the message is not. Every other variant
+    /// (including the `ModeMismatch` actual/required fields) must match
+    /// EXACTLY.
+    fn verdicts_equivalent(a: &CreateNewVerdict, b: &CreateNewVerdict) -> bool {
+        match (a, b) {
+            (
+                CreateNewVerdict::Conflict(VerifiedExisting::Unreadable(_)),
+                CreateNewVerdict::Conflict(VerifiedExisting::Unreadable(_)),
+            ) => true,
+            _ => a == b,
+        }
+    }
+
+    /// Does the generated pre-existing CONTENT satisfy the caller's
+    /// EQUIVALENCE (precedence step 5)? Mirrors [`content_equivalent`]:
+    /// exact bytes always; a semantically-equal reordering only under the
+    /// Semantic relation.
+    fn content_accepted(content: XContent, equivalence: ContentEquivalence) -> bool {
+        match (content, equivalence) {
+            (XContent::Exact, _) => true,
+            (XContent::Semantic, ContentEquivalence::Semantic) => true,
+            (XContent::Semantic, ContentEquivalence::Exact) => false,
+            (XContent::Different, _) => false,
+        }
+    }
+
+    /// THE ORACLE — the expected [`CreateNewVerdict`] for a generated
+    /// (entry, mode, content, readability, equivalence) cell, resolved from
+    /// the DOCUMENTED first-failure precedence of [`verify_existing`]
+    /// (shared by `durable_create_new`'s verify-on-retry and the SSH EEXIST
+    /// verification): lstat absence → regular-file type → readability →
+    /// exact mode → content equivalence. The FIRST applicable class WINS — a
+    /// cell with several mismatches (an unreadable directory, an unreadable
+    /// wrong-mode file) is classified by the earliest failing check, exactly
+    /// like the implementation. The proptest asserts the implementation's
+    /// verdict equals THIS oracle for every generated combination — never an
+    /// ad-hoc per-cell expectation.
+    fn oracle_expected(
+        entry: XEntry,
+        mode: XMode,
+        content: XContent,
+        readability: XReadability,
+        equivalence: ContentEquivalence,
+        required_mode: u32,
+        wrong_mode: u32,
+    ) -> CreateNewVerdict {
+        match entry {
+            // 1. lstat absence — the only `Created` cell.
+            XEntry::Absent => CreateNewVerdict::Created,
+            // 2. regular-file type — BEFORE readability/mode/content: even an
+            //    unreadable or wrong-mode directory/symlink/other is the TYPE
+            //    class.
+            XEntry::Directory => CreateNewVerdict::Conflict(VerifiedExisting::NotRegularFile {
+                kind: NotRegularFileKind::Directory,
+            }),
+            XEntry::Symlink => CreateNewVerdict::Conflict(VerifiedExisting::NotRegularFile {
+                kind: NotRegularFileKind::Symlink,
+            }),
+            XEntry::Other => CreateNewVerdict::Conflict(VerifiedExisting::NotRegularFile {
+                kind: NotRegularFileKind::Other,
+            }),
+            XEntry::Regular => {
+                // 3. readability — the read precedes the mode check: an
+                //    unreadable regular file is Unreadable even with a wrong
+                //    mode.
+                if readability == XReadability::Unreadable {
+                    CreateNewVerdict::Conflict(VerifiedExisting::Unreadable(
+                        "the fixture stripped all permissions".to_string(),
+                    ))
+                // 4. exact mode — a mode mismatch is reported before the
+                //    content is even compared.
+                } else if mode == XMode::Wrong {
+                    CreateNewVerdict::Conflict(VerifiedExisting::ModeMismatch {
+                        actual: wrong_mode,
+                        required: required_mode,
+                    })
+                // 5. content equivalence — AlreadyPresent ONLY for regular +
+                //    exact mode + accepted content.
+                } else if content_accepted(content, equivalence) {
+                    CreateNewVerdict::AlreadyPresent
+                } else {
+                    CreateNewVerdict::Conflict(VerifiedExisting::ContentMismatch)
+                }
+            }
+        }
+    }
+
     proptest! {
         // Bounded cases (house style), fixed seed 0x5EED_5EED, no failure
         // persistence, and every case drives its OWN fixture (per-fixture
@@ -3255,13 +3373,13 @@ exec /bin/mv "$@"
         #![proptest_config(ProptestConfig {
             cases: crate::testutil::proptest_cases(64),
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
-            failure_persistence: None,
+            failure_persistence: crate::testutil::proptest_persistence(),
             ..ProptestConfig::default()
         })]
 
         #[test]
         fn try_write_new_verification_cross_product(
-            (transport, entry, mode, content, equivalence) in prop_oneof![
+            (transport, entry, mode, content, readability, equivalence) in prop_oneof![
                 Just(XTransport::Local),
                 Just(XTransport::Ssh),
             ]
@@ -3275,6 +3393,11 @@ exec /bin/mv "$@"
                         Just(XContent::Semantic),
                         Just(XContent::Different),
                     ],
+                    // The FOUR mismatch dimensions (content, type,
+                    // readability, mode) are generated INDEPENDENTLY — the
+                    // cross-product covers every combination, and the ORACLE
+                    // resolves the precedence whenever several apply.
+                    prop_oneof![Just(XReadability::Readable), Just(XReadability::Unreadable)],
                     prop_oneof![
                         Just(ContentEquivalence::Exact),
                         Just(ContentEquivalence::Semantic),
@@ -3331,7 +3454,18 @@ exec /bin/mv "$@"
                 }
             };
 
-            // Stage the EXISTING entry per (entry, mode, content). A symlink
+            // Stage the EXISTING entry per (entry, mode, content,
+            // readability). A CONTENT-only mismatch cell pre-creates the
+            // existing file WITH THE INTENDED MODE (mode == Exact →
+            // required_mode), so content is the ONLY difference and the
+            // verdict is the content class — never a spurious mode mismatch
+            // from a fixture that left the winner at `write`'s umask default.
+            // A MODE-only cell uses the intended content with a wrong mode. A
+            // TYPE cell uses whatever mode such an entry naturally has (its
+            // class is the type class per the precedence). An UNREADABLE cell
+            // strips ALL permissions from the regular file: the
+            // verification's read (precedence step 3, BEFORE the mode check)
+            // then fails → Unreadable regardless of the mode. A symlink
             // points AT a matching regular file (intent bytes, required mode)
             // — a FOLLOWING stat would accept it, the lstat must not (the
             // symlink-never-followed guarantee).
@@ -3351,6 +3485,10 @@ exec /bin/mv "$@"
                     std::fs::write(&dest, existing_bytes).unwrap();
                     std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(entry_mode))
                         .unwrap();
+                    if readability == XReadability::Unreadable {
+                        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o000))
+                            .unwrap();
+                    }
                 }
                 XEntry::Directory => std::fs::create_dir(&dest).unwrap(),
                 XEntry::Symlink => {
@@ -3382,48 +3520,27 @@ exec /bin/mv "$@"
                 .try_write_new_with(rel, intent, equivalence)
                 .expect("a create-new attempt must return a verdict, never hang");
 
-            // The CROSS-PRODUCT expectation: `Created` ONLY for absent;
-            // `AlreadyPresent` ONLY for a regular file with the required mode
-            // and an accepted content equivalence; every other combination is
-            // `Conflict` with the correct typed reason.
-            let expected = match entry {
-                XEntry::Absent => CreateNewVerdict::Created,
-                XEntry::Directory => CreateNewVerdict::Conflict(VerifiedExisting::NotRegularFile {
-                    kind: NotRegularFileKind::Directory,
-                }),
-                XEntry::Symlink => CreateNewVerdict::Conflict(VerifiedExisting::NotRegularFile {
-                    kind: NotRegularFileKind::Symlink,
-                }),
-                XEntry::Other => CreateNewVerdict::Conflict(VerifiedExisting::NotRegularFile {
-                    kind: NotRegularFileKind::Other,
-                }),
-                XEntry::Regular => match mode {
-                    XMode::Wrong => CreateNewVerdict::Conflict(VerifiedExisting::ModeMismatch {
-                        actual: wrong_mode,
-                        required: required_mode,
-                    }),
-                    XMode::Exact => match content {
-                        XContent::Exact => CreateNewVerdict::AlreadyPresent,
-                        XContent::Different => {
-                            CreateNewVerdict::Conflict(VerifiedExisting::ContentMismatch)
-                        }
-                        XContent::Semantic => match equivalence {
-                            ContentEquivalence::Semantic => CreateNewVerdict::AlreadyPresent,
-                            ContentEquivalence::Exact => {
-                                CreateNewVerdict::Conflict(VerifiedExisting::ContentMismatch)
-                            }
-                        },
-                    },
-                },
-            };
-            prop_assert_eq!(
-                verdict,
-                expected,
-                "cross-product mismatch: transport={:?} entry={:?} mode={:?} content={:?} equivalence={:?}",
+            // THE ORACLE comparison: the implementation's verdict must equal
+            // the FIRST APPLICABLE class from the DOCUMENTED first-failure
+            // precedence — computed by [`oracle_expected`], never by ad-hoc
+            // per-cell logic.
+            let expected = oracle_expected(
+                entry,
+                mode,
+                content,
+                readability,
+                equivalence,
+                required_mode,
+                wrong_mode,
+            );
+            prop_assert!(
+                verdicts_equivalent(&verdict, &expected),
+                "cross-product mismatch: transport={:?} entry={:?} mode={:?} content={:?} readability={:?} equivalence={:?}: implementation={verdict:?} oracle={expected:?}",
                 transport,
                 entry,
                 mode,
                 content,
+                readability,
                 equivalence
             );
         }
