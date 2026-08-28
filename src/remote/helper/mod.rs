@@ -502,7 +502,6 @@ impl<'a> RemoteHelper<'a> {
 /// it. The recovery path is the only removal besides the owner's own
 /// release. Callers that need the release outcome call [`HeldSlotLock::release`]
 /// explicitly.
-
 ///
 /// Contract: "only the outermost owner may release" — dropping a guard
 /// releases the remote lock ONLY when it is the outermost instance for that
@@ -518,7 +517,8 @@ impl<'a> RemoteHelper<'a> {
 /// `write_commit_marker`, `remove_current_if`, `publish_from_incoming`).
 /// The guard is OPAQUE — the held [`LockRecord`] is private and cannot be
 /// forged.
-pub struct HeldSlotLock<'a> {    helper: &'a RemoteHelper<'a>,
+pub struct HeldSlotLock<'a> {
+    helper: &'a RemoteHelper<'a>,
     /// The authoritative lock record (owner + unique acquisition id)
     /// this guard holds; release compares the on-disk lock against EXACTLY
     /// this record, so a stale release can never delete a successor's lock.

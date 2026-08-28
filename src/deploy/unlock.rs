@@ -14,7 +14,7 @@ use crate::config::ProjectConfig;
 use crate::deploy::lock::FileLock;
 use crate::deploy::push::RemoteFactory;
 use crate::error::{Error, Result};
-use crate::identity::{OperationId, SlotId};
+use crate::identity::{AcquisitionId, OperationId, SlotId};
 use crate::remote::helper::{RemoteHelper, read_lock_record};
 use crate::remote::layout;
 use crate::store::local::LocalStore;
@@ -37,8 +37,21 @@ pub(crate) fn run_unlock(
     factory: &RemoteFactory,
     target_name: &str,
     slot_id: &SlotId,
+    acquisition: Option<AcquisitionId>,
     yes: bool,
 ) -> Result<UnlockReport> {
+    // CLI binding rule: --yes requires --acquisition; --acquisition requires --yes.
+    if yes && acquisition.is_none() {
+        return Err(Error::preflight(format!(
+            "unlock --yes requires --acquisition: pass --acquisition <id> with --yes after confirming the holding controller died (re-inspect via `deploy unlock {} {}` to obtain the acquisition id)",
+            target_name, slot_id
+        )));
+    }
+    if !yes && acquisition.is_some() {
+        return Err(Error::preflight(
+            "--acquisition requires --yes: pass --yes with --acquisition <id> after confirming the holding controller died",
+        ));
+    }
     // 1. Resolve the slot: `config.target_slots` validates the target exists;
     // unknown target → not_found. If the slot is not a member → config error
     // naming slot, target, and member list.
@@ -82,14 +95,24 @@ pub(crate) fn run_unlock(
         }
         Some(record) => {
             if !yes {
-                // Without --yes: preflight refusal, lock untouched.
+                // Without --yes: preflight refusal, lock untouched. The remedy line
+                // must SHOW the literal `--acquisition <id>` to copy.
                 return Err(Error::preflight(format!(
-                    "slot '{}' mutation lock held by '{}' (acquisition {}) — pass --yes to recover (confirm the holding controller died) via `deploy unlock {} {} --yes`",
-                    slot_id, record.operation_id, record.acquisition_id, target_name, slot_id
+                    "slot '{}' mutation lock held by '{}' (acquisition {}) — pass --yes with --acquisition {} after confirming the holding controller died via `deploy unlock {} {} --acquisition {} --yes`",
+                    slot_id,
+                    record.operation_id,
+                    record.acquisition_id,
+                    record.acquisition_id,
+                    target_name,
+                    slot_id,
+                    record.acquisition_id
                 )));
             }
-            // With --yes: acquire authoritative local store lock, re-read,
-            // recover (fresh acquisition), release.
+            // With --yes: the supplied acquisition is the operator's inspected
+            // premise. Re-read under the authoritative local store lock and
+            // REFUSE if the on-disk acquisition differs — NEVER reinterpret a
+            // newer record as the confirmed premise.
+            let supplied = acquisition.expect("--yes requires --acquisition (validated above)");
             let op_id = OperationId::generate();
             let _local_guard =
                 FileLock::acquire(&store.base().join("operation.lock"), op_id.as_str())?;
@@ -110,6 +133,13 @@ pub(crate) fn run_unlock(
                 }
                 Some(o) => o,
             };
+
+            if observed.acquisition_id != supplied {
+                return Err(Error::preflight(format!(
+                    "recovery refused: the lock now carries acquisition {}, not the {} you inspected; re-inspect and re-confirm",
+                    observed.acquisition_id, supplied
+                )));
+            }
 
             // Explicit recovery: fresh acquisition id, then explicit release leaving slot free.
             let successor = helper.recover_lock(&observed, op_id.as_str())?;
@@ -242,6 +272,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &factory,
             "production",
             &SlotId::parse("p1").unwrap(),
+            None,
             false,
         )
         .unwrap();
@@ -281,6 +312,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &factory,
             "production",
             &SlotId::parse("p1").unwrap(),
+            None,
             false,
         )
         .expect_err("held without --yes must refuse");
@@ -292,6 +324,21 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "must name acquisition id: {msg}"
         );
         assert!(msg.contains("--yes"), "must name remedy: {msg}");
+        assert!(
+            msg.contains("--acquisition"),
+            "remedy must show --acquisition flag: {msg}"
+        );
+        // The exact acquisition id must appear as a literal to copy.
+        let rec: crate::remote::helper::LockRecord = serde_json::from_slice(&before).unwrap();
+        assert!(
+            msg.contains(rec.acquisition_id.as_str()),
+            "remedy must show literal acquisition id {}: {msg}",
+            rec.acquisition_id
+        );
+        assert!(
+            msg.contains(&format!("--acquisition {}", rec.acquisition_id)),
+            "remedy must show `--acquisition <id>`: {msg}"
+        );
 
         let after = remote.read(&layout::operation_lock()).unwrap();
         assert_eq!(before, after, "lock file must be byte-identical");
@@ -307,7 +354,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // Plant hostile lock.
         let remote = LocalTransport::new(&fixture_env(), slot_dir.clone()).unwrap();
         let helper = RemoteHelper::new(&remote);
-        helper.acquire_lock("op-dead", false).unwrap();
+        let rec = helper.acquire_lock("op-dead", false).unwrap();
 
         let factory = slot_factory(slot_dir.clone());
         let report = run_unlock(
@@ -316,6 +363,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &factory,
             "production",
             &SlotId::parse("p1").unwrap(),
+            Some(rec.acquisition_id.clone()),
             true,
         )
         .unwrap();
@@ -366,6 +414,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &factory,
             "production",
             &SlotId::parse("not-a-member").unwrap(),
+            None,
             false,
         )
         .expect_err("non-member slot must be config error");
@@ -389,9 +438,187 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &factory,
             "unknown-target",
             &SlotId::parse("p1").unwrap(),
+            None,
             false,
         )
         .expect_err("unknown target must be not_found");
         assert!(err.to_string().contains("unknown-target"));
+    }
+
+    #[test]
+    fn unlock_yes_without_acquisition_refuses_and_leaves_byte_identical() {
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let slot_dir = dir.path().join("remote-p1");
+        let (config, _cfg_path) = test_config(&dir, slot_dir.clone());
+        let store = crate::store::local::LocalStore::with_base(dir.path().join("store")).unwrap();
+        let remote = LocalTransport::new(&fixture_env(), slot_dir.clone()).unwrap();
+        let helper = RemoteHelper::new(&remote);
+        helper.acquire_lock("op-dead", false).unwrap();
+        let before = remote.read(&layout::operation_lock()).unwrap();
+        let factory = slot_factory(slot_dir.clone());
+        let err = run_unlock(
+            &store,
+            &config,
+            &factory,
+            "production",
+            &SlotId::parse("p1").unwrap(),
+            None,
+            true,
+        )
+        .expect_err("--yes without --acquisition must refuse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--acquisition"),
+            "must name required flag: {msg}"
+        );
+        let after = remote.read(&layout::operation_lock()).unwrap();
+        assert_eq!(before, after, "lock must be byte-identical after refusal");
+    }
+
+    #[test]
+    fn unlock_acquisition_without_yes_refuses() {
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let slot_dir = dir.path().join("remote-p1");
+        let (config, _cfg_path) = test_config(&dir, slot_dir.clone());
+        let store = crate::store::local::LocalStore::with_base(dir.path().join("store")).unwrap();
+        let remote = LocalTransport::new(&fixture_env(), slot_dir.clone()).unwrap();
+        let helper = RemoteHelper::new(&remote);
+        let rec = helper.acquire_lock("op-dead", false).unwrap();
+        let before = remote.read(&layout::operation_lock()).unwrap();
+        let factory = slot_factory(slot_dir.clone());
+        let err = run_unlock(
+            &store,
+            &config,
+            &factory,
+            "production",
+            &SlotId::parse("p1").unwrap(),
+            Some(rec.acquisition_id.clone()),
+            false,
+        )
+        .expect_err("--acquisition without --yes must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("--acquisition"), "must name flag: {msg}");
+        let after = remote.read(&layout::operation_lock()).unwrap();
+        assert_eq!(before, after, "lock must be byte-identical");
+    }
+
+    #[test]
+    fn unlock_mismatch_refuses_and_leaves_newer_byte_identical() {
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let slot_dir = dir.path().join("remote-p1");
+        let (config, _cfg_path) = test_config(&dir, slot_dir.clone());
+        let store = crate::store::local::LocalStore::with_base(dir.path().join("store")).unwrap();
+        let remote = LocalTransport::new(&fixture_env(), slot_dir.clone()).unwrap();
+        let helper = RemoteHelper::new(&remote);
+        // Inspect-A: plant A and record its acquisition.
+        let rec_a = helper.acquire_lock("op-A", false).unwrap();
+        let acq_a = rec_a.acquisition_id.clone();
+        // Release A -> acquire B (newer record installed after inspection).
+        helper.release_lock(&rec_a).unwrap();
+        let rec_b = helper.acquire_lock("op-B", false).unwrap();
+        assert_ne!(
+            rec_b.acquisition_id, acq_a,
+            "B must carry fresh acquisition"
+        );
+        let before_b = remote.read(&layout::operation_lock()).unwrap();
+        let factory = slot_factory(slot_dir.clone());
+        // Confirm with stale A — must refuse.
+        let err = run_unlock(
+            &store,
+            &config,
+            &factory,
+            "production",
+            &SlotId::parse("p1").unwrap(),
+            Some(acq_a.clone()),
+            true,
+        )
+        .expect_err("mismatch must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(rec_b.acquisition_id.as_str()),
+            "must name on-disk acquisition {}: {msg}",
+            rec_b.acquisition_id
+        );
+        assert!(
+            msg.contains(acq_a.as_str()),
+            "must name supplied acquisition {}: {msg}",
+            acq_a
+        );
+        assert!(msg.contains("re-inspect"), "must ask to re-inspect: {msg}");
+        let after = remote.read(&layout::operation_lock()).unwrap();
+        assert_eq!(before_b, after, "newer record must remain byte-identical");
+        // Matching acquisition succeeds.
+        let report = run_unlock(
+            &store,
+            &config,
+            &factory,
+            "production",
+            &SlotId::parse("p1").unwrap(),
+            Some(rec_b.acquisition_id.clone()),
+            true,
+        )
+        .unwrap();
+        assert!(
+            report.message.contains("recovered"),
+            "report: {}",
+            report.message
+        );
+        assert!(
+            remote
+                .metadata_opt(&layout::operation_lock())
+                .unwrap()
+                .is_none(),
+            "slot free after matching recovery"
+        );
+    }
+
+    // Proptest: inspect-A → release A → acquire B → confirm A (--acquisition <A> --yes)
+    // must refuse and leave B byte-identical. Fixed seed, proptest_cases(64),
+    // failure_persistence: None per house style.
+    use proptest::prelude::*;
+    use proptest::test_runner::RngSeed;
+
+    proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: crate::testutil::proptest_cases(64),
+            max_shrink_iters: 10000,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..proptest::test_runner::Config::default()
+        })]
+        #[test]
+        fn unlock_proptest_stale_acquisition_refused(
+            tag_a in prop::sample::select(vec!["proptest-A1", "proptest-A2", "proptest-A3"]),
+            tag_b in prop::sample::select(vec!["proptest-B1", "proptest-B2", "proptest-B3"]),
+        ) {
+            let dir = fixture_tmpdir(&fixture_env()).unwrap();
+            let slot_dir = dir.path().join("remote-p1");
+            let (config, _cfg_path) = test_config(&dir, slot_dir.clone());
+            let store = crate::store::local::LocalStore::with_base(dir.path().join("store")).unwrap();
+            let remote = LocalTransport::new(&fixture_env(), slot_dir.clone()).unwrap();
+            let helper = RemoteHelper::new(&remote);
+            let rec_a = helper.acquire_lock(&format!("op-{tag_a}"), false).unwrap();
+            let acq_a = rec_a.acquisition_id.clone();
+            helper.release_lock(&rec_a).unwrap();
+            let rec_b = helper.acquire_lock(&format!("op-{tag_b}"), false).unwrap();
+            prop_assert_ne!(rec_b.acquisition_id.clone(), acq_a.clone());
+            let before_b = remote.read(&layout::operation_lock()).unwrap();
+            let factory = slot_factory(slot_dir.clone());
+            let acq_b = rec_b.acquisition_id.clone();
+            let err = run_unlock(
+                &store,
+                &config,
+                &factory,
+                "production",
+                &SlotId::parse("p1").unwrap(),
+                Some(acq_a.clone()),
+                true,
+            ).expect_err("stale acquisition must be refused");
+            let msg = err.to_string();
+            prop_assert!(msg.contains(acq_b.as_str()), "must name on-disk: {msg}");
+            prop_assert!(msg.contains(acq_a.as_str()), "must name supplied: {msg}");
+            let after = remote.read(&layout::operation_lock()).unwrap();
+            prop_assert_eq!(before_b, after, "B must remain byte-identical");
+        }
     }
 }

@@ -71,7 +71,7 @@ pub(crate) fn compensate_server_locked(
             // it and we must not clobber their state.
             if helper
                 .swap_current(
-                    &held,
+                    held,
                     &crate::remote::helper::ExpectedCurrent::Generation(advanced_gen.clone()),
                     prior.as_str(),
                     op_id.as_str(),
@@ -105,7 +105,7 @@ pub(crate) fn compensate_server_locked(
             // generation we advanced (compare-and-swap style).
             Ok(helper
                 .remove_current_if(
-                    &held,
+                    held,
                     &crate::remote::helper::ExpectedCurrent::Generation(advanced_gen.clone()),
                 )
                 .unwrap_or(false))

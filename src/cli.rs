@@ -10,7 +10,7 @@ use crate::config::ProjectConfig;
 use crate::deploy::{PushOptions, PushReport, push};
 use crate::env::SysEnv;
 use crate::error::{Error, Result};
-use crate::identity::{DeploymentId, ReleaseId, SlotId, valid_hex_digest};
+use crate::identity::{AcquisitionId, DeploymentId, ReleaseId, SlotId, valid_hex_digest};
 use crate::init::{InitOptions, init_project};
 use crate::ledger::{ObservedAssignment, ObservedTarget};
 // The `deploy log` RENDERING lives in [`crate::ledger::log`]; cli.rs stays the
@@ -311,18 +311,25 @@ recovered and released; the slot ends free. The operation is idempotent\n\
 (a free slot stays free) and a stale observed record is refused\n\
 (the lock changed; re-read and re-confirm).",
         after_help = "Examples:\n\
-  deploy unlock production p1                 # inspect: free or held + remedy\n\
-  deploy unlock production p1 --yes           # recover (fresh acquisition) and release — slot free\n\
-  deploy push production                      # now succeeds (lock was freed)"
+  deploy unlock production p1                                      # inspect: free or held + remedy\n\
+  deploy unlock production p1 --acquisition acq-0192a3b4-c5d6-7e7f-8a9b-0c1d2e3f4a5b --yes  # recover the inspected acquisition and release — slot free\n\
+  deploy push production                                           # now succeeds (lock was freed)"
     )]
     Unlock {
         /// The target whose member slot's mutation lock to inspect/recover.
         target: String,
         /// The member slot (one of the target's slots) whose server mutation lock is stuck.
         slot: SlotId,
+        /// The acquisition id you inspected (the exact `acquisition <id>` shown by the
+        /// inspect preview). Required with --yes: recovery is bound to the
+        /// acquisition you confirmed dead.
+        #[arg(long)]
+        acquisition: Option<AcquisitionId>,
         /// Recover the lock: confirm the holding operation died and replace it with a
         /// successor record (fresh acquisition id), then release — leaving the slot free. Required
-        /// for the real operation; refused without it.
+        /// for the real operation; refused without it. When --yes is present,
+        /// --acquisition is required and must match the current on-disk
+        /// acquisition id or the recovery is refused.
         #[arg(long)]
         yes: bool,
     },
@@ -501,9 +508,32 @@ where
                 println!("{line}");
             }
         }
-        Command::Unlock { target, slot, yes } => {
-            let report =
-                crate::deploy::unlock::run_unlock(&store, &config, &factory, &target, &slot, yes)?;
+        Command::Unlock {
+            target,
+            slot,
+            acquisition,
+            yes,
+        } => {
+            if yes && acquisition.is_none() {
+                return Err(Error::preflight(format!(
+                    "unlock --yes requires --acquisition: pass --acquisition <id> with --yes after confirming the holding controller died (re-inspect via `deploy unlock {} {}` to obtain the acquisition id)",
+                    target, slot
+                )));
+            }
+            if !yes && acquisition.is_some() {
+                return Err(Error::preflight(
+                    "--acquisition requires --yes: pass --yes with --acquisition <id> after confirming the holding controller died",
+                ));
+            }
+            let report = crate::deploy::unlock::run_unlock(
+                &store,
+                &config,
+                &factory,
+                &target,
+                &slot,
+                acquisition,
+                yes,
+            )?;
             for line in crate::deploy::unlock::render_unlock_report(&report) {
                 println!("{line}");
             }
@@ -1804,8 +1834,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let remote =
             LocalTransport::new(&crate::testutil::fixture_env(), slot_deploy_dir.clone()).unwrap();
         let helper = RemoteHelper::new(&remote);
-        helper.acquire_lock("op-dead", false).unwrap();
-        // No --yes: refusal naming holder+acquisition+--yes, lock byte-identical.
+        let rec = helper.acquire_lock("op-dead", false).unwrap();
+        // No --yes: refusal naming holder+acquisition+--yes+--acquisition, lock byte-identical.
         let before = remote.read(&layout::operation_lock()).unwrap();
         let err = run_with(
             [
@@ -1826,10 +1856,23 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "must name acquisition id: {msg}"
         );
         assert!(msg.contains("--yes"), "must name remedy: {msg}");
+        assert!(
+            msg.contains("--acquisition"),
+            "must name --acquisition: {msg}"
+        );
+        assert!(
+            msg.contains(rec.acquisition_id.as_str()),
+            "must show literal acquisition {}: {msg}",
+            rec.acquisition_id
+        );
+        assert!(
+            msg.contains(&format!("--acquisition {}", rec.acquisition_id)),
+            "remedy must show --acquisition <id>: {msg}"
+        );
         let after = remote.read(&layout::operation_lock()).unwrap();
         assert_eq!(before, after, "lock must be byte-identical after refusal");
-        // With --yes: prints recovered line and lock file gone.
-        run_with(
+        // --yes without --acquisition: refused up front, lock untouched.
+        let err2 = run_with(
             [
                 "deploy",
                 "--config",
@@ -1841,7 +1884,33 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             ],
             &env,
         )
-        .expect("unlock with --yes must succeed");
+        .expect_err("--yes without --acquisition must refuse");
+        assert!(
+            err2.to_string().contains("--acquisition"),
+            "must name required flag: {}",
+            err2
+        );
+        let after2 = remote.read(&layout::operation_lock()).unwrap();
+        assert_eq!(
+            before, after2,
+            "lock must stay byte-identical after --yes without acquisition"
+        );
+        // With matching --acquisition + --yes: recovered and released.
+        run_with(
+            [
+                "deploy",
+                "--config",
+                cfg_path.to_str().unwrap(),
+                "unlock",
+                "production",
+                "p1",
+                "--acquisition",
+                rec.acquisition_id.as_str(),
+                "--yes",
+            ],
+            &env,
+        )
+        .expect("unlock with matching --acquisition --yes must succeed");
         assert!(
             remote
                 .metadata_opt(&layout::operation_lock())
@@ -1857,7 +1926,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let remote2 =
             LocalTransport::new(&crate::testutil::fixture_env(), slot_deploy_dir.clone()).unwrap();
         let helper2 = RemoteHelper::new(&remote2);
-        helper2.acquire_lock("op-dead2", false).unwrap();
+        let rec2 = helper2.acquire_lock("op-dead2", false).unwrap();
         let factory =
             move |s: &crate::config::ServerDef,
                   slot: &crate::config::SlotConfig|
@@ -1870,6 +1939,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &factory,
             "production",
             &crate::identity::SlotId::parse("p1").unwrap(),
+            Some(rec2.acquisition_id.clone()),
             true,
         )
         .unwrap();
