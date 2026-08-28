@@ -84,8 +84,9 @@ pub(crate) fn process_server(
     config: &ProjectConfig,
 ) -> Result<ServerProc> {
     // Acquire the slot's mutation lock via an RAII guard so every return path
-    // (including errors) releases it.
-    let _guard = match helper.acquire_lock_guard(op_id.as_str()) {
+    // (including errors) releases it. Held in a named binding so in-process
+    // compensation can borrow it without re-acquiring.
+    let held = match helper.acquire_lock_guard(op_id.as_str()) {
         Ok(g) => g,
         Err(e) => {
             return Ok(ServerProc {
@@ -269,13 +270,15 @@ pub(crate) fn process_server(
         .join("root");
 
     // Activation adapter. On failure, compensate (current was advanced).
+    // Compensation borrows the held lock — no second acquisition in-process.
     if let Err(e) = run_activation(
         remote,
         &generation_root,
         &behavior.activation,
         template_vars,
     ) {
-        let comp = compensate_server(
+        let comp = compensate_server_locked(
+            &held,
             store,
             remote,
             helper,
@@ -307,9 +310,10 @@ pub(crate) fn process_server(
         });
     }
 
-    // Verification adapter. On failure, compensate.
+    // Verification adapter. On failure, compensate (borrow held lock).
     if let Err(e) = run_verification(remote, &behavior.verification, template_vars) {
-        let comp = compensate_server(
+        let comp = compensate_server_locked(
+            &held,
             store,
             remote,
             helper,

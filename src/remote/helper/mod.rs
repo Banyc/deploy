@@ -111,6 +111,21 @@ use crate::identity::{BehaviorContract, GenerationId, ReleaseId, ReleaseRecord};
 use crate::remote::layout;
 use crate::remote::transport::{CreateNewVerdict, Remote, RemoveIfVerdict, VerifiedExisting};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
+static HELD_LOCK_COUNTS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+fn held_lock_counts() -> &'static Mutex<HashMap<String, usize>> {
+    HELD_LOCK_COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+fn lock_key(helper: &RemoteHelper<'_>) -> String {
+    helper
+        .remote
+        .root()
+        .join(layout::operation_lock())
+        .to_string_lossy()
+        .to_string()
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct RemoteStatus {
@@ -423,15 +438,21 @@ impl<'a> RemoteHelper<'a> {
     /// Acquire the server mutation lock and return a guard that releases it
     /// on drop, so every return path (including early errors) releases the
     /// lock. Returns an error only if the lock is held by a different
-    /// operation. An explicit [`LockGuard::release`] surfaces the release
+    /// operation. An explicit [`HeldSlotLock::release`] surfaces the release
     /// outcome; the drop path is best-effort — with no lease, a failed
     /// drop-time release leaves the lock HELD until explicit recovery (see
-    /// [`LockGuard`]).
-    pub fn acquire_lock_guard(&self, op_id: &str) -> Result<LockGuard<'_>> {
+    /// [`HeldSlotLock`]).
+    pub fn acquire_lock_guard(&self, op_id: &str) -> Result<HeldSlotLock<'_>> {
         let record = self.acquire_lock(op_id, false)?;
-        Ok(LockGuard {
+        let key = lock_key(self);
+        {
+            let mut counts = held_lock_counts().lock().unwrap();
+            *counts.entry(key.clone()).or_insert(0) += 1;
+        }
+        Ok(HeldSlotLock {
             helper: self,
             record,
+            key,
             active: true,
         })
     }
@@ -457,51 +478,99 @@ impl<'a> RemoteHelper<'a> {
 
 /// RAII guard for the server mutation lock: releases it on drop (every
 /// return path, including early errors). The release is a compare-and-delete
-/// against the record acquired ([`LockGuard::release`] surfaces the outcome
+/// against the record acquired ([`HeldSlotLock::release`] surfaces the outcome
 /// as a `Result`); the drop path cannot return errors, so a drop-time release
 /// failure is never destructive but — with NO LEASE in the protocol — it is
 /// also no longer self-healing: a failed drop-time release leaves the lock
 /// HELD until an EXPLICIT RECOVERY ([`RemoteHelper::recover_lock`]) removes
 /// it. The recovery path is the only removal besides the owner's own
-/// release. Callers that need the release outcome call [`LockGuard::release`]
+/// release. Callers that need the release outcome call [`HeldSlotLock::release`]
 /// explicitly.
-pub struct LockGuard<'a> {
+///
+/// Contract: "only the outermost owner may release" — dropping a guard
+/// releases the remote lock ONLY when it is the outermost instance for that
+/// slot; a nested/aliased instance's drop NEVER releases. Nesting is made
+/// impossible by construction for production paths (the locked body takes
+/// `&HeldSlotLock`, a borrow — there is no second guard to drop), while the
+/// guard's Drop itself defensively enforces outermost-only release via a
+/// process-wide refcount keyed by the lock file path.
+pub struct HeldSlotLock<'a> {
     helper: &'a RemoteHelper<'a>,
     /// The authoritative lock record (owner + persisted monotonic epoch)
     /// this guard holds; release compares the on-disk lock against EXACTLY
     /// this record, so a stale release can never delete a successor's lock.
     record: LockRecord,
+    key: String,
     active: bool,
 }
 
-impl<'a> LockGuard<'a> {
+impl<'a> HeldSlotLock<'a> {
     /// Release the lock now, surfacing the outcome: `Ok` when the lock was
     /// removed (or was already gone — idempotent), `Err` when the release
     /// FAILED — a stale release whose record no longer matches the on-disk
     /// lock (a successor holds it; it is NEVER deleted) or a transport
     /// fault. Idempotent: releasing twice is a no-op success.
+    /// Only the outermost guard actually performs the remote compare-and-delete;
+    /// nested guards decrement the refcount and return `Ok(())` without touching
+    /// the remote lock.
     pub fn release(mut self) -> Result<()> {
         if !self.active {
             return Ok(());
         }
         self.active = false;
-        self.helper.release_lock(&self.record)
-    }
-}
-
-impl<'a> Drop for LockGuard<'a> {
-    fn drop(&mut self) {
-        if self.active {
-            // Best-effort compare-and-delete; a failure is NOT propagated
-            // (drop cannot return errors) and is never destructive — but with
-            // no lease the protocol does not self-heal: a failed drop-time
-            // release leaves the lock HELD until an EXPLICIT recovery
-            // ([`RemoteHelper::recover_lock`]) removes it. Callers that need
-            // the release outcome use the explicit [`LockGuard::release`].
-            let _ = self.helper.release_lock(&self.record);
+        let outermost = {
+            let mut counts = held_lock_counts().lock().unwrap();
+            if let Some(cnt) = counts.get_mut(&self.key) {
+                *cnt = cnt.saturating_sub(1);
+                let is_last = *cnt == 0;
+                if is_last {
+                    counts.remove(&self.key);
+                }
+                is_last
+            } else {
+                true
+            }
+        };
+        if outermost {
+            self.helper.release_lock(&self.record)
+        } else {
+            Ok(())
         }
     }
 }
+
+impl<'a> Drop for HeldSlotLock<'a> {
+    fn drop(&mut self) {
+        if self.active {
+            let outermost = {
+                let mut counts = held_lock_counts().lock().unwrap();
+                if let Some(cnt) = counts.get_mut(&self.key) {
+                    *cnt = cnt.saturating_sub(1);
+                    let is_last = *cnt == 0;
+                    if is_last {
+                        counts.remove(&self.key);
+                    }
+                    is_last
+                } else {
+                    true
+                }
+            };
+            if outermost {
+                // Best-effort compare-and-delete; a failure is NOT propagated
+                // (drop cannot return errors) and is never destructive — but with
+                // no lease the protocol does not self-heal: a failed drop-time
+                // release leaves the lock HELD until an EXPLICIT recovery
+                // ([`RemoteHelper::recover_lock`]) removes it. Callers that need
+                // the release outcome use the explicit [`HeldSlotLock::release`].
+                let _ = self.helper.release_lock(&self.record);
+            }
+        }
+    }
+}
+
+/// Backwards-compat alias: existing call sites using `LockGuard` keep compiling.
+/// New code should use `HeldSlotLock`.
+pub type LockGuard<'a> = HeldSlotLock<'a>;
 
 pub fn now_rfc3339() -> String {
     jiff::Timestamp::now().to_string()
@@ -923,6 +992,179 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod nested_guard_proptest {
+    use super::*;
+    use crate::remote::transport::LocalTransport;
+    use proptest::prelude::*;
+    use proptest::test_runner::RngSeed;
+
+    fn run_nested_case(depth: usize, outcome: u8) -> std::result::Result<(), TestCaseError> {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let remote =
+            LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
+                .unwrap();
+        let helper_a = RemoteHelper::new(&remote);
+        let helper_b = RemoteHelper::new(&remote);
+        let op_a = "op-A";
+        let op_b = "op-B";
+        // Outer acquires — the process_server guard.
+        let outer = helper_a
+            .acquire_lock_guard(op_a)
+            .expect("outer acquire must succeed");
+        let initial_bytes = remote.read(&layout::operation_lock()).unwrap();
+        let initial_rec: LockRecord = serde_json::from_slice(&initial_bytes).unwrap();
+        prop_assert_eq!(initial_rec.owner, op_a);
+        // Inner "compensation" scopes — reentrant acquire with SAME op_id
+        // must converge (identical bytes) and create nested guards. Depth 1..=3.
+        let mut inners: Vec<HeldSlotLock<'_>> = Vec::new();
+        for _ in 0..depth {
+            let g = helper_a
+                .acquire_lock_guard(op_a)
+                .expect("inner reentrant acquire must converge");
+            let bytes = remote.read(&layout::operation_lock()).unwrap();
+            prop_assert_eq!(
+                bytes,
+                initial_bytes.clone(),
+                "reentrant acquire must leave on-disk record byte-identical"
+            );
+            inners.push(g);
+        }
+        // Simulate compensation outcome variation — success / failure / faulted
+        // do not change lock behavior, but exercise the generated variations:
+        // we optionally exercise explicit release vs drop for faulted.
+        if outcome == 2 {
+            // faulted: explicitly release the innermost guard via `release()`
+            // — must still NOT free the lock while outer lives.
+            if let Some(g) = inners.pop() {
+                let r = g.release();
+                prop_assert!(r.is_ok(), "nested explicit release must not error");
+                let bytes = remote.read(&layout::operation_lock()).unwrap();
+                prop_assert_eq!(
+                    bytes,
+                    initial_bytes.clone(),
+                    "nested explicit release must not delete outer lock"
+                );
+                // B must still be blocked in the faulted tail window.
+                let b_attempt = helper_b.acquire_lock(op_b, false);
+                prop_assert!(
+                    b_attempt.is_err(),
+                    "B must remain blocked after faulted inner release while outer lives"
+                );
+            }
+        }
+        // Drop remaining inners one by one, checking after each that B stays blocked.
+        while let Some(g) = inners.pop() {
+            drop(g);
+            let bytes = remote.read(&layout::operation_lock()).unwrap();
+            prop_assert_eq!(
+                bytes,
+                initial_bytes.clone(),
+                "inner drop must not delete outer lock"
+            );
+            let b_attempt = helper_b.acquire_lock(op_b, false);
+            prop_assert!(
+                b_attempt.is_err(),
+                "B must remain blocked after inner drop while outer lives"
+            );
+        }
+        // Tail window: inner scope ended, outer still alive — the
+        // process_server-tail window after compensation returns.
+        {
+            let bytes = remote.read(&layout::operation_lock()).unwrap();
+            prop_assert_eq!(
+                bytes,
+                initial_bytes.clone(),
+                "tail window must keep A's record byte-for-byte"
+            );
+            let b_attempt = helper_b.acquire_lock(op_b, false);
+            prop_assert!(
+                b_attempt.is_err(),
+                "B must remain blocked in process_server tail window while outer lives"
+            );
+            prop_assert!(
+                remote
+                    .metadata_opt(&layout::operation_lock())
+                    .unwrap()
+                    .is_some(),
+                "lock file must still exist in tail window"
+            );
+        }
+        // Only after outer drops may B succeed.
+        drop(outer);
+        prop_assert!(
+            remote
+                .metadata_opt(&layout::operation_lock())
+                .unwrap()
+                .is_none(),
+            "lock file must be removed after outer drop"
+        );
+        let b_ok = helper_b.acquire_lock(op_b, false);
+        prop_assert!(b_ok.is_ok(), "B may succeed only after outer guard drops");
+        // Clean up B for next case isolation.
+        if let Ok(rec) = b_ok {
+            let _ = helper_b.release_lock(&rec);
+        }
+        Ok(())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: crate::testutil::proptest_cases(64),
+            max_shrink_iters: 1000,
+            rng_seed: RngSeed::Fixed(0x5EED_5EEF),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+        #[test]
+        fn nested_acquire_blocks_contender_until_outer_drop(
+            depth in 1usize..=3,
+            outcome in 0u8..=2,
+        ) {
+            run_nested_case(depth, outcome)?;
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: crate::testutil::proptest_cases(64),
+            max_shrink_iters: 1000,
+            rng_seed: RngSeed::Fixed(0x5EED_5EF0),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+        #[test]
+        fn contender_in_tail_window_with_outer_alive(
+            depth in 1usize..=3,
+        ) {
+            // Dedicated tail-window assertion: outer guard alive, inner(s)
+            // dropped, contender injected immediately after compensation returns.
+            let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+            let remote = LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote")).unwrap();
+            let helper_a = RemoteHelper::new(&remote);
+            let helper_b = RemoteHelper::new(&remote);
+            let op_a = "op-A-tail";
+            let outer = helper_a.acquire_lock_guard(op_a).unwrap();
+            let initial_bytes = remote.read(&layout::operation_lock()).unwrap();
+            let mut inners: Vec<HeldSlotLock<'_>> = Vec::new();
+            for _ in 0..depth {
+                inners.push(helper_a.acquire_lock_guard(op_a).unwrap());
+            }
+            for g in inners.into_iter().rev() {
+                drop(g);
+            }
+            // Tail window — outer still alive.
+            let b_attempt = helper_b.acquire_lock("op-B-tail", false);
+            prop_assert!(b_attempt.is_err(), "B must fail in tail window while outer lives");
+            let after_bytes = remote.read(&layout::operation_lock()).unwrap();
+            prop_assert_eq!(after_bytes, initial_bytes, "on-disk record must remain A's record byte-for-byte in tail window");
+            drop(outer);
+            // After outer drop B may succeed.
+            prop_assert!(helper_b.acquire_lock("op-B-tail", false).is_ok(), "B may succeed after outer drop");
         }
     }
 }

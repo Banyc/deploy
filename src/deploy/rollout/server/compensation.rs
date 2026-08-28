@@ -7,6 +7,7 @@ use crate::error::Result;
 use crate::identity::DeploymentId;
 use crate::identity::GenerationId;
 use crate::identity::OperationId;
+use crate::remote::helper::HeldSlotLock;
 use crate::remote::helper::RemoteHelper;
 use crate::remote::layout;
 use crate::remote::transport::Remote;
@@ -34,7 +35,8 @@ use crate::verify::systemd::run_activation;
 // consolidation of the trailing config/vars args is a dedicated refactor;
 // the allow documents the deliberate choice).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn compensate_server(
+pub(crate) fn compensate_server_locked(
+    _held: &HeldSlotLock<'_>,
     _store: &LocalStore,
     remote: &dyn Remote,
     helper: &RemoteHelper,
@@ -45,13 +47,6 @@ pub(crate) fn compensate_server(
     _config: &ProjectConfig,
     template_vars: &crate::remote::canonical::TemplateVars,
 ) -> Result<bool> {
-    // Hold the slot's mutation lock for the duration of compensation. Re-acquiring
-    // is idempotent when the same op_id already holds it (process_server holds it
-    // via a guard that is still alive on the in-process failure paths).
-    let _guard = match helper.acquire_lock_guard(op_id.as_str()) {
-        Ok(g) => g,
-        Err(_) => return Ok(false),
-    };
     match prior_gen {
         Some(prior) => {
             // Load the prior generation's behavior contract from the remote.
@@ -114,6 +109,39 @@ pub(crate) fn compensate_server(
                 .unwrap_or(false))
         }
     }
+}
+
+/// External wrapper: acquires the slot mutation lock ONCE, calls
+/// `compensate_server_locked`, and drops the guard at the end. An acquire
+/// failure is swallowed as `Ok(false)` (slot stays advanced → attempt Degraded).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compensate_server(
+    store: &LocalStore,
+    remote: &dyn Remote,
+    helper: &RemoteHelper,
+    op_id: &OperationId,
+    deployment_id: &DeploymentId,
+    prior_gen: Option<&GenerationId>,
+    advanced_gen: &GenerationId,
+    config: &ProjectConfig,
+    template_vars: &crate::remote::canonical::TemplateVars,
+) -> Result<bool> {
+    let guard = match helper.acquire_lock_guard(op_id.as_str()) {
+        Ok(g) => g,
+        Err(_) => return Ok(false),
+    };
+    compensate_server_locked(
+        &guard,
+        store,
+        remote,
+        helper,
+        op_id,
+        deployment_id,
+        prior_gen,
+        advanced_gen,
+        config,
+        template_vars,
+    )
 }
 
 #[cfg(test)]
