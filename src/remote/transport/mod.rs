@@ -87,18 +87,64 @@ pub trait Remote {
     /// publishes WITHOUT replacement (a concurrent winner is never replaced),
     /// removes the temp, and fsyncs the PARENT DIRECTORY — every failure
     /// propagates. Returns the TYPED [`CreateNewVerdict`]: `Created` when the
-    /// record was durably installed by this call; `AlreadyPresent` when the
-    /// destination already existed with IDENTICAL bytes and final mode (the
-    /// identical retry converges — the parent directory is synced here too,
-    /// so the retry returns with a durable entry); `Conflict` when it existed
-    /// with DIFFERENT bytes or mode (the winner is NEVER replaced or
-    /// modified — the caller's read-back comparison decides the semantic
-    /// verdict); or `Err` on every other failure (a pre-install failure, a
-    /// failed parent-dir sync, a transport fault — never a verdict). This is
+    /// record was durably installed by this call; `AlreadyPresent` ONLY when
+    /// the destination already existed and VERIFIED as an identical entry —
+    /// an `lstat`, a REGULAR FILE, the EXACT final mode, and byte-identical
+    /// content (the identical retry converges — the parent directory is
+    /// synced here too, so the retry returns with a durable entry);
+    /// `Conflict` carrying the TYPED [`VerifiedExisting`] reason when it
+    /// existed but did NOT verify (different bytes, a MODE MISMATCH, a
+    /// directory/symlink/other entry — a symlink is never followed — or an
+    /// unreadable entry; the winner is NEVER replaced or modified, and the
+    /// caller receives the typed reason, never an undifferentiated conflict
+    /// it can reinterpret); or `Err` on every other failure (a pre-install
+    /// failure, a failed parent-dir sync, a transport fault — never a
+    /// verdict). This is
     /// the non-racy primitive used for lock acquisition:
     /// `exists`-then-`write` would let two controllers both observe "no lock"
     /// and both proceed.
     fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<CreateNewVerdict>;
+    /// [`Remote::try_write_new`] with a CALLER-CHOSEN content equivalence for
+    /// the EEXIST verification: `Semantic` (JSON parse-equal, byte-exact
+    /// fallback) is used by the release-file publisher whose idempotent
+    /// re-publication legitimately re-serializes the same contract with
+    /// different key order/whitespace. Transports whose centralized
+    /// verification can apply the equivalence directly (LocalTransport,
+    /// SshTransport) override this; the default performs the byte-exact
+    /// [`Remote::try_write_new`] and, for `Semantic`, re-reads and
+    /// semantically compares a `ContentMismatch` conflict — the identical
+    /// outcome a direct application would produce.
+    fn try_write_new_with(
+        &self,
+        rel: &Path,
+        data: &[u8],
+        equivalence: ContentEquivalence,
+    ) -> Result<CreateNewVerdict> {
+        let verdict = self.try_write_new(rel, data)?;
+        if equivalence != ContentEquivalence::Semantic {
+            return Ok(verdict);
+        }
+        match verdict {
+            CreateNewVerdict::Conflict(VerifiedExisting::ContentMismatch) => {
+                // The transport's Exact verification reported a content
+                // mismatch; the caller's SEMANTIC equivalence may still
+                // accept the winner (JSON key order/whitespace are not part
+                // of the contract). Type and mode were already verified
+                // (that is why the reason is ContentMismatch, not
+                // NotRegularFile/ModeMismatch), so only the content needs
+                // re-comparing.
+                let existing = self.read(rel)?;
+                if content_equivalent(&existing, data, ContentEquivalence::Semantic) {
+                    Ok(CreateNewVerdict::AlreadyPresent)
+                } else {
+                    Ok(CreateNewVerdict::Conflict(
+                        VerifiedExisting::ContentMismatch,
+                    ))
+                }
+            }
+            v => Ok(v),
+        }
+    }
     fn create_dir(&self, rel: &Path) -> Result<()>;
     fn create_dir_all(&self, rel: &Path) -> Result<()>;
     /// Apply a permission mode to an existing remote entry (file or directory).
@@ -246,20 +292,24 @@ pub enum RemoveIfVerdict {
 /// `pub` because it crosses the [`Remote`] trait boundary: every transport's
 /// `try_write_new` returns it, and every caller (and external test crate)
 /// branches on it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CreateNewVerdict {
     /// The record was durably installed: exact bytes, the final mode, and a
     /// parent-directory-fsync'd directory entry all hold.
     Created,
-    /// The destination already existed with IDENTICAL bytes and final mode:
-    /// the identical retry converges — no error, no replace.
+    /// The destination already existed and VERIFIED as an identical entry:
+    /// the `lstat` succeeded, the entry is a REGULAR FILE, its mode matched
+    /// EXACTLY, and its content matched per the caller's requested
+    /// equivalence — the identical retry converges, no error, no replace.
     AlreadyPresent,
-    /// The destination already existed with DIFFERENT bytes or mode: a real
-    /// conflict. The winner is NEVER replaced or modified; the caller's
-    /// read-back comparison (every `try_write_new` caller performs one)
-    /// decides the semantic verdict — a same-operation retry converges, a
-    /// foreign winner is a genuine conflict.
-    Conflict,
+    /// The destination already existed but did NOT verify as an identical
+    /// entry: the TYPED [`VerifiedExisting`] reason says why (not a regular
+    /// file — directory/symlink/other, never followed; a MODE MISMATCH; a
+    /// CONTENT MISMATCH per the caller's equivalence; unreadable; or
+    /// vanished). The winner is NEVER replaced or modified, and the caller
+    /// receives the typed reason — it can never reinterpret an
+    /// undifferentiated conflict as "already present, fine".
+    Conflict(VerifiedExisting),
 }
 
 /// The seven stages of the canonical create-new sequence — the crash/failure
@@ -308,11 +358,93 @@ impl CreateNewFault {
     }
 }
 
+/// The caller-chosen content-equivalence relation applied to an EXISTING
+/// entry during create-new verification: the create-new EEXIST path verifies
+/// the existing entry and the CALLER decides whether byte-exact equality is
+/// required or whether a semantic (JSON parse-equal) relation is accepted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContentEquivalence {
+    /// Byte-exact: the existing entry's bytes must equal the intended bytes.
+    /// Every immutable record's identical retry (markers, locks, the protocol
+    /// marker, assignment records) converges under this relation.
+    Exact,
+    /// Semantic: JSON parse-equal (object key order and whitespace are not
+    /// part of the contract), falling back to byte-exact when either side is
+    /// not JSON. Used by the release-file publisher whose idempotent
+    /// re-publication legitimately re-serializes the same contract with
+    /// different key order/whitespace.
+    Semantic,
+}
+
+/// WHY an existing create-new destination is not a clean identical retry —
+/// the typed companion of [`CreateNewVerdict::Conflict`]. Every reason is a
+/// distinct variant: a caller can never reinterpret an undifferentiated
+/// conflict (a directory, a symlink, a mode mismatch, or unreadable entry
+/// can never be silently accepted as "already present, fine").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotRegularFileKind {
+    /// A directory occupies the destination path.
+    Directory,
+    /// A symlink occupies the destination path — reported from the `lstat`
+    /// itself, NEVER followed (a symlink pointing at a matching regular file
+    /// is still a conflict, never an accepted retry).
+    Symlink,
+    /// Any other non-regular kind: a fifo, socket, device, ...
+    Other,
+}
+
+/// The TYPED result of verifying an EXISTING create-new destination against
+/// the intended content — the single lstat-based verification shared by BOTH
+/// transports (the local [`durable_create_new`] verify-on-retry and the SSH
+/// transport's EEXIST verification). `Ok` is reached ONLY when the `lstat`
+/// succeeded AND the entry is a REGULAR FILE AND its content was read; every
+/// other outcome is one of the explicit reasons below. The verdict
+/// [`CreateNewVerdict::AlreadyPresent`] is produced ONLY when this is
+/// [`VerifiedExisting::Ok`] with `mode_ok` true (the mode matched EXACTLY)
+/// and the content matched per the caller's requested equivalence; EVERY
+/// other variant is [`CreateNewVerdict::Conflict`] carrying this reason.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VerifiedExisting {
+    /// The `lstat` succeeded, the entry is a REGULAR FILE, and its content
+    /// was read. `mode_ok` records whether the entry's mode matched the
+    /// required mode EXACTLY (a mismatch is reported as
+    /// [`VerifiedExisting::ModeMismatch`]; `mode_ok` stays a first-class
+    /// dimension so the verdict constructor must consult it — an entry is
+    /// only ever [`CreateNewVerdict::AlreadyPresent`] when it is true) and
+    /// `content` records the caller's requested content equivalence, which
+    /// HELD (a failed comparison is [`VerifiedExisting::ContentMismatch`]).
+    Ok {
+        mode_ok: bool,
+        content: ContentEquivalence,
+    },
+    /// The `lstat` reported the destination absent. Should not happen on the
+    /// EEXIST-confirmed path (the no-clobber publish observed the
+    /// destination), but typed rather than assumed.
+    NotFound,
+    /// The `lstat` succeeded but the entry is NOT a regular file: a
+    /// directory, a symlink (never followed), or another kind.
+    NotRegularFile { kind: NotRegularFileKind },
+    /// The entry is a regular file whose mode does NOT match the required
+    /// mode EXACTLY — the mode is part of the immutable record, so a mode
+    /// mismatch is a real conflict, never an accepted retry.
+    ModeMismatch { actual: u32, required: u32 },
+    /// The entry is a regular file with the EXACT required mode, but its
+    /// content did NOT match per the caller's requested equivalence.
+    ContentMismatch,
+    /// The entry exists (and is a regular file) but its content could not be
+    /// read during verification (permission, I/O fault): a real failure, never
+    /// a fabricated verdict. The payload carries the errno-bearing error text.
+    Unreadable(String),
+}
+
 /// Settings for one [`durable_create_new`] attempt: the FINAL MODE the
-/// published inode must carry, and (test-only) the one-shot stage fault.
+/// published inode must carry, the caller-chosen CONTENT EQUIVALENCE the
+/// EEXIST verification applies to the existing entry, and (test-only) the
+/// one-shot stage fault.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CreateNewOptions<'a> {
     pub(crate) mode: u32,
+    pub(crate) content: ContentEquivalence,
     pub(crate) fault: Option<&'a CreateNewFault>,
 }
 
@@ -342,12 +474,16 @@ pub(crate) struct CreateNewOptions<'a> {
 /// Every state failure in every step PROPAGATES as an error — `Ok(Created)`
 /// therefore implies exact bytes (the fully-written inode), the final mode,
 /// and a DURABLE directory entry. On a conflict (step 5's `EEXIST`) the
-/// existing entry is read back and compared byte-and-mode to the intended
-/// content: identical → [`CreateNewVerdict::AlreadyPresent`] (the identical
-/// retry converges — no error, no replace); different →
-/// [`CreateNewVerdict::Conflict`] (a genuine conflict — never replaced).
-/// `Ok(AlreadyPresent)` runs the parent fsync too, so the convergent path
-/// still returns with a durable entry.
+/// existing entry is VERIFIED through the ONE centralized lstat-based
+/// verification ([`verify_existing`]): only a regular file whose mode matched
+/// EXACTLY and whose content matched per the caller's requested equivalence
+/// → [`CreateNewVerdict::AlreadyPresent`] (the identical retry converges —
+/// no error, no replace); EVERY other outcome →
+/// [`CreateNewVerdict::Conflict`] carrying the TYPED [`VerifiedExisting`]
+/// reason (never an undifferentiated conflict — a directory, a symlink that
+/// is never followed, a mode mismatch, or an unreadable entry is a real
+/// conflict). `Ok(AlreadyPresent)` runs the parent fsync too, so the
+/// convergent path still returns with a durable entry.
 pub(crate) fn durable_create_new(
     base: &Path,
     rel: &Path,
@@ -424,9 +560,11 @@ pub(crate) fn durable_create_new(
     drop(f);
     // 5. no-replace publish — link(2) fails with EEXIST when a concurrent
     //    writer won; the winner is NEVER replaced. On EEXIST the existing
-    //    entry is VERIFIED (verify-on-retry): byte-and-mode identical →
-    //    AlreadyPresent (the identical retry converges), anything else →
-    //    Conflict (a genuine conflict).
+    //    entry is VERIFIED (verify-on-retry) through THE ONE CENTRALIZED
+    //    lstat-based verification ([`verify_existing`] — a regular file with
+    //    the EXACT required mode and the caller's accepted content
+    //    equivalence → AlreadyPresent, the identical retry converges; every
+    //    other outcome → Conflict carrying the TYPED reason).
     if fail(CreateNewStep::Publish) {
         return Err(Error::transport(format!(
             "test fault: create-new step {step:?} forced to fail (once)",
@@ -436,19 +574,30 @@ pub(crate) fn durable_create_new(
     let verdict = match std::fs::hard_link(&tmp, &p) {
         Ok(()) => CreateNewVerdict::Created,
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let verify = (|| -> Result<CreateNewVerdict> {
-                let existing = std::fs::read(&p)
-                    .map_err(|e| Error::transport(format!("verify read {}: {e}", p.display())))?;
-                let meta = std::fs::metadata(&p)
-                    .map_err(|e| Error::transport(format!("verify stat {}: {e}", p.display())))?;
-                if existing == data && (meta.mode() & 0o7777) == (options.mode & 0o7777) {
-                    Ok(CreateNewVerdict::AlreadyPresent)
-                } else {
-                    Ok(CreateNewVerdict::Conflict)
-                }
-            })();
-            match verify {
-                Ok(v) => v,
+            // The lstat-based verification (the LOCAL side MUST use the
+            // symlink-safe `symlink_metadata` form — never `metadata`, which
+            // follows a symlink — so a symlink is never mistaken for a
+            // regular file) and the shared verdict construction.
+            let p2 = p.clone();
+            let verified = verify_existing(
+                || match std::fs::symlink_metadata(&p2) {
+                    Ok(m) => Ok(Some(meta_to_remote(&m))),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(e) => Err(Error::transport(format!(
+                        "verify stat {}: {e}",
+                        p2.display()
+                    ))),
+                },
+                || {
+                    std::fs::read(&p2)
+                        .map_err(|e| Error::transport(format!("verify read {}: {e}", p2.display())))
+                },
+                data,
+                options.mode,
+                options.content,
+            );
+            match verified {
+                Ok(v) => verified_to_verdict(v),
                 Err(e) => {
                     let _ = std::fs::remove_file(&tmp);
                     return Err(e);
@@ -493,6 +642,108 @@ pub(crate) fn durable_create_new(
             .map_err(|e| Error::transport(format!("fsync dir {}: {e}", parent.display())))?;
     }
     Ok(verdict)
+}
+
+/// Compare two byte slices under the caller's requested content equivalence:
+/// `Exact` is byte equality; `Semantic` is JSON parse-equality (object key
+/// order and whitespace are not part of the contract), falling back to byte
+/// equality when either side does not parse as JSON. The ONE content
+/// comparison used by the centralized verification ([`verify_existing`]) and
+/// by the trait's default [`Remote::try_write_new_with`] semantic fallback.
+pub(crate) fn content_equivalent(a: &[u8], b: &[u8], equivalence: ContentEquivalence) -> bool {
+    match equivalence {
+        ContentEquivalence::Exact => a == b,
+        ContentEquivalence::Semantic => {
+            if a == b {
+                return true;
+            }
+            match (
+                serde_json::from_slice::<serde_json::Value>(a),
+                serde_json::from_slice::<serde_json::Value>(b),
+            ) {
+                (Ok(va), Ok(vb)) => va == vb,
+                _ => false,
+            }
+        }
+    }
+}
+
+/// THE ONE CENTRALIZED verification of an EXISTING create-new destination —
+/// used by BOTH transports (the local [`durable_create_new`] verify-on-retry
+/// and the SSH transport's EEXIST verification), so the two can never drift.
+/// The checks run IN ORDER and the FIRST failure is the typed reason:
+///
+/// 1. **lstat** (`meta_opt` must be the symlink-safe `lstat` form — the
+///    local `symlink_metadata` / the ssh `metadata_opt` perl-lstat protocol —
+///    so a symlink is NEVER followed and mistaken for a regular file);
+/// 2. **regular-file type** (a directory/symlink/other is
+///    [`VerifiedExisting::NotRegularFile`]);
+/// 3. **read** the existing content (a read failure is
+///    [`VerifiedExisting::Unreadable`] — never a fabricated verdict);
+/// 4. **exact mode** (the required mode, masked to `0o7777`);
+/// 5. **the caller's content equivalence** ([`ContentEquivalence`]: exact
+///    bytes or semantic JSON equality, per the caller's request).
+///
+/// `Ok` — and therefore [`CreateNewVerdict::AlreadyPresent`] via
+/// [`verified_to_verdict`] — is produced ONLY when every check held.
+pub(crate) fn verify_existing(
+    meta_opt: impl FnOnce() -> Result<Option<RemoteMeta>>,
+    read: impl FnOnce() -> Result<Vec<u8>>,
+    intended: &[u8],
+    required_mode: u32,
+    equivalence: ContentEquivalence,
+) -> Result<VerifiedExisting> {
+    // 1. lstat — the symlink-safe stat, so a symlink is never followed.
+    let Some(meta) = meta_opt()? else {
+        return Ok(VerifiedExisting::NotFound);
+    };
+    // 2. regular-file type. The lstat already settled the kind: a symlink is
+    //    reported as a symlink with its OWN metadata — the lstat guarantee.
+    let kind = if meta.is_dir {
+        NotRegularFileKind::Directory
+    } else if meta.is_symlink {
+        NotRegularFileKind::Symlink
+    } else if meta.is_file {
+        // 3. read — a read failure is the Unreadable reason, never a
+        //    fabricated verdict.
+        match read() {
+            Ok(existing) => {
+                // 4. exact mode — the mode is part of the immutable record.
+                let actual = meta.mode & 0o7777;
+                let required = required_mode & 0o7777;
+                if actual != required {
+                    return Ok(VerifiedExisting::ModeMismatch { actual, required });
+                }
+                // 5. the caller's content equivalence.
+                if content_equivalent(&existing, intended, equivalence) {
+                    return Ok(VerifiedExisting::Ok {
+                        mode_ok: true,
+                        content: equivalence,
+                    });
+                }
+                return Ok(VerifiedExisting::ContentMismatch);
+            }
+            Err(e) => {
+                return Ok(VerifiedExisting::Unreadable(format!("verify read: {e}")));
+            }
+        }
+    } else {
+        NotRegularFileKind::Other
+    };
+    Ok(VerifiedExisting::NotRegularFile { kind })
+}
+
+/// The ONE verdict-construction path: [`CreateNewVerdict::AlreadyPresent`]
+/// ONLY when the typed verification is `Ok` WITH the mode check held (the
+/// entry was a regular file whose mode matched EXACTLY — `content` already
+/// held by construction); EVERY other reason is
+/// [`CreateNewVerdict::Conflict`] carrying the typed reason. Callers receive
+/// the typed reason and can never reinterpret an undifferentiated conflict.
+pub(crate) fn verified_to_verdict(v: VerifiedExisting) -> CreateNewVerdict {
+    match v {
+        VerifiedExisting::Ok { mode_ok: true, .. } => CreateNewVerdict::AlreadyPresent,
+        v => CreateNewVerdict::Conflict(v),
+    }
 }
 
 /// A transport that operates on a local directory, executing commands on the
@@ -731,6 +982,7 @@ impl Remote for LocalTransport {
             &content,
             CreateNewOptions {
                 mode: IMMUTABLE_RECORD_MODE,
+                content: ContentEquivalence::Exact,
                 fault: None,
             },
         );
@@ -755,13 +1007,24 @@ impl Remote for LocalTransport {
         // canonical final mode (`IMMUTABLE_RECORD_MODE`), never the umask.
         // The TYPED verdict survives this trait boundary untouched — Created
         // for a fresh durable install, AlreadyPresent for an identical retry
-        // (parent-sync'd too), Conflict for a different winner.
+        // (parent-sync'd too), Conflict carrying the typed reason for any
+        // other winner.
+        self.try_write_new_with(rel, data, ContentEquivalence::Exact)
+    }
+
+    fn try_write_new_with(
+        &self,
+        rel: &Path,
+        data: &[u8],
+        equivalence: ContentEquivalence,
+    ) -> Result<CreateNewVerdict> {
         durable_create_new(
             &self.base,
             rel,
             data,
             CreateNewOptions {
                 mode: IMMUTABLE_RECORD_MODE,
+                content: equivalence,
                 fault: None,
             },
         )
@@ -1031,9 +1294,11 @@ mod tests {
             "the identical retry must not touch the winner"
         );
         // Different content: the conflict verdict — never replaced.
-        assert_eq!(
-            t.try_write_new(rel, b"other").unwrap(),
-            CreateNewVerdict::Conflict,
+        assert!(
+            matches!(
+                t.try_write_new(rel, b"other").unwrap(),
+                CreateNewVerdict::Conflict(VerifiedExisting::ContentMismatch)
+            ),
             "a different-content conflict is the verdict"
         );
         assert_eq!(
@@ -1184,7 +1449,7 @@ mod tests {
                         &root,
                         rel,
                         &content,
-                        CreateNewOptions { mode, fault: None },
+                        CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None },
                     )
                     .expect("the healthy install must succeed");
                     prop_assert_eq!(verdict, CreateNewVerdict::Created);
@@ -1222,7 +1487,7 @@ mod tests {
                         &root,
                         rel,
                         &content,
-                        CreateNewOptions { mode, fault: Some(&fault) },
+                        CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: Some(&fault) },
                     )
                     .expect_err("a failure at every stage must propagate as Err");
                     prop_assert!(
@@ -1237,7 +1502,7 @@ mod tests {
                         &root,
                         rel,
                         &content,
-                        CreateNewOptions { mode, fault: None },
+                        CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None },
                     )
                     .expect("the identical retry must converge");
                     prop_assert!(
@@ -1265,10 +1530,10 @@ mod tests {
                     // A previous successful publish (identical bytes + mode):
                     // the identical retry converges — AlreadyPresent, no
                     // error, no replace.
-                    durable_create_new(&root, rel, &content, CreateNewOptions { mode, fault: None })
+                    durable_create_new(&root, rel, &content, CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None })
                         .expect("the first install must succeed");
                     let verdict =
-                        durable_create_new(&root, rel, &content, CreateNewOptions { mode, fault: None })
+                        durable_create_new(&root, rel, &content, CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None })
                             .expect("an identical retry must converge, not error");
                     prop_assert_eq!(verdict, CreateNewVerdict::AlreadyPresent);
                     prop_assert_eq!(
@@ -1293,10 +1558,13 @@ mod tests {
                         &root,
                         rel,
                         &content,
-                        CreateNewOptions { mode, fault: None },
+                        CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None },
                     )
                     .expect("a conflict is a verdict, not an I/O error");
-                    prop_assert_eq!(verdict, CreateNewVerdict::Conflict);
+                    prop_assert!(matches!(
+                        verdict,
+                        CreateNewVerdict::Conflict(VerifiedExisting::ContentMismatch)
+                    ));
                     prop_assert_eq!(
                         std::fs::read(&dest).unwrap(),
                         other,
@@ -1307,7 +1575,7 @@ mod tests {
                     // Identical bytes but a DIFFERENT mode: still a genuine
                     // conflict (the mode is part of the record) — the verdict,
                     // never a replace.
-                    durable_create_new(&root, rel, &content, CreateNewOptions { mode, fault: None })
+                    durable_create_new(&root, rel, &content, CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None })
                         .expect("the first install must succeed");
                     let other_mode = if (mode & 0o7777) == 0o600 { 0o644 } else { 0o600 };
                     std::fs::set_permissions(
@@ -1316,9 +1584,13 @@ mod tests {
                     )
                     .unwrap();
                     let verdict =
-                        durable_create_new(&root, rel, &content, CreateNewOptions { mode, fault: None })
+                        durable_create_new(&root, rel, &content, CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None })
                             .expect("a mode mismatch is a verdict, not an I/O error");
-                    prop_assert_eq!(verdict, CreateNewVerdict::Conflict);
+                    let is_mode_mismatch = matches!(
+                        verdict,
+                        CreateNewVerdict::Conflict(VerifiedExisting::ModeMismatch { .. })
+                    );
+                    prop_assert!(is_mode_mismatch);
                     let meta = std::fs::metadata(&dest).unwrap();
                     prop_assert_eq!(
                         meta.mode() & 0o7777,
@@ -1346,7 +1618,7 @@ mod tests {
                         &root,
                         rel,
                         &content,
-                        CreateNewOptions { mode, fault: None },
+                        CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None },
                     )
                     .expect("the identical retry over a published-before-parent-sync entry must converge");
                     prop_assert_eq!(verdict, CreateNewVerdict::AlreadyPresent);
@@ -1377,7 +1649,7 @@ mod tests {
                     // identical existing entry — the retry must return Err
                     // (the faulted parent fsync), never a false
                     // Ok(AlreadyPresent) that claims durability.
-                    durable_create_new(&root, rel, &content, CreateNewOptions { mode, fault: None })
+                    durable_create_new(&root, rel, &content, CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None })
                         .expect("the first install must succeed");
                     let fault = CreateNewFault::new(CreateNewStep::ParentFsync);
                     let err = durable_create_new(
@@ -1386,6 +1658,7 @@ mod tests {
                         &content,
                         CreateNewOptions {
                             mode,
+                            content: ContentEquivalence::Exact,
                             fault: Some(&fault),
                         },
                     )
@@ -1428,6 +1701,7 @@ mod tests {
                 data,
                 CreateNewOptions {
                     mode: IMMUTABLE_RECORD_MODE,
+                    content: ContentEquivalence::Exact,
                     fault: Some(&self.fault),
                 },
             )
@@ -1580,7 +1854,7 @@ mod tests {
                     let verdict = t
                         .try_write_new(rel, &content)
                         .expect("an identical retry must converge, not error");
-                    prop_assert_eq!(verdict, CreateNewVerdict::AlreadyPresent);
+                    prop_assert!(matches!(verdict, CreateNewVerdict::AlreadyPresent));
                     prop_assert_eq!(
                         std::fs::read(&dest).unwrap(),
                         content,
@@ -1611,7 +1885,10 @@ mod tests {
                     let verdict = t
                         .try_write_new(rel, &content)
                         .expect("a different-content winner is a verdict, not an I/O error");
-                    prop_assert_eq!(verdict, CreateNewVerdict::Conflict);
+                    prop_assert!(matches!(
+                        verdict,
+                        CreateNewVerdict::Conflict(VerifiedExisting::ContentMismatch)
+                    ));
                     prop_assert_eq!(
                         std::fs::read(&dest).unwrap(),
                         other,
@@ -1630,7 +1907,11 @@ mod tests {
                     let verdict = t
                         .try_write_new(rel, &content)
                         .expect("a mode mismatch is a verdict, not an I/O error");
-                    prop_assert_eq!(verdict, CreateNewVerdict::Conflict);
+                    let is_mode_mismatch = matches!(
+                        verdict,
+                        CreateNewVerdict::Conflict(VerifiedExisting::ModeMismatch { .. })
+                    );
+                    prop_assert!(is_mode_mismatch);
                     let meta = std::fs::metadata(&dest).unwrap();
                     prop_assert_eq!(
                         meta.mode() & 0o7777,

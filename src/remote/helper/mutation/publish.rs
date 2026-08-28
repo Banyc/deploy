@@ -6,7 +6,7 @@
 use crate::error::{Error, Result};
 use crate::identity::ReleaseRecord;
 use crate::remote::layout;
-use crate::remote::transport::{CreateNewVerdict, Remote};
+use crate::remote::transport::{ContentEquivalence, CreateNewVerdict, Remote, VerifiedExisting};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use walkdir::WalkDir;
@@ -122,26 +122,62 @@ impl<'a> RemoteHelper<'a> {
     /// Install one immutable release-side file with create-or-compare
     /// semantics: the first writer wins via an exclusive create; a subsequent
     /// writer must observe equivalent content or fail. Equivalence is
-    /// semantic for JSON (key order and whitespace may differ between
-    /// serializations of the same contract) and byte-exact otherwise.
+    /// SEMANTIC for JSON (key order and whitespace may differ between
+    /// serializations of the same contract) and byte-exact otherwise — the
+    /// caller's requested [`ContentEquivalence::Semantic`] is passed INTO the
+    /// transport, so the centralized verification applies it directly.
     fn publish_release_file(&self, rel: &Path, data: &[u8]) -> Result<()> {
-        // The TYPED verdict: `Created`/`AlreadyPresent` (the identical retry
-        // — byte-and-mode identical, so trivially equivalent) are success;
-        // only a `Conflict` needs the semantic read-back comparison (JSON key
-        // order/whitespace may differ between serializations of the same
-        // contract — the winner is never replaced, exactly as before).
-        match self.remote.try_write_new(rel, data)? {
+        // The TYPED verdict: `Created`/`AlreadyPresent` (the existing entry
+        // verified as a regular file with the exact mode and SEMANTICALLY
+        // equivalent content — the idempotent re-publication) are success;
+        // a `Conflict` carries the TYPED reason: only a CONTENT mismatch
+        // keeps the caller-layer semantic read-back (for transports whose
+        // default `try_write_new_with` could not apply the equivalence
+        // directly), while a METADATA conflict — a directory/symlink where
+        // the immutable record should be, a mode mismatch, an unreadable
+        // entry — is a REAL conflict, never silently accepted as equivalent.
+        match self
+            .remote
+            .try_write_new_with(rel, data, ContentEquivalence::Semantic)?
+        {
             CreateNewVerdict::Created | CreateNewVerdict::AlreadyPresent => Ok(()),
-            CreateNewVerdict::Conflict => {
-                let existing = self.remote.read(rel)?;
-                if json_semantically_equal(&existing, data) {
-                    return Ok(());
+            CreateNewVerdict::Conflict(reason) => match reason {
+                VerifiedExisting::ContentMismatch => {
+                    // Type and mode were verified; only the content differs.
+                    // The caller's semantic equivalence decides: JSON-equal is
+                    // the same contract re-serialized (accepted); anything
+                    // else is an integrity conflict.
+                    let existing = self.remote.read(rel)?;
+                    if json_semantically_equal(&existing, data) {
+                        return Ok(());
+                    }
+                    Err(Error::integrity(format!(
+                        "refusing to replace existing {} with different content",
+                        rel.display()
+                    )))
                 }
-                Err(Error::integrity(format!(
-                    "refusing to replace existing {} with different content",
+                VerifiedExisting::ModeMismatch { actual, required } => {
+                    Err(Error::integrity(format!(
+                        "refusing to replace existing {} with a different mode ({actual:o} != {required:o})",
+                        rel.display()
+                    )))
+                }
+                VerifiedExisting::NotRegularFile { kind } => Err(Error::integrity(format!(
+                    "refusing to replace existing {} with a {kind:?} entry",
                     rel.display()
-                )))
-            }
+                ))),
+                VerifiedExisting::Unreadable(e) => Err(Error::integrity(format!(
+                    "existing {} is unreadable: {e}",
+                    rel.display()
+                ))),
+                VerifiedExisting::NotFound => Err(Error::integrity(format!(
+                    "existing {} vanished during verification",
+                    rel.display()
+                ))),
+                VerifiedExisting::Ok { .. } => {
+                    unreachable!("a verified-ok entry is AlreadyPresent, never Conflict")
+                }
+            },
         }
     }
 
@@ -182,17 +218,11 @@ impl<'a> RemoteHelper<'a> {
 /// Compare two serialized JSON documents semantically: equal when they parse
 /// to equal `serde_json` values (object key order and whitespace are not part
 /// of the contract). Falls back to byte equality when either side is not JSON.
+/// Delegates to THE centralized comparison
+/// ([`crate::remote::transport::content_equivalent`]) so the transport's
+/// verification and the caller-layer fallback can never drift.
 fn json_semantically_equal(a: &[u8], b: &[u8]) -> bool {
-    if a == b {
-        return true;
-    }
-    match (
-        serde_json::from_slice::<serde_json::Value>(a),
-        serde_json::from_slice::<serde_json::Value>(b),
-    ) {
-        (Ok(va), Ok(vb)) => va == vb,
-        _ => false,
-    }
+    crate::remote::transport::content_equivalent(a, b, ContentEquivalence::Semantic)
 }
 
 /// Copy a host-local tree into a remote-relative path, reconstructing symlinks
@@ -662,6 +692,48 @@ mod tests_publish {
         helper
             .publish_release(rid, &release_json, reordered)
             .expect("a digest-equal key reorder must publish");
+    }
+
+    /// A MODE-MISMATCHED existing release file is a REAL conflict for the
+    /// SEMANTIC caller too — the old read-back comparison only checked
+    /// content, so a mode-mismatched-but-content-equivalent winner was
+    /// silently accepted as "already present, fine". The typed
+    /// `ModeMismatch` reason now fails the republish closed: the mode is
+    /// part of the immutable record.
+    #[test]
+    fn publish_release_file_mode_mismatch_is_a_real_conflict() {
+        let (_dir, remote, rec, release_json, behavior_json) = published_release_fixture();
+        // Corrupt ONLY the mode of the existing behavior.json (content stays
+        // the semantically-equal pristine payload).
+        let bpath = layout::remote_release(rec.release_id.as_str()).join("behavior.json");
+        let other_mode = if crate::remote::transport::IMMUTABLE_RECORD_MODE & 0o7777 == 0o600 {
+            0o640
+        } else {
+            0o600
+        };
+        remote.set_mode(&bpath, other_mode).unwrap();
+        let helper = RemoteHelper::new(&remote);
+        let err = helper
+            .publish_release(
+                rec.release_id.as_str(),
+                &release_json,
+                &behavior_json,
+            )
+            .expect_err(
+                "a mode-mismatched existing release file must fail the republish, never be silently accepted",
+            );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("mode"),
+            "error must name the mode mismatch, got: {msg}"
+        );
+        // The winner stays untouched (content AND mode).
+        let meta = remote.metadata(&bpath).unwrap();
+        assert_eq!(
+            meta.mode & 0o7777,
+            other_mode,
+            "the mode mismatch must never be replaced"
+        );
     }
 
     /// A tree containing a READ-ONLY directory uploads successfully: directories

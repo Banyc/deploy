@@ -4,7 +4,7 @@
 use crate::error::{Error, Result};
 use crate::identity::{ArtifactRef, DeploymentId, GenerationId, TargetName};
 use crate::remote::layout;
-use crate::remote::transport::CreateNewVerdict;
+use crate::remote::transport::{CreateNewVerdict, VerifiedExisting};
 use serde::{Deserialize, Serialize};
 
 use super::super::RemoteHelper;
@@ -53,19 +53,48 @@ impl<'a> RemoteHelper<'a> {
             .map_err(|e| Error::remote(format!("serialize assignment: {e}")))?;
         let assignment_path = gen_dir.join("assignment.json");
         // The TYPED verdict: `Created`/`AlreadyPresent` (the identical retry)
-        // skip the read-back; only a `Conflict` (different bytes or mode)
-        // performs it — the winner is never replaced, exactly as before.
+        // skip the read-back; a `Conflict` carries the TYPED reason — the
+        // winner is never replaced, and a metadata conflict (a
+        // directory/symlink where the record should be, a mode mismatch, an
+        // unreadable entry) is a REAL conflict, never accepted as "already
+        // present, fine".
         match self.remote.try_write_new(&assignment_path, &json)? {
             CreateNewVerdict::Created | CreateNewVerdict::AlreadyPresent => {}
-            CreateNewVerdict::Conflict => {
-                let existing = self.remote.read(&assignment_path)?;
-                if existing != json {
+            CreateNewVerdict::Conflict(reason) => match reason {
+                VerifiedExisting::ContentMismatch => {
                     return Err(Error::integrity(format!(
                         "generation {} already exists with different content",
                         assignment.generation_id
                     )));
                 }
-            }
+                VerifiedExisting::ModeMismatch { actual, required } => {
+                    return Err(Error::integrity(format!(
+                        "generation {} already exists with mode {actual:o} (required {required:o})",
+                        assignment.generation_id
+                    )));
+                }
+                VerifiedExisting::NotRegularFile { kind } => {
+                    return Err(Error::integrity(format!(
+                        "generation {} already exists as a {kind:?} entry, not a regular file",
+                        assignment.generation_id
+                    )));
+                }
+                VerifiedExisting::Unreadable(e) => {
+                    return Err(Error::integrity(format!(
+                        "generation {} already exists but could not be verified: {e}",
+                        assignment.generation_id
+                    )));
+                }
+                VerifiedExisting::NotFound => {
+                    return Err(Error::integrity(format!(
+                        "generation {} vanished during verification",
+                        assignment.generation_id
+                    )));
+                }
+                VerifiedExisting::Ok { .. } => {
+                    unreachable!("a verified-ok entry is AlreadyPresent, never Conflict")
+                }
+            },
         }
         // The `root` symlink lives inside `generations/<gen>/`, so it must be
         // relative to that directory (../../objects/...). Its target is derived

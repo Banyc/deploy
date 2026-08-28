@@ -23,8 +23,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::{
-    CreateNewVerdict, FsBytes, IMMUTABLE_RECORD_MODE, Remote, RemoteEntry, RemoteMeta,
-    RemoveIfVerdict, has_normal_component_below_root,
+    ContentEquivalence, CreateNewVerdict, FsBytes, IMMUTABLE_RECORD_MODE, Remote, RemoteEntry,
+    RemoteMeta, RemoveIfVerdict, has_normal_component_below_root, verified_to_verdict,
+    verify_existing,
 };
 use hostkey::pin_known_hosts;
 use runner::{OpKind, RunError, SSH_CONNECT_TIMEOUT_SECS, SshRunner};
@@ -53,19 +54,23 @@ const LSTAT_ERRNO_ENOENT: i32 = 2;
 const LSTAT_ERRNO_ENOTDIR: i32 = 20;
 
 /// The reserved exit code the remote `try_write_new` script (`write_new_cmd`)
-/// exits with when the no-clobber `ln` hit an EXISTING destination — the
-/// conflict/verdict decision point. It is the ONLY nonzero exit the transport
+/// exits with when the no-clobber publish (perl `link(2)`) hit an EXISTING
+/// destination — the conflict/verdict decision point. It is the ONLY nonzero
+/// exit the transport
 /// maps to a verdict; every other nonzero exit (a failed pre-install step OR
 /// the final parent-directory sync) is a propagated error. `17` cannot collide
 /// with the pre-install steps' own failures (each exits nonzero, but the
 /// transport distinguishes the verdict by code, never by `exists`-sniffing),
 /// and it is deliberately distinct from [`SSH_TWRITE_PREINSTALL_EXIT`].
+/// `17` is also EEXIST (POSIX, identical on Linux and macOS) — the raw
+/// `link(2)` errno the script maps directly to this code.
 pub const SSH_TWRITE_CONFLICT_EXIT: i32 = 17;
 
 /// The exit code the remote `write_new_cmd` script uses for a PRE-INSTALL
 /// failure — any failure BEFORE the no-clobber publish: the parent `mkdir`,
-/// the `mktemp` allocation, the payload write, the final `chmod`, or the file
-/// `sync`. Such a failure means the operation never reached the publish
+/// the `mktemp` allocation, the payload write, the final `chmod`, the file
+/// `sync`, or a non-EEXIST `link(2)` failure. Such a failure means the
+/// operation never reached the publish
 /// decision point, so it is a propagated Error, NEVER a verdict — the
 /// transport refuses to guess the destination's state. Deliberately distinct
 /// from [`SSH_TWRITE_CONFLICT_EXIT`] so the script can tell "the install never
@@ -445,8 +450,11 @@ impl SshTransport {
     /// 3. Apply the FINAL MODE with `chmod` BEFORE the file fsync — the
     ///    published inode carries the caller's mode, never the remote umask.
     /// 4. `sync "$tmp"` — the file is durable.
-    /// 5. Install atomically WITHOUT replacement via `ln` — it fails if the
-    ///    destination exists, so no loser can clobber a winner. The loser's
+    /// 5. Install atomically WITHOUT replacement via perl's raw `link(2)`
+    ///    (the same interpreter the framed `lstat` helper relies on) — it
+    ///    FAILS if the destination exists in ANY form (a regular file, a
+    ///    directory, a symlink — never linked-inside or dereferenced the way
+    ///    a shell `ln` would), so no loser can clobber a winner. The loser's
     ///    failure is reported through the reserved `SSH_TWRITE_CONFLICT_EXIT`
     ///    exit code, NEVER by replacing the winner.
     /// 6. Remove only the temporary file THIS invocation created (the
@@ -464,15 +472,21 @@ impl SshTransport {
     /// [`SSH_TWRITE_PREINSTALL_EXIT`] WITHOUT installing anything (fail
     /// closed) — a pre-install failure is a propagated ERROR, never the
     /// conflict verdict, because the operation never reached the publish
-    /// decision point. Only the no-clobber `ln` failure is then examined: a
-    /// NONZERO `ln` exit with the destination PRESENT (`[ -e ]`/`[ -L ]`) is
-    /// the confirmed-EEXIST verdict [`SSH_TWRITE_CONFLICT_EXIT`] (the winner
-    /// is never replaced; the transport verifies it and decides
-    /// AlreadyPresent vs Conflict); a nonzero `ln` exit with the destination
-    /// ABSENT is a real publish failure, again the pre-install exit (an
-    /// error). The final `sync <parent>` runs ONLY on the install-success
-    /// path, and its exit status is the command's exit status — a real
-    /// `sync <dir>`/fsync, never a best-effort swallow. (The
+    /// decision point. The publish is perl `link(2)` — RAW link semantics,
+    /// so a destination that exists in ANY form (a regular file, a DIRECTORY
+    /// — which a shell `ln` would silently link INSIDE — or a symlink) is
+    /// EEXIST, never dereferenced and never linked-into; EEXIST (17, the
+    /// same value as [`SSH_TWRITE_CONFLICT_EXIT`]) exits the reserved
+    /// conflict code directly, any other link failure is the pre-install
+    /// exit. Only a nonzero publish exit whose destination is then PRESENT
+    /// (`[ -e ]`/`[ -L ]`) is the confirmed-EEXIST verdict
+    /// [`SSH_TWRITE_CONFLICT_EXIT`] (the winner is never replaced; the
+    /// transport verifies it and decides AlreadyPresent vs Conflict); a
+    /// nonzero publish exit with the destination ABSENT is a real publish
+    /// failure, again the pre-install exit (an error). The final `sync
+    /// <parent>` runs ONLY on the install-success path, and its exit status
+    /// is the command's exit status — a real `sync <dir>`/fsync, never a
+    /// best-effort swallow. (The
     /// AlreadyPresent retry's parent sync runs in the TRANSPORT — see
     /// [`SshTransport::try_write_new`] — mirroring the local primitive's
     /// "parent fsync on Created AND AlreadyPresent, never on Conflict".)
@@ -495,10 +509,14 @@ impl SshTransport {
         // this function; the comment here only notes the pieces that are
         // invisible in the final string: the pre-install chain fails closed
         // with the PRE-INSTALL exit (distinct from the conflict verdict), the
-        // confirmed-EEXIST decision is made by checking the destination's
-        // PRESENCE after a failed `ln` (never by swallowing every `ln`
-        // failure as a verdict), the `rc` capture keeps the temp cleanup
-        // outside the chain so it runs on the conflict path too, and the
+        // publish is perl `link(2)` (raw link semantics — a destination that
+        // exists in ANY form is EEXIST and exits the reserved conflict code
+        // directly, never linked-inside or dereferenced the way a shell `ln`
+        // would), the confirmed-EEXIST fallback decision is made by checking
+        // the destination's PRESENCE after a failed publish (never by
+        // swallowing every publish failure as a verdict), the `rc` capture
+        // keeps the temp cleanup outside the chain so it runs on the
+        // conflict path too, and the
         // parent-dir sync runs ONLY after a successful install and its
         // failure is the command's exit status.
         let basename = Path::new(&remote_path_str)
@@ -514,8 +532,18 @@ impl SshTransport {
         // and BSD mktemp both accept it.
         let tmp_template = format!("{}/.{}.tmp.XXXXXX", parent.trim_end_matches('/'), basename,);
         let mode_str = format!("{:o}", mode & 0o7777);
+        // The publish step: perl's raw `link(2)` (perl ships with every
+        // reasonable remote — the same interpreter the framed `lstat` helper
+        // already relies on). A shell `ln` would silently place the link
+        // INSIDE an existing directory destination (or follow a symlink);
+        // `link(2)` fails with EEXIST whenever the destination name exists in
+        // ANY form — a regular file, a directory, a symlink — so the
+        // immutable-record destination can never be silently created over a
+        // non-file entry. EEXIST is 17 on both Linux and macOS (POSIX),
+        // identical to the reserved [`SSH_TWRITE_CONFLICT_EXIT`]; any other
+        // link failure is the pre-install exit (a real publish error).
         format!(
-            "mkdir -p {p} && tmp=$(mktemp {tpl}) && cat > \"$tmp\" && chmod {mode} \"$tmp\" && sync \"$tmp\"; pre=$?; if [ \"$pre\" -ne 0 ]; then rm -f \"$tmp\"; exit {preinst}; fi; ln \"$tmp\" {d}; rc=$?; rm -f \"$tmp\"; if [ \"$rc\" -eq 0 ]; then sync {parent}; exit $?; fi; if [ -e {d} ] || [ -L {d} ]; then exit {conflict}; fi; exit {preinst}",
+            "mkdir -p {p} && tmp=$(mktemp {tpl}) && cat > \"$tmp\" && chmod {mode} \"$tmp\" && sync \"$tmp\"; pre=$?; if [ \"$pre\" -ne 0 ]; then rm -f \"$tmp\"; exit {preinst}; fi; perl -e 'exit 0 if link($ARGV[0], $ARGV[1]); exit(($! + 0) == 17 ? {conflict} : {preinst})' \"$tmp\" {d}; rc=$?; rm -f \"$tmp\"; if [ \"$rc\" -eq 0 ]; then sync {parent}; exit $?; fi; if [ -e {d} ] || [ -L {d} ]; then exit {conflict}; fi; exit {preinst}",
             p = shell_quote(&parent),
             tpl = shell_quote(&tmp_template),
             mode = mode_str,
@@ -970,6 +998,15 @@ impl Remote for SshTransport {
     }
 
     fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<CreateNewVerdict> {
+        self.try_write_new_with(rel, data, ContentEquivalence::Exact)
+    }
+
+    fn try_write_new_with(
+        &self,
+        rel: &Path,
+        data: &[u8],
+        equivalence: ContentEquivalence,
+    ) -> Result<CreateNewVerdict> {
         let cmd = Self::write_new_cmd(&self.root, rel, IMMUTABLE_RECORD_MODE);
         let mut argv = vec!["ssh".to_string()];
         argv.extend(self.ssh_args()?);
@@ -1015,19 +1052,29 @@ impl Remote for SshTransport {
                 String::from_utf8_lossy(&out.stderr)
             )));
         }
-        // CONFIRMED EEXIST: the no-clobber `ln` found the destination already
-        // present — the verdict decision point. The winner is NEVER replaced.
-        // VERIFY the existing entry INSIDE the transport — its bytes AND mode
-        // against the intent: identical → AlreadyPresent (and the PARENT
-        // DIRECTORY is synced here, so the convergent retry returns with a
-        // durable entry — the same parent-sync guarantee a fresh Created
-        // install gets); anything else — different bytes OR a mode mismatch
-        // over identical bytes — → Conflict (a genuine conflict, not ours to
-        // bless). A failed verification read is a propagated error, never a
-        // fabricated verdict.
-        let existing = self.read(rel)?;
-        let meta = self.metadata(rel)?;
-        if existing == data && (meta.mode & 0o7777) == (IMMUTABLE_RECORD_MODE & 0o7777) {
+        // CONFIRMED EEXIST: the no-clobber publish (perl `link(2)`) found
+        // the destination already present — the verdict decision point. The
+        // winner is NEVER replaced.
+        // VERIFY the existing entry through THE ONE CENTRALIZED lstat-based
+        // verification ([`crate::remote::transport::verify_existing`] — the
+        // `metadata_opt` perl-lstat protocol is the symlink-safe `lstat` form,
+        // so a symlink is never followed): a regular file with the EXACT
+        // required mode and the caller's accepted content equivalence →
+        // AlreadyPresent (and the PARENT DIRECTORY is synced here, so the
+        // convergent retry returns with a durable entry — the same
+        // parent-sync guarantee a fresh Created install gets); every other
+        // outcome → Conflict carrying the TYPED reason (a different-content
+        // winner, a mode mismatch, a directory/symlink/other entry, an
+        // unreadable entry — never an undifferentiated conflict).
+        let verified = verify_existing(
+            || self.metadata_opt(rel),
+            || self.read(rel),
+            data,
+            IMMUTABLE_RECORD_MODE,
+            equivalence,
+        )?;
+        let verdict = verified_to_verdict(verified);
+        if let CreateNewVerdict::AlreadyPresent = &verdict {
             let remote_path_str = self.root.join(rel).to_string_lossy().into_owned();
             let parent = Path::new(&remote_path_str)
                 .parent()
@@ -1036,7 +1083,7 @@ impl Remote for SshTransport {
             self.run_remote_ok(&format!("sync {}", shell_quote(&parent)))?;
             return Ok(CreateNewVerdict::AlreadyPresent);
         }
-        Ok(CreateNewVerdict::Conflict)
+        Ok(verdict)
     }
 }
 
@@ -1366,7 +1413,7 @@ mod tests_ssh {
     // The old temp name derived from the LOCAL pid + a per-process counter, so
     // two controllers on different hosts could share a pid and collide on the
     // same remote temp name; `printf ... > tmp` then truncated the collided
-    // path, and the no-clobber `ln` could install the WRONG payload. With
+    // path, and the no-clobber publish could install the WRONG payload. With
     // remote `mktemp` allocation, concurrent controllers can never be handed
     // the same name: exactly one install wins, every loser reports failure,
     // and no reader ever observes torn/mixed content.
@@ -1544,11 +1591,11 @@ mod tests_ssh {
         let fsync_pos = cmd
             .find("sync \"$tmp\"")
             .expect("the file fsync step must be present");
-        let ln_pos = cmd
-            .find("ln \"$tmp\"")
+        let publish_pos = cmd
+            .find("link($ARGV[0], $ARGV[1])")
             .expect("the no-replace install must be present");
         assert!(
-            chmod_pos < fsync_pos && fsync_pos < ln_pos,
+            chmod_pos < fsync_pos && fsync_pos < publish_pos,
             "step order must be chmod -> file fsync -> install, got: {cmd}"
         );
         // Step 7: a real `sync <dir>` — and no `2>/dev/null` swallow.
@@ -1683,7 +1730,9 @@ mod tests_ssh {
         /// `sync "$tmp"` fails (step 4).
         FileFsync,
         /// `ln` fails for a reason OTHER than EEXIST (step 5) — with the
-        /// destination ABSENT, so the script must NOT call it a verdict.
+        /// destination ABSENT, so the script must NOT call it a verdict. The
+        /// publish is perl `link(2)`, so the stage is faulted by a fake
+        /// `perl` that exits 1.
         Publish,
         /// `sync <dir>` fails (step 7) — the file sync passes, the
         /// parent-dir sync is the propagated failure.
@@ -1728,7 +1777,7 @@ mod tests_ssh {
                 ),
                 SshStageFailure::Chmod => ("chmod", "#!/bin/sh\nexit 1\n"),
                 SshStageFailure::FileFsync => ("sync", "#!/bin/sh\nexit 1\n"),
-                SshStageFailure::Publish => ("ln", "#!/bin/sh\nexit 1\n"),
+                SshStageFailure::Publish => ("perl", "#!/bin/sh\nexit 1\n"),
                 SshStageFailure::ParentFsync => (
                     "sync",
                     "#!/bin/sh\nif [ -d \"$1\" ]; then echo 'sync: dir sync failed' >&2; exit 9; fi\nexit 0\n",
@@ -1789,6 +1838,7 @@ mod tests_ssh {
 mod fingerprint_ssh_tests {
     use super::*;
     use crate::remote::helper::{ExpectedCurrent, RemoteHelper};
+    use crate::remote::transport::{NotRegularFileKind, VerifiedExisting};
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
     use std::ffi::OsString;
@@ -2940,7 +2990,11 @@ exec /bin/mv "$@"
                     let verdict = t
                         .try_write_new(rel, data)
                         .expect("a different-content winner is a verdict, not an I/O error");
-                    prop_assert_eq!(verdict, CreateNewVerdict::Conflict);
+                    let is_content_mismatch = matches!(
+                        verdict,
+                        CreateNewVerdict::Conflict(VerifiedExisting::ContentMismatch)
+                    );
+                    prop_assert!(is_content_mismatch);
                     prop_assert_eq!(
                         std::fs::read(&dest).unwrap(),
                         b"foreign-winner",
@@ -2964,7 +3018,11 @@ exec /bin/mv "$@"
                     let verdict = t
                         .try_write_new(rel, data)
                         .expect("a mode mismatch is a verdict, not an I/O error");
-                    prop_assert_eq!(verdict, CreateNewVerdict::Conflict);
+                    let is_mode_mismatch = matches!(
+                        verdict,
+                        CreateNewVerdict::Conflict(VerifiedExisting::ModeMismatch { .. })
+                    );
+                    prop_assert!(is_mode_mismatch);
                     let meta = std::fs::metadata(&dest).unwrap();
                     prop_assert_eq!(
                         meta.mode() & 0o7777,
@@ -3118,6 +3176,255 @@ exec /bin/mv "$@"
                 local_read_back.as_slice(),
                 data.as_slice(),
                 "arbitrary bytes must round-trip EXACTLY through the local transport"
+            );
+        }
+    }
+
+    // The cross-product create-new verification matrix — the central
+    // verification contract, property-tested over the FULL product:
+    // TRANSPORT (Local + Ssh-with-fake) × ENTRY TYPE (absent / regular /
+    // DIRECTORY / SYMLINK / other-fifo) × MODE (exact / wrong) × CONTENT
+    // (exact / semantically-equal / different) × the caller's CONTENT
+    // EQUIVALENCE (Exact / Semantic). `Created` ONLY for absent;
+    // `AlreadyPresent` ONLY for a REGULAR FILE with the REQUIRED MODE and an
+    // ACCEPTED content equivalence; every other combination is `Conflict`
+    // carrying the CORRECT typed reason — a directory → NotRegularFile, a
+    // SYMLINK → NotRegularFile and NEVER FOLLOWED (the symlink points at a
+    // matching regular file, so a following stat would wrongly accept it), a
+    // wrong mode → ModeMismatch, different content → ContentMismatch. The
+    // `Other` (fifo) kind is generated only for the LOCAL leg: the ssh
+    // perl-lstat's THREE-way classification (dir/symlink/file) cannot
+    // express a fifo — it reports as a file, and reading it with `cat`
+    // would block the transport.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum XTransport {
+        Local,
+        Ssh,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum XEntry {
+        Absent,
+        Regular,
+        Directory,
+        Symlink,
+        Other,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum XMode {
+        Exact,
+        Wrong,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum XContent {
+        Exact,
+        Semantic,
+        Different,
+    }
+
+    fn x_entry_strategy(transport: XTransport) -> BoxedStrategy<XEntry> {
+        let all = prop_oneof![
+            Just(XEntry::Absent),
+            Just(XEntry::Regular),
+            Just(XEntry::Directory),
+            Just(XEntry::Symlink),
+            Just(XEntry::Other),
+        ]
+        .boxed();
+        match transport {
+            XTransport::Local => all,
+            // The ssh perl-lstat classifies dir/symlink/file only: a fifo
+            // reports as a file and its `cat` read would block, so the Ssh
+            // leg filters the inexpressible fifo kind out of the same
+            // strategy.
+            XTransport::Ssh => all
+                .prop_filter("fifo is not expressible over the ssh lstat", |e| {
+                    *e != XEntry::Other
+                })
+                .boxed(),
+        }
+    }
+
+    proptest! {
+        // Bounded cases (house style), fixed seed 0x5EED_5EED, no failure
+        // persistence, and every case drives its OWN fixture (per-fixture
+        // isolation — a fifo or symlink in one case can never leak into
+        // another).
+        #![proptest_config(ProptestConfig {
+            cases: crate::testutil::proptest_cases(64),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn try_write_new_verification_cross_product(
+            (transport, entry, mode, content, equivalence) in prop_oneof![
+                Just(XTransport::Local),
+                Just(XTransport::Ssh),
+            ]
+            .prop_flat_map(|t| {
+                (
+                    Just(t),
+                    x_entry_strategy(t),
+                    prop_oneof![Just(XMode::Exact), Just(XMode::Wrong)],
+                    prop_oneof![
+                        Just(XContent::Exact),
+                        Just(XContent::Semantic),
+                        Just(XContent::Different),
+                    ],
+                    prop_oneof![
+                        Just(ContentEquivalence::Exact),
+                        Just(ContentEquivalence::Semantic),
+                    ],
+                )
+            }),
+        ) {
+            use crate::remote::transport::LocalTransport;
+            use std::ffi::CString;
+            use std::os::unix::fs::PermissionsExt;
+
+            // The immutable-record intent: a JSON payload whose key order can
+            // be re-arranged without changing its value.
+            let intent: &[u8] = br#"{"a":1,"b":2}"#;
+            let required_mode = IMMUTABLE_RECORD_MODE & 0o7777;
+            let wrong_mode = if required_mode == 0o600 { 0o640 } else { 0o600 };
+            let rel = Path::new("state/record.json");
+            let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+
+            // Each case drives its OWN transport fixture: LocalTransport
+            // rooted at a fresh dir, or the fake-ssh transport rooted at a
+            // fresh emulated remote. The fake-ssh leg installs a no-op `sync`
+            // (the write_new_cmd runs `sync` on the temp AND the parent; the
+            // real /sbin/sync must never run inside a test).
+            let (handle, dest): (Box<dyn Remote>, std::path::PathBuf) = match transport {
+                XTransport::Local => {
+                    let t = LocalTransport::new(
+                        &crate::testutil::fixture_env(),
+                        tmp.path().join("r"),
+                    )
+                    .unwrap();
+                    let dest = t.root().join(rel);
+                    (Box::new(t), dest)
+                }
+                XTransport::Ssh => {
+                    let fake = FakeSsh::new(
+                        tmp.path().join("bin"),
+                        tmp.path().join("remote"),
+                        "xprod-ssh.test",
+                        Path::new("/srv/deploy/xprod-ssh"),
+                    );
+                    let cache = tmp.path().join("knownhosts");
+                    let env = fake_env(
+                        &fake.bin,
+                        &cache,
+                        &fake.remote_root,
+                        "/srv/deploy/xprod-ssh",
+                    );
+                    let t = fake.transport(&cache, &env);
+                    t.prepare_identity().unwrap();
+                    write_fake_bin(&fake.bin, "sync", "#!/bin/sh\nexit 0\n");
+                    let dest = fake.remote_root.join("srv/deploy/xprod-ssh").join(rel);
+                    (Box::new(t), dest)
+                }
+            };
+
+            // Stage the EXISTING entry per (entry, mode, content). A symlink
+            // points AT a matching regular file (intent bytes, required mode)
+            // — a FOLLOWING stat would accept it, the lstat must not (the
+            // symlink-never-followed guarantee).
+            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            let existing_bytes: &[u8] = match content {
+                XContent::Exact => intent,
+                XContent::Semantic => br#"{"b":2,"a":1}"#,
+                XContent::Different => br#"{"a":9,"b":9}"#,
+            };
+            let entry_mode = match mode {
+                XMode::Exact => required_mode,
+                XMode::Wrong => wrong_mode,
+            };
+            match entry {
+                XEntry::Absent => {}
+                XEntry::Regular => {
+                    std::fs::write(&dest, existing_bytes).unwrap();
+                    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(entry_mode))
+                        .unwrap();
+                }
+                XEntry::Directory => std::fs::create_dir(&dest).unwrap(),
+                XEntry::Symlink => {
+                    let target = dest.with_file_name("target.json");
+                    std::fs::write(&target, intent).unwrap();
+                    std::fs::set_permissions(
+                        &target,
+                        std::fs::Permissions::from_mode(required_mode),
+                    )
+                    .unwrap();
+                    std::os::unix::fs::symlink(&target, &dest).unwrap();
+                }
+                XEntry::Other => {
+                    // Local-only: the strategy never generates Other for Ssh.
+                    prop_assert_eq!(transport, XTransport::Local, "fifo is local-only");
+                    let c = CString::new(dest.as_os_str().as_encoded_bytes()).unwrap();
+                    let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o644) };
+                    prop_assert_eq!(
+                        rc,
+                        0,
+                        "mkfifo {} must succeed: {}",
+                        dest.display(),
+                        std::io::Error::last_os_error()
+                    );
+                }
+            }
+
+            let verdict = handle
+                .try_write_new_with(rel, intent, equivalence)
+                .expect("a create-new attempt must return a verdict, never hang");
+
+            // The CROSS-PRODUCT expectation: `Created` ONLY for absent;
+            // `AlreadyPresent` ONLY for a regular file with the required mode
+            // and an accepted content equivalence; every other combination is
+            // `Conflict` with the correct typed reason.
+            let expected = match entry {
+                XEntry::Absent => CreateNewVerdict::Created,
+                XEntry::Directory => CreateNewVerdict::Conflict(VerifiedExisting::NotRegularFile {
+                    kind: NotRegularFileKind::Directory,
+                }),
+                XEntry::Symlink => CreateNewVerdict::Conflict(VerifiedExisting::NotRegularFile {
+                    kind: NotRegularFileKind::Symlink,
+                }),
+                XEntry::Other => CreateNewVerdict::Conflict(VerifiedExisting::NotRegularFile {
+                    kind: NotRegularFileKind::Other,
+                }),
+                XEntry::Regular => match mode {
+                    XMode::Wrong => CreateNewVerdict::Conflict(VerifiedExisting::ModeMismatch {
+                        actual: wrong_mode,
+                        required: required_mode,
+                    }),
+                    XMode::Exact => match content {
+                        XContent::Exact => CreateNewVerdict::AlreadyPresent,
+                        XContent::Different => {
+                            CreateNewVerdict::Conflict(VerifiedExisting::ContentMismatch)
+                        }
+                        XContent::Semantic => match equivalence {
+                            ContentEquivalence::Semantic => CreateNewVerdict::AlreadyPresent,
+                            ContentEquivalence::Exact => {
+                                CreateNewVerdict::Conflict(VerifiedExisting::ContentMismatch)
+                            }
+                        },
+                    },
+                },
+            };
+            prop_assert_eq!(
+                verdict,
+                expected,
+                "cross-product mismatch: transport={:?} entry={:?} mode={:?} content={:?} equivalence={:?}",
+                transport,
+                entry,
+                mode,
+                content,
+                equivalence
             );
         }
     }

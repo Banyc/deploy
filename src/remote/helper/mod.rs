@@ -33,7 +33,7 @@ pub use state::current::{CurrentState, ExpectedCurrent};
 use crate::error::{Error, Result};
 use crate::identity::{BehaviorContract, GenerationId, ReleaseId, ReleaseRecord};
 use crate::remote::layout;
-use crate::remote::transport::{CreateNewVerdict, Remote, RemoveIfVerdict};
+use crate::remote::transport::{CreateNewVerdict, Remote, RemoveIfVerdict, VerifiedExisting};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -155,10 +155,41 @@ impl<'a> RemoteHelper<'a> {
             // directly: `Created` (I won the race) and `AlreadyPresent` with
             // IDENTICAL bytes (the identical retry — my own record is
             // already installed) both mean the lock now carries my record;
-            // `Conflict` means a DIFFERENT record won — read it and decide.
+            // `Conflict` carries the TYPED reason — only a CONTENT conflict
+            // (a DIFFERENT holder's lock bytes, type+mode verified regular)
+            // is the read-the-winner path below, while a METADATA conflict
+            // (a directory or symlink where the lock file should be, a mode
+            // mismatch, an unreadable entry) is a REAL conflict: the lock is
+            // never silently accepted and the entry is never treated as a
+            // lease record.
             match self.remote.try_write_new(p, &bytes)? {
                 CreateNewVerdict::Created | CreateNewVerdict::AlreadyPresent => return Ok(record),
-                CreateNewVerdict::Conflict => {}
+                CreateNewVerdict::Conflict(VerifiedExisting::ContentMismatch) => {}
+                CreateNewVerdict::Conflict(VerifiedExisting::ModeMismatch { actual, required }) => {
+                    return Err(Error::remote(format!(
+                        "remote mutation lock exists with mode {actual:o} (required {required:o}); refusing to treat it as a lock"
+                    )));
+                }
+                CreateNewVerdict::Conflict(VerifiedExisting::NotRegularFile { kind }) => {
+                    return Err(Error::remote(format!(
+                        "remote mutation lock path is a {kind:?} entry, not a regular lock file; refusing to treat it as a lock"
+                    )));
+                }
+                CreateNewVerdict::Conflict(VerifiedExisting::Unreadable(e)) => {
+                    return Err(Error::remote(format!(
+                        "remote mutation lock exists but is unreadable: {e}"
+                    )));
+                }
+                CreateNewVerdict::Conflict(VerifiedExisting::NotFound) => {
+                    return Err(Error::remote(
+                        "remote mutation lock vanished during verification",
+                    ));
+                }
+                CreateNewVerdict::Conflict(VerifiedExisting::Ok { .. }) => {
+                    return Err(Error::remote(
+                        "remote mutation lock verification unexpectedly succeeded as Ok",
+                    ));
+                }
             }
             // Already held by a different record: read the winner and decide
             // — a same-owner retry (the file's record is authoritative),

@@ -3,7 +3,7 @@
 
 use crate::error::{Error, Result};
 use crate::remote::layout;
-use crate::remote::transport::CreateNewVerdict;
+use crate::remote::transport::{CreateNewVerdict, VerifiedExisting};
 
 use super::super::RemoteHelper;
 
@@ -39,21 +39,37 @@ impl<'a> RemoteHelper<'a> {
         let bytes = serde_json::to_vec_pretty(&payload)
             .map_err(|e| Error::remote(format!("serialize commit: {e}")))?;
         // The TYPED verdict: `Created` installed the marker, `AlreadyPresent`
-        // means the winner is byte-and-mode identical (the identical retry
-        // converges — treat like success with "already there" semantics).
-        // Only a `Conflict` (different bytes or mode) needs the read-back
-        // comparison, which decides the semantic verdict exactly as before.
+        // means the winner was VERIFIED as a regular file with the exact mode
+        // and byte-identical content (the identical retry converges — treat
+        // like success with "already there" semantics). A `Conflict` carries
+        // the TYPED reason: a CONTENT mismatch means the winner's bytes
+        // differ (the transport already performed the byte comparison — a
+        // read-back would only re-derive the same verdict), and a METADATA
+        // conflict — a directory/symlink where the marker should be, a mode
+        // mismatch, an unreadable entry — is a real marker-integrity
+        // conflict, never silently accepted as "already present, fine".
         match self.remote.try_write_new(&p, &bytes)? {
             CreateNewVerdict::Created | CreateNewVerdict::AlreadyPresent => Ok(()),
-            CreateNewVerdict::Conflict => {
-                let existing = self.remote.read(&p)?;
-                if existing != bytes {
-                    return Err(Error::integrity(format!(
-                        "commit marker for {deployment_id} already exists with different content"
-                    )));
+            CreateNewVerdict::Conflict(reason) => Err(Error::integrity(match reason {
+                VerifiedExisting::ContentMismatch => format!(
+                    "commit marker for {deployment_id} already exists with different content"
+                ),
+                VerifiedExisting::ModeMismatch { actual, required } => format!(
+                    "commit marker for {deployment_id} exists with mode {actual:o} (required {required:o})"
+                ),
+                VerifiedExisting::NotRegularFile { kind } => format!(
+                    "commit marker for {deployment_id} exists as a {kind:?} entry, not a regular file"
+                ),
+                VerifiedExisting::Unreadable(e) => format!(
+                    "commit marker for {deployment_id} exists but could not be verified: {e}"
+                ),
+                VerifiedExisting::NotFound => {
+                    format!("commit marker for {deployment_id} vanished during verification")
                 }
-                Ok(())
-            }
+                VerifiedExisting::Ok { .. } => {
+                    unreachable!("a verified-ok entry is AlreadyPresent, never Conflict")
+                }
+            })),
         }
     }
 }
@@ -103,6 +119,60 @@ mod tests_markers {
         .expect("installed commit marker must be valid JSON");
         assert_eq!(marker["committed"], serde_json::json!(true));
         assert_eq!(marker["generation"], serde_json::json!("gen-0"));
+    }
+
+    /// A SYMLINK where a commit marker should be — even one pointing at a
+    /// byte-identical regular file — is a marker-integrity CONFLICT, never
+    /// silently accepted as "already present, fine". The lstat guarantee:
+    /// the symlink is never followed, so a symlink that would verify as a
+    /// perfect retry if followed is still rejected as
+    /// `NotRegularFile { Symlink }`.
+    #[test]
+    fn commit_marker_symlink_is_a_conflict_never_followed() {
+        let (_dir, remote, root) = setup();
+        let marker = layout::commit_marker("deploy-0");
+        std::fs::create_dir_all(root.join(marker.parent().unwrap())).unwrap();
+
+        // The marker the writer would install: deterministic bytes for this
+        // (deployment, generation, slots, target). The symlink points AT a
+        // regular file carrying EXACTLY these bytes and the canonical mode —
+        // a stat (which follows symlinks) would accept it as an identical
+        // retry; the lstat must not.
+        let payload = serde_json::json!({
+            "deployment_id": "deploy-0",
+            "committed": true,
+            "generation": "gen-0",
+            "slots": ["p1"],
+            "target": "t1",
+        });
+        let bytes = serde_json::to_vec_pretty(&payload).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let target = root.join("target.json");
+        std::fs::write(&target, &bytes).unwrap();
+        std::fs::set_permissions(
+            &target,
+            std::fs::Permissions::from_mode(crate::remote::transport::IMMUTABLE_RECORD_MODE),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&target, root.join(&marker)).unwrap();
+
+        let helper = RemoteHelper::new(&remote);
+        let err = helper
+            .write_commit_marker("deploy-0", "gen-0", &["p1".to_string()], Some("t1"))
+            .expect_err("a symlink where the marker should be is a real conflict");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Symlink"),
+            "error must name the NotRegularFile(Symlink) reason, got: {msg}"
+        );
+        // The symlink (and its target) stay untouched.
+        assert!(
+            std::fs::symlink_metadata(root.join(&marker))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), bytes);
     }
 
     /// Concurrent readers listing and parsing commit markers while they are

@@ -3,7 +3,7 @@
 
 use crate::error::{Error, Result};
 use crate::remote::layout;
-use crate::remote::transport::CreateNewVerdict;
+use crate::remote::transport::{CreateNewVerdict, VerifiedExisting};
 
 use super::RemoteHelper;
 
@@ -23,34 +23,45 @@ impl<'a> RemoteHelper<'a> {
             .map_err(|e| Error::remote(format!("serialize marker: {e}")))?;
         let marker_path = layout::protocol_marker();
         // The TYPED verdict: `Created` wrote the marker, `AlreadyPresent`
-        // means it is byte-identical (the identical retry — the parse below
-        // would only re-derive the same version); only a `Conflict` needs the
-        // read-back parse to decide (corrupt marker -> error, version mismatch
-        // -> error, exactly as before).
+        // means it was VERIFIED as a regular file with the exact mode and
+        // byte-identical content (the identical retry — the parse below
+        // would only re-derive the same version). A `Conflict` carries the
+        // TYPED reason: only a CONTENT mismatch (the marker exists with
+        // different bytes — a different version, or a different
+        // serialization) keeps the read-back parse; a METADATA conflict — a
+        // directory/symlink where the marker should be, a mode mismatch, an
+        // unreadable entry — refuses the negotiation outright, never
+        // accepted as "already present, fine".
         match self.remote.try_write_new(&marker_path, &bytes)? {
             CreateNewVerdict::Created | CreateNewVerdict::AlreadyPresent => {
                 Ok(crate::remote::transport::PROTOCOL_VERSION)
             }
-            CreateNewVerdict::Conflict => {
-                #[derive(serde::Deserialize)]
-                struct ProtocolMarker {
-                    protocol_version: u32,
+            CreateNewVerdict::Conflict(reason) => match reason {
+                VerifiedExisting::ContentMismatch => {
+                    #[derive(serde::Deserialize)]
+                    struct ProtocolMarker {
+                        protocol_version: u32,
+                    }
+                    let existing = self.remote.read(&marker_path)?;
+                    let recorded: ProtocolMarker =
+                        serde_json::from_slice(&existing).map_err(|e| {
+                            Error::remote(format!(
+                                "corrupt control/protocol.json: {e}; refusing to negotiate"
+                            ))
+                        })?;
+                    if recorded.protocol_version != crate::remote::transport::PROTOCOL_VERSION {
+                        return Err(Error::remote(format!(
+                            "protocol mismatch: remote state was written with protocol {}, but this client speaks {}",
+                            recorded.protocol_version,
+                            crate::remote::transport::PROTOCOL_VERSION
+                        )));
+                    }
+                    Ok(recorded.protocol_version)
                 }
-                let existing = self.remote.read(&marker_path)?;
-                let recorded: ProtocolMarker = serde_json::from_slice(&existing).map_err(|e| {
-                    Error::remote(format!(
-                        "corrupt control/protocol.json: {e}; refusing to negotiate"
-                    ))
-                })?;
-                if recorded.protocol_version != crate::remote::transport::PROTOCOL_VERSION {
-                    return Err(Error::remote(format!(
-                        "protocol mismatch: remote state was written with protocol {}, but this client speaks {}",
-                        recorded.protocol_version,
-                        crate::remote::transport::PROTOCOL_VERSION
-                    )));
-                }
-                Ok(recorded.protocol_version)
-            }
+                reason => Err(Error::remote(format!(
+                    "corrupt control/protocol.json: refusing to negotiate (conflict: {reason:?})"
+                ))),
+            },
         }
     }
 }
