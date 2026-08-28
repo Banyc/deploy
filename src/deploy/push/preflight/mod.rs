@@ -229,7 +229,7 @@ pub(crate) fn run_preflight(
     // absent. Runs under the local target lock already held by this push;
     // never reactivates or restarts services (markers/transition/snapshot
     // only). A recovered attempt finalizes through the SHARED finalizer
-    // (`ledger::finalize_successful_attempt`), which APPENDS its snapshot
+    // (`ledger::finalize_successful_locked`), which APPENDS its snapshot
     // entry to the target's chain — the very append the relative refs below
     // must see. Dry-run never reconciles (it touches nothing).
     if !opts.dry_run {

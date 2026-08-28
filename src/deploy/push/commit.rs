@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 // POST-MUTATION phases of the push transaction (steps 16-17): the terminal
 // event finalization (the `Successful` / `Degraded` / `FailedRolledBack`
 // status decision — [`disposition_for`] — plus the
-// shared successful finalizer [`crate::ledger::finalize_successful_attempt`]),
+// shared successful finalizer [`crate::ledger::finalize_successful_locked`]),
 // the observed-refresh + post-commit maintenance wiring
 // ([`crate::deploy::maintenance`]), and the report assembly.
 // [`run_commit`] is the single coordinator; everything here runs AFTER the
@@ -64,7 +64,7 @@ pub(crate) fn run_commit(
 
     // Finalize the attempt's terminal event. A SUCCESSFUL attempt goes
     // through the SAME shared finalizer as recovery
-    // ([`ledger::finalize_successful_attempt`]): ONE atomic terminal append
+    // ([`ledger::finalize_successful_locked`]): ONE atomic terminal append
     // carrying the `Successful` status, the per-slot outcomes, and the
     // ROLLBACK STATE (built from the actual per-slot OUTCOMES
     // (`actual_servers`), never from the intent record). A non-successful
@@ -107,20 +107,75 @@ pub(crate) fn run_commit(
         // REPRODUCE the intent's frozen selected/full), and — for a FULL
         // push (no group, distinguished by the intent's `group`) — selected
         // == full.
-        ledger::finalize_successful_attempt(
+        // THE ONE LOCK-VERIFIED FINALIZER — the SAME shared operation as
+        // recovery ([`ledger::finalize_successful_locked`]): acquire ALL
+        // selected-slot mutation locks (deterministic sorted-slot-id order),
+        // re-observe EVERY selected slot's LIVE `GenerationRef` (generation
+        // AND artifact) under the locks and require it to EXACTLY equal the
+        // frozen desired assignment (`attempt_intent.slots[sid].desired`),
+        // write the commit markers, append the `Successful` terminal (ONE
+        // atomic line append), and release the locks. A slot whose live
+        // state diverged (a concurrent controller swapped `current`) REFUSES
+        // the finalization: the attempt ends `Degraded` — never
+        // `Successful`, no rollback payload.
+        match ledger::finalize_successful_locked(
             store,
             attempt_intent,
+            helpers,
             &outcomes_map,
             &execution.actual_servers,
-            "push completed",
             &slot_bindings,
-        )?;
-        // The new successful deployment is keyed by its deployment id (the
-        // public grammar is deployment-keyed — successful positions are
-        // derived internally, never exposed as sN).
-        message = format!(
-            "push successful; rollback payload keyed by deployment {deployment_id} of target {target_name}"
-        );
+            &ledger::FinalizeSettings {
+                reason: "push completed",
+                op_id,
+            },
+        )? {
+            ledger::FinalizeOutcome::Finalized => {
+                // The new successful deployment is keyed by its deployment id
+                // (the public grammar is deployment-keyed — successful
+                // positions are derived internally, never exposed as sN).
+                message = format!(
+                    "push successful; rollback payload keyed by deployment {deployment_id} of target {target_name}"
+                );
+            }
+            ledger::FinalizeOutcome::Pending => {
+                // A TRANSIENT failure (a slot lock held elsewhere, a live
+                // status/assignment read failure, a marker transport write
+                // failure): the terminal is NOT appended — the attempt stays
+                // intent-only (the recoverable pending state a later push
+                // reconciles before its own no-op check). Abort the push so
+                // the incomplete finalization is visible — the attempt is
+                // never reported `Successful` without its durable terminal.
+                return Err(crate::error::Error::remote(format!(
+                    "push {deployment_id}: finalization could not verify the selected-slot locks / live state (transient) — the attempt stays pending for a later push to reconcile"
+                )));
+            }
+            ledger::FinalizeOutcome::Refused { reason, .. } => {
+                // The shared finalizer REFUSED: a selected slot's live
+                // `GenerationRef` diverged from the frozen desired assignment
+                // ("state diverged") or a conflicting commit marker exists
+                // ("marker integrity conflict"). Append a `Degraded`
+                // terminal — NEVER `Successful`, no rollback payload.
+                let outcomes: SlotTable<SlotOutcome> = SlotTable::from_map(
+                    outcomes_map
+                        .into_iter()
+                        .map(|(key, result)| Ok((key, SlotOutcome::from_wire(result)?)))
+                        .collect::<Result<BTreeMap<SlotId, SlotOutcome>>>()?,
+                );
+                let disposition =
+                    crate::deploy::rollout::disposition_for(&DeploymentStatus::Degraded, outcomes)?;
+                store.append_terminal(
+                    target_name,
+                    deployment_id,
+                    &LedgerTerminal {
+                        recorded_at: crate::remote::helper::now_rfc3339(),
+                        disposition,
+                        reason: Some(reason.to_string()),
+                    },
+                )?;
+                message = format!("push degraded: {reason}");
+            }
+        }
     } else if execution.commit_status != DeploymentStatus::PendingCommit {
         // A demoted `PendingCommit` status is NOT terminal: the entry stays
         // intent-only (the recoverable pending state a later push reconciles
@@ -233,7 +288,8 @@ pub(crate) mod commit_tests {
     use crate::identity::{OperationId, ServerId, test_deployment_id};
     use crate::ledger::SlotOutcomeKind;
     use crate::ledger::recovery::reconcile_pending_commits;
-    use crate::remote::helper::{GenerationAssignment, RemoteHelper};
+    use crate::remote::helper::{ExpectedCurrent, GenerationAssignment, RemoteHelper};
+    use crate::remote::layout;
     use crate::remote::transport::{LocalTransport, Remote};
     use crate::testutil::test_remotes::FailOnceMarkerRemote;
     use proptest::prelude::*;
@@ -397,7 +453,7 @@ pub(crate) mod commit_tests {
     // ---- Main-path replay-safe finalization ------------------------------
     //
     // The NORMAL success path finalizes through the SAME replay-safe
-    // finalizer as recovery (`ledger::finalize_successful_attempt`):
+    // finalizer as recovery (`ledger::finalize_successful_locked`):
     // recoverable `PendingCommit` marker -> idempotent snapshot +
     // `refs/last-successful` -> terminal `Successful` transition LAST. These
     // tests fault a normal push's finalization once at each persistence step
@@ -1770,6 +1826,290 @@ pub(crate) mod commit_tests {
                     assert!(
                         h.store.read_snapshots("t1").unwrap().is_empty(),
                         "a degraded attempt records no snapshot"
+                    );
+                }
+            }
+        }
+    }
+
+    // ---- THE ONE LOCK-VERIFIED FINALIZATION: swap-at-every-boundary ----
+    //
+    // The shared operation
+    // ([`crate::ledger::finalize_successful_locked`]) acquires ALL
+    // selected-slot mutation locks (deterministic sorted-slot-id order),
+    // re-observes EVERY selected slot's LIVE `GenerationRef` (generation AND
+    // artifact) under the locks and requires it to EXACTLY equal the frozen
+    // desired assignment (`attempt.slots[sid].desired`), writes the markers,
+    // and appends the terminal — then releases the locks. A CONCURRENT
+    // controller that swaps a slot's `current` to a DIFFERENT
+    // generation/artifact must make the finalization REFUSE (the attempt
+    // ends `Degraded`, never `Successful`).
+
+    /// Mint a slot's LIVE state on its remote: a real
+    /// `generations/<gen>/root` chain (`create_generation` + the tree
+    /// object) with `current` pointing at the given generation — exactly the
+    /// state a deployment leaves behind when the commit-marker write failed
+    /// (a PENDING attempt whose remote state is the frozen desired).
+    fn mint_live_slot(
+        h: &TwoSlotHarness,
+        server: &str,
+        generation: &GenerationId,
+        artifact: &ArtifactRef,
+        deployment_id: &DeploymentId,
+    ) {
+        let base = h.remotes_base.join(server);
+        let remote = LocalTransport::new(&crate::testutil::fixture_env(), base).unwrap();
+        remote
+            .create_dir_all(&layout::tree_root(artifact.tree.as_str()))
+            .unwrap();
+        let helper = RemoteHelper::new(&remote);
+        helper
+            .create_generation(
+                "op-mint",
+                &GenerationAssignment {
+                    deployment_id: deployment_id.clone(),
+                    generation_id: generation.clone(),
+                    artifact: artifact.clone(),
+                    behavior_sha256: "sha256-aa".to_string(),
+                    prior_generation: None,
+                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                    target: Some(TargetName::new("t1".to_string())),
+                },
+            )
+            .unwrap();
+        helper
+            .swap_current(&ExpectedCurrent::Absent, generation.as_str(), "op-mint")
+            .unwrap();
+    }
+
+    /// Mint a REAL FOREIGN generation on a slot's remote — a valid
+    /// `generations/<gen>/root` chain whose assignment's artifact DIFFERS
+    /// from the slot's frozen desired assignment — and return its id (the
+    /// `current` swap target of [`SwapInjectRemote`]).
+    fn mint_foreign_generation(h: &TwoSlotHarness, server: &str) -> GenerationId {
+        let base = h.remotes_base.join(server);
+        let remote = LocalTransport::new(&crate::testutil::fixture_env(), base).unwrap();
+        let foreign_gen = GenerationId::generate();
+        let foreign_artifact = ArtifactRef {
+            release: crate::identity::test_release_id("rel-foreign"),
+            variant: VariantName::new("standard".to_string()),
+            tree: test_tree_digest("tree-foreign"),
+        };
+        remote
+            .create_dir_all(&layout::tree_root(foreign_artifact.tree.as_str()))
+            .unwrap();
+        let helper = RemoteHelper::new(&remote);
+        helper
+            .create_generation(
+                "op-foreign",
+                &GenerationAssignment {
+                    deployment_id: test_deployment_id("deploy-foreign"),
+                    generation_id: foreign_gen.clone(),
+                    artifact: foreign_artifact,
+                    behavior_sha256: "b".to_string(),
+                    prior_generation: None,
+                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                    target: Some(TargetName::new("t1".to_string())),
+                },
+            )
+            .unwrap();
+        foreign_gen
+    }
+
+    proptest! {
+        // THE SWAP-AT-EVERY-BOUNDARY FINALIZATION PROPERTY: a PENDING
+        // two-slot attempt whose selected slots' live state EXACTLY equals
+        // the frozen desired assignment, with a CONCURRENT CONTROLLER's swap
+        // of a slot's `current` (re-pointed at a REAL foreign generation
+        // with a DIFFERENT artifact) injected at EVERY boundary of the ONE
+        // lock-verified finalization — BEFORE the re-observation status
+        // read, AFTER the status read but before the assignment read,
+        // BETWEEN marker writes, and BEFORE the terminal append (plus the
+        // unchanged control). `Successful` IMPLIES every selected rollback
+        // assignment EXACTLY equals the frozen desired assignment: whenever
+        // a swap makes a selected slot's live GenerationRef diverge from the
+        // frozen desired (at ANY boundary), the finalization is NOT
+        // `Successful` (it refuses → the attempt ends `Degraded`); when no
+        // swap diverges, the finalization is `Successful` with the rollback
+        // assignments == the frozen desired.
+        //
+        // Bounded `proptest_cases(16)` (full 16 with `DEPLOY_FULL_TESTS=1`,
+        // fast default), fixed seed 0x5EED_5EED (house style), no failure
+        // persistence — the identical vectors on every run.
+        #![proptest_config(ProptestConfig {
+            cases: crate::testutil::proptest_cases(16),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn lock_verified_finalize_refuses_swaps_at_every_boundary(
+            swap_stage in prop_oneof![
+                Just(None),
+                Just(Some(SwapStage::BeforeStatus)),
+                Just(Some(SwapStage::AfterStatus)),
+                Just(Some(SwapStage::BetweenMarkers)),
+                Just(Some(SwapStage::BeforeTerminal)),
+            ],
+        ) {
+            let h = TwoSlotHarness::new();
+            // The FROZEN DESIRED assignments (a distinct artifact per slot)
+            // and the LIVE state minted to match them exactly.
+            let p1 = SlotId::new("p1".to_string());
+            let p2 = SlotId::new("p2".to_string());
+            let gen_p1 = GenerationId::generate();
+            let gen_p2 = GenerationId::generate();
+            let art_p1 = ArtifactRef {
+                release: crate::identity::test_release_id("rel-1"),
+                variant: VariantName::new("standard".to_string()),
+                tree: test_tree_digest("tree-1"),
+            };
+            let art_p2 = ArtifactRef {
+                release: crate::identity::test_release_id("rel-2"),
+                variant: VariantName::new("standard".to_string()),
+                tree: test_tree_digest("tree-2"),
+            };
+            let deployment_id = test_deployment_id("deploy-swap-prop");
+            mint_live_slot(&h, "s1", &gen_p1, &art_p1, &deployment_id);
+            mint_live_slot(&h, "s2", &gen_p2, &art_p2, &deployment_id);
+            // The FOREIGN generations the injected swaps re-point `current`
+            // at (a DIFFERENT generation AND artifact per slot).
+            let foreign_p1 = mint_foreign_generation(&h, "s1");
+            let foreign_p2 = mint_foreign_generation(&h, "s2");
+
+            // The PENDING intent: durable, no terminal, the frozen desired
+            // assignments + the plan-time physical bindings (equal to the
+            // live config's, so the degrade is the injected swap's
+            // divergence, never binding drift).
+            let bindings = h.config.target_slot_bindings("t1").unwrap();
+            let intent = DeploymentIntent {
+                deployment_id: deployment_id.clone(),
+                target: TargetName::new("t1".to_string()),
+                group: None,
+                behavior_sha256: "sha256-aa".to_string(),
+                attempted_at: "2026-01-01T00:00:00Z".to_string(),
+                slots: NonEmptySlotTable::build(vec![
+                    (
+                        p1.clone(),
+                        IntentSlot {
+                            desired: DesiredGeneration {
+                                generation: gen_p1.clone(),
+                                artifact: art_p1.clone(),
+                            },
+                            pre_push: None,
+                            binding: bindings
+                                .get(&p1)
+                                .cloned()
+                                .expect("p1 is a target slot"),
+                        },
+                    ),
+                    (
+                        p2.clone(),
+                        IntentSlot {
+                            desired: DesiredGeneration {
+                                generation: gen_p2.clone(),
+                                artifact: art_p2.clone(),
+                            },
+                            pre_push: None,
+                            binding: bindings
+                                .get(&p2)
+                                .cloned()
+                                .expect("p2 is a target slot"),
+                        },
+                    ),
+                ])
+                .expect("two selected slots"),
+                full_membership: BTreeSet::from([p1.clone(), p2.clone()]),
+            };
+            h.store.append_attempt("t1", &intent).unwrap();
+
+            // The per-slot helpers: the injected swap rides the FIRST slot's
+            // remote (BeforeStatus / AfterStatus — before / inside the first
+            // re-observation) or the SECOND slot's remote (BetweenMarkers /
+            // BeforeTerminal — the second slot's marker / the final
+            // verification before the terminal append).
+            let env = crate::testutil::fixture_env();
+            let mut helpers: HashMap<SlotId, RemoteHelper> = HashMap::new();
+            let p1_remote: Box<dyn Remote> = match swap_stage {
+                Some(SwapStage::BeforeStatus) | Some(SwapStage::AfterStatus) => {
+                    SwapInjectRemote::build(
+                        h.remotes_base.join("s1"),
+                        swap_stage.expect("matched above"),
+                        foreign_p1,
+                    )
+                    .unwrap()
+                }
+                _ => Box::new(LocalTransport::new(&env, h.remotes_base.join("s1")).unwrap()),
+            };
+            let p2_remote: Box<dyn Remote> = match swap_stage {
+                Some(SwapStage::BetweenMarkers) | Some(SwapStage::BeforeTerminal) => {
+                    SwapInjectRemote::build(
+                        h.remotes_base.join("s2"),
+                        swap_stage.expect("matched above"),
+                        foreign_p2,
+                    )
+                    .unwrap()
+                }
+                _ => Box::new(LocalTransport::new(&env, h.remotes_base.join("s2")).unwrap()),
+            };
+            helpers.insert(p1.clone(), RemoteHelper::new(p1_remote.as_ref()));
+            helpers.insert(p2.clone(), RemoteHelper::new(p2_remote.as_ref()));
+
+            // RECOVER: the ONE lock-verified finalization acquires BOTH
+            // locks (deterministic order), re-observes both slots' live
+            // GenerationRefs, writes the markers, and appends the terminal —
+            // or refuses on the injected divergence.
+            let op_id = OperationId::new("op-swap-prop".to_string());
+            reconcile_pending_commits(&h.store, &h.config, "t1", &op_id, &helpers).unwrap();
+
+            let status = h
+                .store
+                .latest_status(deployment_id.as_str())
+                .unwrap()
+                .expect("the recovered attempt has a status");
+            match status {
+                DeploymentStatus::Successful => {
+                    assert_eq!(
+                        swap_stage,
+                        None,
+                        "a swap at ANY boundary must prevent a Successful terminal — the shared operation must refuse a diverged live state (stage {swap_stage:?})"
+                    );
+                    // SUCCESSFUL IMPLIES every selected rollback assignment
+                    // EXACTLY equals the frozen desired assignment (the
+                    // generation AND its artifact: release/variant/tree).
+                    let snapshots = h.store.read_snapshots("t1").unwrap();
+                    assert_eq!(snapshots.len(), 1, "exactly one successful snapshot");
+                    assert_eq!(snapshots[0].deployment_id, deployment_id);
+                    let rb = rollback_of(&snapshots[0]);
+                    for (sid, slot) in intent.slots.iter() {
+                        let rbs = rb
+                            .slots
+                            .get(sid)
+                            .expect("the rollback covers every selected slot");
+                        assert_eq!(
+                            rbs.generation, slot.desired.generation,
+                            "rollback generation for {sid} must equal the frozen desired generation"
+                        );
+                        assert_eq!(
+                            rbs.assignment.artifact, slot.desired.artifact,
+                            "rollback artifact for {sid} must equal the frozen desired artifact (release/variant/tree)"
+                        );
+                    }
+                }
+                DeploymentStatus::Degraded => {
+                    assert!(
+                        swap_stage.is_some(),
+                        "the unchanged control (no swap) must finalize Successful, got Degraded"
+                    );
+                    assert!(
+                        h.store.read_snapshots("t1").unwrap().is_empty(),
+                        "a refused/degraded attempt records no snapshot — never Successful"
+                    );
+                }
+                other => {
+                    panic!(
+                        "unexpected disposition {other:?} for swap stage {swap_stage:?} — the shared operation must finalize Successful (control) or Degraded (refused)"
                     );
                 }
             }

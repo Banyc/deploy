@@ -47,7 +47,7 @@
 //! [`crate::ledger::tables::NonEmptySlotTable`] over the private ordered
 //! map) are generic slot collection INFRASTRUCTURE and stay in
 //! [`crate::ledger::tables`]; the ledger WRITE path (replay-safe
-//! finalization [`crate::ledger::finalize::finalize_successful_attempt`]
+//! finalization [`crate::ledger::finalize::finalize_successful_locked`]
 //! and the two physical append line kinds
 //! [`crate::ledger::finalize::LedgerLine`]) lives in
 //! [`crate::ledger::finalize`]; reconciliation lives in

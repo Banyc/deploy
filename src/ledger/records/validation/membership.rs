@@ -21,7 +21,7 @@
 //!
 //! The single verification helper is shared by the wire → domain conversion
 //! ([`crate::ledger::records::LedgerTerminalWire::into_domain`]); the
-//! successful writer ([`crate::ledger::finalize::finalize_successful_attempt`])
+//! successful writer ([`crate::ledger::finalize::finalize_successful_locked`])
 //! produces the proven shape by construction and pins the rollback-key
 //! equality itself.
 

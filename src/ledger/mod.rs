@@ -36,8 +36,9 @@
 //! * [`tables`] — the per-slot ordered TABLES ([`SlotTable`] /
 //!   [`NonEmptySlotTable`] over the private ordered map): generic slot
 //!   collection INFRASTRUCTURE shared by the record model.
-//! * [`finalize`] — the ledger WRITE path: replay-safe finalization
-//!   ([`finalize_successful_attempt`] + [`recovery_outcomes`]) and the two
+//! * [`finalize`] — the ledger WRITE path: replay-safe, LOCK-VERIFIED
+//!   finalization ([`finalize_successful_locked`] + [`recovery_outcomes`])
+//!   and the two
 //!   physical append line kinds ([`LedgerLine`] — the intent + terminal
 //!   WIRE events) with the merged-entry re-export.
 //! * [`recovery`] — pending-attempt RECONCILIATION
@@ -80,7 +81,10 @@ pub mod recovery;
 pub mod refs;
 pub mod tables;
 
-pub use finalize::{LedgerEntry, LedgerLine, finalize_successful_attempt, recovery_outcomes};
+pub use finalize::{
+    FinalizeOutcome, FinalizeSettings, LedgerEntry, LedgerLine, finalize_successful_locked,
+    recovery_outcomes,
+};
 pub use log::render_log;
 pub use records::{
     ArtifactRefWire, BehaviorIndex, CompensationReport, CompleteRollback, DeploymentIntent,

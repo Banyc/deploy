@@ -1,17 +1,32 @@
-//! REPLAY-SAFE FINALIZATION of a successful deployment (feature area A2:
-//! Ledger semantics).
+//! REPLAY-SAFE, LOCK-VERIFIED FINALIZATION of a successful deployment
+//! (feature area A2: Ledger semantics).
 //!
-//! [`finalize_successful_attempt`] is the SINGLE shared terminal path used
+//! [`finalize_successful_locked`] is the SINGLE shared terminal path used
 //! by BOTH the normal push success path and recovery
-//! (`crate::ledger::recovery::reconcile_pending_commits`): it APPENDS the
-//! TERMINAL EVENT (status `Successful`, the per-slot `outcomes`, and the
-//! rollback state built from `actuals`) to the target's ledger — ONE atomic
-//! line append, the only commit of the finalize. Replay idempotency: a
-//! crash after the append can never duplicate the terminal (a repeated
-//! finalize for the same deployment id is a no-op; the store refuses
-//! duplicate appends). The rollback payload itself is built by
-//! [`crate::ledger::records::build_rollback`] (the complete-snapshot
+//! (`crate::ledger::recovery::reconcile_pending_commits`): it ACQUIRES ALL
+//! SELECTED-SLOT MUTATION LOCKS (deterministic sorted-slot-id order, held
+//! TOGETHER for the whole finalize), RE-OBSERVES every selected slot's LIVE
+//! assignment under the locks and requires the COMPLETE `GenerationRef`
+//! (generation AND artifact: release/variant/tree) to EXACTLY EQUAL the
+//! attempt's FROZEN DESIRED assignment (`attempt.slots[sid].desired` — the
+//! value the intent froze at plan time), writes the commit markers, and
+//! APPENDS the TERMINAL EVENT (status `Successful`, the per-slot
+//! `outcomes`, and the rollback state built from `actuals`) — ONE atomic
+//! line append, the only commit of the finalize — then releases the locks.
+//! Replay idempotency: a crash after the append can never duplicate the
+//! terminal (a repeated finalize for the same deployment id is a no-op; the
+//! store refuses duplicate appends). The rollback payload itself is built
+//! by [`crate::ledger::records::build_rollback`] (the complete-snapshot
 //! overlay + exact-rollback verification semantics).
+//!
+//! ANY SELECTED SLOT whose LIVE `GenerationRef` diverges from the frozen
+//! desired assignment — a concurrent controller swapped the slot's `current`
+//! (or otherwise changed its live generation/artifact) since the attempt
+//! was planned — REFUSES the finalization ([`FinalizeOutcome::Refused`]):
+//! the attempt ends `Degraded` (a "state diverged" disposition), NEVER
+//! `Successful`, and no rollback payload is recorded. The refusal is the
+//! shared operation's replacement for recovery's old per-slot generation
+//! check (the "generation diverged" degraded case).
 //!
 //! [`recovery_outcomes`] derives the per-slot outcomes + actuals used to
 //! finalize a PENDING deployment when the engine no longer has the live
@@ -25,27 +40,55 @@
 //! write path; see the "append / read line kinds" section below.
 
 use crate::error::{Error, Result};
-use crate::identity::SlotId;
+use crate::identity::{OperationId, SlotId};
 pub use crate::ledger::records::{
     DeploymentIntent, LedgerEntry, LedgerIntentWire, LedgerTerminal, LedgerTerminalWire,
     ObservationWire, ObservedGenerationWire, PhysicalBinding, SlotAttemptState, SlotOutcome,
     SlotResult, SlotTable, TerminalDisposition, build_rollback,
 };
+use crate::remote::helper::{LockGuard, RemoteHelper};
 use crate::store::local::LocalStore;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-/// Finalize a successful deployment replay-safely: the SINGLE shared
-/// terminal path used by BOTH the normal push success path and recovery
-/// (`crate::ledger::recovery::reconcile_pending_commits`). Appends the
-/// TERMINAL EVENT (status `Successful`, the per-slot `outcomes`, and the
-/// rollback state built from `actuals`) to the target's ledger — ONE atomic
-/// line append, the only commit of the finalize.
+/// Finalize a successful deployment replay-safely and LOCK-VERIFIED: the
+/// SINGLE shared terminal path used by BOTH the normal push success path
+/// and recovery (`crate::ledger::recovery::reconcile_pending_commits`).
+///
+/// # The lock-verified window (the ONE operation)
+///
+/// 1. ACQUIRE ALL SELECTED-SLOT MUTATION LOCKS in DETERMINISTIC ORDER — the
+///    selected slot ids SORTED (every controller acquires in the same
+///    sequence, so two controllers can never deadlock), all held TOGETHER
+///    for the whole finalize and released only on guard drop after the
+///    terminal is appended.
+/// 2. WHILE HOLDING THE LOCKS, RE-OBSERVE every selected slot's LIVE
+///    assignment: a fresh `status()` read, the live generation's
+///    assignment record (`read_assignment`), and a SECOND fresh `status()`
+///    read (so a swap between the generation read and the assignment read
+///    cannot be missed). The COMPLETE live `GenerationRef` — the live
+///    generation AND its artifact (release/variant/tree) — must EXACTLY
+///    EQUAL the FROZEN DESIRED assignment (`attempt.slots[sid].desired`).
+///    ANY slot whose live `GenerationRef` diverges REFUSES the finalization
+///    ([`FinalizeOutcome::Refused`] — the attempt ends `Degraded`, never
+///    `Successful`; no rollback payload is recorded). This re-observation
+///    is done TWICE: once before the markers and once IMMEDIATELY BEFORE
+///    the terminal append, so a swap at ANY boundary (before the status
+///    read, between the status and assignment reads, between marker writes,
+///    or right before the terminal append) is caught.
+/// 3. WHILE HOLDING THE LOCKS, write the per-slot COMMIT MARKERS (already-
+///    present markers are a byte-for-byte idempotent no-op) and APPEND THE
+///    TERMINAL — the `Successful` status, the per-slot `outcomes`, and the
+///    rollback state built from `actuals` — ONE atomic line append, the
+///    only commit of the finalize.
+/// 4. The locks are RELEASED only after the terminal is appended (the RAII
+///    guards drop on every return path, including the refusals and the
+///    transient-pending path).
 ///
 /// Replay idempotency: if the entry already carries a terminal event, every
 /// durable step already happened and this call is a no-op — a crash after
-/// the append can never duplicate the terminal ([`LocalStore::append_terminal`]
-/// refuses duplicates).
+/// the append can never duplicate the terminal
+/// ([`LocalStore::append_terminal`] refuses duplicates).
 ///
 /// The rollback is built from the attempt's OUTCOMES (`actuals`: per-slot
 /// actual state observed by the engine — live actuals on the main path, the
@@ -78,21 +121,32 @@ use std::collections::{BTreeMap, BTreeSet};
 /// slots carried forward from the base, outside slots omitted, and the
 /// partial-rollout guards in `crate::deploy::plan::validate_partial_rollout`
 /// refuse any current slot without a base entry), and this check pins it.
-pub fn finalize_successful_attempt(
+///
+/// DATA-THEN-SETTINGS: the positional arguments are the pure inputs the
+/// operation acts on (the store, the attempt intent with its frozen desired
+/// assignments, the per-slot live helpers, the outcomes/actuals, the
+/// rollback bindings); the LAST argument is the [`FinalizeSettings`] bundle
+/// (the terminal `reason` and the `op_id` the selected-slot mutation locks
+/// are acquired under).
+pub fn finalize_successful_locked(
     store: &LocalStore,
     attempt: &DeploymentIntent,
+    helpers: &HashMap<SlotId, RemoteHelper>,
     outcomes: &BTreeMap<SlotId, SlotResult>,
     actuals: &BTreeMap<SlotId, SlotAttemptState>,
-    reason: &str,
     bindings: &BTreeMap<SlotId, PhysicalBinding>,
-) -> Result<()> {
+    settings: &FinalizeSettings<'_>,
+) -> Result<FinalizeOutcome> {
+    let FinalizeSettings { reason, op_id } = settings;
+    // Replay idempotency: a repeated finalize for the same deployment id is
+    // a no-op — every durable step already happened.
     let entries = store.read_ledger(attempt.target.as_str())?;
     if let Some(e) = entries
         .iter()
         .find(|e| e.deployment_id == attempt.deployment_id)
         && e.terminal.is_some()
     {
-        return Ok(());
+        return Ok(FinalizeOutcome::Finalized);
     }
     // The base for the complete snapshot: the latest successful snapshot
     // BEFORE this attempt (this attempt's terminal is not yet appended).
@@ -119,6 +173,98 @@ pub fn finalize_successful_attempt(
             attempt.deployment_id
         )));
     }
+
+    // 1. ACQUIRE ALL SELECTED-SLOT MUTATION LOCKS IN DETERMINISTIC ORDER —
+    //    the SELECTED slot ids SORTED (the slot table iterates in
+    //    deployment order, so the sorted order is chosen explicitly): every
+    //    controller acquires the same sequence and two controllers can
+    //    never deadlock. All guards stay alive TOGETHER for the whole
+    //    finalize and release their locks on drop (every return path,
+    //    including the refusals and the transient-pending path).
+    let mut selected: Vec<&SlotId> = attempt.slots.keys().collect();
+    selected.sort();
+    let mut guards: Vec<LockGuard<'_>> = Vec::with_capacity(selected.len());
+    for sid in &selected {
+        let Some(helper) = helpers.get(sid) else {
+            // No live helper for a selected slot: the live state cannot be
+            // verified — fail closed, refuse the Successful finalization.
+            return Ok(FinalizeOutcome::Refused {
+                reason: "state diverged",
+                slot: (*sid).clone(),
+            });
+        };
+        match helper.acquire_lock_guard(op_id.as_str()) {
+            Ok(guard) => guards.push(guard),
+            Err(_) => {
+                // The lock is transiently held elsewhere: leave the attempt
+                // PENDING for a later retry (fail closed — never finalize
+                // without the locks).
+                return Ok(FinalizeOutcome::Pending);
+            }
+        }
+    }
+
+    // 2. THE LOCK-VERIFIED RE-OBSERVATION (pass 1, before the markers):
+    //    re-observe EVERY selected slot's live assignment under the locks
+    //    and require the COMPLETE GenerationRef to exactly equal the frozen
+    //    desired assignment; any divergence REFUSES the finalization.
+    if let Some(slot) = verify_selected_locked(helpers, attempt)? {
+        return Ok(FinalizeOutcome::Refused {
+            reason: "state diverged",
+            slot,
+        });
+    }
+
+    // 3. WRITE THE COMMIT MARKERS under the locks (already-present markers
+    //    are a byte-for-byte idempotent no-op). A conflicting existing
+    //    marker is a PERMANENT condition: refuse — the caller finalizes the
+    //    attempt `Degraded` rather than stranding it pending forever.
+    let slot_ids: Vec<String> = attempt
+        .slots
+        .keys()
+        .map(|s| s.as_str().to_string())
+        .collect();
+    for sid in &selected {
+        let helper = &helpers[*sid];
+        let slot = &attempt.slots[*sid];
+        match helper.write_commit_marker(
+            attempt.deployment_id.as_str(),
+            slot.desired.generation.as_str(),
+            &slot_ids,
+            Some(attempt.target.as_str()),
+        ) {
+            Err(Error::Integrity(_)) => {
+                return Ok(FinalizeOutcome::Refused {
+                    reason: "marker integrity conflict",
+                    slot: (*sid).clone(),
+                });
+            }
+            Err(_) => {
+                // Marker not durable yet: leave the attempt pending for a
+                // later retry.
+                return Ok(FinalizeOutcome::Pending);
+            }
+            Ok(_) => {}
+        }
+    }
+
+    // 4. THE FINAL LOCK-VERIFIED RE-OBSERVATION, IMMEDIATELY BEFORE THE
+    //    TERMINAL APPEND: a swap injected at ANY boundary — before the
+    //    status read, between the status and assignment reads, BETWEEN
+    //    MARKER WRITES, or right before the terminal append — is caught
+    //    here (and by pass 1), so the terminal is never appended for a
+    //    diverged attempt.
+    if let Some(slot) = verify_selected_locked(helpers, attempt)? {
+        return Ok(FinalizeOutcome::Refused {
+            reason: "state diverged",
+            slot,
+        });
+    }
+
+    // 5. APPEND THE TERMINAL while still holding the locks (the ONLY
+    //    commit of the finalize); a failure propagates as an `Err` — the
+    //    caller aborts and the next push replays the whole finalize. The
+    //    guards drop after this line, releasing every lock.
     let terminal = LedgerTerminal {
         recorded_at: crate::remote::helper::now_rfc3339(),
         // The Successful disposition ALWAYS carries the complete rollback
@@ -146,7 +292,91 @@ pub fn finalize_successful_attempt(
         },
         reason: Some(reason.to_string()),
     };
-    store.append_terminal(attempt.target.as_str(), &attempt.deployment_id, &terminal)
+    store.append_terminal(attempt.target.as_str(), &attempt.deployment_id, &terminal)?;
+    Ok(FinalizeOutcome::Finalized)
+}
+
+/// The FINALIZATION SETTINGS (the caller-policy bundle, LAST argument per
+/// the data-then-settings convention): the terminal event's `reason` label
+/// and the `op_id` under which the selected-slot mutation locks are
+/// acquired (and released on guard drop).
+pub struct FinalizeSettings<'a> {
+    /// The terminal event's reason label (e.g. "push completed" /
+    /// "recovery finalized").
+    pub reason: &'a str,
+    /// The operation identity the selected-slot mutation locks are acquired
+    /// under — the deterministic-order lock hold keyed by this operation.
+    pub op_id: &'a OperationId,
+}
+
+/// The outcome of the ONE lock-verified finalization
+/// ([`finalize_successful_locked`]): either the `Successful` terminal was
+/// appended, or the finalization did not complete — the caller acts on the
+/// outcome (a `Refused` attempt ends `Degraded`, a `Pending` attempt stays
+/// intent-only for a later retry).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FinalizeOutcome {
+    /// The `Successful` terminal was appended under the locks; every
+    /// selected slot's live `GenerationRef` equaled the frozen desired
+    /// assignment at both verification passes, the markers are durable, and
+    /// the locks have been released.
+    Finalized,
+    /// A TRANSIENT condition (a slot lock held elsewhere, a live status /
+    /// assignment read failure, a marker transport write failure): no
+    /// terminal is appended and the attempt stays PENDING (intent-only) for
+    /// a later retry — never finalized `Successful` on unverified state.
+    Pending,
+    /// A PERMANENT refusal: a selected slot's live `GenerationRef` diverged
+    /// from the frozen desired assignment (`reason` "state diverged") or a
+    /// conflicting commit marker already exists (`reason` "marker integrity
+    /// conflict"). No terminal is appended; the caller finalizes the attempt
+    /// `Degraded` (terminal only, no rollback) — NEVER `Successful`.
+    Refused {
+        reason: &'static str,
+        /// The slot whose live state (or marker) refused the finalization.
+        slot: SlotId,
+    },
+}
+
+/// Re-observe EVERY selected slot's LIVE assignment while the mutation
+/// locks are held and require the COMPLETE `GenerationRef` — the live
+/// generation AND its artifact (release/variant/tree) — to EXACTLY EQUAL
+/// the FROZEN DESIRED assignment (`attempt.slots[sid].desired`). Each slot
+/// is read as a status read, the live generation's assignment record, and a
+/// SECOND status read: the second read verifies the generation did not
+/// change while the assignment was read, so a swap between the two reads is
+/// never missed. Returns the first diverged slot (`None` = every selected
+/// slot's live `GenerationRef` matches the frozen desired); a transient
+/// read failure is an `Err` (the caller leaves the attempt pending).
+fn verify_selected_locked(
+    helpers: &HashMap<SlotId, RemoteHelper>,
+    attempt: &DeploymentIntent,
+) -> Result<Option<SlotId>> {
+    let mut selected: Vec<&SlotId> = attempt.slots.keys().collect();
+    selected.sort();
+    for sid in selected {
+        let slot = &attempt.slots[sid];
+        let Some(helper) = helpers.get(sid) else {
+            // No live helper for a selected slot: cannot verify — fail
+            // closed (the live state is not provably the frozen desired).
+            return Ok(Some(sid.clone()));
+        };
+        let st1 = helper.status()?;
+        let Some(live_gen) = st1.current_generation else {
+            // No `current` at all: the slot's live state diverged from the
+            // frozen desired (this attempt deployed a generation).
+            return Ok(Some(sid.clone()));
+        };
+        let asn = helper.read_assignment(live_gen.as_str())?;
+        let st2 = helper.status()?;
+        if st2.current_generation.as_ref() != Some(&live_gen)
+            || live_gen != slot.desired.generation
+            || asn.artifact != slot.desired.artifact
+        {
+            return Ok(Some(sid.clone()));
+        }
+    }
+    Ok(None)
 }
 /// Resolve the per-slot OUTCOMES used to finalize a pending deployment when
 /// the engine no longer has the live outcomes at hand (recovery): recovery
@@ -308,8 +538,17 @@ mod tests {
 
     /// Finalization appends the terminal event exactly once (replay-safe by
     /// deployment id): a repeated finalize for the same attempt is a no-op.
+    /// The finalize is LOCK-VERIFIED, so the fixture mints the attempt's
+    /// desired generation on a live remote and points `current` at it (the
+    /// live `GenerationRef` == the frozen desired) — the shared operation
+    /// then acquires the slot lock, re-observes the matching live state,
+    /// writes the marker, and appends the terminal under the lock.
     #[test]
     fn finalize_is_idempotent_by_deployment_id() {
+        use crate::identity::OperationId;
+        use crate::remote::helper::{ExpectedCurrent, RemoteHelper};
+        use crate::remote::transport::{LocalTransport, Remote};
+
         let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
         let target = TargetName::new("production".to_string());
@@ -346,15 +585,59 @@ mod tests {
             },
         )]);
 
-        finalize_successful_attempt(
-            &store,
-            &attempt,
-            &outcomes,
-            &actuals,
-            "push completed",
-            &bindings,
-        )
-        .unwrap();
+        // The LOCK-VERIFIED finalize re-observes the slot's LIVE state under
+        // the mutation lock, so the fixture mints the attempt's desired
+        // generation on a live remote (a valid `generations/<gen>/root`
+        // chain + the tree object) and points `current` at it: the live
+        // `GenerationRef` EXACTLY equals the frozen desired assignment.
+        let remote =
+            LocalTransport::new(&crate::testutil::fixture_env(), tmp.path().join("remote"))
+                .unwrap();
+        let helper = RemoteHelper::new(&remote);
+        remote
+            .create_dir_all(&crate::remote::layout::tree_root(
+                test_tree_digest("tree-1").as_str(),
+            ))
+            .unwrap();
+        helper
+            .create_generation(
+                "op-seed",
+                &crate::remote::helper::GenerationAssignment {
+                    deployment_id: attempt.deployment_id.clone(),
+                    generation_id: test_generation_id("gen-1"),
+                    artifact: ArtifactRef {
+                        release: crate::identity::test_release_id("rel-1"),
+                        variant: VariantName::new("standard".to_string()),
+                        tree: test_tree_digest("tree-1"),
+                    },
+                    behavior_sha256: "sha256-aa".to_string(),
+                    prior_generation: None,
+                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                    target: Some(target.clone()),
+                },
+            )
+            .unwrap();
+        helper
+            .swap_current(
+                &ExpectedCurrent::Absent,
+                test_generation_id("gen-1").as_str(),
+                "op-seed",
+            )
+            .unwrap();
+        let helpers = HashMap::from([(SlotId::new("p1"), helper)]);
+        let settings = FinalizeSettings {
+            reason: "push completed",
+            op_id: &OperationId::new("op-finalize-test".to_string()),
+        };
+
+        assert_eq!(
+            finalize_successful_locked(
+                &store, &attempt, &helpers, &outcomes, &actuals, &bindings, &settings,
+            )
+            .unwrap(),
+            FinalizeOutcome::Finalized,
+            "the live GenerationRef equals the frozen desired, so the lock-verified finalize appends the terminal"
+        );
         let entries = store.read_ledger(target.as_str()).unwrap();
         assert_eq!(entries.len(), 1);
         assert!(entries[0].terminal.is_some());
@@ -367,15 +650,14 @@ mod tests {
 
         // Repeated finalize with the same deployment ID is a no-op: same
         // key, no duplicate terminal.
-        finalize_successful_attempt(
-            &store,
-            &attempt,
-            &outcomes,
-            &actuals,
-            "push completed",
-            &bindings,
-        )
-        .unwrap();
+        assert_eq!(
+            finalize_successful_locked(
+                &store, &attempt, &helpers, &outcomes, &actuals, &bindings, &settings,
+            )
+            .unwrap(),
+            FinalizeOutcome::Finalized,
+            "a replay for a finalized deployment id is a no-op"
+        );
         let entries = store.read_ledger(target.as_str()).unwrap();
         assert_eq!(entries.len(), 1, "no duplicate terminal event");
     }

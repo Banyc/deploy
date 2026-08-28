@@ -32,7 +32,7 @@ pub(crate) use crate::verify::release::RELEASE_RECORD_SCHEMA_VERSION;
 pub(crate) use std::collections::{BTreeMap, BTreeSet};
 pub(crate) use std::os::unix::fs::PermissionsExt;
 pub(crate) use std::path::{Path, PathBuf};
-pub(crate) use std::sync::atomic::AtomicBool;
+pub(crate) use std::sync::atomic::{AtomicBool, Ordering};
 pub(crate) use std::sync::{Arc, Mutex};
 
 /// The KNOWN artifact of a report actual ([`SlotAttemptState`]): a
@@ -511,6 +511,214 @@ impl Remote for RecordingRemote {
         timeout: std::time::Duration,
     ) -> Result<crate::remote::transport::ExecOutcome> {
         self.executed.lock().unwrap().push(argv.to_vec());
+        self.inner.exec(argv, timeout)
+    }
+    fn filesystem_bytes(&self) -> Result<FsBytes> {
+        self.inner.filesystem_bytes()
+    }
+}
+
+/// The boundary at which a CONCURRENT controller's swap of a slot's
+/// `current` is injected into the ONE lock-verified finalization
+/// ([`crate::ledger::finalize::finalize_successful_locked`]): the swap
+/// re-points `current` at a REAL foreign generation (minted up front, so
+/// every later `status()` read validates it cleanly and reports a DIFFERENT
+/// `GenerationRef` than the frozen desired assignment).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SwapStage {
+    /// The swap is in place BEFORE the shared operation runs (the wrapper
+    /// re-points `current` at construction) — i.e. before the re-observation
+    /// status read.
+    BeforeStatus,
+    /// The swap lands right AFTER the re-observation's first `current`
+    /// resolution read, before the assignment read.
+    AfterStatus,
+    /// The swap lands BETWEEN the selected slots' commit-marker writes
+    /// (before the wrapper's own marker write — the second slot's marker).
+    BetweenMarkers,
+    /// The swap lands right BEFORE the final verification that precedes the
+    /// terminal append (after every marker write).
+    BeforeTerminal,
+}
+
+/// A remote wrapper that injects a concurrent controller's `current` swap
+/// at a chosen stage of the ONE lock-verified finalization
+/// ([`crate::ledger::finalize::finalize_successful_locked`]), then passes
+/// through untouched. The foreign generation is a REAL generation (a valid
+/// `generations/<gen>/assignment.json` + `root` chain + tree object, minted
+/// by the harness), so a `status()` read after the swap validates it cleanly
+/// and reports a DIFFERENT `GenerationRef` than the frozen desired
+/// assignment — the state divergence the shared operation must refuse.
+pub(crate) struct SwapInjectRemote {
+    inner: LocalTransport,
+    stage: SwapStage,
+    fired: Arc<AtomicBool>,
+    /// True once this remote has observed its commit-marker write (the
+    /// `BeforeTerminal` trigger fires on the first `current` read after it).
+    marker_seen: Arc<AtomicBool>,
+    /// True once this remote's first `current` resolution read (a status
+    /// read) has been observed (the `AfterStatus` trigger fires on the
+    /// following call).
+    current_read_seen: Arc<AtomicBool>,
+    /// The foreign generation `current` is re-pointed at.
+    foreign_gen: crate::identity::GenerationId,
+}
+
+impl SwapInjectRemote {
+    pub(crate) fn build(
+        base: PathBuf,
+        stage: SwapStage,
+        foreign_gen: crate::identity::GenerationId,
+    ) -> Result<Box<dyn Remote>> {
+        let inner = LocalTransport::new(&crate::testutil::fixture_env(), base)?;
+        let wrapper = SwapInjectRemote {
+            inner,
+            stage,
+            fired: Arc::new(AtomicBool::new(false)),
+            marker_seen: Arc::new(AtomicBool::new(false)),
+            current_read_seen: Arc::new(AtomicBool::new(false)),
+            foreign_gen,
+        };
+        if stage == SwapStage::BeforeStatus {
+            wrapper.do_swap()?;
+        }
+        Ok(Box::new(wrapper))
+    }
+
+    /// Re-point `current` at the foreign generation (a concurrent controller
+    /// that ignores the lock protocol).
+    fn do_swap(&self) -> Result<()> {
+        if self.fired.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.inner.remove_file(crate::remote::layout::current())?;
+        let target = crate::remote::layout::generation(self.foreign_gen.as_str()).join("root");
+        self.inner
+            .symlink(&target, crate::remote::layout::current())?;
+        Ok(())
+    }
+
+    /// The stage trigger, checked BEFORE every delegated remote operation:
+    /// true when the injected swap must land before this call.
+    fn stage_fire(&self, rel: &std::path::Path) -> bool {
+        if self.fired.load(Ordering::SeqCst) {
+            return false;
+        }
+        let is_current_read = rel == crate::remote::layout::current();
+        let is_marker_write = rel.to_string_lossy().starts_with("state/commits/");
+        match self.stage {
+            SwapStage::BeforeStatus => false, // fired at construction
+            SwapStage::AfterStatus => {
+                if is_current_read {
+                    self.current_read_seen.store(true, Ordering::SeqCst);
+                    false
+                } else if self.current_read_seen.load(Ordering::SeqCst) {
+                    // The first call after the status read (the assignment
+                    // read): the swap lands here.
+                    true
+                } else {
+                    false
+                }
+            }
+            SwapStage::BetweenMarkers => {
+                // Before this remote's marker write — the second slot's
+                // marker, i.e. BETWEEN the selected slots' marker writes.
+                is_marker_write
+            }
+            SwapStage::BeforeTerminal => {
+                if is_marker_write {
+                    self.marker_seen.store(true, Ordering::SeqCst);
+                }
+                // The first status read after this remote's marker write is
+                // the final verification right before the terminal append.
+                is_current_read && self.marker_seen.load(Ordering::SeqCst)
+            }
+        }
+    }
+}
+
+impl Remote for SwapInjectRemote {
+    fn root(&self) -> &std::path::Path {
+        self.inner.root()
+    }
+    fn read(&self, rel: &std::path::Path) -> Result<Vec<u8>> {
+        if self.stage_fire(rel) {
+            self.do_swap()?;
+        }
+        self.inner.read(rel)
+    }
+    fn write(&self, rel: &std::path::Path, data: &[u8], mode: u32) -> Result<()> {
+        if self.stage_fire(rel) {
+            self.do_swap()?;
+        }
+        self.inner.write(rel, data, mode)
+    }
+    fn try_write_new(&self, rel: &std::path::Path, data: &[u8]) -> Result<CreateNewVerdict> {
+        if self.stage_fire(rel) {
+            self.do_swap()?;
+        }
+        self.inner.try_write_new(rel, data)
+    }
+    fn create_dir(&self, rel: &std::path::Path) -> Result<()> {
+        self.inner.create_dir(rel)
+    }
+    fn create_dir_all(&self, rel: &std::path::Path) -> Result<()> {
+        self.inner.create_dir_all(rel)
+    }
+    fn set_mode(&self, rel: &std::path::Path, mode: u32) -> Result<()> {
+        self.inner.set_mode(rel, mode)
+    }
+    fn list(&self, rel: &std::path::Path) -> Result<Vec<crate::remote::transport::RemoteEntry>> {
+        self.inner.list(rel)
+    }
+    fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+        self.inner.rename(from, to)
+    }
+    fn symlink(&self, target: &std::path::Path, link: &std::path::Path) -> Result<()> {
+        self.inner.symlink(target, link)
+    }
+    fn read_link(&self, rel: &std::path::Path) -> Result<std::path::PathBuf> {
+        if self.stage_fire(rel) {
+            self.do_swap()?;
+        }
+        self.inner.read_link(rel)
+    }
+    fn remove_file(&self, rel: &std::path::Path) -> Result<()> {
+        self.inner.remove_file(rel)
+    }
+    fn remove_dir_all(&self, rel: &std::path::Path) -> Result<()> {
+        self.inner.remove_dir_all(rel)
+    }
+    fn exists(&self, rel: &std::path::Path) -> bool {
+        // `exists` is infallible: a stage-triggered swap swallows its own
+        // failure the same way the raw `bool` API does (the swap itself
+        // cannot fail here — the foreign generation is pre-minted and
+        // `remove_file`/`symlink` on a healthy transport succeed).
+        if self.stage_fire(rel) {
+            let _ = self.do_swap();
+        }
+        self.inner.exists(rel)
+    }
+    fn metadata(&self, rel: &std::path::Path) -> Result<crate::remote::transport::RemoteMeta> {
+        if self.stage_fire(rel) {
+            self.do_swap()?;
+        }
+        self.inner.metadata(rel)
+    }
+    fn metadata_opt(
+        &self,
+        rel: &std::path::Path,
+    ) -> Result<Option<crate::remote::transport::RemoteMeta>> {
+        if self.stage_fire(rel) {
+            self.do_swap()?;
+        }
+        self.inner.metadata_opt(rel)
+    }
+    fn exec(
+        &self,
+        argv: &[String],
+        timeout: std::time::Duration,
+    ) -> Result<crate::remote::transport::ExecOutcome> {
         self.inner.exec(argv, timeout)
     }
     fn filesystem_bytes(&self) -> Result<FsBytes> {

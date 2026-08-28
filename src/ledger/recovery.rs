@@ -7,14 +7,20 @@
 //! between the intent append and the terminal append, a faulted terminal
 //! append, or a demoted `PendingCommit` commit). Eligibility gating is the
 //! ENTRY SHAPE itself — no transition stream exists anymore. Recovery
-//! verifies membership and generations, writes missing commit markers, and
-//! finalizes replay-safely through the SAME shared finalizer as the main
-//! success path ([`crate::ledger::finalize::finalize_successful_attempt`]).
+//! verifies membership and bindings, then finalizes replay-safely through
+//! the SAME shared LOCK-VERIFIED finalizer as the main success path
+//! ([`crate::ledger::finalize::finalize_successful_locked`]): ONE operation
+//! that acquires ALL selected-slot locks (deterministic order), re-observes
+//! every selected slot's live `GenerationRef` under the locks and requires
+//! it to EXACTLY equal the frozen desired assignment, writes the missing
+//! commit markers, and appends the terminal before releasing the locks.
 
 use crate::config::ProjectConfig;
 use crate::error::{Error, Result};
-use crate::identity::{GenerationId, OperationId, SlotId};
-use crate::ledger::finalize::{finalize_successful_attempt, recovery_outcomes};
+use crate::identity::{OperationId, SlotId};
+use crate::ledger::finalize::{
+    FinalizeOutcome, FinalizeSettings, finalize_successful_locked, recovery_outcomes,
+};
 use crate::ledger::records::DeploymentIntent;
 use crate::ledger::records::SlotTable;
 use crate::ledger::records::{LedgerTerminal, TerminalDisposition};
@@ -35,28 +41,38 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 /// For each eligible entry, oldest first (ledger order, so the successful
 /// chain stays ordered):
 /// 1. Membership: every participating server must still exist in the target.
-/// 2. Generations: each participating server's CURRENT generation (fresh
-///    `helper.status()`) must equal the generation the attempt recorded for it
-///    (`desired[slot].generation`).
-/// 3. If everything matches, write the missing markers under each server's
-///    mutation lock (idempotent: already-written markers are a byte-for-byte
-///    no-op) using the attempt's ORIGINAL deployment ID, then finalize
-///    REPLAY-SAFELY through the SAME shared finalizer as the main success
-///    path ([`crate::ledger::finalize::finalize_successful_attempt`]): ONE
-///    atomic terminal append carrying the `Successful` status, the per-slot
-///    outcomes, and the rollback state (built from the VERIFIED DESIRED
-///    state — the old `deployments/<id>/results.json` outcomes store is
-///    GONE, and a terminal-less entry has no outcomes by construction).
-/// 4. A confirmed membership/generation mismatch finalizes the attempt as
-///    `Degraded` (a terminal event with no rollback). An existing marker
-///    whose content differs from the deterministic payload is an integrity
-///    conflict — a concurrent controller recorded a different fact or the
-///    remote state diverged — and is NOT transient: the conflicting marker
-///    is left untouched and the attempt is finalized `Degraded` (terminal
-///    only, no rollback) instead of being stranded pending forever. Only
-///    transient remote failures (lock held, status read error,
-///    transport-level marker write error) leave the attempt pending (no
-///    terminal) for a later retry.
+/// 2. Binding drift: every selected slot's LIVE physical binding must equal
+///    the intent's FROZEN binding.
+/// 3. THE ONE LOCK-VERIFIED FINALIZATION (the SAME shared operation as the
+///    main success path
+///    ([`crate::ledger::finalize::finalize_successful_locked`])): acquire
+///    ALL selected-slot mutation locks in deterministic sorted-slot-id
+///    order, re-observe EVERY selected slot's live `GenerationRef`
+///    (generation AND artifact) under the locks and require it to EXACTLY
+///    equal the frozen desired assignment, write the missing markers under
+///    the locks (idempotent: already-written markers are a byte-for-byte
+///    no-op) using the attempt's ORIGINAL deployment ID, and append the
+///    terminal REPLAY-SAFELY — ONE atomic terminal append carrying the
+///    `Successful` status, the per-slot outcomes, and the rollback state
+///    (built from the VERIFIED DESIRED state — the old
+///    `deployments/<id>/results.json` outcomes store is GONE, and a
+///    terminal-less entry has no outcomes by construction). The locks are
+///    released only after the terminal is appended. This replaces the old
+///    per-slot lock + generation check: a slot whose live state diverged
+///    (the old "generation diverged" degraded case) is the shared
+///    operation's REFUSAL.
+/// 4. A confirmed membership/binding mismatch OR the shared operation's
+///    REFUSAL (a selected slot's live `GenerationRef` diverged — "state
+///    diverged" — or a conflicting marker exists — "marker integrity
+///    conflict") finalizes the attempt as `Degraded` (a terminal event with
+///    no rollback). An existing marker whose content differs from the
+///    deterministic payload is an integrity conflict — a concurrent
+///    controller recorded a different fact or the remote state diverged —
+///    and is NOT transient: the conflicting marker is left untouched and the
+///    attempt is finalized `Degraded` (terminal only, no rollback) instead
+///    of being stranded pending forever. Only transient remote failures
+///    (lock held, status read error, transport-level marker write error)
+///    leave the attempt pending (no terminal) for a later retry.
 ///
 /// Recovery only touches markers and the ledger's terminal event: no
 /// activation, no verification adapters, no `current` changes, no restart of
@@ -97,7 +113,7 @@ pub(crate) fn reconcile_pending_commits(
     // DEGRADED attempt, not as a false historical fact.
     let live_bindings = config.target_slot_bindings(target_name)?;
 
-    'pending: for attempt in pending {
+    for attempt in pending {
         // 1. Membership check.
         let membership_ok = attempt
             .slots
@@ -138,132 +154,69 @@ pub(crate) fn reconcile_pending_commits(
             continue;
         }
 
-        // 3. Generation verification against fresh remote status reads.
-        let mut recorded: BTreeMap<SlotId, GenerationId> = BTreeMap::new();
-        let mut all_match = true;
-        let mut unverifiable = false;
-        for sid in attempt.slots.keys() {
-            let Some(slot) = attempt.slots.get(sid) else {
-                // No recorded generation for a participant: the attempt is not
-                // a coherent commit; finalize as degraded.
-                all_match = false;
-                break;
-            };
-            let recorded_gen = slot.desired.generation.clone();
-            let Some(helper) = helpers.get(sid) else {
-                all_match = false;
-                break;
-            };
-            match helper.status() {
-                Ok(st)
-                    if st.current_generation.as_ref().map(|g| g.as_str())
-                        == Some(recorded_gen.as_str()) =>
-                {
-                    recorded.insert(sid.clone(), recorded_gen);
-                }
-                Ok(_) => {
-                    // Confirmed divergence: the slot no longer points at the
-                    // generation this attempt minted.
-                    all_match = false;
-                    break;
-                }
-                Err(_) => {
-                    // Transient status read failure: cannot verify, so leave
-                    // the attempt pending for a later retry (fail-closed).
-                    unverifiable = true;
-                    break;
-                }
-            }
-        }
-        if unverifiable {
-            continue;
-        }
-        if !all_match {
-            append_degraded(store, target_name, &attempt, "generation diverged")?;
-            continue;
-        }
-
-        // 4. Write the missing markers under each slot's mutation lock
-        // (mirroring step 15's lock discipline: the guard is held for the
-        // whole write and released on drop). The marker payload carries the
-        // full participating slot set; already-present markers are an
-        // idempotent byte-for-byte no-op.
-        let slot_ids: Vec<String> = attempt
-            .slots
-            .keys()
-            .map(|s| s.as_str().to_string())
-            .collect();
-        let mut markers_written = true;
-        for sid in attempt.slots.keys() {
-            let helper = &helpers[sid];
-            let _guard = match helper.acquire_lock_guard(op_id.as_str()) {
-                Ok(g) => g,
-                Err(_) => {
-                    // Lock transiently held elsewhere: keep the attempt pending
-                    // so a later push retries rather than degrading a healthy
-                    // attempt on a transient blip.
-                    markers_written = false;
-                    break;
-                }
-            };
-            match helper.write_commit_marker(
-                attempt.deployment_id.as_str(),
-                recorded[sid].as_str(),
-                &slot_ids,
-                Some(attempt.target.as_str()),
-            ) {
-                Err(Error::Integrity(_)) => {
-                    // Conflicting marker already exists with different
-                    // content: a permanent condition, not a transient blip.
-                    // Leave the conflicting marker untouched, finalize THIS
-                    // attempt as `Degraded` (terminal only, no rollback) and
-                    // move on to the next pending attempt — a later retry
-                    // would only hit the same integrity error again.
-                    append_degraded(store, target_name, &attempt, "marker integrity conflict")?;
-                    continue 'pending;
-                }
-                Err(_) => {
-                    // Marker not durable yet: leave the attempt pending.
-                    markers_written = false;
-                    break;
-                }
-                Ok(_) => {}
-            }
-            // `_guard` drops here, releasing the lock.
-        }
-        if !markers_written {
-            continue;
-        }
-
-        // 5. Finalize REPLAY-SAFELY through the SAME shared finalizer as the
-        //    main success path ([`crate::ledger::finalize::finalize_successful_attempt`]):
-        //    ONE atomic terminal append (status `Successful`, the per-slot
+        // 3. THE ONE LOCK-VERIFIED FINALIZATION — the SAME shared operation
+        //    as the main success path
+        //    ([`crate::ledger::finalize::finalize_successful_locked`]):
+        //    acquire ALL selected-slot mutation locks (deterministic
+        //    sorted-slot-id order), re-observe EVERY selected slot's LIVE
+        //    `GenerationRef` (generation AND artifact) under the locks and
+        //    require it to EXACTLY equal the frozen desired assignment, write
+        //    the missing markers under the locks (already-present markers are
+        //    a byte-for-byte idempotent no-op), and append the terminal — ONE
+        //    atomic terminal append (status `Successful`, the per-slot
         //    outcomes, and the rollback state built from the VERIFIED DESIRED
-        //    state). A crash or error at the append leaves the entry
-        //    intent-only (eligible) and the next push replays exactly the
-        //    remaining steps; once the terminal exists, every earlier step is
-        //    already durable. The terminal's FULL MEMBERSHIP is the intent's
-        //    FROZEN value (the finalizer reads `attempt.full_membership()` —
-        //    the complete target membership at PLAN TIME): the live
-        //    configuration may have changed arbitrarily since the intent was
-        //    written, and recovery must reproduce exactly what the intent
-        //    froze — never derive the memberships from the current
-        //    configuration. The rollback's PHYSICAL BINDINGS are likewise the
-        //    intent's FROZEN per-slot bindings ([`frozen_bindings`], built
-        //    above from `attempt.slots[sid].binding` — the values the
-        //    binding-drift check just verified EQUAL the live map's):
-        //    recovery never stamps the live configuration's bindings into a
-        //    rollback, because a drifted configuration is degraded, never
-        //    recorded as history.
+        //    state) — then release the locks. This replaces the old per-slot
+        //    lock + generation check: a slot whose live state diverged (the
+        //    old "generation diverged" degraded case) is the shared
+        //    operation's REFUSAL. A crash or error at the append leaves the
+        //    entry intent-only (eligible) and the next push replays exactly
+        //    the remaining steps; once the terminal exists, every earlier
+        //    step is already durable. The terminal's FULL MEMBERSHIP is the
+        //    intent's FROZEN value (the finalizer reads
+        //    `attempt.full_membership()` — the complete target membership at
+        //    PLAN TIME): the live configuration may have changed arbitrarily
+        //    since the intent was written, and recovery must reproduce
+        //    exactly what the intent froze — never derive the memberships
+        //    from the current configuration. The rollback's PHYSICAL
+        //    BINDINGS are likewise the intent's FROZEN per-slot bindings
+        //    ([`frozen_bindings`], built above from `attempt.slots[sid].binding`
+        //    — the values the binding-drift check just verified EQUAL the
+        //    live map's): recovery never stamps the live configuration's
+        //    bindings into a rollback, because a drifted configuration is
+        //    degraded, never recorded as history.
         let (outcomes, actuals) = recovery_outcomes(&attempt);
-        finalize_successful_attempt(
+        match finalize_successful_locked(
             store,
             &attempt,
+            helpers,
             &outcomes,
             &actuals,
-            "recovery finalized",
             &frozen_bindings,
-        )?;
+            &FinalizeSettings {
+                reason: "recovery finalized",
+                op_id,
+            },
+        )? {
+            FinalizeOutcome::Finalized => {}
+            FinalizeOutcome::Pending => {
+                // A TRANSIENT failure (a slot lock held elsewhere, a live
+                // status/assignment read failure, a marker transport write
+                // failure): the attempt stays PENDING (intent-only) for a
+                // later retry — never finalized on unverified state.
+                continue;
+            }
+            FinalizeOutcome::Refused { reason, .. } => {
+                // The shared operation REFUSED: a selected slot's live
+                // `GenerationRef` diverged from the frozen desired
+                // ("state diverged") or a conflicting marker exists
+                // ("marker integrity conflict" — left untouched; a retry
+                // would only hit the same permanent condition). Finalize
+                // THIS attempt as `Degraded` (terminal only, no rollback)
+                // and move on to the next pending attempt — NEVER
+                // `Successful`.
+                append_degraded(store, target_name, &attempt, reason)?;
+            }
+        }
     }
     Ok(())
 }
