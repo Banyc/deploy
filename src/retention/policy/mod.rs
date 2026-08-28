@@ -15,8 +15,8 @@ pub mod pins;
 pub mod rotate;
 
 use crate::config::{Pin, RetentionConfig};
-use crate::error::Result;
-use crate::identity::TreeDigest;
+use crate::error::{Error, Result};
+use crate::identity::{GenerationId, TreeDigest};
 use crate::remote::helper::{RemoteHelper, RemoteStatus};
 use crate::remote::layout;
 use crate::store::local::LocalStore;
@@ -62,21 +62,52 @@ pub fn compute_retained(
     // under the slot's single owning-variant policy (there is no per-target
     // attribution anymore: the slot has one policy regardless of which target
     // created a generation).
+    //
+    // The ENTIRE inventory is loaded through FALLIBLE TYPED operations: only a
+    // CONFIRMED root absence (`metadata_opt` returning `Ok(None)` — the typed
+    // replacement for the error-swallowing `exists` bool) means an empty
+    // history. A root-metadata, listing, assignment-read, identity, or
+    // timestamp failure ABORTS retention BEFORE any deletion — the step-17
+    // caller records the retention-debt marker and sweeps nothing, so an
+    // unreadable history is never mistaken for an unprotected one.
     let mut gens: Vec<GenRecord> = Vec::new();
     let gen_root = layout::generations();
-    if helper.remote().exists(gen_root) {
+    if helper.remote().metadata_opt(gen_root)?.is_some() {
         for e in helper.remote().list(gen_root)? {
             if !e.is_dir {
                 continue;
             }
-            let a = match helper.read_assignment(&e.name) {
-                Ok(a) => a,
-                Err(_) => continue,
-            };
-            let created = a
-                .created_at
-                .parse::<Timestamp>()
-                .unwrap_or_else(|_| Timestamp::now());
+            // Assignment read/parse failure aborts the whole rotation (no
+            // more `continue`): a generation that cannot be read must not
+            // silently disappear from the inventory — its tree would look
+            // unprotected and be deleted.
+            let a = helper.read_assignment(&e.name)?;
+            // Identity: the record must agree with the directory it lives
+            // under. A tampered/mismatched record fails closed — it is never
+            // trusted as evidence about the generation's tree.
+            let dir_gen = GenerationId::parse(&e.name).map_err(|err| {
+                Error::integrity(format!(
+                    "generation directory {} names an invalid generation id: {err}",
+                    e.name
+                ))
+            })?;
+            if a.generation_id != dir_gen {
+                return Err(Error::integrity(format!(
+                    "generation {} assignment names generation {}, not its directory",
+                    e.name, a.generation_id
+                )));
+            }
+            // Timestamp: an unparseable `created_at` ABORTS (never the
+            // current time — a corrupt record must not be treated as
+            // brand-new).
+            let created = crate::identity::Timestamp::parse(&a.created_at)
+                .map(|t| *t.inner())
+                .map_err(|err| {
+                    Error::remote(format!(
+                        "generation {} has an unparseable created_at {:?}: {err}",
+                        e.name, a.created_at
+                    ))
+                })?;
             gens.push(GenRecord {
                 created_at: created,
                 release: a.artifact.release.as_str().to_string(),
@@ -197,22 +228,22 @@ pub fn retained_summary(retained: &HashSet<String>) -> Vec<TreeDigest> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ProjectConfig, SlotConfig};
+    use crate::config::{DeploymentRetention, PerServerRetention, ProjectConfig, SlotConfig};
     use crate::deploy::set_retention_deferred;
     use crate::error::Error;
     use crate::identity::{
-        ReleaseId, ReleaseRecord, SlotId, TreeDigest, VariantName, test_deployment_id,
-        test_generation_id, test_tree_digest,
+        ArtifactRef, DeploymentId, GenerationId, ReleaseId, ReleaseRecord, SlotId, TreeDigest,
+        VariantName, test_deployment_id, test_generation_id, test_release_id, test_tree_digest,
     };
     use crate::remote::helper::{GenerationAssignment, RemoteHelper};
     use crate::remote::layout;
-    use crate::remote::transport::LocalTransport;
+    use crate::remote::transport::{LocalTransport, Remote, RemoteEntry, RemoteMeta};
     use crate::store::local::LocalStore;
     use crate::verify::release::RELEASE_RECORD_SCHEMA_VERSION;
     use crate::verify::release::build_release;
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     fn cfg() -> ProjectConfig {
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
@@ -1445,6 +1476,477 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     "garbage {t} is removed by the retry"
                 );
             }
+            let mut debt = store.read_retention_debt("t1").unwrap();
+            assert!(
+                debt.remove("p1").is_some(),
+                "the retried retention services the marker"
+            );
+            store.write_retention_debt("t1", &debt).unwrap();
+            assert!(
+                store.read_retention_debt("t1").unwrap().is_empty(),
+                "the debt marker is cleared once the retry succeeds"
+            );
+        }
+    }
+
+    // ---- fallible inventory loading: an unreadable history is NOT unprotected ----
+
+    /// One generated generation record in the fixture history: the typed
+    /// wire fields (canonical ids + digest) plus the parsed timestamp, so
+    /// the fixture builder and the reference model share one source.
+    #[derive(Clone, Debug)]
+    struct TestGen {
+        id: String,
+        deployment: String,
+        tree: String,
+        created_at: Timestamp,
+        prior: Option<String>,
+        release: String,
+        variant: String,
+    }
+
+    /// The REFERENCE-MODEL retained set for a generated history: every tree
+    /// the slot policy MUST keep — the current tree, the protected previous
+    /// tree, the newest `keep_distinct` distinct (release, variant, tree)
+    /// bindings, every binding activated inside the `keep_days` window, and
+    /// every tree of the newest `protect_deployments` distinct deployment
+    /// ids. Computed INDEPENDENTLY of [`compute_retained`] — plain set
+    /// arithmetic over the generated history + policy, no transport calls —
+    /// so the healthy sanity and the post-repair retry both pin the exact
+    /// expected set.
+    fn reference_retained(
+        history: &[TestGen],
+        current: &TestGen,
+        policy: &RetentionConfig,
+    ) -> HashSet<String> {
+        let mut retained: HashSet<String> = HashSet::new();
+        retained.insert(current.tree.clone());
+
+        if policy.per_server.protect_previous
+            && let Some(prior) = &current.prior
+            && let Some(p) = history.iter().find(|g| g.id == *prior)
+        {
+            retained.insert(p.tree.clone());
+        }
+
+        // Distinct successful artifact bindings, keyed by (release, variant,
+        // tree), newest activation first.
+        let mut distinct: BTreeMap<(String, String, String), Timestamp> = BTreeMap::new();
+        for g in history {
+            let key = (g.release.clone(), g.variant.clone(), g.tree.clone());
+            let slot = distinct.entry(key).or_insert(g.created_at);
+            if g.created_at > *slot {
+                *slot = g.created_at;
+            }
+        }
+        let mut ordered: Vec<((String, String, String), Timestamp)> =
+            distinct.into_iter().collect();
+        ordered.sort_by_key(|(_, ts)| std::cmp::Reverse(*ts));
+        for ((_, _, tree), _) in ordered
+            .iter()
+            .take(policy.per_server.keep_distinct_artifacts as usize)
+        {
+            retained.insert(tree.clone());
+        }
+
+        let keep_days = policy.per_server.keep_days;
+        if keep_days > 0 {
+            let cutoff = Timestamp::now() - jiff::SignedDuration::from_hours(keep_days as i64 * 24);
+            for ((_, _, tree), ts) in &ordered {
+                if *ts >= cutoff {
+                    retained.insert(tree.clone());
+                }
+            }
+        }
+
+        let protect_deployments = policy.deployment.protect_deployments as usize;
+        if protect_deployments > 0 {
+            let mut depl: BTreeMap<String, Timestamp> = BTreeMap::new();
+            for g in history {
+                let slot = depl.entry(g.deployment.clone()).or_insert(g.created_at);
+                if g.created_at > *slot {
+                    *slot = g.created_at;
+                }
+            }
+            let mut depl_ordered: Vec<(String, Timestamp)> = depl.into_iter().collect();
+            depl_ordered.sort_by_key(|(_, ts)| std::cmp::Reverse(*ts));
+            let keep_ids: HashSet<String> = depl_ordered
+                .iter()
+                .take(protect_deployments)
+                .map(|(id, _)| id.clone())
+                .collect();
+            for g in history {
+                if keep_ids.contains(&g.deployment) {
+                    retained.insert(g.tree.clone());
+                }
+            }
+        }
+        retained
+    }
+
+    /// A one-shot fault-injection wrapper over [`LocalTransport`]: the FIRST
+    /// `metadata_opt` (or `list`) on the `generations/` root fails with a
+    /// remote error and then passes every operation through. Path-scoped so
+    /// the `status()` reads that PRECEDE the inventory load (`current`, the
+    /// object store, the lock, incoming) pass through untouched — the fault
+    /// fires exactly in the inventory-loading section of `compute_retained`.
+    struct FailOnceInventoryRemote {
+        inner: LocalTransport,
+        fail_root_metadata: std::cell::Cell<bool>,
+        fail_root_list: std::cell::Cell<bool>,
+    }
+
+    impl FailOnceInventoryRemote {
+        fn new(base: PathBuf, fail_metadata: bool, fail_list: bool) -> Self {
+            FailOnceInventoryRemote {
+                inner: LocalTransport::new(&crate::testutil::fixture_env(), base).unwrap(),
+                fail_root_metadata: std::cell::Cell::new(fail_metadata),
+                fail_root_list: std::cell::Cell::new(fail_list),
+            }
+        }
+    }
+
+    impl Remote for FailOnceInventoryRemote {
+        fn root(&self) -> &Path {
+            self.inner.root()
+        }
+        fn read(&self, rel: &Path) -> Result<Vec<u8>> {
+            self.inner.read(rel)
+        }
+        fn write(&self, rel: &Path, data: &[u8], mode: u32) -> Result<()> {
+            self.inner.write(rel, data, mode)
+        }
+        fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<bool> {
+            self.inner.try_write_new(rel, data)
+        }
+        fn create_dir(&self, rel: &Path) -> Result<()> {
+            self.inner.create_dir(rel)
+        }
+        fn create_dir_all(&self, rel: &Path) -> Result<()> {
+            self.inner.create_dir_all(rel)
+        }
+        fn set_mode(&self, rel: &Path, mode: u32) -> Result<()> {
+            self.inner.set_mode(rel, mode)
+        }
+        fn list(&self, rel: &Path) -> Result<Vec<RemoteEntry>> {
+            if self.fail_root_list.get() && rel == layout::generations() {
+                self.fail_root_list.set(false);
+                return Err(Error::remote(
+                    "injected fault: generations listing failed once",
+                ));
+            }
+            self.inner.list(rel)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+            self.inner.rename(from, to)
+        }
+        fn symlink(&self, target: &Path, link: &Path) -> Result<()> {
+            self.inner.symlink(target, link)
+        }
+        fn read_link(&self, rel: &Path) -> Result<PathBuf> {
+            self.inner.read_link(rel)
+        }
+        fn remove_file(&self, rel: &Path) -> Result<()> {
+            self.inner.remove_file(rel)
+        }
+        fn remove_dir_all(&self, rel: &Path) -> Result<()> {
+            self.inner.remove_dir_all(rel)
+        }
+        fn exists(&self, rel: &Path) -> bool {
+            self.inner.exists(rel)
+        }
+        fn metadata(&self, rel: &Path) -> Result<RemoteMeta> {
+            self.inner.metadata(rel)
+        }
+        fn metadata_opt(&self, rel: &Path) -> Result<Option<RemoteMeta>> {
+            if self.fail_root_metadata.get() && rel == layout::generations() {
+                self.fail_root_metadata.set(false);
+                return Err(Error::remote(
+                    "injected fault: generations metadata failed once",
+                ));
+            }
+            self.inner.metadata_opt(rel)
+        }
+        fn exec(
+            &self,
+            argv: &[String],
+            timeout: std::time::Duration,
+        ) -> Result<crate::remote::transport::ExecOutcome> {
+            self.inner.exec(argv, timeout)
+        }
+        fn filesystem_bytes(&self) -> Result<crate::remote::transport::FsBytes> {
+            self.inner.filesystem_bytes()
+        }
+    }
+
+    proptest! {
+        // FIXED-SEED property (0x5EED_5EED, per house style): a random
+        // history (2..=4 generations with canonical ids/trees/timestamps
+        // relative to now) + a random policy, with ONE injected failure at
+        // the root metadata / listing / assignment parsing / timestamp
+        // parsing / identity check. The abort is FAIL-CLOSED: `compute_retained`
+        // errors, the retention-debt machinery records the durable marker,
+        // and ZERO trees are deleted (the receiver inventory is
+        // byte-identical and every tree survives). After the fault is
+        // REPAIRED, the retry's retained set is EXACTLY the reference-model
+        // set (the healthy sanity already pinned equality), and the
+        // mark-and-sweep retry deletes exactly the trees outside that set.
+        #![proptest_config(ProptestConfig {
+            cases: crate::testutil::proptest_cases(16),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn inventory_failure_aborts_before_deletion_debt_then_retry_matches_reference(
+            n_gens in 2usize..=4,
+            keep_distinct in 0u32..=2,
+            keep_days in prop::sample::select(vec![0u64, 2, 4]),
+            protect_previous: bool,
+            protect_deployments in 0u32..=2,
+            fault in 0u8..=4,
+            corrupt_idx in 0usize..=3,
+        ) {
+            let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+            let base = dir.path().join("remote");
+            let plain =
+                LocalTransport::new(&crate::testutil::fixture_env(), base.clone()).unwrap();
+            let helper = RemoteHelper::new(&plain);
+
+            // A generation record created at `now - (2*(n-1-i)+1)` days: the
+            // NEWEST (i = n-1) is 1 day old, each older is 2 days further
+            // back, so every generated `created_at` is an ODD number of days
+            // before `now`. With `keep_days` even (0/2/4), no generated
+            // timestamp can land within a day of the age cutoff — the
+            // code-under-test and the reference model each call
+            // `Timestamp::now()` independently, and the sub-day skew can
+            // never flip the window boundary.
+            let now = Timestamp::now();
+            let mut history: Vec<TestGen> = Vec::new();
+            for i in 0..n_gens {
+                let offset_days = (2 * (n_gens - 1 - i) + 1) as i64;
+                history.push(TestGen {
+                    id: test_generation_id(&format!("g{i}")).as_str().to_string(),
+                    deployment: test_deployment_id(&format!("d{i}")).as_str().to_string(),
+                    tree: test_tree_digest(&format!("t{i}")).as_str().to_string(),
+                    created_at: now - jiff::SignedDuration::from_hours(offset_days * 24),
+                    prior: (i > 0).then(|| {
+                        test_generation_id(&format!("g{}", i - 1)).as_str().to_string()
+                    }),
+                    release: test_release_id("r").as_str().to_string(),
+                    variant: "standard".to_string(),
+                });
+            }
+
+            // Build the fixture history on the remote: tree objects +
+            // assignments + `current` -> the newest generation. The original
+            // `GenerationAssignment` records are kept for deterministic
+            // REPAIR after a corrupt-record fault.
+            let mut assignments: Vec<GenerationAssignment> = Vec::new();
+            for g in &history {
+                helper
+                    .remote()
+                    .create_dir_all(&layout::tree_root(&g.tree))
+                    .unwrap();
+                let asn = GenerationAssignment {
+                    deployment_id: DeploymentId::parse(&g.deployment).unwrap(),
+                    generation_id: GenerationId::parse(&g.id).unwrap(),
+                    artifact: ArtifactRef {
+                        release: test_release_id("r"),
+                        variant: VariantName::new("standard"),
+                        tree: TreeDigest::parse(&g.tree).unwrap(),
+                    },
+                    behavior_sha256: "b".into(),
+                    prior_generation: g.prior.as_ref().map(|p| GenerationId::parse(p).unwrap()),
+                    created_at: g.created_at.to_string(),
+                    target: None,
+                };
+                helper.create_generation("op", &asn).unwrap();
+                assignments.push(asn);
+            }
+            let current = history.last().unwrap().clone();
+            helper
+                .swap_current(
+                    &crate::remote::helper::ExpectedCurrent::Absent,
+                    current.id.as_str(),
+                    "op",
+                )
+                .unwrap();
+            // A garbage tree referenced by nothing: retained by NO window, so
+            // the retry's mark-and-sweep must remove it (and the
+            // out-of-window history) while the reference set survives.
+            helper
+                .remote()
+                .create_dir_all(&layout::tree_root(test_tree_digest("garbage").as_str()))
+                .unwrap();
+
+            let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+            let policy = RetentionConfig {
+                per_server: PerServerRetention {
+                    keep_distinct_artifacts: keep_distinct,
+                    keep_days,
+                    protect_previous,
+                },
+                deployment: DeploymentRetention {
+                    protect_deployments,
+                },
+            };
+            let expected = reference_retained(&history, &current, &policy);
+
+            // Healthy sanity: the happy path's retained set is EXACTLY the
+            // reference model — this pins behavior-identical-for-healthy-
+            // remotes for every generated history + policy.
+            assert_eq!(
+                compute_retained(&helper, &[], &store, &policy).unwrap(),
+                expected,
+                "the healthy retained set must match the reference model"
+            );
+
+            // The receiver inventory snapshot (byte-identical after the
+            // failed retention: the retained set was never computed, so the
+            // sweep never ran).
+            helper.write_inventory().unwrap();
+            let inv_path = dir.path().join("remote").join(layout::inventory());
+            let inventory_before = std::fs::read(&inv_path).unwrap();
+
+            // Inject ONE failure: a one-shot transport fault on the
+            // generations root (metadata / listing), or a corrupt record on
+            // a NON-current generation (assignment / timestamp / identity).
+            let corrupt_idx = corrupt_idx % (n_gens - 1);
+            let fault_remote: Option<FailOnceInventoryRemote> = match fault {
+                0 => Some(FailOnceInventoryRemote::new(base.clone(), true, false)),
+                1 => Some(FailOnceInventoryRemote::new(base.clone(), false, true)),
+                _ => None,
+            };
+            match fault {
+                2 => {
+                    let p = layout::generation(&history[corrupt_idx].id).join("assignment.json");
+                    std::fs::write(dir.path().join("remote").join(p), b"{ corrupt !").unwrap();
+                }
+                3 => {
+                    let mut a = assignments[corrupt_idx].clone();
+                    a.created_at = "not-a-timestamp".into();
+                    let p = layout::generation(&history[corrupt_idx].id).join("assignment.json");
+                    std::fs::write(
+                        dir.path().join("remote").join(p),
+                        serde_json::to_vec_pretty(&a).unwrap(),
+                    )
+                    .unwrap();
+                }
+                4 => {
+                    let mut a = assignments[corrupt_idx].clone();
+                    a.generation_id = test_generation_id("tampered");
+                    let p = layout::generation(&history[corrupt_idx].id).join("assignment.json");
+                    std::fs::write(
+                        dir.path().join("remote").join(p),
+                        serde_json::to_vec_pretty(&a).unwrap(),
+                    )
+                    .unwrap();
+                }
+                _ => {}
+            }
+
+            // ABORT before any deletion: the injected fault propagates as an
+            // `Err` — the inventory is never loaded as "unprotected", so
+            // nothing is ever swept. The error names the injected step, so
+            // the assertion proves the fault fired exactly where intended.
+            let err = match &fault_remote {
+                Some(fr) => {
+                    let fh = RemoteHelper::new(fr);
+                    compute_retained(&fh, &[], &store, &policy).unwrap_err()
+                }
+                None => compute_retained(&helper, &[], &store, &policy).unwrap_err(),
+            };
+            let err_text = err.to_string();
+            let expected_marker = match fault {
+                0 => "injected fault: generations metadata",
+                1 => "injected fault: generations listing",
+                2 => "parse assignment",
+                3 => "unparseable created_at",
+                _ => "assignment names generation",
+            };
+            assert!(
+                err_text.contains(expected_marker),
+                "the {fault}-fault must abort at the injected step, got: {err_text}"
+            );
+
+            // ZERO DELETIONS: the receiver inventory is byte-identical and
+            // every tree — every history tree AND the garbage — survives.
+            assert_eq!(
+                std::fs::read(&inv_path).unwrap(),
+                inventory_before,
+                "the failed retention must not delete a single tree object"
+            );
+            for g in &history {
+                assert!(
+                    helper.remote().exists(&layout::tree_root(&g.tree)),
+                    "history tree {} must survive the failed retention",
+                    g.tree
+                );
+            }
+            assert!(
+                helper.remote().exists(&layout::tree_root(
+                    test_tree_digest("garbage").as_str()
+                )),
+                "the garbage tree must survive the failed retention"
+            );
+
+            // ROTATION DEBT: the engine's post-commit conversion records the
+            // durable marker (the abort is a maintenance deferral, never a
+            // hard push failure); the retry services it once the fault is
+            // repaired.
+            let slot = SlotId::new("p1".to_string());
+            let warnings = set_retention_deferred(&store, "t1", &slot, &err_text);
+            assert!(warnings.is_empty(), "the marker write must succeed: {warnings:?}");
+            let debt = store.read_retention_debt("t1").unwrap();
+            assert_eq!(
+                debt.get("p1").map(|s| s.as_str()),
+                Some(err_text.as_str()),
+                "the debt marker records the abort reason for the next push"
+            );
+
+            // REPAIR: restore the corrupted record (the one-shot wrapper
+            // already disarmed itself after firing).
+            if fault >= 2 {
+                let asn = &assignments[corrupt_idx];
+                let p = layout::generation(asn.generation_id.as_str()).join("assignment.json");
+                helper
+                    .remote()
+                    .write(&p, &serde_json::to_vec_pretty(asn).unwrap(), 0o644)
+                    .unwrap();
+            }
+
+            // RETRY: the retained set is EXACTLY the reference-model set,
+            // and the mark-and-sweep deletes exactly the trees outside it.
+            let retained = match &fault_remote {
+                Some(fr) => {
+                    let fh = RemoteHelper::new(fr);
+                    compute_retained(&fh, &[], &store, &policy).unwrap()
+                }
+                None => compute_retained(&helper, &[], &store, &policy).unwrap(),
+            };
+            assert_eq!(
+                retained, expected,
+                "the retried retention must retain exactly the reference-model set"
+            );
+            helper.rotate(&retained, &HashSet::new()).unwrap();
+            for g in &history {
+                assert_eq!(
+                    helper.remote().exists(&layout::tree_root(&g.tree)),
+                    expected.contains(&g.tree),
+                    "history tree {} must survive iff the reference model retains it",
+                    g.tree
+                );
+            }
+            assert!(
+                !helper.remote().exists(&layout::tree_root(
+                    test_tree_digest("garbage").as_str()
+                )),
+                "the garbage tree is removed by the retry"
+            );
+
+            // The retried retention services the marker.
             let mut debt = store.read_retention_debt("t1").unwrap();
             assert!(
                 debt.remove("p1").is_some(),
