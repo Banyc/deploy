@@ -31,6 +31,9 @@ pub const RELEASES: &str = "releases";
 
 /// Remote mutation lock file (inside `state/`).
 pub const OPERATION_LOCK: &str = "operation.lock";
+/// Sidecar mutex for serializing `operation.lock` mutations (inside `state/`).
+/// Created once durably and never removed/renamed, so every participant flocks the same inode.
+pub const OPERATION_LOCK_SIDECAR: &str = "operation.lock.mutex";
 /// Remote inventory snapshot file (inside `state/`).
 pub const INVENTORY: &str = "inventory.json";
 /// Suffix appended to a digest while a tree upload is still in flight.
@@ -112,6 +115,14 @@ fn state_file(name: &str) -> PathBuf {
 /// Remote mutation lock.
 pub fn operation_lock() -> PathBuf {
     state_file(OPERATION_LOCK)
+}
+
+/// Sidecar mutex file that serializes every mutation of `operation.lock`.
+/// The file is created once durably and never removed/renamed, so every
+/// participant flocks the SAME inode via `flock(2)`; the lock is released
+/// by the kernel on holder death, so no lease is needed.
+pub fn operation_lock_sidecar() -> PathBuf {
+    state_file(OPERATION_LOCK_SIDECAR)
 }
 
 /// Directory holding commit markers.

@@ -260,6 +260,18 @@ pub trait Remote {
     /// compares against the AVAILABLE space.
     fn filesystem_bytes(&self) -> Result<FsBytes>;
 
+    /// Atomic recover of the operation lock: remove `rel` iff it equals
+    /// `observed`, then install `new_data`, all while holding the sidecar
+    /// mutex exclusively. Returns `Ok(Some(()))` on success, `Ok(None)` if
+    /// not implemented (caller falls back to helper-layer flock), `Err` on
+    /// mismatch/absent/contended/transport failure. Object-safe so
+    /// `RemoteHelper` can call it via `&dyn Remote` without knowing the
+    /// transport.
+    fn atomic_recover(&self, rel: &Path, observed: &[u8], new_data: &[u8]) -> Result<Option<()>> {
+        let _ = (rel, observed, new_data);
+        Ok(None)
+    }
+
     /// Prepare the host identity (verify/pin the host key) before ANY remote
     /// request, including read-only status inspection in a dry run. A dry run
     /// still connects over the transport to inspect status, so the identity
@@ -316,6 +328,119 @@ fn meta_to_remote(m: &std::fs::Metadata) -> RemoteMeta {
 /// mode — never the process umask the temp was created with — or the record's
 /// permissions would silently depend on the caller's umask.
 pub(crate) const IMMUTABLE_RECORD_MODE: u32 = 0o644;
+
+/// Bounded retry budget for the sidecar mutex: a contended sidecar fails
+/// explicitly, never hangs. Non-blocking `flock(LOCK_EX|LOCK_NB)` is retried
+/// this many times with a `yield_now` between attempts; this respects the
+/// repo's "nothing is unbounded" rule while remaining deadlock-free
+/// (kernel releases flock on holder death, so no lease needed).
+pub(crate) const SIDECAR_RETRY_ATTEMPTS: usize = 32;
+
+// Thread-local re-entrancy depth for the sidecar critical section. When
+// `>0`, the current thread already holds the sidecar flock, so nested
+// transport calls for the lock path skip re-acquiring it. Depth is
+// incremented on entry and decremented on exit, even on error.
+thread_local! {
+    static SIDECAR_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Ensure the sidecar mutex file exists durably: create the parent
+/// directory, create the file with `create_new` (so a concurrent creator
+/// is not truncated), `fsync` the file and `fsync` the parent directory.
+/// The file is created once and never removed/renamed, so every
+/// participant flocks the same inode. Mode 0o644, durable.
+pub(crate) fn ensure_operation_lock_sidecar_durable(base: &Path) -> Result<()> {
+    let rel = crate::remote::layout::operation_lock_sidecar();
+    let p = join(base, &rel);
+    if let Some(parent) = p.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Error::transport(format!("mkdir {}: {e}", parent.display())))?;
+    }
+    // Fast path: already exists.
+    if p.exists() {
+        return Ok(());
+    }
+    // Create with create_new to avoid truncating a concurrent winner.
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&p)
+    {
+        Ok(f) => {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644));
+            f.sync_all()
+                .map_err(|e| Error::transport(format!("fsync {}: {e}", p.display())))?;
+            drop(f);
+            if let Some(parent) = p.parent() {
+                let dir = std::fs::File::open(parent)
+                    .map_err(|e| Error::transport(format!("open dir {}: {e}", parent.display())))?;
+                dir.sync_all().map_err(|e| {
+                    Error::transport(format!("fsync dir {}: {e}", parent.display()))
+                })?;
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(Error::transport(format!("create {}: {e}", p.display()))),
+    }
+}
+
+/// Run `f` while holding an exclusive `flock` on the sidecar mutex file.
+/// The sidecar is ensured durably before locking. Uses non-blocking
+/// `LOCK_EX|LOCK_NB` with a bounded retry budget (`SIDECAR_RETRY_ATTEMPTS`)
+/// and `yield_now` between attempts; a contended sidecar after the budget
+/// fails with an explicit transport error, never hangs. Re-entrant: if the
+/// current thread already holds the sidecar (depth>0), `f` runs directly.
+pub(crate) fn with_operation_lock_sidecar<R>(
+    base: &Path,
+    f: impl FnOnce() -> Result<R>,
+) -> Result<R> {
+    let depth = SIDECAR_DEPTH.with(|c| c.get());
+    if depth > 0 {
+        return f();
+    }
+    ensure_operation_lock_sidecar_durable(base)?;
+    let rel = crate::remote::layout::operation_lock_sidecar();
+    let p = join(base, &rel);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .open(&p)
+        .map_err(|e| Error::transport(format!("open sidecar {}: {e}", p.display())))?;
+    use std::os::unix::io::AsRawFd;
+    let fd = file.as_raw_fd();
+    let mut acquired = false;
+    for _ in 0..SIDECAR_RETRY_ATTEMPTS {
+        let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+        if ret == 0 {
+            acquired = true;
+            break;
+        }
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        if errno == libc::EWOULDBLOCK {
+            std::thread::yield_now();
+            continue;
+        } else {
+            return Err(Error::transport(format!(
+                "flock sidecar {}: {}",
+                p.display(),
+                std::io::Error::last_os_error()
+            )));
+        }
+    }
+    if !acquired {
+        return Err(Error::transport(format!(
+            "sidecar mutex contended after {} attempts: {}",
+            SIDECAR_RETRY_ATTEMPTS,
+            p.display()
+        )));
+    }
+    SIDECAR_DEPTH.with(|c| c.set(depth + 1));
+    let res = f();
+    SIDECAR_DEPTH.with(|c| c.set(depth));
+    unsafe { libc::flock(fd, libc::LOCK_UN) };
+    res
+}
 
 /// The verdict of one atomic compare-and-delete attempt
 /// ([`Remote::remove_file_if`]): the entry was removed because it carried
@@ -1250,87 +1375,22 @@ impl Remote for LocalTransport {
     }
 
     fn remove_file_if(&self, rel: &Path, expected: &[u8]) -> Result<RemoveIfVerdict> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static CLAIM_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-        let p = join(&self.base, rel);
-        // The atomic CLAIM target: a unique dot-prefixed name INSIDE the
-        // destination's parent directory (same filesystem, same directory
-        // namespace as the lock), exactly like durable_create_new's temps.
-        let tmp = p.with_file_name(format!(
-            ".{}.claim.{}.{}",
-            p.file_name()
-                .map(|n| n.to_string_lossy())
-                .unwrap_or_default(),
-            std::process::id(),
-            CLAIM_COUNTER.fetch_add(1, Ordering::Relaxed),
-        ));
-        // CLAIM: rename the entry to the temp — atomic, so only ONE
-        // contender can ever win the claim; every other breaker's rename
-        // fails with NotFound (the slot was already claimed or free).
-        match std::fs::rename(&p, &tmp) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(RemoveIfVerdict::Absent);
-            }
-            Err(e) => {
-                return Err(Error::transport(format!("claim {}: {e}", p.display())));
-            }
+        // If this is the lock path, serialize through the sidecar mutex so
+        // the compare-then-delete becomes operation-atomic: a contender's
+        // create-if-absent cannot win the freed path mid-operation.
+        if rel == crate::remote::layout::operation_lock() {
+            return with_operation_lock_sidecar(&self.base, || {
+                self.remove_file_if_inner(rel, expected)
+            });
         }
-        // VERIFY the claimed entry against the expectation.
-        let content = match std::fs::read(&tmp) {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(Error::transport(format!("verify {}: {e}", tmp.display())));
-            }
-        };
-        if content == expected {
-            // MATCH: the claimed entry was EXACTLY the expected record —
-            // delete it; the slot is now free.
-            let _ = std::fs::remove_file(&tmp);
-            return Ok(RemoveIfVerdict::Removed);
-        }
-        // MISMATCH: the entry changed under the reader (a successor's newer
-        // generation). RESTORE it no-replace — the moved record is
-        // re-created with the canonical final mode only while the path is
-        // still free; a CONCURRENT install is never replaced (Conflict) and
-        // the moved claim is discarded, never destroying the winner. Either
-        // way a successor's lock survives untouched.
-        let restored = durable_create_new(
-            &self.base,
-            rel,
-            &content,
-            CreateNewOptions {
-                mode: IMMUTABLE_RECORD_MODE,
-                content: ContentEquivalence::Exact,
-                fault: None,
-            },
-        );
-        let _ = std::fs::remove_file(&tmp);
-        match restored {
-            // Created (restored), AlreadyPresent (a concurrent identical
-            // restore), or Conflict (a different winner is in place): the
-            // lock is intact — the compare failed, never a delete.
-            Ok(_) => Ok(RemoveIfVerdict::Mismatch),
-            // A transport failure on the no-replace restore propagates
-            // EXPLICITLY (the moved claim was the only thing lost; the slot
-            // is not blocked — the lease is the backstop).
-            Err(e) => Err(e),
-        }
+        self.remove_file_if_inner(rel, expected)
     }
 
     fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<CreateNewVerdict> {
-        // The ONE canonical create-new primitive (see `durable_create_new`):
-        // temp -> write -> final chmod -> file fsync -> no-replace publish ->
-        // unlink temp -> parent-directory fsync, every failure propagated, and
-        // verify-on-retry. The immutable records this installs carry the
-        // canonical final mode (`IMMUTABLE_RECORD_MODE`), never the umask.
-        // The TYPED verdict survives this trait boundary untouched — Created
-        // for a fresh durable install, AlreadyPresent for an identical retry
-        // (parent-sync'd too), Conflict carrying the typed reason for any
-        // other winner.
-        self.try_write_new_with(rel, data, ContentEquivalence::Exact)
+        if rel == crate::remote::layout::operation_lock() {
+            return with_operation_lock_sidecar(&self.base, || self.try_write_new_inner(rel, data));
+        }
+        self.try_write_new_inner(rel, data)
     }
 
     fn try_write_new_with(
@@ -1339,16 +1399,12 @@ impl Remote for LocalTransport {
         data: &[u8],
         equivalence: ContentEquivalence,
     ) -> Result<CreateNewVerdict> {
-        durable_create_new(
-            &self.base,
-            rel,
-            data,
-            CreateNewOptions {
-                mode: IMMUTABLE_RECORD_MODE,
-                content: equivalence,
-                fault: None,
-            },
-        )
+        if rel == crate::remote::layout::operation_lock() {
+            return with_operation_lock_sidecar(&self.base, || {
+                self.try_write_new_with_inner(rel, data, equivalence)
+            });
+        }
+        self.try_write_new_with_inner(rel, data, equivalence)
     }
 
     fn remove_dir_all(&self, rel: &Path) -> Result<()> {
@@ -1425,6 +1481,127 @@ impl Remote for LocalTransport {
             total: total_kb * 1024,
             available: avail_kb * 1024,
         })
+    }
+}
+
+impl LocalTransport {
+    fn remove_file_if_inner(&self, rel: &Path, expected: &[u8]) -> Result<RemoveIfVerdict> {
+        let p = join(&self.base, rel);
+        // When already holding the sidecar (we are inside with_operation_lock_sidecar),
+        // the mutation is already serialized, so a simple read-compare-unlink
+        // keeps the record continuously visible for a mismatched remove (no
+        // transient absence) and is safe from TOCTOU.
+        if SIDECAR_DEPTH.with(|c| c.get() > 0) {
+            let cur = match std::fs::read(&p) {
+                Ok(c) => c,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(RemoveIfVerdict::Absent);
+                }
+                Err(e) => return Err(Error::transport(format!("read {}: {e}", p.display()))),
+            };
+            if cur == expected {
+                match std::fs::remove_file(&p) {
+                    Ok(()) => return Ok(RemoveIfVerdict::Removed),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(RemoveIfVerdict::Absent);
+                    }
+                    Err(e) => return Err(Error::transport(format!("remove {}: {e}", p.display()))),
+                }
+            } else {
+                return Ok(RemoveIfVerdict::Mismatch);
+            }
+        }
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CLAIM_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        // Fallback claim path (when not under sidecar, e.g. non-lock paths
+        // or direct calls): atomic rename claim, verify, delete or restore.
+        // The atomic CLAIM target: a unique dot-prefixed name INSIDE the
+        // destination's parent directory (same filesystem, same directory
+        // namespace as the lock), exactly like durable_create_new's temps.
+        let tmp = p.with_file_name(format!(
+            ".{}.claim.{}.{}",
+            p.file_name()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_default(),
+            std::process::id(),
+            CLAIM_COUNTER.fetch_add(1, Ordering::Relaxed),
+        ));
+        // CLAIM: rename the entry to the temp — atomic, so only ONE
+        // contender can ever win the claim; every other breaker's rename
+        // fails with NotFound (the slot was already claimed or free).
+        match std::fs::rename(&p, &tmp) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(RemoveIfVerdict::Absent);
+            }
+            Err(e) => {
+                return Err(Error::transport(format!("claim {}: {e}", p.display())));
+            }
+        }
+        // VERIFY the claimed entry against the expectation.
+        let content = match std::fs::read(&tmp) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(Error::transport(format!("verify {}: {e}", tmp.display())));
+            }
+        };
+        if content == expected {
+            // MATCH: the claimed entry was EXACTLY the expected record —
+            // delete it; the slot is now free.
+            let _ = std::fs::remove_file(&tmp);
+            return Ok(RemoveIfVerdict::Removed);
+        }
+        // MISMATCH: the entry changed under the reader (a successor's newer
+        // generation). RESTORE it no-replace — the moved record is
+        // re-created with the canonical final mode only while the path is
+        // still free; a CONCURRENT install is never replaced (Conflict) and
+        // the moved claim is discarded, never destroying the winner. Either
+        // way a successor's lock survives untouched.
+        let restored = durable_create_new(
+            &self.base,
+            rel,
+            &content,
+            CreateNewOptions {
+                mode: IMMUTABLE_RECORD_MODE,
+                content: ContentEquivalence::Exact,
+                fault: None,
+            },
+        );
+        let _ = std::fs::remove_file(&tmp);
+        match restored {
+            // Created (restored), AlreadyPresent (a concurrent identical
+            // restore), or Conflict (a different winner is in place): the
+            // lock is intact — the compare failed, never a delete.
+            Ok(_) => Ok(RemoveIfVerdict::Mismatch),
+            // A transport failure on the no-replace restore propagates
+            // EXPLICITLY (the moved claim was the only thing lost; the slot
+            // is not blocked — the lease is the backstop).
+            Err(e) => Err(e),
+        }
+    }
+
+    fn try_write_new_inner(&self, rel: &Path, data: &[u8]) -> Result<CreateNewVerdict> {
+        self.try_write_new_with_inner(rel, data, ContentEquivalence::Exact)
+    }
+
+    fn try_write_new_with_inner(
+        &self,
+        rel: &Path,
+        data: &[u8],
+        equivalence: ContentEquivalence,
+    ) -> Result<CreateNewVerdict> {
+        durable_create_new(
+            &self.base,
+            rel,
+            data,
+            CreateNewOptions {
+                mode: IMMUTABLE_RECORD_MODE,
+                content: equivalence,
+                fault: None,
+            },
+        )
     }
 }
 

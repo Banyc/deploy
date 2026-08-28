@@ -426,6 +426,142 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Build a shell wrapper that holds an exclusive `flock` on the sidecar
+/// mutex file for the entire `inner` command. The sidecar is created
+/// durably (`mkdir -p`, `touch`, `chmod 644`, `sync`) and never removed;
+/// the perl helper opens it and attempts a non-blocking `LOCK_EX|LOCK_NB`
+/// with a bounded retry budget (32 attempts, ~5ms sleep between them,
+/// mirroring `SIDECAR_RETRY_ATTEMPTS` on the local side). A contended
+/// sidecar after the budget fails explicitly, never hangs. The lock is
+/// held via the open file description across the `exec "sh", "-c", inner`
+/// so the whole critical section (create-if-absent or compare-and-delete)
+/// is operation-atomic; the lock is released by the kernel on process
+/// exit. Perl is used because it ships on every Linux/macOS remote and
+/// provides portable `flock` (the `flock(1)` command is absent on macOS).
+fn with_sidecar_cmd(root: &Path, inner: &str) -> String {
+    let sidecar = root
+        .join(crate::remote::layout::operation_lock_sidecar())
+        .to_string_lossy()
+        .into_owned();
+    let parent = std::path::Path::new(&sidecar)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| ".".to_string());
+    let sidecar_q = shell_quote(&sidecar);
+    let parent_q = shell_quote(&parent);
+    let inner_q = shell_quote(inner);
+    format!(
+        "mkdir -p {parent} && touch {sidecar} && chmod 644 {sidecar} && perl -e 'use Fcntl qw(:flock); open my $fh, \"+<\", $ARGV[0] or die \"open sidecar $ARGV[0]: $!\"; my $locked=0; for (1..32) {{ if (flock($fh, LOCK_EX|LOCK_NB)) {{ $locked=1; last; }} select(undef,undef,undef,0.005); }} die \"sidecar contended\" unless $locked; exec \"sh\", \"-c\", $ARGV[1];' -- {sidecar} {inner}",
+        parent = parent_q,
+        sidecar = sidecar_q,
+        inner = inner_q,
+    )
+}
+
+/// Build the perl script for atomic compare-and-delete under the sidecar:
+/// open the sidecar, flock exclusively with bounded retry, then read the
+/// lock file, compare to `expected`, unlink if match, otherwise leave it.
+/// Prints a single verdict frame: `R` (removed), `M` (mismatch), or `A`
+/// (absent). Continuously visible for mismatch — the file is never made
+/// absent.
+fn remove_file_if_sidecar_cmd(root: &Path, expected: &[u8]) -> String {
+    let sidecar = root
+        .join(crate::remote::layout::operation_lock_sidecar())
+        .to_string_lossy()
+        .into_owned();
+    let lock = root
+        .join(crate::remote::layout::operation_lock())
+        .to_string_lossy()
+        .into_owned();
+    let sidecar_parent = std::path::Path::new(&sidecar)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| ".".to_string());
+    let sidecar_q = shell_quote(&sidecar);
+    let sidecar_parent_q = shell_quote(&sidecar_parent);
+    let lock_q = shell_quote(&lock);
+    let expected_q = shell_quote(&String::from_utf8_lossy(expected));
+    format!(
+        "mkdir -p {sidecar_parent} && touch {sidecar} && chmod 644 {sidecar} && perl -e '
+use Fcntl qw(:flock);
+open my $fh, \"+<\", $ARGV[0] or die \"open sidecar: $!\";
+my $locked=0; for (1..32) {{ if (flock($fh, LOCK_EX|LOCK_NB)) {{ $locked=1; last; }} select(undef,undef,undef,0.005); }}
+die \"sidecar contended\" unless $locked;
+my $lock=$ARGV[1]; my $exp=$ARGV[2];
+if (! -e $lock && ! -l $lock) {{ print \"A\"; exit 0; }}
+open my $lf, \"<\", $lock or do {{ print \"M\"; exit 0; }};
+my $content=do {{ local $/; <$lf> }}; close $lf;
+if ($content eq $exp) {{ unlink $lock or die \"unlink: $!\"; print \"R\"; }} else {{ print \"M\"; }}
+' -- {sidecar} {lock} {exp}",
+        sidecar_parent = sidecar_parent_q,
+        sidecar = sidecar_q,
+        lock = lock_q,
+        exp = expected_q,
+    )
+}
+
+/// Build the perl script for atomic recover under the sidecar: open the
+/// sidecar, flock exclusively with bounded retry, then read the lock file,
+/// compare to `observed`, unlink if match, then install `new_data` via a
+/// temp+rename with durability (chmod 644, fsync file, fsync parent). Prints
+/// a single verdict frame: `OK`, `MISMATCH`, or `ABSENT` (or dies on
+/// contended/transport failure).
+fn recover_sidecar_cmd(root: &Path, observed: &[u8], new_data: &[u8]) -> String {
+    let sidecar = root
+        .join(crate::remote::layout::operation_lock_sidecar())
+        .to_string_lossy()
+        .into_owned();
+    let lock = root
+        .join(crate::remote::layout::operation_lock())
+        .to_string_lossy()
+        .into_owned();
+    let parent = std::path::Path::new(&lock)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| ".".to_string());
+    let sidecar_q = shell_quote(&sidecar);
+    let lock_q = shell_quote(&lock);
+    let parent_q = shell_quote(&parent);
+    let observed_q = shell_quote(&String::from_utf8_lossy(observed));
+    let new_q = shell_quote(&String::from_utf8_lossy(new_data));
+    let sidecar_parent = std::path::Path::new(&sidecar)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| ".".to_string());
+    let sidecar_parent_q = shell_quote(&sidecar_parent);
+    format!(
+        "mkdir -p {parent} && mkdir -p {sidecar_parent} && touch {sidecar} && chmod 644 {sidecar} && perl -e '
+use Fcntl qw(:flock);
+open my $fh, \"+<\", $ARGV[0] or die \"open sidecar: $!\";
+my $locked=0; for (1..32) {{ if (flock($fh, LOCK_EX|LOCK_NB)) {{ $locked=1; last; }} select(undef,undef,undef,0.005); }}
+die \"sidecar contended\" unless $locked;
+my $lock=$ARGV[1]; my $obs=$ARGV[2]; my $new=$ARGV[3];
+if (! -e $lock && ! -l $lock) {{ print \"ABSENT\\n\"; exit 0; }}
+open my $lf, \"<\", $lock or do {{ print \"MISMATCH\\n\"; exit 0; }};
+my $content=do {{ local $/; <$lf> }}; close $lf;
+if ($content ne $obs) {{ print \"MISMATCH\\n\"; exit 0; }}
+unlink $lock or die \"unlink: $!\";
+my $dir=$lock; $dir=~s{{/[^/]+$}}{{}}; $dir=\".\" if $dir eq \"\";
+my $tmp=\"$dir/.operation.lock.tmp.$$\";
+open my $tf, \">\", $tmp or die \"create tmp: $!\";
+print $tf $new; close $tf;
+chmod 0644, $tmp;
+open my $tff, \"+<\", $tmp or die;
+$tff->sync or die \"fsync tmp: $!\"; close $tff;
+rename $tmp, $lock or die \"rename: $!\";
+open my $dfh, \"<\", $dir or die;
+$dfh->sync or die \"fsync dir: $!\";
+print \"OK\\n\";
+' -- {sidecar} {lock} {obs} {new}",
+        parent = parent_q,
+        sidecar_parent = sidecar_parent_q,
+        sidecar = sidecar_q,
+        lock = lock_q,
+        obs = observed_q,
+        new = new_q,
+    )
+}
+
 impl SshTransport {
     /// Build the remote shell command implementing the durability protocol
     /// for an immutable record at `root.join(rel)` — the remote realization
@@ -1057,7 +1193,11 @@ impl Remote for SshTransport {
     }
 
     fn remove_file_if(&self, rel: &Path, expected: &[u8]) -> Result<RemoveIfVerdict> {
-        let cmd = Self::remove_file_if_cmd(&self.root, rel, expected);
+        let cmd = if rel == crate::remote::layout::operation_lock() {
+            remove_file_if_sidecar_cmd(&self.root, expected)
+        } else {
+            Self::remove_file_if_cmd(&self.root, rel, expected)
+        };
         let out = self.run_remote(&cmd)?;
         if !out.status.success() {
             return Err(Error::transport(format!(
@@ -1190,7 +1330,12 @@ impl Remote for SshTransport {
         data: &[u8],
         equivalence: ContentEquivalence,
     ) -> Result<CreateNewVerdict> {
-        let cmd = Self::write_new_cmd(&self.root, rel, IMMUTABLE_RECORD_MODE);
+        let inner = Self::write_new_cmd(&self.root, rel, IMMUTABLE_RECORD_MODE);
+        let cmd = if rel == crate::remote::layout::operation_lock() {
+            with_sidecar_cmd(&self.root, &inner)
+        } else {
+            inner
+        };
         let mut argv = vec!["ssh".to_string()];
         argv.extend(self.ssh_args()?);
         argv.push("--".into());
@@ -1281,6 +1426,33 @@ impl Remote for SshTransport {
             return Ok(CreateNewVerdict::AlreadyPresent);
         }
         Ok(verdict)
+    }
+
+    fn atomic_recover(&self, rel: &Path, observed: &[u8], new_data: &[u8]) -> Result<Option<()>> {
+        // Only the operation lock's recover is sidecar-serialized; other paths are not supported.
+        if rel != crate::remote::layout::operation_lock() {
+            return Ok(None);
+        }
+        let cmd = recover_sidecar_cmd(&self.root, observed, new_data);
+        let out = self.run_remote(&cmd)?;
+        if !out.status.success() {
+            return Err(Error::transport(format!(
+                "ssh atomic_recover failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            )));
+        }
+        match String::from_utf8_lossy(&out.stdout).trim() {
+            "OK" => Ok(Some(())),
+            "MISMATCH" => Err(Error::transport(
+                "recovery refused: the lock no longer carries the observed record — a successor's newer epoch is never removed; re-read and re-confirm",
+            )),
+            "ABSENT" => Err(Error::transport(
+                "no lock to recover: the slot is already free (the observed record is gone) — no recovery needed",
+            )),
+            other => Err(Error::transport(format!(
+                "ssh atomic_recover: malformed verdict {other:?}"
+            ))),
+        }
     }
 }
 

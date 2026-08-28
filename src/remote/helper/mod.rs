@@ -354,62 +354,70 @@ impl<'a> RemoteHelper<'a> {
     /// acquisition — the slot is never left free after a recovery).
     pub fn recover_lock(&self, observed: &LockRecord, new_owner: &str) -> Result<LockRecord> {
         let p = &layout::operation_lock();
-        // READ + VERIFY: the recovery premise. The current on-disk record
-        // must be EXACTLY the observed record — a successor's newer epoch
-        // (or genuine absence after a release) is refused; the operator must
-        // re-read and re-confirm.
-        let current = read_lock_record(self.remote, p)?;
-        match &current {
-            None => {
-                return Err(Error::remote(
-                    "no lock to recover: the slot is already free (the observed record is gone) \
-                     — no recovery needed",
-                ));
-            }
-            Some(rec) if rec != observed => {
-                return Err(Error::remote(format!(
-                    "recovery refused: the lock no longer carries the observed record (now held by \
-                     '{}', epoch {}) — a successor's newer epoch is never removed; re-read and \
-                     re-confirm",
-                    rec.owner, rec.epoch
-                )));
-            }
-            Some(_) => {}
-        }
-        // REMOVE: compare-and-delete the EXACT observed record.
-        let bytes = serde_json::to_vec(observed)
+        // First try the transport's atomic recover (SSH: one remote exec under
+        // the sidecar flock, so the whole read→verify→remove→install is
+        // operation-atomic and no contender can win the freed window).
+        let observed_bytes = serde_json::to_vec(observed)
             .map_err(|e| Error::remote(format!("serialize lock record: {e}")))?;
-        match self.remote.remove_file_if(p, &bytes)? {
-            RemoveIfVerdict::Removed => {}
-            RemoveIfVerdict::Mismatch => {
-                return Err(Error::remote(
-                    "recovery race: the lock changed between the verify-read and the remove — a \
-                     successor's newer epoch is never removed; re-read and re-confirm",
-                ));
-            }
-            RemoveIfVerdict::Absent => {
-                return Err(Error::remote(
-                    "the lock vanished during recovery; re-read and re-confirm",
-                ));
-            }
-        }
-        // INSTALL the successor record: epoch = observed.epoch + 1, by
-        // create-if-absent. A concurrent fresh acquire in the window between
-        // the remove and this install wins the race and this install FAILS —
-        // recovery never overwrites; the caller re-reads and re-decides.
-        let record = LockRecord {
+        let new_record = LockRecord {
             owner: new_owner.to_string(),
             epoch: observed.epoch + 1,
         };
-        let bytes = serde_json::to_vec(&record)
+        let new_bytes = serde_json::to_vec(&new_record)
             .map_err(|e| Error::remote(format!("serialize lock record: {e}")))?;
-        match self.remote.try_write_new(p, &bytes)? {
-            CreateNewVerdict::Created | CreateNewVerdict::AlreadyPresent => Ok(record),
-            CreateNewVerdict::Conflict(reason) => Err(Error::remote(format!(
-                "recovery install contended (a concurrent acquire won the freed slot: {reason:?}); \
-                 re-read and re-confirm"
-            ))),
+        if let Some(()) = self.remote.atomic_recover(p, &observed_bytes, &new_bytes)? {
+            return Ok(new_record);
         }
+        // Local fallback: hold the sidecar flock for the entire
+        // read→verify→remove→install sequence, so the compare-then-delete
+        // plus the install becomes operation-atomic and a contender's
+        // create-if-absent cannot interleave.
+        crate::remote::transport::with_operation_lock_sidecar(self.remote.root(), || {
+            // READ + VERIFY under the sidecar.
+            let current = read_lock_record(self.remote, p)?;
+            match &current {
+                None => {
+                    return Err(Error::remote(
+                        "no lock to recover: the slot is already free (the observed record is gone) \
+                         — no recovery needed",
+                    ));
+                }
+                Some(rec) if rec != observed => {
+                    return Err(Error::remote(format!(
+                        "recovery refused: the lock no longer carries the observed record (now held by \
+                         '{}', epoch {}) — a successor's newer epoch is never removed; re-read and \
+                         re-confirm",
+                        rec.owner, rec.epoch
+                    )));
+                }
+                Some(_) => {}
+            }
+            // REMOVE under the same sidecar.
+            match self.remote.remove_file_if(p, &observed_bytes)? {
+                RemoveIfVerdict::Removed => {}
+                RemoveIfVerdict::Mismatch => {
+                    return Err(Error::remote(
+                        "recovery race: the lock changed between the verify-read and the remove — a \
+                         successor's newer epoch is never removed; re-read and re-confirm",
+                    ));
+                }
+                RemoveIfVerdict::Absent => {
+                    return Err(Error::remote(
+                        "the lock vanished during recovery; re-read and re-confirm",
+                    ));
+                }
+            }
+            // INSTALL under the same sidecar.
+            match self.remote.try_write_new(p, &new_bytes)? {
+                CreateNewVerdict::Created | CreateNewVerdict::AlreadyPresent => {
+                    Ok(new_record.clone())
+                }
+                CreateNewVerdict::Conflict(reason) => Err(Error::remote(format!(
+                    "recovery install contended (a concurrent acquire won the freed slot: {reason:?}); \
+                     re-read and re-confirm"
+                ))),
+            }
+        })
     }
 
     /// Acquire the server mutation lock and return a guard that releases it
@@ -815,5 +823,106 @@ mod tests {
         );
         // The genuine release still works.
         helper.release_lock(&held).unwrap();
+    }
+
+    /// Sidecar mutex property: a mismatched or failed `remove_file_if` must
+    /// leave the original record byte-identical and continuously visible, and
+    /// a contender can only succeed when the slot is legitimately free.
+    /// The test exposes the claim/compare/restore/delete boundaries of the
+    /// remove and inserts a contender acquisition after EVERY boundary.
+    /// With the sidecar, a contended remove is operation-atomic: the
+    /// contender's create-if-absent is serialized behind the sidecar and
+    /// fails, and the record is never absent. Without the sidecar, the
+    /// transient claim window would let the contender win the freed path
+    /// and the original record would be destroyed.
+    #[cfg(test)]
+    mod sidecar_mutex {
+        use super::*;
+        use crate::remote::layout;
+        use crate::remote::transport::{CreateNewVerdict, LocalTransport, Remote, RemoveIfVerdict};
+        use proptest::prelude::*;
+        use proptest::test_runner::RngSeed;
+
+        fn lock_bytes(owner: &str, epoch: u64) -> Vec<u8> {
+            serde_json::to_vec(&LockRecord {
+                owner: owner.to_string(),
+                epoch,
+            })
+            .unwrap()
+        }
+
+        proptest! {
+            #![proptest_config(proptest::test_runner::Config {
+                cases: crate::testutil::proptest_cases(64),
+                max_shrink_iters: 10000,
+                rng_seed: RngSeed::Fixed(0x5EED_5EED),
+                failure_persistence: None,
+                ..proptest::test_runner::Config::default()
+            })]
+            #[test]
+            fn contender_after_every_boundary(
+                holder in prop_oneof![Just("holder-A".to_string()), Just("holder-B".to_string())],
+                holder_epoch in 1u64..10,
+                contender in prop_oneof![Just("contender-X".to_string()), Just("contender-Y".to_string())],
+                mismatch_epoch in 100u64..200,
+                steps in prop::collection::vec(
+                    prop_oneof![
+                        Just(0u8), // mismatched remove
+                        Just(1u8), // matched remove
+                    ],
+                    1..=crate::testutil::proptest_steps(40)
+                )
+            ) {
+                let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+                let remote = LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote")).unwrap();
+                let holder_bytes = lock_bytes(&holder, holder_epoch);
+                // Claim by holder (create-if-absent, sidecar-serialized).
+                let verdict = remote.try_write_new(&layout::operation_lock(), &holder_bytes).unwrap();
+                prop_assert!(matches!(verdict, CreateNewVerdict::Created | CreateNewVerdict::AlreadyPresent));
+                let original = remote.read(&layout::operation_lock()).unwrap();
+                prop_assert_eq!(original.clone(), holder_bytes.clone(), "original must be byte-identical after claim");
+                // Contender after claim: must fail (slot held).
+                let contender_bytes = lock_bytes(&contender, 1);
+                let c1 = remote.try_write_new(&layout::operation_lock(), &contender_bytes).unwrap();
+                prop_assert!(matches!(c1, CreateNewVerdict::Conflict(_)), "contender after held claim must be Conflict, got {c1:?}");
+                prop_assert_eq!(remote.read(&layout::operation_lock()).unwrap(), original.clone(), "record must stay byte-identical after contender");
+                prop_assert!(remote.metadata_opt(&layout::operation_lock()).unwrap().is_some(), "record must stay continuously visible after contender");
+                for &step in &steps {
+                    if step == 0 {
+                        // Mismatched remove: compare-boundary then delete-boundary.
+                        let mismatched = lock_bytes(&contender, mismatch_epoch);
+                        // Expose compare-boundary: read+compare without mutating, then contender.
+                        let cur = remote.read(&layout::operation_lock()).unwrap();
+                        prop_assert_eq!(cur, original.clone(), "compare-boundary: record still original");
+                        let cc = remote.try_write_new(&layout::operation_lock(), &contender_bytes).unwrap();
+                        prop_assert!(matches!(cc, CreateNewVerdict::Conflict(_)), "contender after compare-boundary (mismatched) must fail");
+                        prop_assert_eq!(remote.read(&layout::operation_lock()).unwrap(), original.clone());
+                        // Now the actual mismatched remove (sidecar-serialized, continuously visible).
+                        let v = remote.remove_file_if(&layout::operation_lock(), &mismatched).unwrap();
+                        prop_assert_eq!(v, RemoveIfVerdict::Mismatch, "mismatched remove must be Mismatch");
+                        // Delete-boundary: after the remove, contender again.
+                        prop_assert_eq!(remote.read(&layout::operation_lock()).unwrap(), original.clone(), "delete-boundary mismatched must leave original byte-identical");
+                        prop_assert!(remote.metadata_opt(&layout::operation_lock()).unwrap().is_some(), "mismatched remove must never leave path absent");
+                        let cd = remote.try_write_new(&layout::operation_lock(), &contender_bytes).unwrap();
+                        prop_assert!(matches!(cd, CreateNewVerdict::Conflict(_)), "contender after mismatched delete-boundary must fail");
+                        prop_assert_eq!(remote.read(&layout::operation_lock()).unwrap(), original.clone());
+                    } else {
+                        // Matched remove: the slot becomes legitimately free, contender must succeed.
+                        let v = remote.remove_file_if(&layout::operation_lock(), &original).unwrap();
+                        if v == RemoveIfVerdict::Removed {
+                            prop_assert!(remote.metadata_opt(&layout::operation_lock()).unwrap().is_none(), "matched remove must leave path absent");
+                            let cd = remote.try_write_new(&layout::operation_lock(), &contender_bytes).unwrap();
+                            prop_assert!(matches!(cd, CreateNewVerdict::Created), "contender after legitimate free must succeed, got {cd:?}");
+                            // Re-establish holder for next iteration if needed
+                            let _ = remote.remove_file_if(&layout::operation_lock(), &contender_bytes).unwrap();
+                            let _ = remote.try_write_new(&layout::operation_lock(), &holder_bytes).unwrap();
+                        } else {
+                            // Already absent (idempotent) — also legitimately free
+                            prop_assert_eq!(v, RemoveIfVerdict::Absent);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
