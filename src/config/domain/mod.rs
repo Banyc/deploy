@@ -473,7 +473,27 @@ impl TryFrom<RawProject> for ProjectConfig {
                     artifact: variant.artifact.clone(),
                     activation,
                     verification: variant.verification.clone(),
-                    slots: variant.slots.clone(),
+                    // The slots enter the domain graph with their deploy_dir
+                    // stored in the validated CANONICAL form (the ONE
+                    // authoritative effective root each local slot operates
+                    // on): the raw spelling is normalized through the
+                    // [`AbsoluteDeployDir`] scalar — a relative, traversal-
+                    // carrying, or root deploy_dir is rejected HERE, and the
+                    // location-uniqueness rules below compare effective
+                    // roots, not mere spellings (`/srv/a` and `/srv//a/` are
+                    // the SAME effective root).
+                    slots: variant
+                        .slots
+                        .iter()
+                        .map(|s| {
+                            s.with_canonical_deploy_dir().map_err(|e| {
+                                Error::config(format!(
+                                    "variant '{vname}': slot '{}' deploy_dir is invalid: {e}",
+                                    s.id
+                                ))
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?,
                     retention: variant.retention.clone(),
                 },
             );
@@ -566,6 +586,17 @@ impl TryFrom<RawProject> for ProjectConfig {
             ));
         }
 
+        // A LOCAL connection operates on the HOST FILESYSTEM: two local slots
+        // with the same deploy_dir — even on DIFFERENT server ids — operate on
+        // the SAME local directory (the server id does not separate local
+        // roots the way a remote host does). The injection rule below keys
+        // local effective roots on the deploy_dir ALONE.
+        let local_server_ids: HashSet<&str> = domain_servers
+            .iter()
+            .filter(|s| matches!(s.connection(), ServerConnection::Local { .. }))
+            .map(|s| s.id.as_str())
+            .collect();
+
         // Slots are declared INSIDE each variant's file (the declaring file
         // is the slot's variant binding), so they are aggregated across every
         // variant: IDs are unique across ALL variants, each slot's server must
@@ -577,6 +608,7 @@ impl TryFrom<RawProject> for ProjectConfig {
         // location that exactly one slot may own.
         let mut slot_ids = HashSet::new();
         let mut bound_locations: BTreeMap<(&str, &Path), &str> = BTreeMap::new();
+        let mut local_roots: BTreeMap<&Path, &str> = BTreeMap::new();
         for (vname, variant) in &domain_variants {
             for p in &variant.slots {
                 // The slot's id-bearing fields are parsed into the validated
@@ -639,13 +671,34 @@ impl TryFrom<RawProject> for ProjectConfig {
                     }
                 }
                 // The deploy_dir is validated by the [`AbsoluteDeployDir`]
-                // scalar (absolute path on the server).
+                // scalar (absolute path on the server). The slots entered the
+                // domain graph already in their CANONICAL form (built above
+                // through [`SlotConfig::with_canonical_deploy_dir`]), so this
+                // parse re-checks the gate and the location-uniqueness rules
+                // below compare EFFECTIVE ROOTS, not raw spellings.
                 AbsoluteDeployDir::parse(&p.deploy_dir().to_string_lossy()).map_err(|_| {
                     Error::config(format!(
                         "variant '{vname}': slot '{}' deploy_dir must be an absolute path on the server",
                         p.id
                     ))
                 })?;
+                // INJECTIVE LOCAL EFFECTIVE ROOTS: no two local slots may
+                // operate on the same directory. Every local transport shares
+                // the host filesystem, so the same deploy_dir on two local
+                // servers is ONE directory two slots would operate on —
+                // rejected here (fail closed), independent of server id.
+                if local_server_ids.contains(p.server.as_str())
+                    && let Some(existing) = local_roots.get(p.deploy_dir())
+                {
+                    return Err(Error::config(format!(
+                        "slots '{existing}' and '{}' bind the same local deploy_dir '{}'; two local slots must not operate on the same directory",
+                        p.id,
+                        p.deploy_dir().display()
+                    )));
+                }
+                if local_server_ids.contains(p.server.as_str()) {
+                    local_roots.insert(p.deploy_dir(), &p.id);
+                }
                 if let Some(existing) = bound_locations.get(&(p.server.as_str(), p.deploy_dir())) {
                     return Err(Error::config(format!(
                         "slots '{existing}' and '{}' bind the same location (server '{}', deploy_dir '{}'); each server+deploy_dir pair must belong to exactly one slot",

@@ -2,6 +2,7 @@ use super::*;
 use crate::config::domain::{RawProject, valid_identifier};
 use crate::config::raw::CONFIG_SCHEMA_VERSION;
 use crate::config::*;
+use crate::env::SysEnv;
 use crate::error::Error;
 use crate::identity::{
     AbsoluteDeployDir, ApplicationStoreKey, BatchSize, CapacityPercent, Identifier,
@@ -15,6 +16,7 @@ use crate::ledger::{
     DeploymentIntent, DesiredGeneration, IntentSlot, LEDGER_SCHEMA_VERSION, LedgerIntentWire,
     LedgerLine, NonEmptySlotTable,
 };
+use crate::remote::{EffectiveDeployRoot, create_remote};
 use crate::store::local::LocalStore;
 use proptest::prelude::*;
 use proptest::test_runner::RngSeed;
@@ -705,6 +707,95 @@ fn slots_on_the_same_server_never_share_a_deploy_dir() {
     std::fs::write(&p, format!("{}{}", deploy_toml("v1"), t2)).unwrap();
     let cfg = ProjectConfig::load(&p).expect("distinct deploy_dir on the same server is valid");
     assert_eq!(cfg.slot_defs().len(), 2);
+}
+
+/// INJECTIVE LOCAL EFFECTIVE ROOTS: two LOCAL slots must never operate on
+/// the same directory — even on DIFFERENT server ids, because every local
+/// transport shares the HOST FILESYSTEM (the server id does not separate
+/// local roots the way a remote host does). The injection rule keys local
+/// roots on the deploy_dir ALONE, and on the NORMALIZED canonical form:
+/// messy spellings (`/srv/p1//`, `/srv/p1/`) are the SAME effective root.
+#[test]
+fn two_local_slots_never_share_a_deploy_dir_even_across_servers() {
+    // Two local servers; the second slot binds a DIFFERENT server but the
+    // SAME deploy_dir as the first: rejected — the two slots would operate
+    // on the very same local directory.
+    let mut p = minimal_raw_project();
+    p.manifest.servers.push(raw::RawServer {
+        id: "s2".to_string(),
+        address: "local:///srv-2".to_string(),
+        user: "u".to_string(),
+        port: 22,
+        known_hosts: None,
+        host_key_fingerprint: None,
+        capacity: raw::RawCapacityConfig::default(),
+    });
+    p.variants
+        .get_mut("standard")
+        .unwrap()
+        .slots
+        .push(SlotConfig::new(
+            "p2",
+            "s2",
+            PathBuf::from("/srv/p1"),
+            "t1",
+            Vec::new(),
+        ));
+    let err = ProjectConfig::from_raw_parts(p.manifest, p.variants)
+        .expect_err("two local slots on one directory must fail");
+    assert!(
+        err.to_string().contains("same local deploy_dir"),
+        "error must name the local injection rule, got: {err}"
+    );
+
+    // MESSY but normalized-equal spellings are the SAME effective root: the
+    // injection rule compares canonical forms, so `/srv/p1//` collides with
+    // `/srv/p1` even on the same server.
+    let mut p = minimal_raw_project();
+    p.variants
+        .get_mut("standard")
+        .unwrap()
+        .slots
+        .push(SlotConfig::new(
+            "p2",
+            "s1",
+            PathBuf::from("/srv/p1//"),
+            "t1",
+            Vec::new(),
+        ));
+    let err = ProjectConfig::from_raw_parts(p.manifest, p.variants)
+        .expect_err("normalized-equal local roots must fail");
+    assert!(
+        err.to_string().contains("same local deploy_dir")
+            || err.to_string().contains("same location"),
+        "error must name the location rule, got: {err}"
+    );
+}
+
+/// The canonical deploy_dir is stored in the VALIDATED graph: a messy but
+/// valid spelling (`/srv/app//`, `/srv/app/`) is normalized to `/srv/app`,
+/// so `SlotConfig::deploy_dir()` — and every binding derived from it —
+/// carries THE ONE authoritative effective root, and the transport root
+/// built by `create_remote` agrees with it.
+#[test]
+fn deploy_dir_is_normalized_in_the_validated_graph() {
+    let mut p = minimal_raw_project();
+    p.variants.get_mut("standard").unwrap().slots[0].set_deploy_dir(PathBuf::from("/srv/app//"));
+    let cfg = ProjectConfig::from_raw_parts(p.manifest, p.variants)
+        .expect("a messy but valid deploy_dir is accepted and normalized");
+    let defs = cfg.slot_defs();
+    let slot = defs.first().expect("one slot");
+    assert_eq!(
+        slot.deploy_dir(),
+        Path::new("/srv/app"),
+        "the validated graph carries the canonical effective root"
+    );
+    let bindings = cfg.target_slot_bindings("t1").unwrap();
+    let binding = bindings.values().next().expect("one binding");
+    assert_eq!(
+        binding.deploy_dir, "/srv/app",
+        "the recorded PhysicalBinding.deploy_dir is the canonical effective root"
+    );
 }
 
 #[test]
@@ -2985,4 +3076,321 @@ fn loaded_config_always_constructs_its_store() {
             }
         }
     });
+}
+
+// =====================================================================
+// LOCAL SLOTS OPERATE ON THEIR RECORDED BINDING — the endpoint x slot dir
+// x multi-slot graph prop test
+// =====================================================================
+//
+// A local slot operates on EXACTLY the directory its physical binding
+// records (`slot.deploy_dir`), and that directory is the one authoritative
+// `EffectiveDeployRoot`: `create_remote` parses the `local://` endpoint as
+// a validated [`AbsoluteDeployDir`] (traversal rejected) and REQUIRES it to
+// EQUAL the slot's deploy_dir (both compared as canonical effective roots).
+// The validated config graph stores the deploy_dir in the same canonical
+// form, so `create_remote(...).root() == PhysicalBinding.deploy_dir` holds
+// for every accepted local slot by construction.
+
+/// A valid local endpoint path, possibly in a MESSY spelling: absolute and
+/// traversal-free, but with a trailing slash or doubled separators that
+/// [`AbsoluteDeployDir`] folds into the same canonical form.
+fn valid_endpoint_path() -> impl Strategy<Value = String> {
+    prop::collection::vec(
+        prop::sample::select(&["srv", "app", "deploy", "x1", "x2"]),
+        1..=3,
+    )
+    .prop_flat_map(|segs| {
+        let base = format!("/{}", segs.join("/"));
+        prop_oneof![
+            Just(base.clone()),
+            Just(format!("{base}/")),
+            Just(base.replace('/', "//")),
+        ]
+    })
+}
+
+/// An arbitrary `local://` server address: valid (possibly messy)
+/// endpoints, traversal-carrying endpoints, a relative endpoint, and the
+/// filesystem root.
+fn arbitrary_local_address() -> impl Strategy<Value = String> {
+    prop_oneof![
+        valid_endpoint_path().prop_map(|p| format!("local://{p}")),
+        Just("local:///srv/../escape".to_string()),
+        Just("local:///srv/./dot".to_string()),
+        Just("local:///srv/a/..".to_string()),
+        Just("local:///..".to_string()),
+        Just("local://rel/relative".to_string()),
+        Just("local:///".to_string()),
+    ]
+}
+
+/// An arbitrary slot deploy_dir: valid (possibly messy) absolute paths,
+/// traversal-carrying paths, a relative path, and the filesystem root.
+fn arbitrary_deploy_dir() -> impl Strategy<Value = String> {
+    prop_oneof![
+        valid_endpoint_path(),
+        Just("/srv/../escape".to_string()),
+        Just("/srv/./dot".to_string()),
+        Just("rel/relative".to_string()),
+        Just("/".to_string()),
+        Just("/srv//".to_string()),
+    ]
+}
+
+/// One generated LOCAL multi-slot graph: 1..=2 local servers (each with an
+/// arbitrary `local://` address, server id `s{i}`) and 1..=3 slots (ids
+/// `p{i}`, target `t1`) bound to them. Deploy_dirs are drawn independently,
+/// so SHARED dirs between slots arise naturally — the graphs the injection
+/// rule must reject.
+#[derive(Clone, Debug)]
+struct LocalGraph {
+    endpoints: Vec<String>,
+    /// `(slot id, server id, deploy_dir)`.
+    slots: Vec<(String, String, String)>,
+}
+
+fn local_graph() -> impl Strategy<Value = LocalGraph> {
+    prop::collection::vec(arbitrary_local_address(), 1..=2).prop_flat_map(|endpoints| {
+        prop::collection::vec((0..endpoints.len(), arbitrary_deploy_dir()), 1..=3).prop_map(
+            move |raw_slots| LocalGraph {
+                endpoints: endpoints.clone(),
+                slots: raw_slots
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (server_idx, dir))| (format!("p{i}"), format!("s{server_idx}"), dir))
+                    .collect(),
+            },
+        )
+    })
+}
+
+/// Build the raw project for a generated graph (one variant file carrying
+/// every slot; every other graph rule — unique ids, resolvable references,
+/// one target — holds by construction).
+fn raw_project_for(graph: &LocalGraph) -> RawProject {
+    let servers = graph
+        .endpoints
+        .iter()
+        .enumerate()
+        .map(|(i, address)| raw::RawServer {
+            id: format!("s{i}"),
+            address: address.clone(),
+            user: "u".to_string(),
+            port: 22,
+            known_hosts: None,
+            host_key_fingerprint: None,
+            capacity: raw::RawCapacityConfig::default(),
+        })
+        .collect();
+    let slots = graph
+        .slots
+        .iter()
+        .map(|(id, server, dir)| {
+            SlotConfig::new(
+                id.clone(),
+                server.clone(),
+                PathBuf::from(dir),
+                "t1",
+                Vec::new(),
+            )
+        })
+        .collect();
+    RawProject {
+        manifest: raw::RawConfig {
+            schema_version: raw::CONFIG_SCHEMA_VERSION,
+            application: "app".to_string(),
+            release: ReleaseName::new("v1"),
+            pins: Vec::new(),
+            servers,
+            targets: BTreeMap::from([(
+                "t1".to_string(),
+                raw::RawTargetConfig {
+                    rollout: raw::RawRolloutConfig::default(),
+                },
+            )]),
+        },
+        variants: BTreeMap::from([(
+            "standard".to_string(),
+            raw::RawVariant {
+                description: None,
+                artifact: ArtifactConfig {
+                    mappings: Vec::new(),
+                },
+                activation: ActivationConfig {
+                    adapter: "none".to_string(),
+                    scope: ActivationScope::User,
+                    reconcile_managed_units: true,
+                    units: Vec::new(),
+                },
+                verification: VerificationConfig {
+                    adapter: "command".to_string(),
+                    argv: vec!["true".to_string()],
+                    timeout_seconds: 5,
+                    attempts: 1,
+                    interval_seconds: 0,
+                },
+                slots,
+                retention: RetentionConfig::default(),
+            },
+        )]),
+    }
+}
+
+/// The canonical form of a deploy_dir (`""` when it is not a valid
+/// [`AbsoluteDeployDir`]).
+fn canonical_or_empty(s: &str) -> String {
+    AbsoluteDeployDir::parse(s)
+        .map(|a| a.as_path().to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// Whether `create_remote` ACCEPTS the slot: the endpoint parses as an
+/// [`EffectiveDeployRoot`] (absolute, traversal-free, normalized) AND equals
+/// the slot's deploy_dir — both compared as canonical effective roots.
+fn slot_accepts(endpoint: &str, deploy_dir: &str) -> bool {
+    let Some(path) = endpoint.strip_prefix("local://") else {
+        return false;
+    };
+    match (
+        EffectiveDeployRoot::parse(path),
+        EffectiveDeployRoot::parse(deploy_dir),
+    ) {
+        (Ok(endpoint), Ok(dir)) => endpoint == dir,
+        _ => false,
+    }
+}
+
+proptest! {
+    // THE PROPERTY: over generated LOCAL multi-slot graphs (arbitrary
+    // `local://` endpoints — valid/messy/traversal/relative/root — arbitrary
+    // slot deploy_dirs, and several slots that may SHARE a deploy_dir), the
+    // acceptance boundary is EXACTLY:
+    //   config loads  <=> every deploy_dir is a valid AbsoluteDeployDir AND
+    //                     the effective local roots are INJECTIVE AND every
+    //                     local:// endpoint is absolute;
+    //   create_remote accepts a slot <=> its endpoint (a validated
+    //   EffectiveDeployRoot) EQUALS the slot's deploy_dir.
+    // Every ACCEPTED graph therefore has traversal-free, injective
+    // effective roots, and `create_remote(...).root() ==
+    // PhysicalBinding.deploy_dir` for every slot. Bounded 16 cases, fixed
+    // seed 0x5EED_5EED per house style.
+    #![proptest_config(ProptestConfig {
+        cases: 16,
+        rng_seed: RngSeed::Fixed(0x5EED_5EED),
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
+
+    #[test]
+    fn local_slots_operate_on_their_recorded_binding(graph in local_graph()) {
+        let dirs_valid = graph
+            .slots
+            .iter()
+            .all(|(_, _, d)| AbsoluteDeployDir::parse(d).is_ok());
+        let mut seen = HashSet::new();
+        let roots_injective = graph.slots.iter().all(|(_, _, d)| {
+            let c = canonical_or_empty(d);
+            c.is_empty() || seen.insert(c)
+        });
+        let endpoints_absolute = graph.endpoints.iter().all(|e| {
+            e.strip_prefix("local://")
+                .map(|p| Path::new(p).is_absolute())
+                .unwrap_or(false)
+        });
+
+        let project = raw_project_for(&graph);
+        match ProjectConfig::from_raw_parts(project.manifest, project.variants) {
+            Err(e) => {
+                // A REJECTED graph must carry a rejecting cause: an invalid
+                // deploy_dir, duplicate effective local roots, or a relative
+                // local:// endpoint (every other graph rule holds by
+                // construction).
+                prop_assert!(
+                    !dirs_valid || !roots_injective || !endpoints_absolute,
+                    "rejected graph without a rejecting cause: {:?} (err {})",
+                    graph,
+                    e
+                );
+            }
+            Ok(cfg) => {
+                // An ACCEPTED graph: every deploy_dir valid, the effective
+                // roots injective, every endpoint absolute.
+                prop_assert!(
+                    dirs_valid && roots_injective && endpoints_absolute,
+                    "accepted graph must have valid, injective effective roots: {:?}",
+                    graph
+                );
+                assert_domain_invariants(&cfg);
+
+                let env = SysEnv::from_process();
+                let bindings = cfg.target_slot_bindings("t1").unwrap();
+                let mut roots: Vec<(String, PathBuf)> = Vec::new();
+                let mut rejected: Option<String> = None;
+                for (slot, server) in cfg.target_slots("t1").unwrap() {
+                    match create_remote(&env, server, slot.deploy_dir()) {
+                        Ok(remote) => roots.push((slot.id.clone(), remote.root().to_path_buf())),
+                        Err(e) => {
+                            rejected = Some(e.to_string());
+                            break;
+                        }
+                    }
+                }
+
+                // EXACT ENDPOINT SEMANTICS: create_remote accepts every slot
+                // iff each slot's endpoint EQUALS its deploy_dir.
+                let all_match = graph.slots.iter().all(|(_, server_id, dir)| {
+                    let idx: usize = server_id[1..].parse().unwrap();
+                    slot_accepts(&graph.endpoints[idx], dir)
+                });
+                prop_assert_eq!(
+                    rejected.is_none(),
+                    all_match,
+                    "create_remote must accept exactly the slots whose endpoint equals the deploy_dir: {:?}",
+                    graph
+                );
+
+                if rejected.is_none() {
+                    // EVERY ACCEPTED GRAPH:
+                    // (1) TRAVERSAL-FREE effective roots — absolute, no `.`/`..`
+                    //     component anywhere, validated as an EffectiveDeployRoot.
+                    for (slot_id, root) in &roots {
+                        let root_str = root.to_string_lossy();
+                        let rp = Path::new(root_str.as_ref());
+                        prop_assert!(
+                            rp.is_absolute()
+                                && rp.components()
+                                    .all(|c| matches!(c, std::path::Component::Normal(_))),
+                            "accepted slot '{}' has a traversal-free effective root: {}",
+                            slot_id,
+                            root_str
+                        );
+                        prop_assert!(
+                            EffectiveDeployRoot::parse(&root_str).is_ok(),
+                            "accepted slot '{}' root is a validated EffectiveDeployRoot: {}",
+                            slot_id,
+                            root_str
+                        );
+                        // (3) THE RECORDED BINDING: create_remote(...).root()
+                        //     == PhysicalBinding.deploy_dir.
+                        let binding = &bindings[&SlotId::parse(slot_id).unwrap()];
+                        prop_assert_eq!(
+                            root.as_path(),
+                            Path::new(binding.deploy_dir.as_str()),
+                            "create_remote(...).root() must equal PhysicalBinding.deploy_dir for slot '{}'",
+                            slot_id
+                        );
+                    }
+                    // (2) INJECTIVE EFFECTIVE ROOTS: no two slots share a root.
+                    let unique: HashSet<&PathBuf> = roots.iter().map(|(_, r)| r).collect();
+                    prop_assert_eq!(
+                        unique.len(),
+                        roots.len(),
+                        "accepted graph must have injective effective roots: {:?}",
+                        graph
+                    );
+                }
+            }
+        }
+    }
 }

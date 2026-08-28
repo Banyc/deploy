@@ -1,6 +1,8 @@
 //! Deployment slots ([`SlotConfig`]): one server + one workload under an id,
 //! with an absolute deploy_dir, bound to exactly one owning target.
 
+use crate::error::Result;
+use crate::identity::AbsoluteDeployDir;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -77,6 +79,25 @@ impl SlotConfig {
     /// in (read-only).
     pub fn deploy_dir(&self) -> &Path {
         &self.deploy_dir
+    }
+
+    /// The slot with its deploy_dir stored in the validated CANONICAL form:
+    /// the current deploy_dir is parsed through the [`AbsoluteDeployDir`]
+    /// scalar (absolute, TRAVERSAL-FREE, normalized — no `.`/`..` at any
+    /// position, the filesystem root refused) and a CLONE carrying the
+    /// canonical path is returned. Fails exactly when the deploy_dir is not a
+    /// valid absolute, traversal-free path. The raw -> domain conversion
+    /// stores this canonical form, so the validated graph carries THE ONE
+    /// authoritative effective root each slot operates on: every consumer
+    /// (`SlotConfig::deploy_dir`, the recorded `PhysicalBinding.deploy_dir`,
+    /// the transport root built by `create_remote`) sees the same normalized
+    /// value — the location-uniqueness rule then compares effective roots,
+    /// not merely the raw spellings.
+    pub(crate) fn with_canonical_deploy_dir(&self) -> Result<SlotConfig> {
+        let canonical = AbsoluteDeployDir::parse(&self.deploy_dir.to_string_lossy())?;
+        let mut slot = self.clone();
+        slot.deploy_dir = canonical.as_path().to_path_buf();
+        Ok(slot)
     }
 
     /// Set the deploy_dir (test-only: the field is private; the

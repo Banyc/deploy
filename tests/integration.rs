@@ -1715,12 +1715,18 @@ user = "deploy"
 [targets.production]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
 "#;
-    let variant_toml = r#"
+    // The slot's deploy_dir IS the configured endpoint directory: under
+    // exact-endpoint semantics a local connection must operate on the slot's
+    // recorded deploy_dir, so the fixture's deploy_dir matches the `local://`
+    // address patched in below (a divergent placeholder like the old
+    // `/srv/deploy/example` would now be refused by create_remote).
+    let variant_toml = format!(
+        r#"
 [[slots]]
 id = "p1"
 server = "server-01"
 target = "production"
-deploy_dir = "/srv/deploy/example"
+deploy_dir = "{}"
 
 [[artifact.mappings]]
 from = "artifacts/build/output/"
@@ -1744,9 +1750,11 @@ argv = ["true"]
 timeout_seconds = 5
 attempts = 1
 interval_seconds = 0
-"#;
+"#,
+        endpoints.join("server-01").display()
+    );
     write_file(&proj.join("deploy.toml"), config_toml);
-    write_variant_file(&proj, "standard", variant_toml);
+    write_variant_file(&proj, "standard", &variant_toml);
     let artifacts = proj.join("releases").join("v1").join("artifacts");
     write_file(&artifacts.join("build/output/app/server"), "v1\n");
     write_file(&artifacts.join("deployment/common/README"), "common\n");
