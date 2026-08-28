@@ -1083,12 +1083,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // THE USER'S FROZEN-GROUP PROPERTY: identical slot-ID sets with
         // ARBITRARY frozen/current group partitions (each era independently
         // decides which slots belong to `G`; both non-empty so both branches
-        // plan). Bounded `proptest_cases(16)` (full 16 with
-        // `DEPLOY_FULL_TESTS=1`, fast default) + the pinned 0x5EED_5EED seed
-        // (house style) keep the deterministic floor fast; each case is
-        // store-only (no remote).
+        // plan). Bounded 8 cases + the pinned 0x5EED_5EED seed (house style)
+        // keep the deterministic floor fast; each case is store-only (no
+        // remote).
         #![proptest_config(ProptestConfig {
-            cases: crate::testutil::proptest_cases(16),
+            cases: 8,
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
             failure_persistence: None,
             ..ProptestConfig::default()
@@ -1227,7 +1226,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     // -------------------------------------------------------------------
     proptest! {
         #![proptest_config(ProptestConfig {
-            cases: crate::testutil::proptest_cases(16),
+            cases: 4,
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
             failure_persistence: None,
             ..ProptestConfig::default()

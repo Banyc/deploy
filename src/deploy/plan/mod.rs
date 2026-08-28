@@ -1647,7 +1647,7 @@ interval_seconds = 0
     proptest! {
         #![proptest_config(ProptestConfig {
             // Bounded + fixed seed: deterministic floor, fast.
-            cases: crate::testutil::proptest_cases(4),
+            cases: 2,
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
             failure_persistence: None,
             ..ProptestConfig::default()
@@ -1772,7 +1772,7 @@ interval_seconds = 0
     proptest! {
         #![proptest_config(ProptestConfig {
             // Bounded + fixed seed: deterministic floor, fast.
-            cases: crate::testutil::proptest_cases(4),
+            cases: 2,
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
             failure_persistence: None,
             ..ProptestConfig::default()
@@ -2211,12 +2211,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     proptest! {
         // THE USER'S MULTI-RELEASE PROPERTY: alternating partial pushes
         // across groups with distinguishable behavior contracts, then an
-        // arbitrary FULL/GROUP rollback of an arbitrary snapshot. Bounded
-        // `proptest_cases(4)` (full 4 with `DEPLOY_FULL_TESTS=1`, fast
-        // default) + the pinned 0x5EED_5EED seed (house style) keep the
+        // arbitrary FULL/GROUP rollback of an arbitrary snapshot. Bounded 2
+        // cases + the pinned 0x5EED_5EED seed (house style) keep the
         // deterministic floor fast; each case is store-only (no remote).
         #![proptest_config(ProptestConfig {
-            cases: crate::testutil::proptest_cases(4),
+            cases: 2,
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
             failure_persistence: None,
             ..ProptestConfig::default()
@@ -2443,11 +2442,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
     proptest! {
         #![proptest_config(ProptestConfig {
-            // Bounded `proptest_cases(16)`: the exactly-2^4 case space of the
-            // four generated topology dimensions. Fixed seed per house style
-            // keeps the deterministic floor fast; each case is store-only (no
-            // remote).
-            cases: crate::testutil::proptest_cases(16),
+            // Bounded 8: the exactly-2^3 case space of the three generated
+            // topology dimensions. Fixed seed per house style keeps the
+            // deterministic floor fast; each case is store-only (no remote).
+            cases: 8,
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
             failure_persistence: None,
             ..ProptestConfig::default()

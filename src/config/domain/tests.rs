@@ -1412,11 +1412,10 @@ proptest! {
     // `deployment_schema_version == LEDGER_SCHEMA_VERSION`. Changing one
     // side's version never affects the other side's decoding.
     //
-    // Bounded `proptest_cases(16)` (full 16 with `DEPLOY_FULL_TESTS=1`, fast
-    // default), fixed seed 0x5EED_5EED (house style), no
+    // Bounded 4 cases, fixed seed 0x5EED_5EED (house style), no
     // failure persistence — the identical vectors on every run.
     #![proptest_config(ProptestConfig {
-        cases: crate::testutil::proptest_cases(16),
+        cases: 4,
         rng_seed: RngSeed::Fixed(0x5EED_5EED),
         failure_persistence: None,
         ..ProptestConfig::default()

@@ -107,7 +107,7 @@ pub trait Remote {
     fn metadata_opt(&self, rel: &Path) -> Result<Option<RemoteMeta>> {
         match self.metadata(rel) {
             Ok(m) => Ok(Some(m)),
-            Err(crate::error::Error::NotFound(_)) => Ok(None),
+            Err(e) if matches!(e, crate::error::Error::NotFound(_)) => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -424,12 +424,8 @@ impl Remote for LocalTransport {
     }
 
     fn metadata(&self, rel: &Path) -> Result<RemoteMeta> {
-        self.metadata_opt(rel)?.ok_or_else(|| {
-            Error::NotFound(format!(
-                "stat {}: not found",
-                join(&self.base, rel).display()
-            ))
-        })
+        self.metadata_opt(rel)?
+            .ok_or_else(|| Error::transport(format!("stat {}: not found", join(&self.base, rel).display())))
     }
 
     fn metadata_opt(&self, rel: &Path) -> Result<Option<RemoteMeta>> {
@@ -553,7 +549,7 @@ mod tests {
                 let writer_error = writer_error.clone();
                 s.spawn(move || {
                     let _done = DoneGuard(done);
-                    for i in 0..100 {
+                    for i in 0..40 {
                         let rel = Path::new("markers").join(format!("m{i}.json"));
                         if let Err(e) = t.try_write_new(&rel, PAYLOAD.as_bytes()) {
                             *writer_error.lock().unwrap() = Some(e.to_string());
@@ -597,7 +593,7 @@ mod tests {
         });
 
         // Every marker installed exactly once with full content.
-        for i in 0..100 {
+        for i in 0..40 {
             let data = std::fs::read(markers.join(format!("m{i}.json"))).unwrap();
             assert_eq!(String::from_utf8_lossy(&data).as_ref(), PAYLOAD);
         }

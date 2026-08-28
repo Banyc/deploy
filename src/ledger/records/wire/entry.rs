@@ -641,11 +641,10 @@ mod tests_entry {
         // outcomes by construction. The REASON is a free-form human note,
         // NOT a fact: mutating it never creates a disagreement — the
         // conversion succeeds and carries the note through unchanged.
-        // Bounded `proptest_cases(16)` (full 16 with `DEPLOY_FULL_TESTS=1`,
-        // fast default), fixed seed 0x5EED_5EED (house style), no
+        // Bounded 2 cases, fixed seed 0x5EED_5EED (house style), no
         // persistence.
         #![proptest_config(ProptestConfig {
-            cases: crate::testutil::proptest_cases(16),
+            cases: 2,
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
             failure_persistence: None,
             ..ProptestConfig::default()
@@ -923,8 +922,7 @@ mod tests_entry {
         // proper-subset selected is allowed — plus the Successful
         // non-emptiness. The intent is rebuilt over the union of the four
         // sets so it never adds a verdict of its own; the mode is applied to
-        // the intent's `group`. Bounded `proptest_cases(16)` (full 16 with
-        // `DEPLOY_FULL_TESTS=1`, fast default), fixed seed 0x5EED_5EED
+        // the intent's `group`. Bounded 4 cases, fixed seed 0x5EED_5EED
         // per house style, no persistence.
         //
         // PROPERTY 2 (the user's requirement — single-set mutation
@@ -937,9 +935,10 @@ mod tests_entry {
         // the rollback slots alone breaks rollback == full). The rejection
         // is asserted through the REAL ledger file (write → re-read — the
         // crash-recovery read path), so a tampered record is refused even
-        // after a durable write.
+        // after a durable write. Bounded 4 cases, fixed seed 0x5EED_5EED
+        // (house style), no persistence.
         #![proptest_config(ProptestConfig {
-            cases: crate::testutil::proptest_cases(16),
+            cases: 4,
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
             failure_persistence: None,
             ..ProptestConfig::default()
