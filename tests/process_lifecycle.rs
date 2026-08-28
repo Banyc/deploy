@@ -130,6 +130,24 @@ enum ChildKind {
     LateMarker,
 }
 
+impl ChildKind {
+    /// Contract: does this kind spawn a grandchild whose PID is published via `gcpid`?
+    fn spawns_grandchild(&self) -> bool {
+        matches!(
+            self,
+            ChildKind::Grandchild
+                | ChildKind::DetachedGrandchild
+                | ChildKind::SetsidInherit
+                | ChildKind::SetsidClose
+        )
+    }
+
+    /// Declared descendant count: 1 for grandchild-spawning kinds, 0 otherwise.
+    fn declared_descendants(&self) -> usize {
+        if self.spawns_grandchild() { 1 } else { 0 }
+    }
+}
+
 /// The injected kill fault. The runner uses `killpg(2)` directly (no external
 /// `kill` binary), so the "missing kill" fault is a syscall-level failure
 /// (ENOENT — what a missing external binary would surface as), EPERM a
@@ -362,15 +380,14 @@ fn run_one_case(kind: ChildKind, fault: KillFault) {
         .unwrap()
         .first()
         .expect("the spawn observer must record the child pid at spawn time");
-    let gc_pid = matches!(
-        kind,
-        ChildKind::Grandchild
-            | ChildKind::DetachedGrandchild
-            | ChildKind::SetsidInherit
-            | ChildKind::SetsidClose
-    )
-    .then(|| read_gc_pid(&dir.path().join("gcpid")))
-    .flatten();
+    let gc_pid =
+        if kind.spawns_grandchild() {
+            Some(read_gc_pid(&dir.path().join("gcpid")).unwrap_or_else(|| {
+                panic!("{kind:?}: grandchild-producing case must publish its PID")
+            }))
+        } else {
+            None
+        };
 
     let times_out = matches!(
         kind,
@@ -534,7 +551,10 @@ fn run_one_case(kind: ChildKind, fault: KillFault) {
         // is gone (the runner reaped it). The marker is NOT asserted absent —
         // the escaped process may write it later (that is the documented
         // exclusion).
-        if let Some(gc) = gc_pid {
+        if kind.spawns_grandchild() {
+            let gc = gc_pid.unwrap_or_else(|| {
+                panic!("{kind:?} × {fault:?}: grandchild-producing case must publish its PID for escaped liveness assertion")
+            });
             assert_pid_alive(gc, &format!("{kind:?} × {fault:?} escaped grandchild"));
         }
         assert_pid_gone(child_pid, &format!("{kind:?} × {fault:?} child"));
@@ -567,7 +587,10 @@ fn run_one_case(kind: ChildKind, fault: KillFault) {
             // left zero live processes; this is what the property actually
             // proves.
             assert_pid_gone(child_pid, &format!("{kind:?} × {fault:?} child"));
-            if let Some(gc) = gc_pid {
+            if kind.spawns_grandchild() {
+                let gc = gc_pid.unwrap_or_else(|| {
+                    panic!("{kind:?} × {fault:?}: grandchild-producing case must publish its PID for containment assertion")
+                });
                 assert_pid_gone(gc, &format!("{kind:?} × {fault:?} grandchild"));
             }
             // The no-post-return-fs probe runs BEFORE any cleanup: the window
@@ -606,7 +629,10 @@ fn run_one_case(kind: ChildKind, fault: KillFault) {
                     &format!("{kind:?} × {fault:?} child (reap-failure survivor)"),
                 );
             }
-            if let Some(gc) = gc_pid {
+            if kind.spawns_grandchild() {
+                let gc = gc_pid.unwrap_or_else(|| {
+                    panic!("{kind:?} × {fault:?}: grandchild-producing case must publish its PID for survivor assertion")
+                });
                 assert_pid_alive(
                     gc,
                     &format!("{kind:?} × {fault:?} grandchild (group-kill-failure survivor)"),
@@ -633,9 +659,10 @@ fn run_one_case(kind: ChildKind, fault: KillFault) {
         // harmless when the runner already reaped it.
         unsafe { libc::waitpid(child_pid as i32, std::ptr::null_mut(), 0) };
     }
-    if matches!(kind, ChildKind::SetsidInherit | ChildKind::SetsidClose)
-        && let Some(gc) = gc_pid
-    {
+    if escaped && kind.spawns_grandchild() {
+        let gc = gc_pid.unwrap_or_else(|| {
+            panic!("{kind:?} × {fault:?}: grandchild-producing case must publish its PID for escaped cleanup")
+        });
         // SAFETY: the escaped grandchild is a LIVE process of this test (its
         // pid is allocated — no reuse); SIGKILL lands.
         unsafe { libc::kill(gc as i32, libc::SIGKILL) };
@@ -646,7 +673,10 @@ fn run_one_case(kind: ChildKind, fault: KillFault) {
     // already proved; for the excluded and honest-failure cases it proves
     // the emergency cleanup landed. ----
     assert_pid_gone(child_pid, &format!("{kind:?} × {fault:?} child"));
-    if let Some(gc) = gc_pid {
+    if kind.spawns_grandchild() {
+        let gc = gc_pid.unwrap_or_else(|| {
+            panic!("{kind:?} × {fault:?}: grandchild-producing case must publish its PID for leak check")
+        });
         assert_pid_gone(gc, &format!("{kind:?} × {fault:?} grandchild"));
     }
 }
@@ -729,5 +759,102 @@ proptest! {
         for (kind, fault) in pairs {
             run_one_case(kind, fault);
         }
+    }
+}
+
+/// Helper for the declared-descendants property: drives ONE ChildKind through
+/// the real runner (Real kill) and asserts observed descendant count ==
+/// declared_descendants(). The observed count is 1 iff a grandchild pid was
+/// published (gcpid exists and parses), 0 otherwise. This is contract-driven:
+/// a declared-1 kind MUST publish its PID (loud expect), a declared-0 kind
+/// MUST NOT have published one.
+fn run_declared_descendants_case(kind: ChildKind) {
+    let env = SysEnv::from_map(BTreeMap::from([(
+        OsString::from("PATH"),
+        OsString::from("/bin:/usr/bin"),
+    )]));
+    let dir = fixture_tmpdir(&env);
+    let argv = script_for(kind, dir.path());
+    let spawned = std::sync::Arc::new(Mutex::new(Vec::<u32>::new()));
+    let runner_reaps = std::sync::Arc::new(AtomicUsize::new(0));
+    let seam = std::sync::Arc::new(FaultSeam {
+        fault: KillFault::Real,
+        group_kills: AtomicUsize::new(0),
+    });
+    let config = RunnerConfig {
+        term_to_kill_grace: Duration::from_millis(25),
+        reap_bound: Duration::from_millis(100),
+        kill: seam.clone(),
+        spawn_observer: Some(std::sync::Arc::new({
+            let spawned = spawned.clone();
+            move |pid| spawned.lock().unwrap().push(pid)
+        })),
+        reap_observer: Some(std::sync::Arc::new({
+            let runner_reaps = runner_reaps.clone();
+            move |_pid| {
+                runner_reaps.fetch_add(1, Ordering::SeqCst);
+            }
+        })),
+    };
+    let runner = ChildRunner::new(&env, dir.path().to_path_buf(), config);
+    let outcome = runner.exec(&argv, TEST_TIMEOUT);
+    let child_pid = *spawned
+        .lock()
+        .unwrap()
+        .first()
+        .expect("the spawn observer must record the child pid at spawn time");
+    let gcpid_path = dir.path().join("gcpid");
+    let declared = kind.declared_descendants();
+    let (observed, gc_pid_opt) = if kind.spawns_grandchild() {
+        let pid = read_gc_pid(&gcpid_path)
+            .unwrap_or_else(|| panic!("{kind:?}: grandchild-producing case must publish its PID"));
+        (1usize, Some(pid))
+    } else {
+        let maybe = std::fs::read_to_string(&gcpid_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok());
+        assert!(
+            maybe.is_none(),
+            "{kind:?}: declared-0 kind must NOT have published a gcpid, but found pid {maybe:?}"
+        );
+        (0usize, None)
+    };
+    assert_eq!(
+        observed, declared,
+        "{kind:?}: observed descendant count {observed} != declared {declared}"
+    );
+    // Emergency cleanup so the property never leaks, mirroring run_one_case's
+    // post-observation cleanup (group kill + escaped pid kill).
+    let escaped = matches!(kind, ChildKind::SetsidInherit | ChildKind::SetsidClose);
+    if outcome.is_err() {
+        unsafe { libc::kill(-(child_pid as i32), libc::SIGKILL) };
+        unsafe { libc::waitpid(child_pid as i32, std::ptr::null_mut(), 0) };
+    }
+    if escaped && let Some(gc) = gc_pid_opt {
+        unsafe { libc::kill(gc as i32, libc::SIGKILL) };
+    }
+    assert_pid_gone(
+        child_pid,
+        &format!("{kind:?} child (descendant-count cleanup)"),
+    );
+    if let Some(gc) = gc_pid_opt {
+        assert_pid_gone(
+            gc,
+            &format!("{kind:?} grandchild (descendant-count cleanup)"),
+        );
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: proptest_cases(16),
+        rng_seed: RngSeed::Fixed(0x5EED_5EED),
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
+
+    #[test]
+    fn declared_descendants_matches_observed(kind in child_strategy()) {
+        run_declared_descendants_case(kind);
     }
 }
