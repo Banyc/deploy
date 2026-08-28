@@ -20,7 +20,7 @@
 
 mod ssh;
 
-pub use ssh::SshTransport;
+pub use ssh::{SSH_STAT_ABSENT_EXIT, SshTransport};
 
 use crate::env::SysEnv;
 use crate::error::{Error, Result};

@@ -26,6 +26,15 @@ use super::{FsBytes, Remote, RemoteEntry, RemoteMeta, has_normal_component_below
 use hostkey::pin_known_hosts;
 use runner::{OpKind, RunError, SSH_CONNECT_TIMEOUT_SECS, SshRunner};
 
+/// The structured ssh-stat absence protocol (see [`SshTransport::metadata_opt`]):
+/// the remote script returns this RESERVED exit code as a machine-readable
+/// signal for a CONFIRMED absence (`! -e <path> && ! -L <path>`). It is the
+/// ONLY nonzero exit `metadata_opt` maps to `Ok(None)` — every other nonzero
+/// exit is an error and successful output is parsed strictly. `44` cannot
+/// collide with `stat`'s own failures (`stat` exits 1 on failure), and the
+/// remote script's explicit `exit 44` is the only way the code is produced.
+pub const SSH_STAT_ABSENT_EXIT: i32 = 44;
+
 /// A transport that drives a real remote host over SSH.
 pub struct SshTransport {
     /// `user@address` passed to `ssh` as the connection target.
@@ -619,45 +628,64 @@ impl Remote for SshTransport {
 
     fn metadata_opt(&self, rel: &Path) -> Result<Option<RemoteMeta>> {
         let p = self.root.join(rel).to_string_lossy().into_owned();
-        // `%s %f` is a SINGLE format argument; it is single-quoted by
-        // `argv_cmd` so the remote shell keeps the space inside one token and
-        // `stat` receives "-c" "%s %f" "<path>" exactly.
-        let out = self.run_remote(&Self::argv_cmd(&[
-            "stat".into(),
-            "-c".into(),
-            "%s %f".into(),
-            p,
-        ]))?;
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-            // ONLY a confirmed no-such-entry is absence; every other stat
-            // failure (permission, transport fault) propagates.
-            if stderr.contains("No such file") {
-                return Ok(None);
+        // The structured absence protocol: ONE remote exec whose EXIT CODE is
+        // the signal. `! -e && ! -L` is a CONFIRMED absence and exits with the
+        // reserved `SSH_STAT_ABSENT_EXIT`; anything present falls through to
+        // `stat -c '%s %f'` (size + raw mode in hex — `%s %f` stays a SINGLE
+        // single-quoted format token so the remote shell passes it verbatim).
+        // `stat` exits 1 on failure, so the reserved code cannot collide with
+        // stat's own errors, and stderr is NEVER parsed.
+        let out = self.run_remote(&format!(
+            "if [ ! -e {p} ] && [ ! -L {p} ]; then exit {absent}; fi; stat -c '%s %f' {p}",
+            p = shell_quote(&p),
+            absent = SSH_STAT_ABSENT_EXIT,
+        ))?;
+        match out.status.code() {
+            // ONLY the reserved exit code is a confirmed absence.
+            Some(SSH_STAT_ABSENT_EXIT) => Ok(None),
+            // Successful output is parsed STRICTLY: exactly two
+            // whitespace-separated fields — `size` (decimal u64) then
+            // `rawmode` (hex u32). Missing, extra, or unparseable fields are
+            // malformed output: an error, never a silent `unwrap_or(0)`.
+            Some(0) => {
+                let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let mut parts = text.split_whitespace();
+                let size = parts
+                    .next()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .ok_or_else(|| {
+                        Error::transport(format!("ssh stat: malformed output: {text:?}"))
+                    })?;
+                let raw = parts
+                    .next()
+                    .and_then(|s| u32::from_str_radix(s, 16).ok())
+                    .ok_or_else(|| {
+                        Error::transport(format!("ssh stat: malformed output: {text:?}"))
+                    })?;
+                if parts.next().is_some() {
+                    return Err(Error::transport(format!(
+                        "ssh stat: malformed output: {text:?}"
+                    )));
+                }
+                let mode = raw & 0o7777;
+                let is_symlink = (raw & 0o170000) == 0o120000;
+                let is_dir = (raw & 0o170000) == 0o040000;
+                let is_file = !is_symlink && !is_dir;
+                Ok(Some(RemoteMeta {
+                    is_dir,
+                    is_symlink,
+                    is_file,
+                    size,
+                    mode,
+                }))
             }
-            return Err(Error::transport(format!("ssh stat failed: {stderr}")));
+            // Every OTHER nonzero exit (permission, transport fault, killed
+            // by signal) is an ERROR — absence is never inferred from stderr.
+            _ => Err(Error::transport(format!(
+                "ssh stat failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ))),
         }
-        let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        let mut parts = text.split_whitespace();
-        let size = parts
-            .next()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
-        let raw = parts
-            .next()
-            .and_then(|s| u32::from_str_radix(s, 16).ok())
-            .unwrap_or(0);
-        let mode = raw & 0o7777;
-        let is_symlink = (raw & 0o170000) == 0o120000;
-        let is_dir = (raw & 0o170000) == 0o040000;
-        let is_file = !is_symlink && !is_dir;
-        Ok(Some(RemoteMeta {
-            is_dir,
-            is_symlink,
-            is_file,
-            size,
-            mode,
-        }))
     }
 
     fn exec(
@@ -1301,10 +1329,15 @@ printf '%s %s\n' "$host" '{pubkey}'
 
             // Fake `stat` emulating GNU coreutils `-c` (macOS stat lacks it):
             // the transport's list/metadata scripts use `stat -c '%f'` (raw
-            // mode in hex) and `stat -c '%s %f'` (size + raw mode hex).
+            // mode in hex) and `stat -c '%s %f'` (size + raw mode hex). A
+            // CONFIRMED absence (`! -e && ! -L`) exits with the reserved
+            // `SSH_STAT_ABSENT_EXIT` — the same structured signal the
+            // transport's metadata script produces — instead of GNU stat's
+            // human-readable stderr, so the fakes model the protocol.
             std::fs::write(
                 bin.join("stat"),
-                r#"#!/bin/sh
+                format!(
+                    r#"#!/bin/sh
 fmt=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -1315,8 +1348,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 if [ ! -e "$1" ] && [ ! -L "$1" ]; then
-  echo "stat: cannot stat '$1': No such file or directory" >&2
-  exit 1
+  exit {absent}
 fi
 case "$fmt" in
   "%f")
@@ -1330,6 +1362,8 @@ case "$fmt" in
     ;;
 esac
 "#,
+                    absent = SSH_STAT_ABSENT_EXIT,
+                ),
             )
             .unwrap();
 
@@ -1397,6 +1431,19 @@ esac
             ),
         ]));
         SysEnv::from_map(vars)
+    }
+
+    /// Overwrite the protocol-faithful fake `stat` (written by [`FakeSsh::new`])
+    /// with a custom script for a single focused test — the transport resolves
+    /// `stat` from the fake bin dir's `PATH`, so the override is picked up by
+    /// every remote command. Kept executable like the originals.
+    fn write_fake_stat(bin: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let p = bin.join("stat");
+        std::fs::write(&p, body).unwrap();
+        let mut perms = std::fs::metadata(&p).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&p, perms).unwrap();
     }
 
     // Scenario (a): a fingerprint-only configuration can make a STATUS request
@@ -1478,6 +1525,158 @@ esac
         assert!(
             text.contains("ssh-ed25519"),
             "repinned file must hold a valid key line"
+        );
+    }
+
+    /// The structured absence protocol: `metadata_opt` maps ONLY the reserved
+    /// exit code (`SSH_STAT_ABSENT_EXIT`) to `Ok(None)`, treats every other
+    /// nonzero exit as an error (no stderr sniffing), and rejects malformed
+    /// successful output. The happy path (present entries) is unchanged: the
+    /// type bits still decode from the raw mode into is_symlink/is_dir/is_file.
+    #[test]
+    fn metadata_opt_structured_absence_protocol() {
+        let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let fake = FakeSsh::new(
+            tmp.path().join("bin"),
+            tmp.path().join("remote"),
+            "meta-unit.test",
+            Path::new("/srv/deploy/meta-unit"),
+        );
+        let cache = tmp.path().join("knownhosts");
+        let env = fake_env(
+            &fake.bin,
+            &cache,
+            &fake.remote_root,
+            "/srv/deploy/meta-unit",
+        );
+        let t = fake.transport(&cache, &env);
+        t.prepare_identity().unwrap();
+
+        use std::os::unix::fs::PermissionsExt;
+        let remote_deploy = fake.remote_root.join("srv/deploy/meta-unit");
+        std::fs::create_dir_all(&remote_deploy).unwrap();
+        let file = remote_deploy.join("app.txt");
+        std::fs::write(&file, b"hello").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink("app.txt", remote_deploy.join("link")).unwrap();
+        std::os::unix::fs::symlink("missing-target", remote_deploy.join("dangling")).unwrap();
+
+        // Present regular file: strictly parsed `size` + `rawmode`.
+        let meta = t
+            .metadata_opt(Path::new("app.txt"))
+            .unwrap()
+            .expect("present file must be Some");
+        assert!(meta.is_file && !meta.is_dir && !meta.is_symlink);
+        assert_eq!(meta.size, 5);
+        assert_eq!(meta.mode, 0o644);
+
+        // Present symlink and DANGLING symlink: lstat semantics decode the
+        // symlink type bits (`! -L` is false for a link, so stat still runs).
+        for rel in ["link", "dangling"] {
+            let m = t
+                .metadata_opt(Path::new(rel))
+                .unwrap()
+                .expect("present symlink must be Some");
+            assert!(m.is_symlink && !m.is_file && !m.is_dir, "{rel}");
+        }
+
+        // Confirmed absence: `! -e && ! -L` -> the reserved exit code -> None.
+        assert!(t.metadata_opt(Path::new("absent.txt")).unwrap().is_none());
+        assert!(
+            t.metadata_opt(Path::new("missing/dir/entry"))
+                .unwrap()
+                .is_none(),
+            "a missing parent is also a confirmed absence"
+        );
+
+        // `metadata()` keeps delegating: confirmed absence -> NotFound.
+        let err = t.metadata(Path::new("absent.txt")).unwrap_err();
+        assert!(
+            matches!(err, Error::NotFound(_)),
+            "metadata() must map confirmed absence to NotFound, got: {err}"
+        );
+    }
+
+    /// A remote `stat` that fails with a DIFFERENT nonzero exit code (not the
+    /// reserved one) is an error — absence is signaled ONLY by the reserved
+    /// code. Confirmed absence still short-circuits to `Ok(None)` via the
+    /// shell guard before `stat` is ever consulted.
+    #[test]
+    fn metadata_opt_errors_on_other_nonzero_exit() {
+        let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let fake = FakeSsh::new(
+            tmp.path().join("bin"),
+            tmp.path().join("remote"),
+            "meta-err.test",
+            Path::new("/srv/deploy/meta-err"),
+        );
+        // A stat that fails like a permission error: exits 3 with stderr.
+        write_fake_stat(
+            &fake.bin,
+            "#!/bin/sh\necho 'stat: cannot stat: Permission denied' >&2\nexit 3\n",
+        );
+        let cache = tmp.path().join("knownhosts");
+        let env = fake_env(&fake.bin, &cache, &fake.remote_root, "/srv/deploy/meta-err");
+        let t = fake.transport(&cache, &env);
+        t.prepare_identity().unwrap();
+
+        let remote_deploy = fake.remote_root.join("srv/deploy/meta-err");
+        std::fs::create_dir_all(&remote_deploy).unwrap();
+        std::fs::write(remote_deploy.join("app.txt"), b"x").unwrap();
+
+        // Present entry, failing stat: a DIFFERENT nonzero exit -> Err; the
+        // stderr text is never sniffed for absence.
+        let err = t.metadata_opt(Path::new("app.txt")).unwrap_err();
+        assert!(
+            err.to_string().contains("ssh stat failed"),
+            "a non-reserved nonzero exit must be an error, got: {err}"
+        );
+        // Absent entry: the shell guard fires BEFORE stat -> still None.
+        assert!(t.metadata_opt(Path::new("absent.txt")).unwrap().is_none());
+    }
+
+    /// Malformed SUCCESSFUL output (exit 0 with garbage) is an error — the
+    /// size and mode fields are parsed strictly, with no lenient fallback.
+    #[test]
+    fn metadata_opt_rejects_malformed_successful_output() {
+        let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let fake = FakeSsh::new(
+            tmp.path().join("bin"),
+            tmp.path().join("remote"),
+            "meta-mal.test",
+            Path::new("/srv/deploy/meta-mal"),
+        );
+        let cache = tmp.path().join("knownhosts");
+        let env = fake_env(&fake.bin, &cache, &fake.remote_root, "/srv/deploy/meta-mal");
+        let t = fake.transport(&cache, &env);
+        t.prepare_identity().unwrap();
+
+        let remote_deploy = fake.remote_root.join("srv/deploy/meta-mal");
+        std::fs::create_dir_all(&remote_deploy).unwrap();
+        std::fs::write(remote_deploy.join("app.txt"), b"x").unwrap();
+
+        // Unparseable size and mode.
+        write_fake_stat(&fake.bin, "#!/bin/sh\necho 'garbage'\nexit 0\n");
+        let err = t.metadata_opt(Path::new("app.txt")).unwrap_err();
+        assert!(
+            err.to_string().contains("malformed output"),
+            "garbage stdout must be malformed, got: {err}"
+        );
+
+        // Size but no mode field.
+        write_fake_stat(&fake.bin, "#!/bin/sh\necho '123'\nexit 0\n");
+        let err = t.metadata_opt(Path::new("app.txt")).unwrap_err();
+        assert!(
+            err.to_string().contains("malformed output"),
+            "missing mode field must be malformed, got: {err}"
+        );
+
+        // Two fields plus a stray third field.
+        write_fake_stat(&fake.bin, "#!/bin/sh\necho '123 deadbeef extra'\nexit 0\n");
+        let err = t.metadata_opt(Path::new("app.txt")).unwrap_err();
+        assert!(
+            err.to_string().contains("malformed output"),
+            "extra field must be malformed, got: {err}"
         );
     }
 }

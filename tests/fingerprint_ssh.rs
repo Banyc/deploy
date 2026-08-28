@@ -11,8 +11,7 @@ use deploy::deploy::{PushOptions, push};
 use deploy::env::SysEnv;
 use deploy::error::Result;
 use deploy::ledger::DeploymentStatus;
-use deploy::remote::transport::Remote;
-use deploy::remote::transport::SshTransport;
+use deploy::remote::transport::{Remote, SSH_STAT_ABSENT_EXIT, SshTransport};
 use deploy::store::local::LocalStore;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -134,7 +133,10 @@ printf '%s %s\n' "$host" '{pubkey}'
 # Emulate GNU coreutils `stat -c` (macOS stat lacks it): the transport's
 # list/metadata scripts use `stat -c '%f'` (raw mode in hex) and
 # `stat -c '%s %f'` (size + raw mode hex). Direct perl (no sh wrapper)
-# keeps each metadata call a single exec.
+# keeps each metadata call a single exec. A CONFIRMED absence
+# (`! -e && ! -L`) exits with the reserved SSH_STAT_ABSENT_EXIT — the same
+# structured signal the transport's metadata script produces — instead of
+# GNU stat's human-readable stderr.
 my $fmt = "";
 my @rest = ();
 while (@ARGV) {
@@ -145,8 +147,7 @@ while (@ARGV) {
     else { @rest = ($a, @ARGV); last; }
 }
 if (($rest[0] // "") ne "" && !-e $rest[0] && !-l $rest[0]) {
-    print STDERR "stat: cannot stat '$rest[0]': No such file or directory\n";
-    exit 1;
+    exit {ABSENT};
 }
 if ($fmt eq "%f") {
     my @s = lstat($rest[0]);
@@ -159,7 +160,8 @@ if ($fmt eq "%s %f") {
     exit 0;
 }
 exec "/usr/bin/stat", @rest;
-"##,
+"##
+        .replace("{ABSENT}", &SSH_STAT_ABSENT_EXIT.to_string()),
     )
     .unwrap();
 
