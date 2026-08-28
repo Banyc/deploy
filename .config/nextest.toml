@@ -1,0 +1,28 @@
+# Nextest configuration.
+#
+# The real-process lifecycle target (`tests/process_lifecycle.rs`) must NEVER
+# run its cases concurrently with each other: it spawns real children, process
+# groups, and grandchildren, and its assertions probe the pid space. The
+# deterministic deployment/state-machine properties drive a scripted fake exec
+# (no real processes), so the only thing left to serialize is THIS binary.
+#
+# Isolation is expressed with the proper nextest mechanism (default config
+# path: workspace-root/.config/nextest.toml):
+#   * `[test-groups]` defines a named group whose tests may use at most one
+#     worker thread (`max-threads = 1`), so the lifecycle cases run strictly
+#     serially and never concurrently with each other.
+#   * A `[[profile.default.overrides]]` entry assigns the process_lifecycle
+#     binary to that group and gives it the generous slow timeout it needs:
+#     the lifecycle property drives real children under a 1s runner deadline
+#     plus cleanup + load-tolerant no-post-return-fs probe windows (~1-3s per
+#     pair, up to 3 pairs x 16 cases), so it can legitimately take minutes
+#     under heavy load (the default slow timeout is 60s).
+#
+# Everything else runs under nextest defaults.
+[test-groups.process-lifecycle]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = "binary(process_lifecycle)"
+test-group = "process-lifecycle"
+slow-timeout = { period = "120s", terminate-after = 2 }
