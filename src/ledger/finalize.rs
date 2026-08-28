@@ -33,21 +33,25 @@
 //! shared operation's replacement for recovery's old per-slot generation
 //! check (the "generation diverged" degraded case).
 //!
-//! THE STALE-ROLLBACK-SNAPSHOT FIX: the lock-verified re-observation
-//! ([`verify_selected_locked`]) RETURNS the observed live `GenerationRef`
-//! per selected slot (alongside the equality verdict), and the successful
-//! path constructs the selected rollback entries EXCLUSIVELY from those
-//! verified values (the frozen desired is an equally-valid source — the
-//! verification proved the two equal; the observed values are used because
-//! they are the values actually read under the locks). The `actuals` /
-//! `outcomes` inputs (the engine's per-slot observation records) are GONE
-//! from the successful finalizer — a stale observation can no longer leak
-//! into the payload. The ACTIVATED slot-id set is derived from the INTENT
-//! (its selected slots), and a PRE-APPEND GUARD
-//! ([`verify_rollback_matches_desired`]) enforces `rollback[selected] ==
-//! intent.desired` (the complete GenerationRef equality: generation AND
-//! artifact) before the terminal is appended — a mismatched payload aborts
-//! (fail closed), never appends.
+//! THE ONE PRIVATE VALIDATED MAP (the unreadable-terminal fix): the
+//! observed `GenerationRef`s and the intent's FROZEN bindings are merged
+//! into a SINGLE map — `SlotId -> BoundGeneration { generation, binding }`
+//! ([`crate::ledger::records::BoundGeneration`]) — and the rollback payload
+//! is built from that ONE map, so the construction has NO parallel maps to
+//! drift (the old two-map construction could append a terminal whose
+//! bindings key set diverged from its slots key set — MISSING / EXTRA /
+//! RENAMED bindings — and the strict reader then refused it: the ledger
+//! became UNREADABLE immediately after a SUCCESSFUL finalization). The
+//! merge is VALIDATED (a selected slot with no binding, an extra binding
+//! for a non-selected slot, or a renamed key is a construction ERROR — the
+//! finalization refuses with an `Err`, never appends), [`build_rollback`]
+//! is FALLIBLE (it verifies its own result's key-set equality + own-key
+//! agreement), and the terminal append is additionally validated against
+//! its intent BEFORE writing by the store
+//! ([`crate::store::local::LocalStore::append_terminal`] — the strict
+//! reader's own legs, run on the constructed pair pre-write): a rejected
+//! pair leaves the ledger bytes UNCHANGED; any successful append is
+//! immediately readable.
 //!
 //! The two PHYSICAL LINE KINDS of the append-only JSONL stream
 //! ([`LedgerLine`] — the WIRE enum) and the MERGED ENTRY re-export
@@ -56,9 +60,10 @@
 
 use crate::error::{Error, Result};
 use crate::identity::{DeploymentId, GenerationRef, OperationId, PlacementSlotAssignment, SlotId};
+use crate::ledger::records::{BoundGeneration, build_rollback};
 pub use crate::ledger::records::{
     DeploymentIntent, LedgerEntry, LedgerIntentWire, LedgerRollback, LedgerTerminal,
-    LedgerTerminalWire, PhysicalBinding, TerminalDisposition, build_rollback,
+    LedgerTerminalWire, PhysicalBinding, TerminalDisposition,
 };
 use crate::remote::helper::{LockGuard, RemoteHelper};
 use crate::store::local::LocalStore;
@@ -290,7 +295,52 @@ pub fn finalize_successful_locked(
     //    values are used because they are the values actually read under
     //    the locks), NEVER from the `actuals`/`outcomes` observation
     //    records (removed from this finalizer's inputs).
-    let rollback = build_rollback(&observed, bindings, base.as_ref(), &current_slot_ids);
+    //
+    //    THE ONE PRIVATE VALIDATED MAP (the unreadable-terminal fix): the
+    //    observed GenerationRefs and the intent's FROZEN bindings are FIRST
+    //    merged into a SINGLE map (`SlotId -> BoundGeneration` — each
+    //    selected slot's verified generation PAIRED with its physical
+    //    binding), and `build_rollback` consumes that one map — the
+    //    rollback's `slots` and `bindings` wire fields are filled from the
+    //    SAME iteration, so there are NO parallel maps to drift (a slot
+    //    present in one but not the other — MISSING / EXTRA / RENAMED
+    //    bindings — could otherwise produce an appended-but-unreadable
+    //    terminal). The MERGE itself is the validation (fail closed): a
+    //    selected slot with NO binding, a binding keyed under a DIFFERENT
+    //    slot, or an EXTRA binding for a non-selected slot is a
+    //    CONSTRUCTION ERROR — the finalization refuses (an `Err`), never
+    //    appends a broken terminal. `build_rollback` is FALLIBLE too: it
+    //    verifies its own result (slots key set == bindings key set, every
+    //    ref names its own slot) before returning.
+    let verified: BTreeMap<SlotId, BoundGeneration> = observed
+        .into_iter()
+        .map(|(sid, generation)| {
+            let binding = bindings.get(&sid).cloned().ok_or_else(|| {
+                Error::integrity(format!(
+                    "finalize {}: the frozen-binding intent carries NO physical binding for selected slot '{sid}' — every selected slot's verified generation must be paired with its physical binding in ONE map (a missing binding cannot produce a consistent rollback payload; refusing to append a terminal the strict reader would reject)",
+                    attempt.deployment_id
+                ))
+            })?;
+            Ok((sid, BoundGeneration { generation, binding }))
+        })
+        .collect::<Result<BTreeMap<SlotId, BoundGeneration>>>()?;
+    // THE MERGE'S EXACT-KEY VALIDATION (fail closed): the input bindings
+    // must key EXACTLY the selected slots — an EXTRA binding (a slot this
+    // attempt never deployed) or a RENAMED key (the same slot under a
+    // different id) is a divergent construction input, refused here the
+    // same way the strict reader refuses a binding for a non-slotted
+    // generation (never silently dropped, never written).
+    let selected_keys: BTreeSet<SlotId> = verified.keys().cloned().collect();
+    let binding_keys: BTreeSet<SlotId> = bindings.keys().cloned().collect();
+    if selected_keys != binding_keys {
+        let missing: Vec<&SlotId> = selected_keys.difference(&binding_keys).collect();
+        let extra: Vec<&SlotId> = binding_keys.difference(&selected_keys).collect();
+        return Err(Error::integrity(format!(
+            "finalize {}: the frozen-binding intent diverges from the selected slots — missing bindings for {missing:?}; extra bindings for {extra:?} (the rollback payload must pair EXACTLY the selected slots' verified generations with their physical bindings in ONE map)",
+            attempt.deployment_id
+        )));
+    }
+    let rollback = build_rollback(&verified, base.as_ref(), &current_slot_ids)?;
     // THE WRITER'S EQUALITY (fail closed): the rollback's key set must
     // EXACTLY equal the frozen full membership (`attempt.full_membership()`)
     // — the read path rejects a mismatch (rollback slots ==

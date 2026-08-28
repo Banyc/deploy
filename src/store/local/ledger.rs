@@ -19,6 +19,170 @@ use std::path::PathBuf;
 #[cfg(test)]
 use crate::testutil::test_faults::FaultKind;
 
+/// THE STRICT READER'S TERMINAL LEG — the terminal-vs-entry verification
+/// [`LocalStore::read_ledger`] applies when a terminal wire merges into its
+/// durable entry, factored out so the WRITE path ([`LocalStore::append_terminal`])
+/// runs the SAME predicates BEFORE an append. The checks are exactly the
+/// read path's: the wire's `target` must EQUAL the entry's, every outcome
+/// key must be a MEMBER of the intent's authoritative membership, the
+/// VERIFYING CONVERSION ([`LedgerTerminalWire::into_domain`] — the rollback's
+/// exact binding-key equality, the membership equations, the complete
+/// equality predicate: a Successful slot's outcome is Known(g) with
+/// g == rollback.slots[slot].generation, error None, uncompensated) must
+/// accept the wire, and the STATUS-SPECIFIC legs (a Successful terminal
+/// must REPRODUCE the intent's FROZEN selected/full memberships + the
+/// full-push selected == full equality; a FailedPreflight terminal must
+/// carry NO outcomes; every other terminal's outcomes must EXACTLY cover
+/// the membership) must hold. A disagreement → `Error::integrity`.
+///
+/// THE PRE-WRITE GUARANTEE: [`LocalStore::append_terminal`] runs this on the
+/// CONSTRUCTED pair (the deployment's durable intent + the terminal about
+/// to be written) BEFORE any write — a terminal the strict reader would
+/// reject is NEVER written (the append is atomic; the ledger bytes stay
+/// UNCHANGED on rejection), so any successful append is IMMEDIATELY
+/// READABLE.
+fn verify_terminal_against_entry(
+    target: &str,
+    entry: &LedgerEntry,
+    wire: LedgerTerminalWire,
+) -> Result<LedgerTerminal> {
+    // TARGET EQUALITY (cross-record invariant, terminal leg): the wire's
+    // `target` must EQUAL the entry's (the intent's) — the domain terminal
+    // carries no identity (the enclosing entry owns it).
+    if wire.target != entry.target {
+        return Err(Error::integrity(format!(
+            "ledger of target '{target}': terminal {} claims target '{}' but its entry (intent) is for target '{}' — the enclosing entry owns identity",
+            wire.deployment_id, wire.target, entry.target
+        )));
+    }
+    // OUTCOME AGREEMENT (cross-record half): every outcome key must be a
+    // MEMBER of the intent's authoritative membership — an outcome for a
+    // slot outside the deployment is a disagreement (a slot the deployment
+    // never touched cannot report a result). KEPT for ALL statuses:
+    // combined with the terminal-local outcomes == selected_membership
+    // equality, it makes selected_membership ⊆ the intent's slot_ids (the
+    // intent's membership IS the frozen selected set). The EXACT equality
+    // intent.slot_ids == selected_membership is the INTENT-BINDING leg
+    // below (the intent FREEZES both memberships at plan time; the
+    // terminal must REPRODUCE them — the verification is a PURE function of
+    // the persisted sets + mode, and never consults the live configuration
+    // for these equations).
+    for key in wire.outcomes.keys().cloned().collect::<Vec<_>>() {
+        if !entry.intent.slots.contains_key(&key) {
+            return Err(Error::integrity(format!(
+                "ledger of target '{target}': terminal {} records an outcome for slot '{key}' outside the intent's membership — every outcome must name a member slot",
+                wire.deployment_id
+            )));
+        }
+    }
+    // VERIFYING CONVERSION (wire → domain): the rollback payload's
+    // duplicate projections (each generation assignment's slot, the
+    // bindings' slot set — the exact key-set equality the single-map
+    // construction guarantees —, the legacy snapshot-wide release) must
+    // agree, the status must map to exactly one disposition whose payload
+    // matches, and each outcome's value must name its own key — a
+    // disagreeing record is refused.
+    let terminal = wire.into_domain().map_err(|e| {
+        Error::integrity(format!(
+            "ledger for target '{target}' refuses a terminal line: {e}"
+        ))
+    })?;
+    // OUTCOME KEY SET AGREEMENT (cross-record invariant, outcome leg), BY
+    // STATUS: the terminal's outcome key set must agree with the intent's
+    // AUTHORITATIVE membership — the outcomes are the disposition's OWN
+    // table ([`LedgerTerminal::outcomes`] — a FailedPreflight terminal
+    // yields an empty table):
+    // - Successful: every outcome key is a member of the intent (checked
+    //   above), and the terminal carries its OWN proven memberships (the
+    //   conversion enforced outcomes == selected_membership, rollback slots
+    //   == full_membership, selected ⊆ full — the record is self-proving),
+    //   so the Successful legs are the INTENT-BINDING legs below (the
+    //   terminal must REPRODUCE the intent's frozen selected/full) plus the
+    //   FULL-push equality (the mode lives in the intent's `group`). The
+    //   intent's `slot_ids` is NOT compared to the terminal's memberships
+    //   EXCEPT through the frozen binding: the intent's OWN frozen selected
+    //   (== its table keys) and full are the AUTHORITATIVE facts, and a
+    //   terminal whose memberships diverge is refused.
+    // - FailedPreflight: outcomes EMPTY (a pre-mutation failure touched no
+    //   slot).
+    // - every other terminal state (FailedRolledBack, Degraded): the
+    //   outcomes EXACTLY COVER the membership — every member slot has one
+    //   outcome, no extras, no missing.
+    // THE MATERIALIZED DERIVED VIEW: for a Successful terminal
+    // [`LedgerTerminal::outcomes`] re-derives the per-slot facts from the
+    // rollback (the accessor is owned), so the key set is copied out by
+    // value here.
+    let outcome_keys: BTreeSet<SlotId> = terminal.outcomes().keys().cloned().collect();
+    let membership: BTreeSet<SlotId> = entry.intent.slots.keys().cloned().collect();
+    match terminal.status() {
+        DeploymentStatus::Successful => {
+            // THE SUCCESSFUL SNAPSHOT RULE (membership leg), BY INTENT
+            // GROUP: the terminal's OWN proven memberships satisfy the
+            // terminal-local equations (outcomes == selected, rollback ==
+            // full, selected ⊆ full — enforced by the conversion).
+            // THE INTENT-BINDING LEGS: the terminal's memberships must
+            // REPRODUCE the intent's FROZEN values — the intent is the
+            // IMMUTABLE record that froze selected (its table keys) and
+            // full (the complete target membership at plan time), and a
+            // terminal whose memberships diverge from it is refused
+            // (integrity error), so the terminal can never be re-derived
+            // from the live configuration. The FULL-push EQUALITY: a FULL
+            // push (no group) selects every target slot, so the ACTIVATED
+            // set (== the wire's selected_membership, the outcomes' keys)
+            // must EQUAL full_membership. A GROUP push allows a proper
+            // subset (activated ⊆ full is already enforced by the
+            // conversion).
+            let (selected, full) = match &terminal.disposition {
+                TerminalDisposition::Successful {
+                    activated,
+                    full_membership,
+                    ..
+                } => (activated, full_membership),
+                _ => unreachable!(
+                    "a Successful terminal carries its rollback + activated set + memberships"
+                ),
+            };
+            if selected != &entry.intent.selected_membership() {
+                return Err(Error::integrity(format!(
+                    "ledger of target '{target}': Successful terminal for deployment '{}' records selected membership {selected:?} but the intent froze selected membership {:?} — the terminal must REPRODUCE the immutable intent's frozen selected membership (never the live configuration)",
+                    entry.deployment_id,
+                    entry.intent.selected_membership()
+                )));
+            }
+            if full != entry.intent.full_membership() {
+                return Err(Error::integrity(format!(
+                    "ledger of target '{target}': Successful terminal for deployment '{}' records full membership {full:?} but the intent froze full membership {:?} — the terminal must REPRODUCE the immutable intent's frozen full membership (the complete target membership at plan time, never the live configuration)",
+                    entry.deployment_id,
+                    entry.intent.full_membership()
+                )));
+            }
+            if entry.intent.group.is_none() && selected != full {
+                return Err(Error::integrity(format!(
+                    "ledger of target '{target}': Successful terminal for deployment '{}' records selected membership {selected:?} and full membership {full:?} — a FULL push (no group) selects every target slot, so its selected membership must EXACTLY equal its full membership",
+                    entry.deployment_id
+                )));
+            }
+        }
+        DeploymentStatus::FailedPreflight => {
+            if !outcome_keys.is_empty() {
+                return Err(Error::integrity(format!(
+                    "ledger of target '{target}': FailedPreflight terminal for deployment '{}' carries outcomes for slots {outcome_keys:?} — a pre-mutation failure touched no slot",
+                    entry.deployment_id
+                )));
+            }
+        }
+        _ => {
+            if outcome_keys != membership {
+                return Err(Error::integrity(format!(
+                    "ledger of target '{target}': terminal for deployment '{}' carries outcomes for slots {outcome_keys:?} but its intent's slot_ids are {membership:?} — every member slot has exactly one outcome, no extras",
+                    entry.deployment_id
+                )));
+            }
+        }
+    }
+    Ok(terminal)
+}
+
 impl LocalStore {
     // ---- the per-target deployment LEDGER --------------------------------
 
@@ -133,12 +297,26 @@ impl LocalStore {
                 "append_terminal for deployment '{deployment_id}': the entry already carries a terminal event (a terminal is written exactly once)"
             )));
         }
-        let line = serde_json::to_string(&LedgerLine::Terminal(LedgerTerminalWire::from_domain(
-            deployment_id,
-            &entry.target,
-            terminal,
-        )))
-        .map_err(|e| Error::store(format!("serialize ledger terminal: {e}")))?;
+        // THE PRE-WRITE VALIDATION (fail closed — the hard guarantee): the
+        // INTENT/TERMINAL PAIR is verified against the STRICT READER'S OWN
+        // legs BEFORE any write — the same terminal-vs-entry verification
+        // `read_ledger` applies when the terminal merges into its entry
+        // ([`verify_terminal_against_entry`]: the wire's target, every
+        // outcome key inside the intent's membership, the VERIFYING
+        // CONVERSION — the rollback's exact binding-key equality, the
+        // membership equations, the complete equality predicate — and the
+        // status-specific legs, including a Successful terminal reproducing
+        // the intent's FROZEN memberships). A terminal the strict reader
+        // would reject — a divergent rollback (bindings key set ≠ slots key
+        // set: MISSING / EXTRA / RENAMED bindings), a membership that does
+        // not reproduce the intent's frozen values, a Successful terminal
+        // without its rollback — ABORTS here, and the append is atomic (the
+        // ledger bytes stay UNCHANGED): a rejected pair NEVER writes, so
+        // any successful append is IMMEDIATELY READABLE.
+        let wire = LedgerTerminalWire::from_domain(deployment_id, &entry.target, terminal);
+        verify_terminal_against_entry(target, entry, wire.clone())?;
+        let line = serde_json::to_string(&LedgerLine::Terminal(wire))
+            .map_err(|e| Error::store(format!("serialize ledger terminal: {e}")))?;
         self.append_ledger_atomic(target, deployment_id.as_str(), &line)
     }
 
@@ -251,175 +429,25 @@ impl LocalStore {
                     // merges into the entry that carries that id — a
                     // terminal whose id matches no intent is corruption),
                     // and its `target` must EQUAL the entry's target (the
-                    // intent's): a terminal claiming a different target than
-                    // its own deployment's intent is a disagreement, refused
-                    // here against the ENTRY's identity (the domain terminal
-                    // itself carries no identity).
+                    // intent's). The terminal-vs-entry verification — the
+                    // target equality, the outcome-key agreement, the
+                    // VERIFYING CONVERSION, and the status-specific legs —
+                    // is the SHARED STRICT-READER TERMINAL LEG
+                    // ([`verify_terminal_against_entry`], factored out so
+                    // the WRITE path runs the SAME predicates before an
+                    // append).
                     let id = wire.deployment_id.clone();
                     let pos = index.get(id.as_str()).copied().ok_or_else(|| {
                         Error::integrity(format!(
                             "ledger of target '{target}': a terminal event for deployment '{id}' has no intent line — a terminal event requires its durable intent (a closed-DB corruption)"
                         ))
                     })?;
-                    if wire.target != out[pos].target {
-                        return Err(Error::integrity(format!(
-                            "ledger of target '{target}': terminal {id} claims target '{}' but its entry (intent) is for target '{}' — the enclosing entry owns identity",
-                            wire.target, out[pos].target
-                        )));
-                    }
-                    // OUTCOME AGREEMENT (cross-record half): every outcome
-                    // key must be a MEMBER of the intent's authoritative
-                    // membership — an outcome for a slot outside the
-                    // deployment is a disagreement (a slot the deployment
-                    // never touched cannot report a result). KEPT for ALL
-                    // statuses in the new model: combined with the
-                    // terminal-local outcomes == selected_membership
-                    // equality, it makes selected_membership ⊆ the intent's
-                    // slot_ids (the intent's membership IS the frozen
-                    // selected set). The EXACT equality intent.slot_ids ==
-                    // selected_membership is the INTENT-BINDING leg below
-                    // (the intent FREEZES both memberships at plan time; the
-                    // terminal must REPRODUCE them — the read is a PURE
-                    // function of the persisted sets + mode, and never
-                    // consults the live configuration for these equations).
-                    for key in wire.outcomes.keys().cloned().collect::<Vec<_>>() {
-                        if !out[pos].intent.slots.contains_key(&key) {
-                            return Err(Error::integrity(format!(
-                                "ledger of target '{target}': terminal {id} records an outcome for slot '{key}' outside the intent's membership — every outcome must name a member slot"
-                            )));
-                        }
-                    }
-                    // VERIFYING CONVERSION (wire → domain): the rollback
-                    // payload's duplicate projections (each generation
-                    // assignment's slot, the bindings' slot set, the legacy
-                    // snapshot-wide release) must agree, the status must map
-                    // to exactly one disposition whose payload matches, and
-                    // each outcome's value must name its own key — a
-                    // disagreeing record is refused.
-                    let terminal = wire.into_domain().map_err(|e| {
-                        Error::integrity(format!(
-                            "ledger for target '{target}' refuses a terminal line: {e}"
-                        ))
-                    })?;
+                    let terminal = verify_terminal_against_entry(target, &out[pos], wire)?;
                     let entry = &mut out[pos];
                     if entry.terminal.is_some() {
                         return Err(Error::integrity(format!(
                             "ledger of target '{target}': two terminal events for deployment '{id}' — a terminal event is written exactly once"
                         )));
-                    }
-                    // TARGET EQUALITY (cross-record invariant, terminal
-                    // leg): already verified on the WIRE against the ENTRY
-                    // above (`wire.target` vs the entry's target) — the DOMAIN
-                    // terminal carries no identity (the enclosing entry owns
-                    // it), so there is nothing further to check here.
-                    // OUTCOME KEY SET AGREEMENT (cross-record invariant,
-                    // outcome leg), BY STATUS: the terminal's outcome key set
-                    // must agree with the intent's AUTHORITATIVE membership —
-                    // the outcomes are the disposition's OWN table
-                    // ([`LedgerTerminal::outcomes`] — a FailedPreflight
-                    // terminal yields an empty table):
-                    // - Successful: every outcome key is a member of the
-                    //   intent (checked above), and the terminal carries its
-                    //   OWN proven memberships (the conversion enforced
-                    //   outcomes == selected_membership, rollback slots ==
-                    //   full_membership, selected ⊆ full — the record is
-                    //   self-proving), so the read's Successful legs are the
-                    //   INTENT-BINDING legs below (the terminal must
-                    //   REPRODUCE the intent's frozen selected/full) plus the
-                    //   FULL-push equality (the mode lives in the intent's
-                    //   `group`). The intent's `slot_ids` is NOT compared to
-                    //   the terminal's memberships EXCEPT through the frozen
-                    //   binding: the intent's OWN frozen selected (== its
-                    //   table keys) and full are the AUTHORITATIVE facts, and
-                    //   a terminal whose memberships diverge is refused —
-                    //   the read is a PURE function of the persisted sets +
-                    //   mode; it never consults the live configuration.
-                    // - FailedPreflight: outcomes EMPTY (a pre-mutation
-                    //   failure touched no slot).
-                    // - every other terminal state (FailedRolledBack,
-                    //   Degraded): the outcomes EXACTLY COVER the
-                    //   membership — every member slot has one outcome, no
-                    //   extras, no missing.
-                    // THE MATERIALIZED DERIVED VIEW: for a Successful
-                    // terminal [`LedgerTerminal::outcomes`] re-derives the
-                    // per-slot facts from the rollback (the accessor is
-                    // owned), so the key set is copied out by value here.
-                    let outcome_keys: BTreeSet<SlotId> =
-                        terminal.outcomes().keys().cloned().collect();
-                    let membership: BTreeSet<SlotId> = entry.intent.slots.keys().cloned().collect();
-                    match terminal.status() {
-                        DeploymentStatus::Successful => {
-                            // THE SUCCESSFUL SNAPSHOT RULE (membership leg),
-                            // BY INTENT GROUP: the terminal's OWN proven
-                            // memberships satisfy the terminal-local equations
-                            // (outcomes == selected, rollback == full,
-                            // selected ⊆ full — enforced by the conversion).
-                            // THE INTENT-BINDING LEGS (the user's
-                            // requirement): the terminal's memberships must
-                            // REPRODUCE the intent's FROZEN values — the
-                            // intent is the IMMUTABLE record that froze
-                            // selected (its table keys) and full (the
-                            // complete target membership at plan time), and a
-                            // terminal whose memberships diverge from it is
-                            // refused (integrity error), so the terminal can
-                            // never be re-derived from the live configuration.
-                            // THE INTENT-BINDING LEGS (the user's
-                            // requirement): the terminal's memberships must
-                            // REPRODUCE the intent's FROZEN values — the
-                            // intent is the IMMUTABLE record that froze
-                            // selected (its table keys) and full (the
-                            // complete target membership at plan time), and a
-                            // terminal whose memberships diverge from it is
-                            // refused (integrity error), so the terminal can
-                            // never be re-derived from the live configuration.
-                            // The FULL-push EQUALITY: a FULL push (no group)
-                            // selects every target slot, so the ACTIVATED set
-                            // (== the wire's selected_membership, the
-                            // outcomes' keys) must EQUAL full_membership. A
-                            // GROUP push allows a proper subset (activated ⊆
-                            // full is already enforced by the conversion).
-                            let (selected, full) = match &terminal.disposition {
-                                TerminalDisposition::Successful {
-                                    activated,
-                                    full_membership,
-                                    ..
-                                } => (activated, full_membership),
-                                _ => unreachable!(
-                                    "a Successful terminal carries its rollback + activated set + memberships"
-                                ),
-                            };
-                            if selected != &entry.intent.selected_membership() {
-                                return Err(Error::integrity(format!(
-                                    "ledger of target '{target}': Successful terminal for deployment '{id}' records selected membership {selected:?} but the intent froze selected membership {:?} — the terminal must REPRODUCE the immutable intent's frozen selected membership (never the live configuration)",
-                                    entry.intent.selected_membership()
-                                )));
-                            }
-                            if full != entry.intent.full_membership() {
-                                return Err(Error::integrity(format!(
-                                    "ledger of target '{target}': Successful terminal for deployment '{id}' records full membership {full:?} but the intent froze full membership {:?} — the terminal must REPRODUCE the immutable intent's frozen full membership (the complete target membership at plan time, never the live configuration)",
-                                    entry.intent.full_membership()
-                                )));
-                            }
-                            if entry.intent.group.is_none() && selected != full {
-                                return Err(Error::integrity(format!(
-                                    "ledger of target '{target}': Successful terminal for deployment '{id}' records selected membership {selected:?} and full membership {full:?} — a FULL push (no group) selects every target slot, so its selected membership must EXACTLY equal its full membership"
-                                )));
-                            }
-                        }
-                        DeploymentStatus::FailedPreflight => {
-                            if !outcome_keys.is_empty() {
-                                return Err(Error::integrity(format!(
-                                    "ledger of target '{target}': FailedPreflight terminal for deployment '{id}' carries outcomes for slots {outcome_keys:?} — a pre-mutation failure touched no slot"
-                                )));
-                            }
-                        }
-                        _ => {
-                            if outcome_keys != membership {
-                                return Err(Error::integrity(format!(
-                                    "ledger of target '{target}': terminal for deployment '{id}' carries outcomes for slots {outcome_keys:?} but its intent's slot_ids are {membership:?} — every member slot has exactly one outcome, no extras"
-                                )));
-                            }
-                        }
                     }
                     entry.terminal = Some(terminal);
                 }
@@ -2474,13 +2502,45 @@ mod tests {
                     );
                 }
             }
-            // ONE mutation at a time — EVERY mutation must be refused by
-            // every consumer.
+            // ONE mutation at a time — EVERY mutation must be refused: the
+            // PRE-WRITE VALIDATION ([`LocalStore::append_terminal`]) refuses
+            // the divergent intent/terminal pair at the APPEND (fail closed —
+            // a terminal the strict reader would reject is never written;
+            // the ledger bytes stay UNCHANGED), and the READ path still
+            // refuses a DIRECTLY-WRITTEN copy of the same mutation (the
+            // reader's refusal is independent of the writer — every
+            // consumer fails on the SAME integrity error).
             for (n, (mutated, why)) in one_field_mutations(&terminal).into_iter().enumerate() {
                 let store =
                     LocalStore::with_base(tmp.path().join(format!("store-{variant}-mut-{n}")))
                         .unwrap();
-                append_pair(&store, target, intent, &mutated);
+                store.append_intent(target, intent).unwrap();
+                let before = std::fs::read(store.ledger_path(target)).unwrap();
+                let err = store
+                    .append_terminal(target, &intent.deployment_id, &mutated)
+                    .unwrap_err();
+                assert!(
+                    matches!(err, Error::Integrity(_)),
+                    "{why}: the writer must refuse the divergent terminal before any write, got: {err}"
+                );
+                let after = std::fs::read(store.ledger_path(target)).unwrap();
+                assert_eq!(
+                    before, after,
+                    "{why}: a rejected terminal NEVER writes — the ledger bytes are unchanged"
+                );
+                // The READ path's refusal, on a directly-written copy of the
+                // same mutation: every consumer fails with the SAME
+                // integrity error at conversion time.
+                write_wire_pair(
+                    &store,
+                    target,
+                    &LedgerIntentWire::from(intent),
+                    &LedgerTerminalWire::from_domain(
+                        &intent.deployment_id,
+                        &TargetName::parse(target).expect("target name is a safe segment"),
+                        &mutated,
+                    ),
+                );
                 assert_consumers_refuse_with_integrity(
                     &store,
                     &config,
@@ -2495,9 +2555,13 @@ mod tests {
     proptest! {
         // THE USER'S PROPERTY: valid ledger pairs load; ONE-FIELD mutations
         // of the terminal — a binding key (add/remove/rename) or an outcome
-        // key (rename) — are ALL refused with `Error::integrity` at
-        // conversion time, before read_ledger, a rollback resolve, or the
-        // GC reachability scan can consume the line. Bounded
+        // key (rename) — are ALL refused with `Error::integrity` at the
+        // WRITE (the pre-write validation in
+        // [`LocalStore::append_terminal`] runs the strict reader's legs on
+        // the intent/terminal pair BEFORE the append — a rejected pair
+        // leaves the ledger bytes UNCHANGED), and a DIRECTLY-WRITTEN copy
+        // of the same mutation is refused by read_ledger, a rollback
+        // resolve, and the GC reachability scan at conversion time. Bounded
         // `proptest_cases(16)` (full 16 with `DEPLOY_FULL_TESTS=1`, fast
         // default), fixed seed 0x5EED_5EED (house style), no persistence.
         #![proptest_config(ProptestConfig {
@@ -2647,7 +2711,11 @@ mod tests {
     }
 
     /// Append a valid intent + a MUTATED terminal to a fresh store and
-    /// assert the read path refuses with an integrity error. `tag` keeps
+    /// assert the divergent intent/terminal PAIR is refused — TWICE over:
+    /// the WRITER refuses it before any write (the pre-write validation in
+    /// [`LocalStore::append_terminal`] — the ledger bytes stay UNCHANGED),
+    /// and the READ path refuses a directly-written copy of the same pair
+    /// (every consumer fails with the same integrity error). `tag` keeps
     /// each mutation's store directory unique.
     fn assert_terminal_refused(
         tmp: &tempfile::TempDir,
@@ -2657,7 +2725,36 @@ mod tests {
         tag: &str,
     ) {
         let store = LocalStore::with_base(tmp.path().join(format!("refuse-t-{tag}"))).unwrap();
-        append_pair(&store, target, intent, mutated);
+        // THE WRITER REFUSES (fail closed — the hard guarantee): a
+        // terminal the strict reader would reject is never written; the
+        // ledger bytes are byte-identical before/after the rejected append.
+        store.append_intent(target, intent).unwrap();
+        let before = std::fs::read(store.ledger_path(target)).unwrap();
+        let err = store
+            .append_terminal(target, &intent.deployment_id, mutated)
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Integrity(_)),
+            "the writer must refuse the divergent terminal before any write, got: {err}"
+        );
+        let after = std::fs::read(store.ledger_path(target)).unwrap();
+        assert_eq!(
+            before, after,
+            "a rejected terminal never writes — the ledger bytes are unchanged"
+        );
+        // THE READER STILL REFUSES a directly-written copy of the same
+        // divergent pair (the read path's refusal is independent of the
+        // writer).
+        write_wire_pair(
+            &store,
+            target,
+            &LedgerIntentWire::from(intent),
+            &LedgerTerminalWire::from_domain(
+                &intent.deployment_id,
+                &TargetName::parse(target).expect("target name is a safe segment"),
+                mutated,
+            ),
+        );
         let err = store.read_ledger(target).unwrap_err();
         assert!(
             matches!(err, Error::Integrity(_)),

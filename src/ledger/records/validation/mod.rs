@@ -25,5 +25,6 @@ mod schema;
 
 pub(crate) use membership::verify_successful_membership_equations;
 pub use rebinding::{FrozenSlotTopology, RebindingPlan, VerifiedReleaseRebinding};
-pub use rollback::build_rollback;
+pub(crate) use rollback::BoundGeneration;
+pub(crate) use rollback::build_rollback;
 pub(crate) use schema::{LEDGER_SCHEMA_VERSION, PINS_SCHEMA_VERSION};

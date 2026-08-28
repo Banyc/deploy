@@ -2361,4 +2361,245 @@ pub(crate) mod commit_tests {
             }
         }
     }
+
+    // ---- THE UNREADABLE-TERMINAL FIX: ONE validated map + a fallible
+    // construction + a pre-write validation ----
+    //
+    // The successful finalizer previously built the rollback payload from
+    // TWO PARALLEL MAPS — the per-slot rollback entries (the generation
+    // per selected slot) AND a separate `bindings` map. If the construction
+    // produced MISSING / EXTRA / RENAMED bindings (a divergence between
+    // the two maps — a slot in one but not the other, or the same slot
+    // under a different key), the terminal was appended (the finalization
+    // reported SUCCESSFUL) but the strict reader refused the terminal's
+    // EXACT key-set equality (bindings == membership): the ledger became
+    // UNREADABLE immediately after a successful finalization. The fix:
+    // the finalizer merges its two inputs into ONE PRIVATE VALIDATED MAP
+    // (`SlotId -> BoundGeneration { generation, binding }`) — the
+    // construction has NO parallel maps to drift — the merge REFUSES a
+    // missing / extra / renamed binding (an integrity `Err` propagated up:
+    // the finalization never appends a broken terminal), `build_rollback`
+    // is FALLIBLE, and `append_terminal` validates the intent/terminal
+    // pair against the strict reader's own legs BEFORE writing.
+
+    /// The DIVERGENCE MUTATIONS applied to the frozen-binding map the
+    /// finalizer merges with the lock-verified observed `GenerationRef`s
+    /// (the property below generates all four):
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum BindingDivergence {
+        /// The healthy control: the bindings key EXACTLY the selected slots
+        /// (the finalization succeeds and the terminal is readable).
+        Healthy,
+        /// A SELECTED slot carries NO binding (the map omits it).
+        Missing,
+        /// A binding for a NON-selected slot (a slot this attempt never
+        /// deployed).
+        Extra,
+        /// The same slot under a DIFFERENT key (its binding moved to a
+        /// renamed id — the missing + extra pair).
+        Renamed,
+    }
+
+    proptest! {
+        // THE USER'S PROPERTY (the unreadable-terminal fix): the frozen
+        // binding map is mutated with a MISSING / EXTRA / RENAMED binding
+        // divergence (or the healthy control), and the ONE lock-verified
+        // finalization runs against the exact live state. ANY SUCCESSFUL
+        // APPEND IS IMMEDIATELY READABLE — when the finalizer returns
+        // `Finalized`, the strict reader (`read_ledger`) accepts the
+        // terminal it wrote and the rollback's bindings key EXACTLY its
+        // slots (the pre-write validation guarantees it); REJECTED INPUTS
+        // LEAVE THE LEDGER BYTES UNCHANGED — the divergent pair is refused
+        // with an integrity error BEFORE any write, and the ledger file is
+        // byte-identical before/after the rejected finalization (the
+        // terminal append is the finalize's ONLY write). Only the healthy
+        // control can succeed; every divergence is refused.
+        //
+        // Bounded `proptest_cases(16)` (full 16 with `DEPLOY_FULL_TESTS=1`,
+        // fast default), fixed seed 0x5EED_5EED (house style), no failure
+        // persistence — the identical vectors on every run.
+        #![proptest_config(ProptestConfig {
+            cases: crate::testutil::proptest_cases(16),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn successful_finalize_never_appends_an_unreadable_terminal(
+            divergence in prop_oneof![
+                Just(BindingDivergence::Healthy),
+                Just(BindingDivergence::Missing),
+                Just(BindingDivergence::Extra),
+                Just(BindingDivergence::Renamed),
+            ],
+        ) {
+            let h = TwoSlotHarness::new();
+            // The FROZEN DESIRED assignments (a distinct artifact per slot)
+            // and the LIVE state minted to match them exactly.
+            let p1 = SlotId::new("p1".to_string());
+            let p2 = SlotId::new("p2".to_string());
+            let gen_p1 = GenerationId::generate();
+            let gen_p2 = GenerationId::generate();
+            let art_p1 = ArtifactRef {
+                release: crate::identity::test_release_id("rel-1"),
+                variant: VariantName::new("standard".to_string()),
+                tree: test_tree_digest("tree-1"),
+            };
+            let art_p2 = ArtifactRef {
+                release: crate::identity::test_release_id("rel-2"),
+                variant: VariantName::new("standard".to_string()),
+                tree: test_tree_digest("tree-2"),
+            };
+            let deployment_id = test_deployment_id("deploy-readable-prop");
+            mint_live_slot(&h, "s1", &gen_p1, &art_p1, &deployment_id);
+            mint_live_slot(&h, "s2", &gen_p2, &art_p2, &deployment_id);
+
+            // The PENDING intent: durable, no terminal, the frozen desired
+            // assignments + the plan-time physical bindings.
+            let bindings = h.config.target_slot_bindings("t1").unwrap();
+            let intent = DeploymentIntent {
+                deployment_id: deployment_id.clone(),
+                target: TargetName::new("t1".to_string()),
+                group: None,
+                behavior_sha256: "sha256-aa".to_string(),
+                attempted_at: "2026-01-01T00:00:00Z".to_string(),
+                slots: NonEmptySlotTable::build(vec![
+                    (
+                        p1.clone(),
+                        IntentSlot {
+                            desired: DesiredGeneration {
+                                generation: gen_p1.clone(),
+                                artifact: art_p1.clone(),
+                            },
+                            pre_push: None,
+                            binding: bindings.get(&p1).cloned().expect("p1 is a target slot"),
+                        },
+                    ),
+                    (
+                        p2.clone(),
+                        IntentSlot {
+                            desired: DesiredGeneration {
+                                generation: gen_p2.clone(),
+                                artifact: art_p2.clone(),
+                            },
+                            pre_push: None,
+                            binding: bindings.get(&p2).cloned().expect("p2 is a target slot"),
+                        },
+                    ),
+                ])
+                .expect("two selected slots"),
+                full_membership: BTreeSet::from([p1.clone(), p2.clone()]),
+            };
+            h.store.append_attempt("t1", &intent).unwrap();
+
+            // THE DIVERGENCE MUTATION of the frozen-binding map (the
+            // finalizer's merge input).
+            let mutated_bindings: BTreeMap<SlotId, crate::ledger::PhysicalBinding> =
+                match divergence {
+                    BindingDivergence::Healthy => bindings.clone(),
+                    BindingDivergence::Missing => {
+                        let mut m = bindings.clone();
+                        m.remove(&p1);
+                        m
+                    }
+                    BindingDivergence::Extra => {
+                        let mut m = bindings.clone();
+                        m.insert(
+                            SlotId::new("p3".to_string()),
+                            bindings.get(&p1).cloned().expect("p1 is bound"),
+                        );
+                        m
+                    }
+                    BindingDivergence::Renamed => {
+                        let mut m = bindings.clone();
+                        let b = m.remove(&p1).expect("p1 is bound");
+                        m.insert(SlotId::new("p1-renamed".to_string()), b);
+                        m
+                    }
+                };
+
+            // The per-slot live helpers (the lock-verified finalizer
+            // re-observes the matching live state under these).
+            let env = crate::testutil::fixture_env();
+            let p1_remote: Box<dyn Remote> =
+                Box::new(LocalTransport::new(&env, h.remotes_base.join("s1")).unwrap());
+            let p2_remote: Box<dyn Remote> =
+                Box::new(LocalTransport::new(&env, h.remotes_base.join("s2")).unwrap());
+            let mut helpers: HashMap<SlotId, RemoteHelper> = HashMap::new();
+            helpers.insert(p1.clone(), RemoteHelper::new(p1_remote.as_ref()));
+            helpers.insert(p2.clone(), RemoteHelper::new(p2_remote.as_ref()));
+            let op_id = OperationId::new("op-readable-prop".to_string());
+
+            // THE LEDGER BYTES BEFORE the finalization attempt: the intent
+            // line only — the terminal append is the ONLY ledger write the
+            // finalize performs (the markers are remote-side).
+            let ledger_path = h.store.ledger_path("t1");
+            let before = std::fs::read(&ledger_path).unwrap();
+
+            match ledger::finalize_successful_locked(
+                &h.store,
+                &intent,
+                &helpers,
+                &mutated_bindings,
+                &ledger::FinalizeSettings {
+                    reason: "push completed",
+                    op_id: &op_id,
+                },
+            ) {
+                // ANY SUCCESSFUL APPEND IS IMMEDIATELY READABLE: the
+                // pre-write validation guarantees the terminal the
+                // finalizer wrote is accepted by the strict reader — the
+                // ledger read succeeds and the rollback's bindings key
+                // EXACTLY its slots (the single-map construction).
+                Ok(ledger::FinalizeOutcome::Finalized) => {
+                    assert_eq!(
+                        divergence,
+                        BindingDivergence::Healthy,
+                        "only the exact-key bindings (the healthy control) can finalize — a divergence must be refused (divergence {divergence:?})"
+                    );
+                    let entries = h.store.read_ledger("t1").unwrap();
+                    assert_eq!(entries.len(), 1, "one merged entry");
+                    let terminal = entries[0]
+                        .terminal
+                        .as_ref()
+                        .expect("the successful finalization appended its terminal");
+                    let ledger::TerminalDisposition::Successful { rollback, .. } =
+                        &terminal.disposition
+                    else {
+                        panic!("a successful finalization appends a Successful terminal");
+                    };
+                    assert_eq!(
+                        rollback.slots.keys().collect::<BTreeSet<_>>(),
+                        rollback.bindings.keys().collect::<BTreeSet<_>>(),
+                        "the appended rollback's bindings key EXACTLY its slots (one validated map — no parallel maps to drift)"
+                    );
+                }
+                // REJECTED INPUTS LEAVE THE LEDGER BYTES UNCHANGED: the
+                // divergent pair was refused (an integrity error — the
+                // construction is fallible and the pre-write validation
+                // aborts before any write) and the ledger file is
+                // byte-identical.
+                Err(e) => {
+                    assert!(
+                        matches!(e, crate::error::Error::Integrity(_)),
+                        "a divergent binding map must be refused with an integrity error, got: {e}"
+                    );
+                    assert_ne!(
+                        divergence,
+                        BindingDivergence::Healthy,
+                        "the healthy control must finalize (divergence {divergence:?})"
+                    );
+                    let after = std::fs::read(&ledger_path).unwrap();
+                    assert_eq!(
+                        before, after,
+                        "a rejected finalization NEVER writes — the ledger bytes are byte-identical before/after (divergence {divergence:?})"
+                    );
+                }
+                Ok(other) => panic!(
+                    "unexpected finalize outcome {other:?} — the live state equals the frozen desired, so only Finalized or a construction refusal is reachable (divergence {divergence:?})"
+                ),
+            }
+        }
+    }
 }

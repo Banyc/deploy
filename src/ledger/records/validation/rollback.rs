@@ -1,47 +1,83 @@
 //! The ROLLBACK PAYLOAD semantics (feature area A2: Ledger semantics).
 //!
 //! [`build_rollback`] builds the rollback state of a successful deployment
-//! from the VERIFIED per-slot [`GenerationRef`]s — the values the
-//! LOCK-VERIFIED finalizer ([`crate::ledger::finalize::finalize_successful_locked`])
-//! re-observed under the selected-slot mutation locks and proved EXACTLY
-//! equal to the frozen desired assignment (never from the engine's earlier
-//! observation records, which a concurrent controller can make stale, and
-//! never from the intent record itself). The payload is the COMPLETE target
-//! snapshot (a [`crate::ledger::records::LedgerRollback`]: per-slot
-//! generation refs + COMPLETE physical bindings), so EXACT ROLLBACK is
-//! possible: `deploy push <target> <deployment-id>` restores exactly that
+//! from THE ONE PRIVATE VALIDATED MAP ([`BoundGeneration`] keyed by
+//! [`SlotId`]) — the construction input that pairs EVERY slot's VERIFIED
+//! [`GenerationRef`] with its COMPLETE physical binding in a SINGLE map, so
+//! there are NO parallel maps to drift (the old two-map input — the per-slot
+//! rollback entries AND a separate `bindings` map — could DIVERGE: a slot
+//! present in one but not the other, and the appended terminal made the
+//! ledger unreadable immediately after a SUCCESSFUL finalization; the
+//! strict reader refuses a key-set mismatch). The values are the ones the
+//! LOCK-VERIFIED finalizer
+//! ([`crate::ledger::finalize::finalize_successful_locked`]) re-observed
+//! under the selected-slot mutation locks and proved EXACTLY equal to the
+//! frozen desired assignment (never from the engine's earlier observation
+//! records, which a concurrent controller can make stale, and never from
+//! the intent record itself). The payload is the COMPLETE target snapshot (a
+//! [`crate::ledger::records::LedgerRollback`]: per-slot generation refs +
+//! COMPLETE physical bindings), so EXACT ROLLBACK is possible:
+//! `deploy push <target> <deployment-id>` restores exactly that
 //! deployment's stored state, verified by the binding map (a missing
 //! binding entry is "unverifiable" and makes exact rollback refuse the
-//! slot). Every verified ref is COMPLETE by construction (a full
-//! generation + artifact read under the locks), so the builder is
-//! INFALLIBLE — there is no unknown/absent observation an input could
-//! carry.
+//! slot).
+//!
+//! THE BUILDER IS FALLIBLE (fail closed): the construction VERIFIES its own
+//! result before returning — the rollback's `slots` key set must EXACTLY
+//! equal its `bindings` key set (every slotted generation has a physical
+//! binding and vice versa — the EXACT equality the strict reader enforces
+//! at conversion time) and every `GenerationRef`'s assignment must name its
+//! own map key. A divergence → [`crate::error::Error::integrity`] — the
+//! finalization refuses, never appends a terminal the reader would reject.
 //!
 //! The wire/domain RECORDS themselves ([`crate::ledger::records::LedgerRollback`],
 //! [`crate::ledger::records::LedgerRollbackWire`],
 //! [`crate::ledger::records::PhysicalBinding`]) live in the shared core
 //! ([`crate::ledger::records`]).
 
+use crate::error::{Error, Result};
 use crate::identity::{GenerationRef, SlotId};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::super::{LedgerRollback, PhysicalBinding};
-/// Build the rollback state of a successful deployment from the VERIFIED
-/// per-slot [`GenerationRef`]s (`verified`: the values the lock-verified
-/// finalizer re-observed under the selected-slot mutation locks and proved
-/// EXACTLY equal to the frozen desired assignment — never the engine's
-/// earlier observation records, which a concurrent controller can make
-/// stale, and never the intent record itself). A successful deployment
-/// carries one complete [`GenerationRef`] per selected slot; every verified
-/// ref is COMPLETE by construction (a full generation + artifact read under
-/// the locks), so the builder is INFALLIBLE. `bindings` records the
-/// COMPLETE physical binding (`{server, deploy_dir}`) each slot had when
-/// the deployment ran; a missing entry is "unverifiable" and makes exact
-/// rollback refuse the slot.
+
+/// THE ONE PRIVATE VALIDATED MAP VALUE — the complete per-slot rollback
+/// fact: a slot's VERIFIED [`GenerationRef`] (generation AND artifact)
+/// TOGETHER with its COMPLETE physical binding (`{server, deploy_dir}`).
+/// The successful finalizer merges its two inputs — the lock-verified
+/// observed `GenerationRef`s and the intent's FROZEN physical bindings —
+/// into ONE `BTreeMap<SlotId, BoundGeneration>` BEFORE building the
+/// rollback, so the construction has NO parallel maps to drift: the map's
+/// key set IS the selected-slot set, and every key carries both halves of
+/// the payload. A slot missing its binding (or a binding keyed under a
+/// different slot) is a construction ERROR — the merge refuses it — never
+/// a silently-dropped entry that would make the appended terminal
+/// unreadable. PRIVATE to the crate (the wire/domain never carry it — the
+/// rollback payload is built from it and the two wire fields are filled
+/// from this ONE source).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BoundGeneration {
+    /// The slot's VERIFIED generation ref (the complete ref observed under
+    /// the locks and proved equal to the frozen desired).
+    pub(crate) generation: GenerationRef,
+    /// The slot's COMPLETE physical binding at deployment time (the frozen
+    /// plan-time `{server, deploy_dir}`).
+    pub(crate) binding: PhysicalBinding,
+}
+
+/// Build the rollback state of a successful deployment from THE ONE
+/// PRIVATE VALIDATED MAP (`verified`: `SlotId -> BoundGeneration` — every
+/// selected slot's verified [`GenerationRef`] paired with its physical
+/// binding in a single map; the values the lock-verified finalizer
+/// re-observed under the selected-slot mutation locks and proved EXACTLY
+/// equal to the frozen desired assignment — never the engine's earlier
+/// observation records, which a concurrent controller can make stale, and
+/// never the intent record itself). A successful deployment carries one
+/// complete [`GenerationRef`] per selected slot.
 ///
 /// PARTIAL-ROLLOUT OVERLAY: the result is the COMPLETE target snapshot — the
 /// latest successful snapshot (`base`) with the SELECTED slots (the
-/// `verified` map's keys) replaced by their verified assignments and current
+/// `verified` map's keys) replaced by their verified assignments and
 /// bindings, unselected slots carried forward unchanged, and slots absent
 /// from `current_slot_ids` (the caller's coverage set — the FROZEN FULL
 /// membership of the finalizing attempt, the complete target membership at
@@ -51,37 +87,65 @@ use super::super::{LedgerRollback, PhysicalBinding};
 /// `GenerationRef` carries its OWN artifact (release/variant/tree), so a
 /// partial snapshot can span several releases (group pushes over time) and
 /// the referenced releases are the set derived from the per-slot bindings.
+///
+/// FALLIBLE (fail closed): the result's `slots` key set must EXACTLY equal
+/// its `bindings` key set (both are filled from the SAME iteration of the
+/// single map, so a divergent `base` — the only other source — surfaces as
+/// an error here rather than as a written-but-unreadable terminal) and each
+/// `GenerationRef`'s assignment must name its own map key — the same
+/// predicates the strict reader enforces at conversion time. A divergence
+/// → [`crate::error::Error::integrity`].
 pub fn build_rollback(
-    verified: &BTreeMap<SlotId, GenerationRef>,
-    bindings: &BTreeMap<SlotId, PhysicalBinding>,
+    verified: &BTreeMap<SlotId, BoundGeneration>,
     base: Option<&LedgerRollback>,
     current_slot_ids: &[SlotId],
-) -> LedgerRollback {
+) -> Result<LedgerRollback> {
     // Start from the base (or empty): unselected slots are carried forward
     // unchanged.
     let mut slots: BTreeMap<SlotId, GenerationRef> =
         base.map(|b| b.slots.clone()).unwrap_or_default();
     let mut out_bindings: BTreeMap<SlotId, PhysicalBinding> =
         base.map(|b| b.bindings.clone()).unwrap_or_default();
-    // Replace the SELECTED slots with their VERIFIED assignments (the
-    // complete GenerationRefs the lock-verified finalizer re-observed under
-    // the locks and proved equal to the frozen desired) and their current
-    // physical bindings.
-    for (slot, gr) in verified {
-        slots.insert(slot.clone(), gr.clone());
-        if let Some(b) = bindings.get(slot) {
-            out_bindings.insert(slot.clone(), b.clone());
-        }
+    // Replace the SELECTED slots with their VERIFIED assignments and their
+    // physical bindings — BOTH filled from the SAME iteration of the ONE
+    // map, so the two wire fields cannot diverge (the key set is inherently
+    // consistent: every key carries its generation AND its binding).
+    for (slot, bg) in verified {
+        slots.insert(slot.clone(), bg.generation.clone());
+        out_bindings.insert(slot.clone(), bg.binding.clone());
     }
     // Omit slots removed from the current target configuration.
     let current: std::collections::HashSet<&str> =
         current_slot_ids.iter().map(|s| s.as_str()).collect();
     slots.retain(|k, _| current.contains(k.as_str()));
     out_bindings.retain(|k, _| current.contains(k.as_str()));
-    LedgerRollback {
+    // THE WRITER'S EXACT-EQUALITY VERIFICATION (fail closed): the result's
+    // key sets must EXACTLY equal (the strict reader refuses a mismatch — a
+    // missing binding is "unverifiable", an extra binding names a slot with
+    // no generation). Filled from one iteration, the only way they diverge
+    // is an inconsistent `base` — refuse it here rather than persist a
+    // terminal the reader would reject.
+    let slot_keys: BTreeSet<&SlotId> = slots.keys().collect();
+    let binding_keys: BTreeSet<&SlotId> = out_bindings.keys().collect();
+    if slot_keys != binding_keys {
+        let missing: Vec<&SlotId> = slot_keys.difference(&binding_keys).copied().collect();
+        let extra: Vec<&SlotId> = binding_keys.difference(&slot_keys).copied().collect();
+        return Err(Error::integrity(format!(
+            "build_rollback: the constructed rollback's bindings must key EXACTLY the slotted generations (missing bindings for {missing:?}; extra bindings for {extra:?}) — refusing to build a payload the strict reader would reject"
+        )));
+    }
+    for (key, g) in &slots {
+        if &g.assignment.placement_slot != key {
+            return Err(Error::integrity(format!(
+                "build_rollback: generation for slot '{key}' names placement '{}' — every GenerationRef must name its own map key",
+                g.assignment.placement_slot
+            )));
+        }
+    }
+    Ok(LedgerRollback {
         slots,
         bindings: out_bindings,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -109,30 +173,34 @@ mod tests_rollback {
         }
     }
 
+    /// A `BoundGeneration` for a slot: the verified ref paired with a
+    /// fixture binding — the ONE-map value the builder consumes.
+    fn bound(key: &SlotId, gen_id: &str, rel: &str, tree: &str) -> BoundGeneration {
+        BoundGeneration {
+            generation: verified_ref_for(key, gen_id, rel, tree),
+            binding: PhysicalBinding {
+                server: ServerId::new("s1".to_string()),
+                deploy_dir: format!("/srv/deploy/{}", key.as_str()),
+            },
+        }
+    }
+
     /// `build_rollback` records each slot's complete physical binding AND
     /// inserts the VERIFIED generation ref intact (generation AND artifact —
     /// the ref is the complete `GenerationRef` the lock-verified finalizer
-    /// re-observed under the locks, never a rebuilt observation).
+    /// re-observed under the locks, never a rebuilt observation), both from
+    /// the ONE validated map.
     #[test]
     fn build_rollback_records_each_slots_physical_binding() {
         let slot = SlotId::new("p1".to_string());
-        let verified = BTreeMap::from([(
-            slot.clone(),
-            verified_ref_for(&slot, "gen-x", "rel-1", "tree-1"),
-        )]);
-        let bindings: BTreeMap<SlotId, PhysicalBinding> = BTreeMap::from([(
-            slot.clone(),
-            PhysicalBinding {
-                server: ServerId::new("server-01"),
-                deploy_dir: "/srv/deploy/p1".to_string(),
-            },
-        )]);
+        let verified = BTreeMap::from([(slot.clone(), bound(&slot, "gen-x", "rel-1", "tree-1"))]);
 
-        let rollback = build_rollback(&verified, &bindings, None, std::slice::from_ref(&slot));
+        let rollback = build_rollback(&verified, None, std::slice::from_ref(&slot))
+            .expect("the single map is consistent");
         assert_eq!(
             rollback.bindings.get(&slot),
             Some(&PhysicalBinding {
-                server: ServerId::new("server-01"),
+                server: ServerId::new("s1"),
                 deploy_dir: "/srv/deploy/p1".to_string(),
             }),
             "the rollback must record the slot's complete physical binding (server AND deploy_dir)"
@@ -196,13 +264,16 @@ mod tests_rollback {
         // The SELECTED slot's VERIFIED ref (observed under the locks, proved
         // equal to the frozen desired) replaces the base's old entry; p2 is
         // carried forward; p3 is omitted (outside the frozen membership).
+        // The ONE validated map pairs the verified ref with the slot's
+        // binding — the builder consumes a single map, never two.
         let verified = BTreeMap::from([(
             selected.clone(),
-            verified_ref_for(&selected, "gen-new", "rel-new", "tree-new"),
+            bound(&selected, "gen-new", "rel-new", "tree-new"),
         )]);
         let coverage = [selected.clone(), unselected.clone()];
 
-        let rollback = build_rollback(&verified, &bindings, Some(&base), &coverage);
+        let rollback = build_rollback(&verified, Some(&base), &coverage)
+            .expect("the single map is consistent");
         assert_eq!(
             rollback.slots.get(&selected),
             Some(&verified_ref_for(
@@ -227,6 +298,79 @@ mod tests_rollback {
         assert!(
             !rollback.bindings.contains_key(&outside),
             "a slot outside the frozen membership is omitted from the bindings too"
+        );
+    }
+
+    /// THE FALLIBLE BUILDER (fail closed): the construction VERIFIES its own
+    /// result — the `slots` key set must EXACTLY equal the `bindings` key
+    /// set (the strict reader's exact-equality predicate) and every
+    /// `GenerationRef`'s assignment must name its own map key. A divergence
+    /// → `Error::integrity`: the builder REFUSES to produce a payload the
+    /// reader would reject (never a written-but-unreadable terminal). The
+    /// healthy single map passes; a base whose bindings diverge from its
+    /// slots (the only other source — the selected entries are filled from
+    /// the ONE map's own iteration) and a ref naming a DIFFERENT slot are
+    /// both refused.
+    #[test]
+    fn build_rollback_refuses_a_divergent_payload() {
+        let p1 = SlotId::new("p1".to_string());
+        let p2 = SlotId::new("p2".to_string());
+        let healthy = BTreeMap::from([(p1.clone(), bound(&p1, "gen-new", "rel-new", "tree-new"))]);
+        build_rollback(&healthy, None, std::slice::from_ref(&p1))
+            .expect("the healthy single map builds");
+
+        // A base whose bindings key set diverges from its slots key set
+        // (a slot present in one map but not the other) — the exact
+        // divergence the strict reader refuses. The UNSELECTED slot p2 is
+        // carried forward from the base unchanged, so the overlay keeps the
+        // inconsistent pair (p2's slot entry has NO binding) — and the
+        // builder REFUSES it (fail closed) instead of persisting a payload
+        // the reader would reject.
+        let divergent_base = LedgerRollback {
+            slots: BTreeMap::from([
+                (
+                    p1.clone(),
+                    verified_ref_for(&p1, "gen-old-1", "rel-old", "tree-old-1"),
+                ),
+                (
+                    p2.clone(),
+                    verified_ref_for(&p2, "gen-old-2", "rel-old", "tree-old-2"),
+                ),
+            ]),
+            bindings: BTreeMap::from([(
+                p1.clone(),
+                PhysicalBinding {
+                    server: ServerId::new("s1"),
+                    deploy_dir: "/srv/deploy/p1".to_string(),
+                },
+            )]),
+        };
+        let err = build_rollback(&healthy, Some(&divergent_base), &[p1.clone(), p2.clone()])
+            .expect_err(
+                "a base whose bindings diverge from its slots must refuse the construction",
+            );
+        assert!(
+            err.to_string().contains("EXACTLY the slotted generations"),
+            "the error names the key-set divergence, got: {err}"
+        );
+
+        // A GenerationRef naming a DIFFERENT slot than its map key — the
+        // strict reader's own-key agreement, enforced at construction.
+        let renamed = BTreeMap::from([(
+            p1.clone(),
+            BoundGeneration {
+                generation: verified_ref_for(&p2, "gen-new", "rel-new", "tree-new"),
+                binding: PhysicalBinding {
+                    server: ServerId::new("s1"),
+                    deploy_dir: "/srv/deploy/p1".to_string(),
+                },
+            },
+        )]);
+        let err = build_rollback(&renamed, None, std::slice::from_ref(&p1))
+            .expect_err("a GenerationRef that names another slot must refuse the construction");
+        assert!(
+            err.to_string().contains("names placement"),
+            "the error names the own-key violation, got: {err}"
         );
     }
 

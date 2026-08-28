@@ -1463,31 +1463,102 @@ interval_seconds = 0
 
         // A snapshot whose `slots` record the generation but whose `bindings`
         // map is EMPTY (legacy pre-feature line). The exact-binding-keys
-        // invariant now refuses such a payload at the STORE READ (the wire →
-        // domain conversion): the missing binding is caught at conversion
-        // time, BEFORE `plan_assignments` can resolve the rollback, and the
-        // refusal propagates out of the plan as an integrity error naming
-        // the missing binding.
-        append_successful_snapshot(
-            &store,
-            "deploy-legacy-snapshot",
-            "sha256-aa",
-            BTreeMap::from([(
-                SlotId::new("p1".to_string()),
-                GenerationRef {
-                    generation: test_generation_id("gen-legacy"),
-                    assignment: PlacementSlotAssignment {
-                        placement_slot: SlotId::new("p1".to_string()),
-                        artifact: ArtifactRef {
-                            release: crate::identity::test_release_id("rel-sha256-legacy"),
-                            variant: VariantName::new("standard".to_string()),
-                            tree: test_tree_digest("tree-legacy"),
-                        },
+        // invariant now refuses such a payload TWICE OVER: the PRE-WRITE
+        // VALIDATION refuses it at the store APPEND (fail closed — the
+        // rejected pair never writes; the ledger bytes stay UNCHANGED), and
+        // a DIRECTLY-WRITTEN legacy line is still refused at the STORE READ
+        // (the wire → domain conversion): the missing binding is caught at
+        // conversion time, BEFORE `plan_assignments` can resolve the
+        // rollback, and the refusal propagates out of the plan as an
+        // integrity error naming the missing binding.
+        let id = test_deployment_id("deploy-legacy-snapshot");
+        let target = TargetName::new("t1".to_string());
+        let slot_p1 = SlotId::new("p1".to_string());
+        let legacy_slot = GenerationRef {
+            generation: test_generation_id("gen-legacy"),
+            assignment: PlacementSlotAssignment {
+                placement_slot: slot_p1.clone(),
+                artifact: ArtifactRef {
+                    release: crate::identity::test_release_id("rel-sha256-legacy"),
+                    variant: VariantName::new("standard".to_string()),
+                    tree: test_tree_digest("tree-legacy"),
+                },
+            },
+        };
+        // The VALID intent (schema v6: it freezes a physical binding) + the
+        // LEGACY terminal whose rollback omits the bindings map.
+        let intent = DeploymentIntent {
+            deployment_id: id.clone(),
+            target: target.clone(),
+            group: None,
+            behavior_sha256: "sha256-aa".to_string(),
+            attempted_at: "2026-01-01T00:00:00Z".to_string(),
+            slots: NonEmptySlotTable::build(BTreeMap::from([(
+                slot_p1.clone(),
+                IntentSlot {
+                    desired: DesiredGeneration {
+                        generation: legacy_slot.generation.clone(),
+                        artifact: legacy_slot.assignment.artifact.clone(),
+                    },
+                    pre_push: None,
+                    binding: PhysicalBinding {
+                        server: ServerId::new("s1".to_string()),
+                        deploy_dir: "/srv/eng".to_string(),
                     },
                 },
-            )]),
-            BTreeMap::new(),
+            )]))
+            .expect("a seeded snapshot always has at least one slot"),
+            full_membership: BTreeSet::from([slot_p1.clone()]),
+        };
+        let legacy_terminal = LedgerTerminal {
+            recorded_at: "2026-01-01T00:00:00Z".to_string(),
+            disposition: TerminalDisposition::Successful {
+                rollback: LedgerRollback {
+                    slots: BTreeMap::from([(slot_p1.clone(), legacy_slot)]),
+                    // THE LEGACY OMISSION: no bindings keyed for the
+                    // slotted generation.
+                    bindings: BTreeMap::new(),
+                },
+                activated: BTreeSet::from([slot_p1.clone()]),
+                full_membership: BTreeSet::from([slot_p1.clone()]),
+            },
+            reason: None,
+        };
+        // THE WRITER REFUSES the missing-binding pair (the hard guarantee):
+        // a terminal the strict reader would reject is never written — the
+        // ledger bytes stay unchanged.
+        store.append_intent("t1", &intent).unwrap();
+        let before = std::fs::read(store.ledger_path("t1")).unwrap();
+        let err = store
+            .append_terminal("t1", &id, &legacy_terminal)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("missing bindings") && err.to_string().contains("p1"),
+            "the writer must name the unverifiable slot and the missing binding, got: {err}"
         );
+        assert!(
+            err.to_string().contains("EXACTLY the slotted generations"),
+            "the writer must explain the exact-binding-keys verification failure, got: {err}"
+        );
+        let after = std::fs::read(store.ledger_path("t1")).unwrap();
+        assert_eq!(
+            before, after,
+            "a rejected terminal never writes — the ledger bytes are unchanged"
+        );
+        // THE READ STILL REFUSES a DIRECTLY-WRITTEN legacy line (the
+        // reader's refusal is independent of the writer): the resolution
+        // path propagates the same integrity error naming the missing
+        // binding.
+        let p = store.ledger_path("t1");
+        let line1 = serde_json::to_string(&crate::ledger::LedgerLine::Intent(
+            crate::ledger::LedgerIntentWire::from(&intent),
+        ))
+        .unwrap();
+        let line2 = serde_json::to_string(&crate::ledger::LedgerLine::Terminal(
+            crate::ledger::LedgerTerminalWire::from_domain(&id, &target, &legacy_terminal),
+        ))
+        .unwrap();
+        std::fs::write(&p, format!("{line1}\n{line2}\n")).unwrap();
 
         let err = plan_assignments(
             &SlotSelection::normalize(&config, "t1", None).unwrap(),

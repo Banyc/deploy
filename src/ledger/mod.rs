@@ -27,7 +27,7 @@
 //!   [`SlotOutcomeKind`] / [`SlotTransition`] / [`SlotResult`]), the
 //!   three-state observations ([`Observation`] and friends), the merged
 //!   entry ([`LedgerEntry`]), the rollback payload builder
-//!   ([`build_rollback`]), the rebinding proof ([`RebindingPlan`] /
+//!   ([`crate::ledger::records::build_rollback`]), the rebinding proof ([`RebindingPlan`] /
 //!   [`VerifiedReleaseRebinding`] / [`FrozenSlotTopology`]), the successful
 //!   membership-equation enforcement
 //!   (`records::verify_successful_membership_equations`), and the
@@ -93,7 +93,7 @@ pub use records::{
     ObservedTarget, PhysicalBinding, Pins, PlanOrigin, PlanSource, PreviousGeneration,
     RebindingPlan, ServerState, SlotAttemptState, SlotAttemptStateWire, SlotOutcome,
     SlotOutcomeKind, SlotPlan, SlotResult, SlotTable, SlotTransition, TerminalDisposition,
-    VerifiedReleaseRebinding, build_rollback,
+    VerifiedReleaseRebinding,
 };
 pub use refs::{
     PushRef, attempt_slot_ids, deployment_index, ref_name, resolve_deployment,
