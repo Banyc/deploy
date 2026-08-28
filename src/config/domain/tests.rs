@@ -1,6 +1,6 @@
 use super::*;
 use crate::config::domain::{RawProject, valid_identifier};
-use crate::config::raw::CONFIG_SCHEMA_VERSION;
+use crate::config::raw::{CONFIG_SCHEMA_VERSION, RawConfig, RawVariant};
 use crate::config::*;
 use crate::env::SysEnv;
 use crate::error::Error;
@@ -314,10 +314,10 @@ interval_seconds = 0
 "#;
 
 /// The default slot body appended to the `standard` variant file used by
-/// the tests below: `p1` on server `s1`, belonging to target `t1`. Slots
-/// are declared inside the variant file that owns the workload and bind
-/// themselves to targets with the `targets` list; a target's members are
-/// derived from these declarations.
+/// the tests below: `p1` on server `s1`, bound to its ONE owning target
+/// `t1`. Slots are declared inside the variant file that owns the workload
+/// and bind themselves to their owning target with the `target` field; a
+/// target's members are derived from these declarations.
 pub(crate) const STANDARD_SLOTS: &str = r#"
 [[slots]]
 id = "p1"
@@ -484,10 +484,9 @@ fn release_directory_without_variants_is_rejected() {
     );
 }
 
-/// Every target named in a slot's `targets` list must be a top-level
-/// `[targets.<name>]` key: membership is derived from the slot
-/// declarations, so a slot bound to an undeclared target is a
-/// configuration error.
+/// A slot's ONE owning `target` must be a top-level `[targets.<name>]` key:
+/// membership is derived from the slot declarations, so a slot bound to an
+/// undeclared target is a configuration error.
 #[test]
 fn slot_target_must_reference_declared_target() {
     let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
@@ -531,7 +530,7 @@ fn slots_declare_their_target_membership() {
     let cfg = ProjectConfig::load(&p).expect("slots spread across targets are valid");
     assert_eq!(cfg.targets_ref().len(), 2);
     assert_eq!(cfg.slot_defs().len(), 2);
-    // Membership is derived from each slot's declared targets list.
+    // Membership is derived from each slot's declared owning target.
     assert_eq!(cfg.target_slot_ids("t1").unwrap(), vec!["p1"]);
     assert_eq!(cfg.target_slot_ids("t2").unwrap(), vec!["p2"]);
 
@@ -563,11 +562,10 @@ fn slots_declare_their_target_membership() {
     );
 }
 
-/// A slot with an EMPTY `targets` list belongs to no target and is
-/// useless (mirroring the rule that a target must have at least one
-/// member), so it is rejected at validation.
+/// A slot's `target` field is REQUIRED (a slot has exactly one owning
+/// target), so a slot declaration that omits it is rejected at validation.
 #[test]
-fn slot_with_no_targets_is_rejected() {
+fn slot_without_a_target_is_rejected() {
     let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let project = dir.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
@@ -3396,6 +3394,161 @@ proptest! {
                         graph
                     );
                 }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// THE DOC-CONSISTENCY SUITE: the public docs (README.md + requirement.md)
+// describe ONE config schema — the one CONFIG_SCHEMA_VERSION enforces. Two
+// guards keep them honest:
+//
+// 1. `docs_render_schema_version_from_config_schema_version` — every
+//    `schema_version = N` literal in the docs (and the `schema vN:` shorthand
+//    in the init output) must render CONFIG_SCHEMA_VERSION itself, so a
+//    schema bump that forgets the docs fails here.
+// 2. `every_documented_toml_block_parses_under_the_strict_loader` — every
+//    embedded ```toml example must parse under the STRICT raw schemas
+//    (`deny_unknown_fields`) the loader uses: a deploy.toml-shaped block as
+//    `RawConfig`, a variant-file-shaped block as `RawVariant`. This is the
+//    audit that catches obsolete shapes (the plural `targets` slot field, the
+//    `conflict`/`optional` mapping controls, a stale schema_version) the
+//    moment they re-enter the docs.
+// ---------------------------------------------------------------------------
+
+/// The public documents that carry config examples.
+const DOC_FILES: [&str; 2] = ["README.md", "requirement.md"];
+
+/// Read a crate-root document.
+fn read_doc(name: &str) -> String {
+    std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(name))
+        .unwrap_or_else(|e| panic!("reading {name}: {e}"))
+}
+
+/// Every ```toml fenced block of a markdown document, in order, without the
+/// fences.
+fn toml_blocks(markdown: &str) -> Vec<String> {
+    let lines: Vec<&str> = markdown.lines().collect();
+    let mut blocks = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].starts_with("```toml") {
+            let mut end = i + 1;
+            while end < lines.len() && !lines[end].starts_with("```") {
+                end += 1;
+            }
+            blocks.push(lines[i + 1..end].join("\n"));
+            i = end + 1;
+        } else {
+            i += 1;
+        }
+    }
+    blocks
+}
+
+/// The `schema_version = <N>` value of one line, when the line is a TOML
+/// `schema_version` assignment of THIS config format. The leading boundary
+/// excludes the sibling schemas' `*_schema_version` keys
+/// (`deployment_schema_version`, `release_schema_version`, ...).
+fn schema_version_literal(line: &str) -> Option<u32> {
+    const PREFIX: &str = "schema_version =";
+    let idx = line.find(PREFIX)?;
+    if idx > 0 {
+        let before = line.as_bytes()[idx - 1];
+        if before.is_ascii_alphanumeric() || before == b'_' {
+            return None;
+        }
+    }
+    let rest = line[idx + PREFIX.len()..].trim_start();
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// The `schema v<N>` shorthand of one line (the `deploy init` output
+/// annotation), when present. `schema version <N>` prose never matches (the
+/// character after `schema v` is not a digit).
+fn schema_v_shorthand(line: &str) -> Option<u32> {
+    const PREFIX: &str = "schema v";
+    let idx = line.find(PREFIX)?;
+    let rest = &line[idx + PREFIX.len()..];
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+#[test]
+fn docs_render_schema_version_from_config_schema_version() {
+    // The docs' config-schema statements are DERIVED from CONFIG_SCHEMA_VERSION:
+    // every `schema_version = N` literal (deploy.toml examples) and the
+    // `schema vN:` shorthand (the init-output annotation) must equal the
+    // constant — the value the loader accepts and rejects anything else at.
+    for doc in DOC_FILES {
+        let text = read_doc(doc);
+        for (i, line) in text.lines().enumerate() {
+            let lineno = i + 1;
+            if let Some(v) = schema_version_literal(line) {
+                assert_eq!(
+                    v, CONFIG_SCHEMA_VERSION,
+                    "{doc}:{lineno}: `schema_version = {v}` must render CONFIG_SCHEMA_VERSION \
+                     ({CONFIG_SCHEMA_VERSION}); a schema bump that forgets the docs fails here"
+                );
+            }
+            if let Some(v) = schema_v_shorthand(line) {
+                assert_eq!(
+                    v, CONFIG_SCHEMA_VERSION,
+                    "{doc}:{lineno}: `schema v{v}:` must render CONFIG_SCHEMA_VERSION \
+                     ({CONFIG_SCHEMA_VERSION})"
+                );
+            }
+        }
+    }
+}
+
+/// Whether a documented TOML block is a `deploy.toml` manifest (it names an
+/// `application`) or a variant file (everything else).
+fn is_manifest_block(block: &str) -> bool {
+    block.contains("application =")
+}
+
+#[test]
+fn every_documented_toml_block_parses_under_the_strict_loader() {
+    // README.md documents 2 TOML blocks (the deploy.toml config reference and
+    // the variant-file reference), requirement.md 3 (the example deploy.toml,
+    // the example variant file, and the mapping-controls example). The audit
+    // asserts the count so a block can never silently disappear from the
+    // docs, then parses every block under the strict raw schemas the loader
+    // uses — `deny_unknown_fields` and all — with the block classified as a
+    // manifest (`RawConfig`) or a variant file (`RawVariant`).
+    let expected = [("README.md", 2usize), ("requirement.md", 3)];
+    for (doc, expected_count) in expected {
+        let blocks = toml_blocks(&read_doc(doc));
+        assert_eq!(
+            blocks.len(),
+            expected_count,
+            "{doc} must document exactly {expected_count} TOML blocks (the audit covers all of them)"
+        );
+        for (b, block) in blocks.iter().enumerate() {
+            let label = format!("{doc} ```toml block #{}", b + 1);
+            if is_manifest_block(block) {
+                toml::from_str::<RawConfig>(block).unwrap_or_else(|e| {
+                    panic!(
+                        "{label} is a deploy.toml-shaped block and must parse under the strict \
+                         loader (deny_unknown_fields): {e}\n---\n{block}"
+                    )
+                });
+            } else {
+                toml::from_str::<RawVariant>(block).unwrap_or_else(|e| {
+                    panic!(
+                        "{label} is a variant-file-shaped block and must parse under the strict \
+                         loader (deny_unknown_fields): {e}\n---\n{block}"
+                    )
+                });
             }
         }
     }

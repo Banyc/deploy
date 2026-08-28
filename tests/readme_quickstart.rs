@@ -43,7 +43,7 @@ fn quickstart_fixture_parses_and_plans() -> Result<()> {
         config.release_root(&config_path).ends_with("releases/v1"),
         "release directory is forced beneath releases/"
     );
-    // Membership is DERIVED from the slots' `targets` lists: the two slots
+    // Membership is DERIVED from the slots' `target` fields: the two slots
     // are declared inside releases/v1/standard.toml and both bind to
     // `production`.
     assert_eq!(config.target_slot_ids("production")?.len(), 2);
@@ -59,7 +59,7 @@ fn quickstart_fixture_parses_and_plans() -> Result<()> {
         "artifacts/build/output/"
     );
     // The `systemd` example variant ships a real unit file as an artifact; it
-    // declares no slots (you add a slot with a `targets` list to bind it), so
+    // declares no slots (you add a slot with a `target` field to bind it), so
     // the dry-run push stays adapter-agnostic.
     let systemd = config.variant("systemd")?;
     let deploy::config::Activation::Systemd(sa) = &systemd.activation else {

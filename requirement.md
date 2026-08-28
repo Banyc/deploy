@@ -51,9 +51,7 @@ Deployment, operation, and generation IDs are opaque collision-resistant IDs (UU
 
 Tree objects contain no release- or variant-specific metadata, so identical trees can be deduplicated safely. Release records bind variants to trees and freeze the release's own canonical per-variant slot declarations (the slot snapshot).
 
--The canonical release ID is derived from a versioned canonical identity payload covering the name-sorted per-variant mapping digests, the name-sorted per-variant SLOT DECLARATION digest (each variant's `[[slots]]` entries canonicalized to their four identity fields `id`/`server`/`deploy_dir`/`target` — `deploy_dir` lexically normalized — and sorted by slot id), all declared `variant → tree digest` bindings, and the name-sorted per-variant activation and verification behavior-contract digest. It explicitly excludes the resulting release ID, creation time, display name, and provenance, avoiding a circular hash. Two variants may share tree bytes while still requiring different activation and verification behavior, so behavior is captured per variant rather than once per release. A slot-only change — rebinding a slot to another server, moving its `deploy_dir`, or retargeting it — produces a NEW release ID: the canonical slot declarations are part of the identity, and the release record persists them as its slot snapshot. Capacity is NOT part of the release identity: it is a per-server policy declared on the server entry and resolved from the caller's current configuration at preflight time, so a server-capacity change never produces a new release. Its stored form is `rel-sha256-<release-digest>`; the CLI may display and accept an unambiguous digest prefix. Git revision and creation time are provenance only because mapped inputs can include generated or untracked files.
--The canonical release ID is derived from a versioned canonical identity payload covering the name-sorted per-variant mapping digests, the name-sorted per-variant SLOT DECLARATION digest (each variant's `[[slots]]` entries canonicalized to their four identity fields `id`/`server`/`deploy_dir`/`targets` — `deploy_dir` lexically normalized, `targets` sorted — and sorted by slot id), all declared `variant → tree digest` bindings, and the name-sorted per-variant activation and verification behavior-contract digest. It explicitly excludes the resulting release ID, creation time, display name, and provenance, avoiding a circular hash. Two variants may share tree bytes while still requiring different activation and verification behavior, so behavior is captured per variant rather than once per release. A slot-only change — rebinding a slot to another server, moving its `deploy_dir`, or changing its target membership — produces a NEW release ID: the canonical slot declarations are part of the identity, and the release record persists them as its slot snapshot. Capacity is NOT part of the release identity: it is a per-server policy declared on the server entry and resolved from the caller's current configuration at preflight time, so a server-capacity change never produces a new release. Its stored form is `rel-sha256-<release-digest>`; the CLI may display and accept an unambiguous digest prefix. Git revision and creation time are provenance only because mapped inputs can include generated or untracked files. The digest is never trusted from the stored `release_sha256` field: every read (`store.read_release`) and every publish (`helper.publish_release`) recomputes the canonical digest from the record's own content (slot snapshot, bindings, provenance digests) and verifies it against BOTH `release_sha256` and `release_id`, failing closed with an integrity error on any mismatch — a record whose content was edited while the digest fields were left unchanged is rejected.
-The canonical release ID is derived from a versioned canonical identity payload covering the name-sorted per-variant mapping digests, the name-sorted per-variant SLOT DECLARATION digest (each variant's `[[slots]]` entries canonicalized to their four identity fields `id`/`server`/`deploy_dir`/`targets` — `deploy_dir` lexically normalized, `targets` sorted and DEDUPLICATED, so duplicate target names never shift identity — and sorted by slot id), all declared `variant → tree digest` bindings, and the name-sorted per-variant activation and verification behavior-contract digest. It explicitly excludes the resulting release ID, creation time, display name, and provenance, avoiding a circular hash. Two variants may share tree bytes while still requiring different activation and verification behavior, so behavior is captured per variant rather than once per release. A slot-only change — rebinding a slot to another server, moving its `deploy_dir`, or changing its target membership — produces a NEW release ID: the canonical slot declarations are part of the identity, and the release record persists them as its slot snapshot. Capacity is NOT part of the release identity: it is a per-server policy declared on the server entry and resolved from the caller's current configuration at preflight time, so a server-capacity change never produces a new release. Its stored form is `rel-sha256-<release-digest>`; the CLI may display and accept an unambiguous digest prefix. Creation time is provenance only because mapped inputs can include generated or untracked files. The digest is never trusted from the stored `release_sha256` field: every read (`store.read_release`) and every publish (`helper.publish_release`) recomputes the canonical digest from the record's own content (slot snapshot, bindings, provenance digests) and verifies it against BOTH `release_sha256` and `release_id`, failing closed with an integrity error on any mismatch — a record whose content was edited while the digest fields were left unchanged is rejected. An EMPTY slot snapshot is rejected outright: a current-format record must persist its canonical slot declarations, so a tampered record whose `slots` map was emptied can no longer bypass verification (no legacy escape hatch). `store.write_release` verifies the INCOMING record from its content before creating anything, and re-verifies the EXISTING record from its content before comparing identities, so a same-id record with different content always fails between two content-verified records — never by trusting the stored digest fields. `store.read_release(id)` additionally binds the record to the read path: the stored `release_id` must equal the requested `id`, else an integrity error names both (a record swapped into the wrong release directory is refused, not returned).
+The canonical release ID is derived from a versioned canonical identity payload covering the name-sorted per-variant mapping digests, the name-sorted per-variant SLOT DECLARATION digest (each variant's `[[slots]]` entries canonicalized to their identity fields `id`/`server`/`deploy_dir`/`target` (the slot's ONE owning target, kept verbatim), with `groups` sorted and DEDUPLICATED, so duplicate group names never shift identity — `deploy_dir` lexically normalized — and sorted by slot id), all declared `variant → tree digest` bindings, and the name-sorted per-variant activation and verification behavior-contract digest. It explicitly excludes the resulting release ID, creation time, display name, and provenance, avoiding a circular hash. Two variants may share tree bytes while still requiring different activation and verification behavior, so behavior is captured per variant rather than once per release. A slot-only change — rebinding a slot to another server, moving its `deploy_dir`, or changing its target membership — produces a NEW release ID: the canonical slot declarations are part of the identity, and the release record persists them as its slot snapshot. Capacity is NOT part of the release identity: it is a per-server policy declared on the server entry and resolved from the caller's current configuration at preflight time, so a server-capacity change never produces a new release. Its stored form is `rel-sha256-<release-digest>`; the CLI may display and accept an unambiguous digest prefix. Git revision and creation time are provenance only because mapped inputs can include generated or untracked files. The digest is never trusted from the stored `release_sha256` field: every read (`store.read_release`) and every publish (`helper.publish_release`) recomputes the canonical digest from the record's own content (slot snapshot, bindings, provenance digests) and verifies it against BOTH `release_sha256` and `release_id`, failing closed with an integrity error on any mismatch — a record whose content was edited while the digest fields were left unchanged is rejected. An EMPTY slot snapshot is rejected outright: a current-format record must persist its canonical slot declarations, so a tampered record whose `slots` map was emptied can no longer bypass verification (no legacy escape hatch). `store.write_release` verifies the INCOMING record from its content before creating anything, and re-verifies the EXISTING record from its content before comparing identities, so a same-id record with different content always fails between two content-verified records — never by trusting the stored digest fields. `store.read_release(id)` additionally binds the record to the read path: the stored `release_id` must equal the requested `id`, else an integrity error names both (a record swapped into the wrong release directory is refused, not returned).
 
 Mapping and behavior digests are computed from versioned canonical data after schema defaults, path normalization, and validation, not from TOML formatting, comments, or key order. The original configuration remains available as provenance, while `behavior.json` records the canonical behavior contract. Snapshot files are written atomically and immutably with create-or-compare semantics: an identical rewrite is an idempotent no-op, and replacing an existing release's `behavior.json` with different content fails. A historical deployment restores the variant's original activation and verification behavior from this snapshot (so a variant renamed or removed after the release was created still rolls back exactly), and resolution fails closed: a missing or corrupt historical behavior snapshot aborts the attempt during preflight rather than silently substituting the caller's current configuration or defaults. The snapshot is cross-checked against the release identity on every read and publish: `store.read_release_behaviors` and the remote behavior publication parse the serialized `behavior.json`, recompute the canonical name-sorted per-variant contract digest (`release.variant_behaviors_digest`), and compare it against the release record's provenance `behavior_sha256` (itself folded into `release_sha256`); a snapshot whose canonical contract set digests to anything else — a deleted or changed identity-bearing field, a removed variant, or unparseable bytes — fails closed with an integrity error naming the release and the expected vs recomputed digest, so a tampered `behavior.json` is never returned as the historical contract and never published. Only a payload that parses to the SAME canonical contract set (e.g. JSON key reordering that deserializes identically) passes — that is the "unless the canonical behavior digest remains equal" clause. Capacity headroom, by contrast, is a per-server policy that is never snapshotted: servers have no per-release history, so every push — HEAD or historical — resolves it from the caller's current `deploy.toml`. Retention is SLOT-OWNED configuration declared inside the VARIANT FILE that declares the slot (each slot has exactly ONE policy — its owning variant's — never a per-target policy and never a union across the slot's member targets), and is read from the caller's current configuration on every push.
 
@@ -138,7 +136,10 @@ my-project/
 Example `deploy.toml`:
 
 ```toml
-schema_version = 1
+# The deploy.toml format version. The loader accepts EXACTLY this version
+# (CONFIG_SCHEMA_VERSION); the doc-consistency test renders this value from
+# the constant and keeps it in sync.
+schema_version = 2
 application = "example"
 release = "v1"              # the release directory is forced to releases/v1/
 
@@ -152,10 +153,10 @@ reason = "known-good recovery release"
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
 
 # Servers are declared once; slots are declared inside the variant files and
-# bind themselves to targets with their `targets` lists (a target's members
-# are derived from the slots). Capacity is a per-server policy, shared by
-# every deployment slot on the server and resolved from this file at preflight
-# time — it is never part of a release.
+# bind themselves to their ONE owning target with their `target` field (a
+# target's members are derived from the slots). Capacity is a per-server
+# policy, shared by every deployment slot on the server and resolved from
+# this file at preflight time — it is never part of a release.
 [[servers]]
 id = "server-01"
 address = "server-01.example.com"
@@ -173,22 +174,19 @@ id = "server-03"
 address = "server-03.example.com"
 user = "deploy"
 capacity = { reserve_bytes = 1073741824, reserve_percent = 5 }
-
-[targets.production]
-rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
 ```
 
 Servers and targets are declared once at the top level of `deploy.toml`;
 slots are declared inside the variant files. Each slot binds one server to the
 variant whose file declares it, names an absolute `deploy_dir`, and carries a
-`targets` list naming the targets it belongs to — a target's member slots
-are DERIVED by scanning every variant's slots for that target name. A slot
-may be a member of several targets (its on-server `deploy_dir` state is
-shared across them), and two slots may share one server in different targets,
-but within a single target each server appears at most once (one running
-generation per server). A slot's `targets` list must not repeat a name: a
-duplicate adds no membership yet would change the release identity, so it is
-rejected at load (the canonical slot form also deduplicates defensively). Besides `id`,
+`target` field naming its ONE owning target — a target's member slots
+are DERIVED by scanning every variant's slots for that target name, and
+`groups` may add rollout-group membership for
+`deploy push <target> --group <name>`. Two slots may share one server in
+different targets, but within a single target each server appears at most once
+(one running generation per server). A slot's `groups` list must not repeat a
+name: a duplicate adds no membership yet would change the release identity, so
+it is rejected at load (the canonical slot form also deduplicates defensively). Besides `id`,
 `address`, and `user`, every server accepts an
 optional `port` (default 22), exactly one host-identity source — a dedicated
 `known_hosts` file used with `StrictHostKeyChecking=yes`, or a pre-verified
@@ -239,13 +237,13 @@ protect_deployments = 2
 [[slots]]
 id = "app-1"
 server = "server-01"
-targets = ["production"]
+target = "production"
 deploy_dir = "/srv/deploy/example"
 
 [[slots]]
 id = "app-2"
 server = "server-02"
-targets = ["production"]
+target = "production"
 deploy_dir = "/srv/deploy/example"
 
 [[artifact.mappings]]
@@ -262,7 +260,6 @@ recursive = true
 from = "artifacts/deployment/variants/{{ variant }}/"
 to = "app/"
 recursive = true
-conflict = "replace"
 
 [[artifact.mappings]]
 from = "artifacts/deployment/systemd/example.service"
@@ -314,23 +311,29 @@ A mapping is only:
 local source path → artifact-relative destination path
 ```
 
-In schema version 1, `from` is relative to the release directory (`releases/<release>/`) and must remain beneath it. Absolute and escaping source paths are rejected. Recursive directory mappings merge directories; their conflict policy applies to colliding descendant entries rather than deleting unrelated entries already placed at the destination.
+A mapping's `from` is relative to the release directory (`releases/<release>/`) and must remain beneath it. Absolute and escaping source paths are rejected. Recursive directory mappings merge directories; collisions are handled by the strict mapping semantics (overlapping destinations are rejected up front, before any staging write).
 
 Supported mapping controls should include:
 
 ```toml
+# releases/<release>/mapping-example.toml — a complete variant file showing
+# every mapping control the strict loader accepts.
+description = "Mapping controls"
+
 [[artifact.mappings]]
-from = "local/path"
-to = "artifact/path"
+from = "artifacts/local/"   # relative to the release directory
+                            # (`releases/<release>/`); must remain beneath it
+to = "app/"                 # artifact-relative destination
 recursive = true
-conflict = "error"
-mode = "preserve"
-optional = false
-# conflict: "error" | "replace" | "keep"
-# mode: "preserve" or an explicit octal mode
+mode = "preserve"           # or an explicit octal mode such as "0644"
+
+[verification]
+adapter = "command"
+argv = ["true"]
+timeout_seconds = 5
 ```
 
-Mappings are applied in declaration order. A collision fails unless the mapping explicitly selects another conflict behavior. Mapping `from` paths are rendered through the template module (`src/template.rs`) with the fixed set of 13 elected variables (see the activation paragraph above). At materialization only the per-variant subset is available: `variant`, `application`, and `release` — where `release` is the release NAME from `deploy.toml`, not the immutable `ReleaseId` (the `ReleaseId` is derived from the materialized trees, so rendering it into a tree would be a circular digest). Every per-slot and per-server variable (`deploy_dir`, `target`, `server`, `user`, `address`, `port`, `slot`, `deployment_id`, `generation`, `tree`) fails loudly at materialization: trees are content-addressed and shared across slots, so target name, server, environment variables, and machine state cannot influence a tree — all servers assigned the same release variant must receive the same digest. Activation (unit-file content) and verification (`argv`) render with the full slot context, where `release` is the deployed artifact's immutable `ReleaseId`. Unknown variables, expressions, filters, and malformed templates fail loudly; the mapper does not implicitly template file contents — unit files and argv are rendered explicitly at activation/verification time.
+Mappings are applied in declaration order. Overlapping destinations are rejected up front, so a collision can never be resolved by declaration order or by a `conflict` control: the only mapping control beyond the destination itself is `mode` (`preserve` or an explicit octal mode). Mapping `from` paths are rendered through the template module (`src/template.rs`) with the fixed set of 13 elected variables (see the activation paragraph above). At materialization only the per-variant subset is available: `variant`, `application`, and `release` — where `release` is the release NAME from `deploy.toml`, not the immutable `ReleaseId` (the `ReleaseId` is derived from the materialized trees, so rendering it into a tree would be a circular digest). Every per-slot and per-server variable (`deploy_dir`, `target`, `server`, `user`, `address`, `port`, `slot`, `deployment_id`, `generation`, `tree`) fails loudly at materialization: trees are content-addressed and shared across slots, so target name, server, environment variables, and machine state cannot influence a tree — all servers assigned the same release variant must receive the same digest. Activation (unit-file content) and verification (`argv`) render with the full slot context, where `release` is the deployed artifact's immutable `ReleaseId`. Unknown variables, expressions, filters, and malformed templates fail loudly; the mapper does not implicitly template file contents — unit files and argv are rendered explicitly at activation/verification time.
 
 Materialization uses a canonical tree format:
 - paths must be valid UTF-8, Unicode NFC-normalized relative paths;
@@ -465,7 +468,7 @@ metadata lives outside the tree object. For example, `release.json` is:
 
 ```json
 {
-  "release_schema_version": 1,
+  "release_schema_version": 2,
   "release_id": "rel-sha256-41da2f63a950c8494c3c0f1663cf15aacf35b209293b36d3d5c59f8f022805f1",
   "release_sha256": "41da2f63a950c8494c3c0f1663cf15aacf35b209293b36d3d5c59f8f022805f1",
   "created_at": "2026-08-21T10:15:00Z",
@@ -721,7 +724,7 @@ Every deployment attempt records its immutable intent: target snapshot, behavior
 
 ```json
 {
-  "deployment_schema_version": 1,
+  "deployment_schema_version": 5,
   "deployment_id": "deploy-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b",
   "target": "production",
   "slot_ids": ["p1", "p2", "p3"],
@@ -822,7 +825,7 @@ A deployment-id ref resolves to THAT deployment's stored rollback payload (the s
 
 Exact snapshot rollback requires the current target to contain the same stable placement-slot set as the saved deployment AND each slot's complete physical binding to match the binding the snapshot recorded (`bindings[slot]` = the `{server, deploy_dir}` pair from the slot's variant-file `[[slots]]` entry): a slot rebound to a different server — or moved to a different `deploy_dir` on the SAME server — would otherwise receive the historical generations on the wrong host or at the wrong on-server location. A legacy snapshot entry that never recorded the binding (pre-feature lines, or the intermediate server-only `servers` shape) is unverifiable and is refused the same way. Addresses may change and are taken from the current target definition after host-identity verification. If membership has changed or any slot's physical binding changed, exact rollback fails during preflight without modifying a server.
 
-Schema version 1 permits a target-history ref only as a source for that same target; cross-target deployment uses a release ref instead.
+A target-history ref resolves only against the target whose history it came from; cross-target deployment uses a release ref instead.
 
 Rollback never rebuilds a tree. It uses the retained immutable object with the recorded digest. All required objects are checked locally and staged remotely before the first server changes. If an object is missing locally, reconciliation first attempts to recover it from a target server that retains the verified digest. If no verified copy can be recovered, preflight fails and leaves every `current` pointer unchanged.
 
@@ -963,7 +966,7 @@ Artifact-controlled unit files are supported by default only with `scope: user`,
 For a system service, an administrator installs a root-owned wrapper unit whose security-sensitive directives, service user, and stable command entry point are not writable by the deployment account. In `scope: system`, `push` only verifies that wrapper's identity and uses a narrowly scoped permission to restart that specific unit. It never links an artifact-controlled unit into `/etc/systemd/system`. Treating a deployment account as authorized to replace system unit contents would make that account effectively root and is outside the safe default design.
 
 ## Transport and remote helper
-The initial transport is SSH with strict host-key verification (per-server `known_hosts` or pinned `host_key_fingerprint` — exactly one source per SSH server, enforced at config validation and re-checked defensively at transport construction). An explicit `local://<absolute-path>` server address instead routes the transport to that exact filesystem endpoint; it exists for tests and for local targets. Server IDs, target names, variant names, release IDs, and paths are validated data and are never concatenated into remote shell commands. Bulk tree transfer uses SFTP or an equivalent framed channel. Every ssh operation runs through ONE bounded subprocess runner: every `ssh` connection carries `-o ConnectTimeout=10`, which bounds only the CONNECTION phase, and the runner imposes a hard deadline on the whole operation AFTER connection establishment — so nothing is unbounded. The `ssh-keyscan` key-pin step keeps the 10-second bound (native `-T` plus the runner's process-level deadline); every remote command and upload gets a distinct 60-second default (`SSH_COMMAND_TIMEOUT_SECS`: slower than connection establishment, which a slow-but-healthy remote legitimately needs, but bounded so a hung remote cannot stall the push); `exec` keeps its caller-supplied timeout. On deadline the runner KILLS the child (SIGKILL) and then deterministically REAPS it (joins the wait thread that owns the child) before returning a Timeout — an unreachable or dead host fails fast, no operation can hang the transport indefinitely, and no child is ever left uncollected (no kill-vs-wait race, no zombies, no return-before-reap). The stdin payload is written inside the same bounded wait: a >pipe-buffer upload to a remote that stops reading blocks the write, the deadline fires, and the kill closes the pipe (EPIPE, SIGPIPE ignored). A stdin-write failure follows the same rule as the deadline — the wait closure SAVES the write error, always drains and collects the child (`wait_with_output`), and only then returns the saved error — so a timed-out or write-failed upload is killed AND reaped, never an un-collected child (no return-before-reap on the write-error path either).
+The initial transport is SSH with strict host-key verification (per-server `known_hosts` or pinned `host_key_fingerprint` — exactly one source per SSH server, enforced at config validation and re-checked defensively at transport construction). An explicit `local://<absolute-path>` server address instead routes the transport to that exact filesystem endpoint; it exists for tests and for local targets. Server IDs, target names, variant names, release IDs, and paths are validated data and are never concatenated into remote shell commands. Bulk tree transfer is a plain bounded ssh stdin channel: each file's bytes are piped to a remote `cat > <path>` command (the target path is shell-quoted, so a path can never smuggle shell metacharacters out of the forced namespace), never a framed binary protocol. Every ssh operation runs through ONE bounded subprocess runner: every `ssh` connection carries `-o ConnectTimeout=10`, which bounds only the CONNECTION phase, and the runner imposes a hard deadline on the whole operation AFTER connection establishment — so nothing is unbounded. The `ssh-keyscan` key-pin step keeps the 10-second bound (native `-T` plus the runner's process-level deadline); every remote command and upload gets a distinct 60-second default (`SSH_COMMAND_TIMEOUT_SECS`: slower than connection establishment, which a slow-but-healthy remote legitimately needs, but bounded so a hung remote cannot stall the push); `exec` keeps its caller-supplied timeout. On deadline the runner KILLS the child (SIGKILL) and then deterministically REAPS it (joins the wait thread that owns the child) before returning a Timeout — an unreachable or dead host fails fast, no operation can hang the transport indefinitely, and no child is ever left uncollected (no kill-vs-wait race, no zombies, no return-before-reap). The stdin payload is written inside the same bounded wait: a >pipe-buffer upload to a remote that stops reading blocks the write, the deadline fires, and the kill closes the pipe (EPIPE, SIGPIPE ignored). A stdin-write failure follows the same rule as the deadline — the wait closure SAVES the write error, always drains and collects the child (`wait_with_output`), and only then returns the saved error — so a timed-out or write-failed upload is killed AND reaped, never an un-collected child (no return-before-reap on the write-error path either).
 
 A small versioned remote helper owns status inspection, locking, object publication, generation switching, transaction-record keeping, adapter invocation, and retention. Client and helper perform a protocol-version handshake before mutation (the negotiated version is recorded under `control/`; schema version 1 speaks protocol 1). Every mutating request carries an operation ID and is idempotent, and each operation's durable per-server transaction record (`transactions/<operation-id>.json`, advanced `prepared` → `committed`/`compensated` by the helper) is written on every mutation. Two items here are PLANNED, not yet implemented: (a) reading those transaction records back so a disconnected client can reconnect and learn whether the operation prepared, committed, compensated, or never began — records are written, but nothing reconciles them on reconnect (unfinished-attempt recovery is driven by the controller's LOCAL attempt/transition records on the next push); and (b) packaging these operations as a single versioned helper binary uploaded beneath each slot's `deploy_dir` — the planned evolution. Neither changes this contract.
 

@@ -44,7 +44,7 @@ What it generates (also visible in `deploy init --help`):
 
 ```text
 my-app/
-  deploy.toml                          # schema v1: one server, target `production` (rollout only)
+  deploy.toml                          # schema v2: one server, target `production` (rollout only)
   releases/v1/standard.toml            # the `standard` variant (mappings + its slot + policies)
   releases/v1/systemd.toml             # example `systemd` activation variant with a real unit
   releases/v1/artifacts/build/output/app/hello   # placeholder artifact source
@@ -54,7 +54,7 @@ my-app/
 
 Slots are declared INSIDE the variant files: `releases/v1/standard.toml`
 carries the project's one slot (`app-1` → `server-01`, bound to the
-`production` target by its `targets` list — targets derive their member slots
+`production` target by its `target` field — targets derive their member slots
 from the slots, they do not list them).
 
 The generated files are typed TOML serialized from the same config structs
@@ -153,7 +153,7 @@ release only via `release:<id>`.
   required (the release may be built/pushed anywhere; a fresh target
   deploys directly). The target's CURRENT slot membership must EXACTLY
   equal the slot set the release record froze for it (derived from the
-  record's per-variant canonical slots whose `targets` contain the target):
+  record's per-variant canonical slots whose `target` field names the target):
   membership drift — a slot added, removed, or renamed since the release
   was built — is rejected at plan time, before any remote access, and
   physical bindings (server / `deploy_dir`) are intentionally allowed to
@@ -254,7 +254,7 @@ deploy push production deploy-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b  # the checkp
 deploy.toml                    # names the active release, servers, and targets (rollout only)
 releases/<name>/              # the release directory named by `release:`
 releases/<name>/<variant>.toml  # every *.toml file here is a variant (file stem = name);
-                                # each variant declares its own [[slots]] (server, deploy_dir, targets)
+                                # each variant declares its own [[slots]] (server, deploy_dir, target)
 releases/<name>/artifacts/    # artifact sources referenced by variant mappings
 ```
 
@@ -267,12 +267,13 @@ releases/<name>/artifacts/    # artifact sources referenced by variant mappings
   file IS the slot's variant binding. Capacity is a per-server policy declared
   on the server entry.
 - A **deployment slot** binds one server to one workload under an ID, names the
-  absolute `deploy_dir` on the server, and declares the targets it belongs to
-  (`targets = ["..."]`). A slot may be a member of several targets, and two
-  slots may share one server in different targets, but within a single target
-  each server appears at most once. A **target** carries ROLLOUT behavior
-  only; its member slots are DERIVED from the slots' `targets` lists —
-  targets do not list their slots.
+  absolute `deploy_dir` on the server, and declares its EXACTLY ONE owning
+  target (`target = "production"`; `groups = ["canary"]` adds rollout-group
+  membership for `deploy push <target> --group <name>`). Two slots may share
+  one server in different targets, but within a single target each server
+  appears at most once. A **target** carries ROLLOUT behavior only; its member
+  slots are DERIVED from the slots' `target` fields — targets do not list
+  their slots.
 - Retention belongs to the SLOT, not the target: the variant
   file that declares the slot owns its one retention policy, so a slot shared
   across several targets keeps exactly one policy and membership changes never
@@ -281,7 +282,10 @@ releases/<name>/artifacts/    # artifact sources referenced by variant mappings
 ## Config reference (condensed)
 
 ```toml
-schema_version = 1
+# The deploy.toml format version. The loader accepts EXACTLY this version
+# (CONFIG_SCHEMA_VERSION); the doc-consistency test renders this value from
+# the constant and keeps it in sync.
+schema_version = 2
 application = "my-app"
 release = "v1"               # active release dir under releases/
 
@@ -297,7 +301,7 @@ capacity = { reserve_bytes = 0, reserve_percent = 0 }  # per-server headroom, ze
 
 [targets.production]         # targets carry ROLLOUT only: their member slots
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-                            # are derived from the slots' `targets` lists
+                            # are derived from the slots' `target` fields
 ```
 
 A variant file (`releases/<release>/<name>.toml`) is a mapping plus policy —
@@ -307,12 +311,12 @@ plus the variant's deployment slots and its slot-owned retention policy:
 description = "Standard deployment"
 
 # This variant's deployment slots: one slot = one server + this variant, under
-# an ID, with an absolute deploy_dir, belonging to one or more targets (targets
+# an ID, with an absolute deploy_dir, bound to its ONE owning target (targets
 # derive their members from these declarations).
 [[slots]]
 id = "app-1"
 server = "server-01"
-targets = ["production"]
+target = "production"
 deploy_dir = "/srv/deploy/my-app"   # absolute path on the server
 
 [[artifact.mappings]]
@@ -352,7 +356,9 @@ before anything is executed: `{{ deploy_dir }}` (the slot's absolute on-server
 directory), `{{ variant }}`, `{{ application }}`, `{{ release }}` (the
 immutable `ReleaseId` of the artifact actually being deployed, e.g.
 `rel-sha256-…` — never the caller's current release name), `{{ target }}`,
-`{{ server }}`. Only these names are recognized — no
+`{{ server }}` — the full elected set also includes `{{ user }}`,
+`{{ address }}`, `{{ port }}`, `{{ slot }}`, `{{ deployment_id }}`,
+`{{ generation }}`, `{{ tree }}`. Only these 13 names are recognized — no
 expressions, filters, or control flow; an unknown or malformed template fails
 the push loudly. Mapping `from` paths use only `{{ variant }}` (trees are
 content-addressed and shared across slots), while activation/verification
@@ -371,9 +377,9 @@ resolved from this file at preflight time — it is never part of a release.
 
 Validation is strict: `deploy_dir` and `known_hosts` must be absolute paths,
 server/slot IDs must be unique (slot IDs across every variant's slots), each
-slot's server must be a declared `[[servers]]` entry, every target in a slot's
-`targets` list must be a declared `[targets.<name>]` key (and the list must
-not be empty), and each target must have at least one member slot. Every
+slot's server must be a declared `[[servers]]` entry, a slot's `target` field
+must name a declared `[targets.<name>]` key, and each target must have at
+least one member slot. Every
 SSH-shaped server address must configure
 EXACTLY ONE of `known_hosts` or `host_key_fingerprint` (neither means
 trust-on-first-use, which is refused; both are ambiguous) — `local://`
@@ -387,14 +393,14 @@ before anything is touched.
 - **Add a server**: add a `[[servers]]` entry to `deploy.toml`, then a
   `[[slots]]` entry inside the variant file that owns the workload (server,
   absolute `deploy_dir`, `target`).
-- **Add a slot to a target**: the slot's `targets` list is the membership —
-  add the target's name to it (a slot may belong to several targets); targets
-  do not list slots.
+- **Add a slot to a target**: the slot's `target` field is the membership —
+  set it to the owning target's name (a slot has EXACTLY ONE owning target);
+  `groups` may add rollout-group membership for
+  `deploy push <target> --group <name>`. Targets do not list slots.
 - **Cut a release**: copy the release directory (e.g. `releases/v1` →
   `releases/v2`), edit the variant files (new mappings, verification, etc.),
   and set `release = "v2"` in `deploy.toml`. Old releases stay deployable
-  via the direct `release:<id>` form (or the release-refid form
-  `parent(<release-id>, 0)` for snapshot ancestry).
+  via the direct `release:<id>` form.
 - **Roll back**: `deploy push production @-` restores the previous
   successful snapshot; `deploy push production 'parent(@, 3)'` the 3rd
   previous. Historical deployments restore their original behavior — they

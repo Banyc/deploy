@@ -88,7 +88,7 @@ impl<'de> Deserialize<'de> for ReleaseName {
                 A: serde::de::MapAccess<'d>,
             {
                 Err(serde::de::Error::custom(
-                    "schema v1 forces the project structure `<project>/releases/<name>/<variant>.toml`: \
+                    "the config schema forces the project structure `<project>/releases/<name>/<variant>.toml`: \
                      set `release: <name>` and drop the release.path/release.variants map",
                 ))
             }

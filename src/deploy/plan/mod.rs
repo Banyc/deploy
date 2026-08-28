@@ -1546,12 +1546,12 @@ interval_seconds = 0
     /// p1's physical binding at deployment time — the binding the CURRENT
     /// config no longer has.
     ///
-    /// The record's canonical slot carries the SAME `targets` list as the
-    /// current config's `p1` (`["t1", "t2"]`), so the release-versioned
-    /// membership and the CURRENT membership both reduce to the set `{p1}`
-    /// on every target — the planning-succeeds side of the direct-release
-    /// membership rule (only the PHYSICAL binding differs, which is
-    /// intentionally allowed).
+    /// The record's canonical slot declares each target's OWN slot (`p1` ->
+    /// `t1`, `p2` -> `t2` — a slot has exactly one owning target), so the
+    /// release-versioned membership equals the CURRENT membership — `{p1}`
+    /// on t1, `{p2}` on t2 — the planning-succeeds side of the
+    /// direct-release membership rule (only the PHYSICAL binding differs,
+    /// which is intentionally allowed).
     fn direct_release_fixture(
         old_binding: &(String, String),
     ) -> (tempfile::TempDir, ProjectConfig, LocalStore, ReleaseId) {

@@ -3489,7 +3489,8 @@ fn sdef(id: &str, server: &str, dir: &str, target: &str) -> SlotConfig {
     )
 }
 
-/// Reordering slots, variants, or a slot's targets list preserves the digest.
+/// Reordering slots or variants, or permuting the owning targets across
+/// slots, preserves the digest.
 #[test]
 fn identity_reordering_preserves_digest() {
     let mut a: BTreeMap<String, Vec<SlotConfig>> = BTreeMap::new();
@@ -3505,8 +3506,8 @@ fn identity_reordering_preserves_digest() {
         vec![sdef("c1", "s3", "/srv/c1", "t3")],
     );
 
-    // Same declarations: slots in the opposite file order, targets lists in
-    // the opposite order, variants inserted in the opposite order.
+    // Same declarations: slots in the opposite file order, owning targets
+    // permuted across the slots, variants inserted in the opposite order.
     let mut b: BTreeMap<String, Vec<SlotConfig>> = BTreeMap::new();
     b.insert(
         "canary".to_string(),

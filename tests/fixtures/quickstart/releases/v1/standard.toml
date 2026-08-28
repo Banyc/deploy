@@ -1,8 +1,8 @@
 # The `standard` variant: its artifact mappings plus deployment policies —
 # and its deployment slots. `from` paths resolve inside the release directory
 # (`releases/<name>/` — the project structure is forced), so artifact sources
-# live under `releases/v1/artifacts/`. Retention is not a variant setting: it
-# belongs to the target.
+# live under `releases/v1/artifacts/`. Retention is slot-owned: it is
+# declared once in the variant file that declares the slot.
 description = "Standard deployment"
 
 # This variant's deployment slots. Each slot binds a server (declared in

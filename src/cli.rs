@@ -63,7 +63,7 @@ enum Command {
 \n\
 Creates (never clobbers; the target must not already contain deploy.toml or a\n\
 releases/ tree):\n\
-  deploy.toml                        schema v1 config: one server, target `production` (rollout+retention)\n\
+  deploy.toml                        schema v2 config: one server, target `production` (rollout only)\n\
   releases/v1/standard.toml          the `standard` variant (mappings + its slot + policies)\n\
   releases/v1/systemd.toml           example `systemd` activation variant with a real unit\n\
   releases/v1/artifacts/build/output/app/hello   placeholder artifact source\n\
@@ -73,7 +73,7 @@ releases/ tree):\n\
 \n\
 Slots are declared INSIDE the variant files: releases/v1/standard.toml\n\
 carries the project's one slot (app-1 -> server-01, bound to target\n\
-`production` by its `targets` list — targets derive their members from the\n\
+`production` by its `target` field — targets derive their members from the\n\
 slots, they do not list them).\n\
 \n\
 The generated files are typed TOML serialized from the same config structs\n\

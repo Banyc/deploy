@@ -1092,9 +1092,9 @@ pub(crate) fn membership_drift_fixture(
         .unwrap();
 
     // The release's OWN frozen canonical snapshot: the generated
-    // membership (targets t1+t2) plus the constant phys (t1+t2, at its
-    // ORIGINAL server s5) and iso (t2-only), exactly mirroring the
-    // current config's targets lists.
+    // membership (slots owning t1 or t2) plus the constant phys (owns t1,
+    // at its ORIGINAL server s5) and iso (owns t2), exactly mirroring the
+    // current config's owning-target assignments.
     let mut canonical: Vec<CanonicalSlot> = Vec::new();
     for (i, id) in MEMBERSHIP_UNIVERSE.iter().enumerate() {
         if release_inc[i] {

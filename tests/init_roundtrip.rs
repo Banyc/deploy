@@ -81,7 +81,7 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
     let config = ProjectConfig::load(&config_path)?;
     assert_eq!(config.application().as_str(), "roundtrip-app");
     assert_eq!(config.release().as_str(), "v1");
-    // Membership is derived from the slots' `targets` lists (the slot is
+    // Membership is derived from the slots' `target` fields (the slot is
     // declared inside releases/v1/standard.toml, bound to `production`).
     assert_eq!(config.target_slot_ids("production")?, vec!["app-1"]);
     assert_eq!(

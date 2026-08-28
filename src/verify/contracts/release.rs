@@ -415,11 +415,12 @@ mod tests {
         }
     }
 
-    /// The `targets` membership list is part of the identity: adding a target
-    /// to a slot's list changes the digest, while REORDERING the list does
-    /// not (the canonical form sorts it).
+    /// The slot's ONE owning target is part of the identity: changing it
+    /// changes the digest, while the canonical form (sorted `groups`, slot
+    /// order normalized) is a pure function of the declaration set — so
+    /// identical declarations canonicalize identically.
     #[test]
-    fn variant_slots_digest_is_sensitive_to_targets_list() {
+    fn variant_slots_digest_is_sensitive_to_owning_target() {
         let base: BTreeMap<String, Vec<SlotConfig>> = BTreeMap::from([(
             "standard".to_string(),
             vec![SlotConfig::new(
