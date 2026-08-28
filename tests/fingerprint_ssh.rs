@@ -11,7 +11,7 @@ use deploy::deploy::{PushOptions, push};
 use deploy::env::SysEnv;
 use deploy::error::Result;
 use deploy::ledger::DeploymentStatus;
-use deploy::remote::transport::{Remote, SSH_STAT_ABSENT_EXIT, SshTransport};
+use deploy::remote::transport::{Remote, SshTransport};
 use deploy::store::local::LocalStore;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -131,12 +131,12 @@ printf '%s %s\n' "$host" '{pubkey}'
         bin.join("stat"),
         r##"#!/usr/bin/perl
 # Emulate GNU coreutils `stat -c` (macOS stat lacks it): the transport's
-# list/metadata scripts use `stat -c '%f'` (raw mode in hex) and
-# `stat -c '%s %f'` (size + raw mode hex). Direct perl (no sh wrapper)
-# keeps each metadata call a single exec. A CONFIRMED absence
-# (`! -e && ! -L`) exits with the reserved SSH_STAT_ABSENT_EXIT — the same
-# structured signal the transport's metadata script produces — instead of
-# GNU stat's human-readable stderr.
+# list script uses `stat -c '%f'` (raw mode in hex). The metadata path no
+# longer calls `stat` at all — it runs the framed perl `lstat` helper
+# directly — so the `%s %f` branch implements the SAME framed protocol
+# (P/A/E frames from a REAL lstat errno; a missing path reports A<tab>2),
+# keeping the fixture faithful for any caller that still formats through
+# `stat`.
 my $fmt = "";
 my @rest = ();
 while (@ARGV) {
@@ -146,9 +146,6 @@ while (@ARGV) {
     elsif ($a =~ /^-/) { }
     else { @rest = ($a, @ARGV); last; }
 }
-if (($rest[0] // "") ne "" && !-e $rest[0] && !-l $rest[0]) {
-    exit {ABSENT};
-}
 if ($fmt eq "%f") {
     my @s = lstat($rest[0]);
     printf "%x\n", $s[2] & 0xffff;
@@ -156,12 +153,16 @@ if ($fmt eq "%f") {
 }
 if ($fmt eq "%s %f") {
     my @s = lstat($rest[0]);
-    printf "%s %x\n", $s[7], $s[2] & 0xffff;
+    if (@s) {
+        printf "P\t%s\t%x\n", $s[7], $s[2] & 0xffff;
+        exit 0;
+    }
+    my $e = $! + 0;
+    print(($e == 2 || $e == 20) ? "A\t$e\n" : "E\t$e\n");
     exit 0;
 }
 exec "/usr/bin/stat", @rest;
-"##
-        .replace("{ABSENT}", &SSH_STAT_ABSENT_EXIT.to_string()),
+"##,
     )
     .unwrap();
 

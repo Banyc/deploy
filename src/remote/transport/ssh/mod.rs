@@ -26,14 +26,28 @@ use super::{FsBytes, Remote, RemoteEntry, RemoteMeta, has_normal_component_below
 use hostkey::pin_known_hosts;
 use runner::{OpKind, RunError, SSH_CONNECT_TIMEOUT_SECS, SshRunner};
 
-/// The structured ssh-stat absence protocol (see [`SshTransport::metadata_opt`]):
-/// the remote script returns this RESERVED exit code as a machine-readable
-/// signal for a CONFIRMED absence (`! -e <path> && ! -L <path>`). It is the
-/// ONLY nonzero exit `metadata_opt` maps to `Ok(None)` — every other nonzero
-/// exit is an error and successful output is parsed strictly. `44` cannot
-/// collide with `stat`'s own failures (`stat` exits 1 on failure), and the
-/// remote script's explicit `exit 44` is the only way the code is produced.
-pub const SSH_STAT_ABSENT_EXIT: i32 = 44;
+/// The framed ssh-lstat absence protocol (see [`SshTransport::metadata_opt`]):
+/// ONE remote exec runs a small perl `lstat` helper that prints a single
+/// TAB-separated frame on stdout — the FRAME is the signal (exit 0 for every
+/// outcome, because an exit code carries no errno):
+///
+/// * `P\t<size>\t<rawmode_hex>` — the entry EXISTS (`lstat` succeeded);
+///   `<size>` is decimal and `<rawmode>` is hex, the `stat -c '%s %f'`-
+///   equivalent format, so the [`RemoteMeta`] parse is unchanged.
+/// * `A\t<errno>` — `lstat` FAILED with a CONFIRMED-ABSENCE errno: ENOENT
+///   or ENOTDIR (the ONLY errnos that mean "no such entry").
+/// * `E\t<errno>` — `lstat` FAILED with any OTHER errno (EACCES, EIO,
+///   ELOOP, ...).
+///
+/// `metadata_opt` maps ONLY the `A` frame with errno ENOENT/ENOTDIR to
+/// `Ok(None)`; every other outcome — EACCES/EIO frames, malformed frames, a
+/// signal-killed command, a nonzero exit, a transport failure — is an error.
+/// The frames carry the actual errno, which a shell boolean (`[ ! -e ]`)
+/// cannot: a permission failure is an ERROR, never absence. The errno
+/// numbers are identical on Linux and macOS (POSIX): ENOENT = 2,
+/// ENOTDIR = 20.
+const LSTAT_ERRNO_ENOENT: i32 = 2;
+const LSTAT_ERRNO_ENOTDIR: i32 = 20;
 
 /// A transport that drives a real remote host over SSH.
 pub struct SshTransport {
@@ -455,6 +469,123 @@ impl SshTransport {
         )
     }
 
+    /// Build the remote framed `lstat` helper for `rel`: ONE remote exec
+    /// whose single stdout frame reports the OUTCOME WITH THE ERRNO (see the
+    /// [`LSTAT_ERRNO_ENOENT`] protocol doc on this module). The helper is a
+    /// `perl -e` one-liner (perl ships with every reasonable Linux/macOS
+    /// remote — the same interpreter the test fixtures already use) that
+    /// performs a REAL `lstat` and prints `P`/`A`/`E` frames, exiting 0 for
+    /// all three outcomes — the FRAME is the signal, an exit code carries no
+    /// errno. The path is passed as a positional argument after `--` (already
+    /// single-quoted), so the shell and perl both see it verbatim.
+    fn lstat_script(&self, rel: &Path) -> String {
+        let p = shell_quote(&self.root.join(rel).to_string_lossy());
+        format!(
+            "perl -e 'my @s = lstat($ARGV[0]); if (@s) {{ printf \"P\\t%s\\t%x\\n\", $s[7], $s[2] & 0xffff; exit 0; }} my $e = $! + 0; print(($e == 2 || $e == 20) ? \"A\\t$e\\n\" : \"E\\t$e\\n\");' -- {p}"
+        )
+    }
+
+    /// Parse the ONE-LINE framed record produced by [`SshTransport::lstat_script`]
+    /// (see the module doc): a `P` frame parses strictly into a [`RemoteMeta`]
+    /// (exactly two TAB-separated payload fields — decimal size, hex raw
+    /// mode), an `A` frame with errno ENOENT/ENOTDIR is the ONLY `Ok(None)`
+    /// (confirmed absence), an `A` frame with any other errno and every `E`
+    /// frame are errors (a permission/IO failure is NEVER absence), and
+    /// anything malformed — garbage, missing fields, wrong prefix, extra
+    /// fields, extra lines — is an error, never a silent default.
+    fn parse_lstat_frame(stdout: &str) -> Result<Option<RemoteMeta>> {
+        let lines: Vec<&str> = stdout.lines().collect();
+        let [line] = lines.as_slice() else {
+            return Err(Error::transport(format!(
+                "ssh lstat: malformed frame: expected exactly one line, got {lines:?}"
+            )));
+        };
+        let mut it = line.split('\t');
+        match it.next() {
+            // Present: strictly parse `size` (decimal) + `rawmode` (hex).
+            Some("P") => {
+                let size = it
+                    .next()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .ok_or_else(|| {
+                        Error::transport(format!("ssh lstat: malformed present frame: {line:?}"))
+                    })?;
+                let raw = it
+                    .next()
+                    .and_then(|s| u32::from_str_radix(s, 16).ok())
+                    .ok_or_else(|| {
+                        Error::transport(format!("ssh lstat: malformed present frame: {line:?}"))
+                    })?;
+                if it.next().is_some() {
+                    return Err(Error::transport(format!(
+                        "ssh lstat: malformed present frame: {line:?}"
+                    )));
+                }
+                let mode = raw & 0o7777;
+                let is_symlink = (raw & 0o170000) == 0o120000;
+                let is_dir = (raw & 0o170000) == 0o040000;
+                let is_file = !is_symlink && !is_dir;
+                Ok(Some(RemoteMeta {
+                    is_dir,
+                    is_symlink,
+                    is_file,
+                    size,
+                    mode,
+                }))
+            }
+            // Absent: ONLY ENOENT/ENOTDIR are confirmed absence; an `A` frame
+            // carrying any other errno is a helper bug/mismatch -> error.
+            Some("A") => {
+                let errno = it.next().and_then(Self::parse_lstat_errno).ok_or_else(|| {
+                    Error::transport(format!("ssh lstat: malformed absent frame: {line:?}"))
+                })?;
+                if it.next().is_some() {
+                    return Err(Error::transport(format!(
+                        "ssh lstat: malformed absent frame: {line:?}"
+                    )));
+                }
+                match errno {
+                    LSTAT_ERRNO_ENOENT | LSTAT_ERRNO_ENOTDIR => Ok(None),
+                    other => Err(Error::transport(format!(
+                        "ssh lstat: absent frame with non-absence errno {other}: {line:?}"
+                    ))),
+                }
+            }
+            // Error: ANY errno here is an error — EACCES/EIO/... are never
+            // absence.
+            Some("E") => {
+                let errno = it.next().and_then(Self::parse_lstat_errno).ok_or_else(|| {
+                    Error::transport(format!("ssh lstat: malformed error frame: {line:?}"))
+                })?;
+                if it.next().is_some() {
+                    return Err(Error::transport(format!(
+                        "ssh lstat: malformed error frame: {line:?}"
+                    )));
+                }
+                Err(Error::transport(format!(
+                    "ssh lstat failed (errno {errno}): {line:?}"
+                )))
+            }
+            _ => Err(Error::transport(format!(
+                "ssh lstat: malformed frame: {line:?}"
+            ))),
+        }
+    }
+
+    /// Parse an `<errno>` frame field: a decimal errno NUMBER (cross-platform
+    /// — ENOENT=2 and ENOTDIR=20 are identical on Linux and macOS), or the
+    /// POSIX name (`ENOENT`/`ENOTDIR`). Anything else is malformed.
+    fn parse_lstat_errno(s: &str) -> Option<i32> {
+        if let Ok(n) = s.parse::<i32>() {
+            return Some(n);
+        }
+        match s {
+            "ENOENT" => Some(LSTAT_ERRNO_ENOENT),
+            "ENOTDIR" => Some(LSTAT_ERRNO_ENOTDIR),
+            _ => None,
+        }
+    }
+
     /// Parse the tab-delimited output produced by [`SshTransport::list_script`].
     /// Each line is `name<TAB>type<TAB>rawmode_hex`; `.` and `..` are never
     /// emitted by the script, but are skipped here defensively.
@@ -627,65 +758,21 @@ impl Remote for SshTransport {
     }
 
     fn metadata_opt(&self, rel: &Path) -> Result<Option<RemoteMeta>> {
-        let p = self.root.join(rel).to_string_lossy().into_owned();
-        // The structured absence protocol: ONE remote exec whose EXIT CODE is
-        // the signal. `! -e && ! -L` is a CONFIRMED absence and exits with the
-        // reserved `SSH_STAT_ABSENT_EXIT`; anything present falls through to
-        // `stat -c '%s %f'` (size + raw mode in hex — `%s %f` stays a SINGLE
-        // single-quoted format token so the remote shell passes it verbatim).
-        // `stat` exits 1 on failure, so the reserved code cannot collide with
-        // stat's own errors, and stderr is NEVER parsed.
-        let out = self.run_remote(&format!(
-            "if [ ! -e {p} ] && [ ! -L {p} ]; then exit {absent}; fi; stat -c '%s %f' {p}",
-            p = shell_quote(&p),
-            absent = SSH_STAT_ABSENT_EXIT,
-        ))?;
-        match out.status.code() {
-            // ONLY the reserved exit code is a confirmed absence.
-            Some(SSH_STAT_ABSENT_EXIT) => Ok(None),
-            // Successful output is parsed STRICTLY: exactly two
-            // whitespace-separated fields — `size` (decimal u64) then
-            // `rawmode` (hex u32). Missing, extra, or unparseable fields are
-            // malformed output: an error, never a silent `unwrap_or(0)`.
-            Some(0) => {
-                let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                let mut parts = text.split_whitespace();
-                let size = parts
-                    .next()
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .ok_or_else(|| {
-                        Error::transport(format!("ssh stat: malformed output: {text:?}"))
-                    })?;
-                let raw = parts
-                    .next()
-                    .and_then(|s| u32::from_str_radix(s, 16).ok())
-                    .ok_or_else(|| {
-                        Error::transport(format!("ssh stat: malformed output: {text:?}"))
-                    })?;
-                if parts.next().is_some() {
-                    return Err(Error::transport(format!(
-                        "ssh stat: malformed output: {text:?}"
-                    )));
-                }
-                let mode = raw & 0o7777;
-                let is_symlink = (raw & 0o170000) == 0o120000;
-                let is_dir = (raw & 0o170000) == 0o040000;
-                let is_file = !is_symlink && !is_dir;
-                Ok(Some(RemoteMeta {
-                    is_dir,
-                    is_symlink,
-                    is_file,
-                    size,
-                    mode,
-                }))
-            }
-            // Every OTHER nonzero exit (permission, transport fault, killed
-            // by signal) is an ERROR — absence is never inferred from stderr.
-            _ => Err(Error::transport(format!(
-                "ssh stat failed: {}",
+        // ONE remote exec: the framed perl `lstat` helper reports the OUTCOME
+        // WITH THE ERRNO (a `P`/`A`/`E` frame on stdout, exit 0 for every
+        // outcome). The frame is the signal — no shell booleans, no reserved
+        // exit code — so a permission failure (EACCES) can never be mistaken
+        // for absence. A transport failure, a signal-killed command, or any
+        // nonzero exit is an error; the single stdout frame is parsed
+        // strictly (malformed output is never a silent default).
+        let out = self.run_remote(&self.lstat_script(rel))?;
+        if !out.status.success() {
+            return Err(Error::transport(format!(
+                "ssh lstat failed: {}",
                 String::from_utf8_lossy(&out.stderr)
-            ))),
+            )));
         }
+        Self::parse_lstat_frame(&String::from_utf8_lossy(&out.stdout))
     }
 
     fn exec(
@@ -1211,7 +1298,9 @@ mod tests_ssh {
 #[cfg(test)]
 mod fingerprint_ssh_tests {
     use super::*;
-    use crate::remote::helper::RemoteHelper;
+    use crate::remote::helper::{ExpectedCurrent, RemoteHelper};
+    use proptest::prelude::*;
+    use proptest::test_runner::RngSeed;
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
 
@@ -1328,16 +1417,17 @@ printf '%s %s\n' "$host" '{pubkey}'
             .unwrap();
 
             // Fake `stat` emulating GNU coreutils `-c` (macOS stat lacks it):
-            // the transport's list/metadata scripts use `stat -c '%f'` (raw
-            // mode in hex) and `stat -c '%s %f'` (size + raw mode hex). A
-            // CONFIRMED absence (`! -e && ! -L`) exits with the reserved
-            // `SSH_STAT_ABSENT_EXIT` — the same structured signal the
-            // transport's metadata script produces — instead of GNU stat's
-            // human-readable stderr, so the fakes model the protocol.
+            // the transport's list script uses `stat -c '%f'` (raw mode in
+            // hex). The metadata path no longer calls `stat` at all — it runs
+            // the framed perl `lstat` helper directly — so the shim's `%s %f`
+            // branch implements the SAME framed protocol (P/A/E frames from a
+            // REAL lstat errno; a missing path reports `A\t2`), keeping the
+            // fixture faithful for any caller that still formats through
+            // `stat`. `/usr/bin/perl` (absolute) is used so an injected fake
+            // `perl` in the test bin dir never shadows the shim's interpreter.
             std::fs::write(
                 bin.join("stat"),
-                format!(
-                    r#"#!/bin/sh
+                r#"#!/bin/sh
 fmt=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -1347,28 +1437,45 @@ while [ $# -gt 0 ]; do
     *) break ;;
   esac
 done
-if [ ! -e "$1" ] && [ ! -L "$1" ]; then
-  exit {absent}
-fi
 case "$fmt" in
   "%f")
-    perl -e 'my @s = lstat($ARGV[0]); printf "%x\n", $s[2] & 0xffff;' "$1"
+    /usr/bin/perl -e 'my @s = lstat($ARGV[0]); printf "%x\n", $s[2] & 0xffff;' "$1"
     ;;
   "%s %f")
-    perl -e 'my @s = lstat($ARGV[0]); printf "%s %x\n", $s[7], $s[2] & 0xffff;' "$1"
+    /usr/bin/perl -e 'my @s = lstat($ARGV[0]); if (@s) { printf "P\t%s\t%x\n", $s[7], $s[2] & 0xffff; exit 0; } my $e = $! + 0; print(($e == 2 || $e == 20) ? "A\t$e\n" : "E\t$e\n");' "$1"
     ;;
   *)
     exec /usr/bin/stat "$@"
     ;;
 esac
 "#,
-                    absent = SSH_STAT_ABSENT_EXIT,
-                ),
+            )
+            .unwrap();
+
+            // Fake `mv` emulating GNU coreutils `mv -T` (no-target-directory):
+            // macOS BSD mv lacks `-T` and, like GNU mv without `-T`, treats a
+            // destination that is a symlink to a directory as the directory
+            // itself and moves the source INTO it. The deploy tool's `current`
+            // swap depends on GNU `-T` semantics, so strip the flag and remove
+            // any existing destination first.
+            std::fs::write(
+                bin.join("mv"),
+                r#"#!/bin/sh
+if [ "$1" = "-T" ]; then
+  shift
+  src="$1"; dst="$2"
+  if [ -n "$src" ] && [ -n "$dst" ]; then
+    rm -f -- "$dst"
+  fi
+  exec /bin/mv -- "$src" "$dst"
+fi
+exec /bin/mv "$@"
+"#,
             )
             .unwrap();
 
             use std::os::unix::fs::PermissionsExt;
-            for name in ["ssh", "ssh-keyscan", "stat"] {
+            for name in ["ssh", "ssh-keyscan", "stat", "mv"] {
                 let p = bin.join(name);
                 let mut perms = std::fs::metadata(&p).unwrap().permissions();
                 perms.set_mode(0o755);
@@ -1433,17 +1540,27 @@ esac
         SysEnv::from_map(vars)
     }
 
-    /// Overwrite the protocol-faithful fake `stat` (written by [`FakeSsh::new`])
+    /// Overwrite a protocol-faithful fake binary (written by [`FakeSsh::new`])
     /// with a custom script for a single focused test — the transport resolves
-    /// `stat` from the fake bin dir's `PATH`, so the override is picked up by
-    /// every remote command. Kept executable like the originals.
-    fn write_fake_stat(bin: &Path, body: &str) {
+    /// every binary (`ssh`, `perl`, `stat`, ...) from the fake bin dir's
+    /// `PATH`, so the override is picked up by every remote command. Kept
+    /// executable like the originals.
+    fn write_fake_bin(bin: &Path, name: &str, body: &str) {
         use std::os::unix::fs::PermissionsExt;
-        let p = bin.join("stat");
+        let p = bin.join(name);
         std::fs::write(&p, body).unwrap();
         let mut perms = std::fs::metadata(&p).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&p, perms).unwrap();
+    }
+
+    /// Overwrite the fake `perl` so the transport's framed `lstat` helper
+    /// resolves to a script that emits `stdout` verbatim (or performs the
+    /// injected process-level behavior). The fake shim runs the helper as
+    /// `perl -e '…' -- <path>`, so a `perl` in the fake bin shadows the real
+    /// interpreter for metadata reads while every other binary is untouched.
+    fn write_fake_lstat(bin: &Path, stdout: &str) {
+        write_fake_bin(bin, "perl", &format!("#!/bin/sh\nprintf '{stdout}\n'\n"));
     }
 
     // Scenario (a): a fingerprint-only configuration can make a STATUS request
@@ -1528,11 +1645,13 @@ esac
         );
     }
 
-    /// The structured absence protocol: `metadata_opt` maps ONLY the reserved
-    /// exit code (`SSH_STAT_ABSENT_EXIT`) to `Ok(None)`, treats every other
-    /// nonzero exit as an error (no stderr sniffing), and rejects malformed
-    /// successful output. The happy path (present entries) is unchanged: the
-    /// type bits still decode from the raw mode into is_symlink/is_dir/is_file.
+    /// The framed absence protocol: `metadata_opt` runs the perl `lstat`
+    /// helper — whose frames carry the ACTUAL errno — and maps ONLY the
+    /// confirmed-absence frames (`A` with ENOENT/ENOTDIR) to `Ok(None)`;
+    /// every other outcome (error frames, malformed frames, nonzero exit) is
+    /// an error, never absence. The happy path (present entries) is
+    /// unchanged: the type bits still decode from the raw mode into
+    /// is_symlink/is_dir/is_file.
     #[test]
     fn metadata_opt_structured_absence_protocol() {
         let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
@@ -1571,7 +1690,8 @@ esac
         assert_eq!(meta.mode, 0o644);
 
         // Present symlink and DANGLING symlink: lstat semantics decode the
-        // symlink type bits (`! -L` is false for a link, so stat still runs).
+        // symlink type bits (the helper lstats the link itself, so a dangling
+        // link is still PRESENT).
         for rel in ["link", "dangling"] {
             let m = t
                 .metadata_opt(Path::new(rel))
@@ -1580,7 +1700,9 @@ esac
             assert!(m.is_symlink && !m.is_file && !m.is_dir, "{rel}");
         }
 
-        // Confirmed absence: `! -e && ! -L` -> the reserved exit code -> None.
+        // Confirmed absence: the helper's real lstat fails with ENOENT (2)
+        // for a missing final component and for a missing ancestor -> `A`
+        // frames -> None.
         assert!(t.metadata_opt(Path::new("absent.txt")).unwrap().is_none());
         assert!(
             t.metadata_opt(Path::new("missing/dir/entry"))
@@ -1597,48 +1719,54 @@ esac
         );
     }
 
-    /// A remote `stat` that fails with a DIFFERENT nonzero exit code (not the
-    /// reserved one) is an error — absence is signaled ONLY by the reserved
-    /// code. Confirmed absence still short-circuits to `Ok(None)` via the
-    /// shell guard before `stat` is ever consulted.
+    /// THE absence-vs-permission regression: a remote `lstat` that fails with
+    /// EACCES (permission denied) is an `E` frame with errno 13 — an ERROR,
+    /// never absence. The old shell-boolean guard (`[ ! -e ]` succeeds on
+    /// EACCES just like on ENOENT) reported permission failures as absent;
+    /// the frame carries the errno so the parser cannot confuse them.
     #[test]
-    fn metadata_opt_errors_on_other_nonzero_exit() {
+    fn metadata_opt_eacces_is_an_error_never_absence() {
         let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let fake = FakeSsh::new(
             tmp.path().join("bin"),
             tmp.path().join("remote"),
-            "meta-err.test",
-            Path::new("/srv/deploy/meta-err"),
-        );
-        // A stat that fails like a permission error: exits 3 with stderr.
-        write_fake_stat(
-            &fake.bin,
-            "#!/bin/sh\necho 'stat: cannot stat: Permission denied' >&2\nexit 3\n",
+            "meta-eacces.test",
+            Path::new("/srv/deploy/meta-eacces"),
         );
         let cache = tmp.path().join("knownhosts");
-        let env = fake_env(&fake.bin, &cache, &fake.remote_root, "/srv/deploy/meta-err");
+        let env = fake_env(
+            &fake.bin,
+            &cache,
+            &fake.remote_root,
+            "/srv/deploy/meta-eacces",
+        );
         let t = fake.transport(&cache, &env);
         t.prepare_identity().unwrap();
 
-        let remote_deploy = fake.remote_root.join("srv/deploy/meta-err");
+        let remote_deploy = fake.remote_root.join("srv/deploy/meta-eacces");
         std::fs::create_dir_all(&remote_deploy).unwrap();
         std::fs::write(remote_deploy.join("app.txt"), b"x").unwrap();
 
-        // Present entry, failing stat: a DIFFERENT nonzero exit -> Err; the
-        // stderr text is never sniffed for absence.
+        // A fake `perl` whose lstat fails with EACCES: `E\t13` on stdout,
+        // exit 0 (the FRAME is the signal).
+        write_fake_lstat(&fake.bin, "E\t13");
         let err = t.metadata_opt(Path::new("app.txt")).unwrap_err();
         assert!(
-            err.to_string().contains("ssh stat failed"),
-            "a non-reserved nonzero exit must be an error, got: {err}"
+            err.to_string().contains("errno 13"),
+            "EACCES must be an error naming the errno, got: {err}"
         );
-        // Absent entry: the shell guard fires BEFORE stat -> still None.
+
+        // Restore the real helper (drop the fake `perl`): confirmed absence
+        // still resolves to None through the REAL errno.
+        std::fs::remove_file(fake.bin.join("perl")).unwrap();
         assert!(t.metadata_opt(Path::new("absent.txt")).unwrap().is_none());
     }
 
-    /// Malformed SUCCESSFUL output (exit 0 with garbage) is an error — the
-    /// size and mode fields are parsed strictly, with no lenient fallback.
+    /// Malformed frames (exit 0 with garbage) are errors — every frame is
+    /// parsed strictly, with no lenient fallback: wrong prefix, missing
+    /// fields, extra fields, and extra lines are all rejected.
     #[test]
-    fn metadata_opt_rejects_malformed_successful_output() {
+    fn metadata_opt_rejects_malformed_frames() {
         let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let fake = FakeSsh::new(
             tmp.path().join("bin"),
@@ -1655,28 +1783,440 @@ esac
         std::fs::create_dir_all(&remote_deploy).unwrap();
         std::fs::write(remote_deploy.join("app.txt"), b"x").unwrap();
 
-        // Unparseable size and mode.
-        write_fake_stat(&fake.bin, "#!/bin/sh\necho 'garbage'\nexit 0\n");
+        // Garbage (no prefix at all).
+        write_fake_lstat(&fake.bin, "garbage");
         let err = t.metadata_opt(Path::new("app.txt")).unwrap_err();
         assert!(
-            err.to_string().contains("malformed output"),
+            err.to_string().contains("malformed"),
             "garbage stdout must be malformed, got: {err}"
         );
 
-        // Size but no mode field.
-        write_fake_stat(&fake.bin, "#!/bin/sh\necho '123'\nexit 0\n");
+        // Wrong prefix.
+        write_fake_lstat(&fake.bin, "X\t2");
         let err = t.metadata_opt(Path::new("app.txt")).unwrap_err();
         assert!(
-            err.to_string().contains("malformed output"),
+            err.to_string().contains("malformed"),
+            "wrong prefix must be malformed, got: {err}"
+        );
+
+        // Present frame with the mode field missing.
+        write_fake_lstat(&fake.bin, "P\t5");
+        let err = t.metadata_opt(Path::new("app.txt")).unwrap_err();
+        assert!(
+            err.to_string().contains("malformed"),
             "missing mode field must be malformed, got: {err}"
         );
 
-        // Two fields plus a stray third field.
-        write_fake_stat(&fake.bin, "#!/bin/sh\necho '123 deadbeef extra'\nexit 0\n");
+        // Absent frame with the errno field missing.
+        write_fake_lstat(&fake.bin, "A");
         let err = t.metadata_opt(Path::new("app.txt")).unwrap_err();
         assert!(
-            err.to_string().contains("malformed output"),
+            err.to_string().contains("malformed"),
+            "missing errno field must be malformed, got: {err}"
+        );
+
+        // Present frame plus a stray extra field.
+        write_fake_lstat(&fake.bin, "P\t5\t81a4\textra");
+        let err = t.metadata_opt(Path::new("app.txt")).unwrap_err();
+        assert!(
+            err.to_string().contains("malformed"),
             "extra field must be malformed, got: {err}"
+        );
+
+        // More than one frame line.
+        write_fake_lstat(&fake.bin, "P\t5\t81a4\nE\t13");
+        let err = t.metadata_opt(Path::new("app.txt")).unwrap_err();
+        assert!(
+            err.to_string().contains("malformed"),
+            "extra lines must be malformed, got: {err}"
+        );
+    }
+
+    /// Byte-identical snapshot of a directory tree (sorted relative paths +
+    /// kind/content digests), so a test can assert ZERO deletions.
+    fn snapshot_tree(root: &Path) -> Vec<(String, String)> {
+        fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, String)>) {
+            let mut entries: Vec<_> = std::fs::read_dir(dir)
+                .map(|rd| rd.flatten().map(|e| e.path()).collect())
+                .unwrap_or_default();
+            entries.sort();
+            for p in entries {
+                let rel = p
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let ft = std::fs::symlink_metadata(&p).unwrap().file_type();
+                if ft.is_symlink() {
+                    out.push((
+                        rel,
+                        format!(
+                            "symlink:{}",
+                            std::fs::read_link(&p).unwrap().to_string_lossy()
+                        ),
+                    ));
+                } else if ft.is_dir() {
+                    out.push((rel, "dir".to_string()));
+                    walk(root, &p, out);
+                } else {
+                    let data = std::fs::read(&p).unwrap_or_default();
+                    out.push((rel, format!("file:{}", crate::digest::sha256_bytes(&data))));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        if root.exists() {
+            walk(root, root, &mut out);
+        }
+        out
+    }
+
+    /// The lstat outcomes the fake remote can be told to emit. The property
+    /// dimension: ONLY the absence errnos (ENOENT/ENOTDIR) may produce
+    /// `Ok(None)`; every other outcome — EACCES, EIO, malformed frames,
+    /// signal-killed commands, transport failures — is an error.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum LstatOutcome {
+        Present,
+        AbsentEnoent,
+        AbsentEnotdir,
+        ErrorEacces,
+        ErrorEio,
+        MalformedGarbage,
+        MalformedWrongPrefix,
+        MalformedTruncated,
+        MalformedMissingErrno,
+        MalformedExtraField,
+        MalformedTwoLines,
+        SignalKilled,
+        TransportSpawnFailure,
+    }
+
+    impl LstatOutcome {
+        /// The frame the fake `perl` must emit for this outcome; `None` when
+        /// the outcome is injected at the process level (signal-killed
+        /// command, spawn failure).
+        fn frame(self) -> Option<&'static str> {
+            match self {
+                LstatOutcome::Present => Some("P\t5\t81a4"),
+                LstatOutcome::AbsentEnoent => Some("A\t2"),
+                LstatOutcome::AbsentEnotdir => Some("A\t20"),
+                LstatOutcome::ErrorEacces => Some("E\t13"),
+                LstatOutcome::ErrorEio => Some("E\t5"),
+                LstatOutcome::MalformedGarbage => Some("garbage"),
+                LstatOutcome::MalformedWrongPrefix => Some("X\t2"),
+                LstatOutcome::MalformedTruncated => Some("P\t5"),
+                LstatOutcome::MalformedMissingErrno => Some("A"),
+                LstatOutcome::MalformedExtraField => Some("P\t5\t81a4\textra"),
+                LstatOutcome::MalformedTwoLines => Some("P\t5\t81a4\nE\t13"),
+                LstatOutcome::SignalKilled | LstatOutcome::TransportSpawnFailure => None,
+            }
+        }
+
+        /// Only the absence errnos (ENOENT/ENOTDIR) are confirmed absence.
+        fn is_absence(self) -> bool {
+            matches!(
+                self,
+                LstatOutcome::AbsentEnoent | LstatOutcome::AbsentEnotdir
+            )
+        }
+
+        /// Every non-absence outcome must be an error.
+        fn is_error(self) -> bool {
+            !matches!(
+                self,
+                LstatOutcome::Present | LstatOutcome::AbsentEnoent | LstatOutcome::AbsentEnotdir
+            )
+        }
+    }
+
+    fn all_lstat_outcomes() -> Vec<LstatOutcome> {
+        vec![
+            LstatOutcome::Present,
+            LstatOutcome::AbsentEnoent,
+            LstatOutcome::AbsentEnotdir,
+            LstatOutcome::ErrorEacces,
+            LstatOutcome::ErrorEio,
+            LstatOutcome::MalformedGarbage,
+            LstatOutcome::MalformedWrongPrefix,
+            LstatOutcome::MalformedTruncated,
+            LstatOutcome::MalformedMissingErrno,
+            LstatOutcome::MalformedExtraField,
+            LstatOutcome::MalformedTwoLines,
+            LstatOutcome::SignalKilled,
+            LstatOutcome::TransportSpawnFailure,
+        ]
+    }
+
+    proptest! {
+        // FIXED-SEED property (0x5EED_5EED, per house style), bounded cases:
+        // the lstat OUTCOME is injected through a fake `perl` (frames) or a
+        // fake `ssh` (signal-killed command / spawn failure) and driven
+        // through the REAL transport + parser. ONLY the absence errnos
+        // (ENOENT/ENOTDIR) return `Ok(None)`; every other outcome returns
+        // `Err`, and for the error cases the caller-level gate
+        // (`swap_current`) also errors and leaves the `current` link
+        // byte-identical — a failed lstat is never absence, so it can never
+        // drive a swap/removal (the same fail-closed rule retention relies
+        // on: zero deletions on a failed read).
+        #![proptest_config(ProptestConfig {
+            cases: crate::testutil::proptest_cases(16),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn lstat_outcome_injection(outcome in prop::sample::select(all_lstat_outcomes())) {
+            let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+            let fake = FakeSsh::new(
+                tmp.path().join("bin"),
+                tmp.path().join("remote"),
+                "lstat-prop.test",
+                Path::new("/srv/deploy/lstat-prop"),
+            );
+            let cache = tmp.path().join("knownhosts");
+            let env = fake_env(
+                &fake.bin,
+                &cache,
+                &fake.remote_root,
+                "/srv/deploy/lstat-prop",
+            );
+            let t = fake.transport(&cache, &env);
+            t.prepare_identity().unwrap();
+            let remote_deploy = fake.remote_root.join("srv/deploy/lstat-prop");
+            std::fs::create_dir_all(&remote_deploy).unwrap();
+
+            // Inject the outcome BEFORE the first remote metadata read.
+            match outcome {
+                LstatOutcome::SignalKilled => {
+                    // The remote command is killed by a signal: the runner's
+                    // direct child dies by SIGTERM, so its exit status carries
+                    // no code (never a success).
+                    write_fake_bin(&fake.bin, "ssh", "#!/bin/sh\nkill -TERM $$\n");
+                }
+                LstatOutcome::TransportSpawnFailure => {
+                    // The transport cannot even spawn the remote command (a
+                    // real dead/broken ssh surfaces the same class of failure
+                    // as a `run_remote` error).
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(
+                        fake.bin.join("ssh"),
+                        std::fs::Permissions::from_mode(0o000),
+                    )
+                    .unwrap();
+                }
+                _ => {
+                    write_fake_lstat(&fake.bin, outcome.frame().unwrap());
+                }
+            }
+
+            // FRAME-LEVEL: the real transport parses the injected outcome.
+            let result = t.metadata_opt(Path::new("probe"));
+            match result {
+                Ok(Some(meta)) => {
+                    // ONLY the Present outcome may be `Some`.
+                    assert_eq!(
+                        outcome,
+                        LstatOutcome::Present,
+                        "{outcome:?} must not be Some"
+                    );
+                    assert!(meta.is_file && !meta.is_dir && !meta.is_symlink);
+                    assert_eq!(meta.size, 5);
+                    assert_eq!(meta.mode, 0o644);
+                }
+                Ok(None) => {
+                    // ONLY the absence errnos (ENOENT/ENOTDIR) may be `None`.
+                    assert!(outcome.is_absence(), "{outcome:?} must not be None");
+                }
+                Err(e) => {
+                    assert!(
+                        outcome.is_error(),
+                        "{outcome:?} must not error, got: {e}"
+                    );
+                    let msg = e.to_string();
+                    match outcome {
+                        LstatOutcome::ErrorEacces => {
+                            assert!(msg.contains("errno 13"), "{outcome:?}: {msg}")
+                        }
+                        LstatOutcome::ErrorEio => {
+                            assert!(msg.contains("errno 5"), "{outcome:?}: {msg}")
+                        }
+                        LstatOutcome::MalformedGarbage
+                        | LstatOutcome::MalformedWrongPrefix
+                        | LstatOutcome::MalformedTruncated
+                        | LstatOutcome::MalformedMissingErrno
+                        | LstatOutcome::MalformedExtraField
+                        | LstatOutcome::MalformedTwoLines => {
+                            assert!(msg.contains("malformed"), "{outcome:?}: {msg}")
+                        }
+                        LstatOutcome::SignalKilled => {
+                            assert!(msg.contains("ssh lstat failed"), "{outcome:?}: {msg}")
+                        }
+                        LstatOutcome::TransportSpawnFailure => {
+                            assert!(msg.contains("ssh"), "{outcome:?}: {msg}")
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            }
+
+            // CALLER-LEVEL (error outcomes only): the current gate reads the
+            // `current` link through `metadata_opt`; a FAILED lstat must
+            // propagate (never be read as absence), so `swap_current` errors
+            // and leaves the link byte-identical — a failed read can never
+            // drive a swap/removal (the same fail-closed rule retention
+            // relies on: zero deletions on a failed read).
+            if outcome.is_error() {
+                use std::os::unix::fs::PermissionsExt;
+                let link = remote_deploy.join("current");
+                std::os::unix::fs::symlink("generations/gen-gate/root", &link).unwrap();
+                let before = (
+                    std::fs::symlink_metadata(&link).unwrap().permissions().mode(),
+                    std::fs::read_link(&link).unwrap(),
+                );
+                let helper = RemoteHelper::new(&t);
+                let err = helper
+                    .swap_current(&ExpectedCurrent::Absent, "gen-gate", "op")
+                    .unwrap_err();
+                assert!(
+                    err.to_string().contains("ssh"),
+                    "{outcome:?}: a failed lstat must propagate, got: {err}"
+                );
+                let after = (
+                    std::fs::symlink_metadata(&link).unwrap().permissions().mode(),
+                    std::fs::read_link(&link).unwrap(),
+                );
+                assert_eq!(
+                    after, before,
+                    "{outcome:?}: a failed lstat must leave the current link byte-identical"
+                );
+            }
+        }
+    }
+
+    /// The retention fail-closed property, end to end over ssh: a remote
+    /// whose `lstat` fails with EACCES (permission denied) on the
+    /// generations root must ABORT `compute_retained` with an error — EACCES
+    /// is never absence — leaving the remote state byte-identical with ZERO
+    /// retention deletions. The old shell-boolean guard mapped this very
+    /// failure to absence, so retention saw an empty history and swept
+    /// everything.
+    #[test]
+    fn lstat_eacces_aborts_retention_with_zero_deletions() {
+        use crate::config::{DeploymentRetention, PerServerRetention, RetentionConfig};
+        use crate::identity::{
+            ArtifactRef, VariantName, test_deployment_id, test_generation_id, test_release_id,
+            test_tree_digest,
+        };
+        use crate::remote::helper::GenerationAssignment;
+        use crate::retention::policy::compute_retained;
+        use crate::store::local::LocalStore;
+
+        let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let fake = FakeSsh::new(
+            tmp.path().join("bin"),
+            tmp.path().join("remote"),
+            "ret-eacces.test",
+            Path::new("/srv/deploy/ret-eacces"),
+        );
+        let cache = tmp.path().join("knownhosts");
+        let env = fake_env(
+            &fake.bin,
+            &cache,
+            &fake.remote_root,
+            "/srv/deploy/ret-eacces",
+        );
+        let t = fake.transport(&cache, &env);
+        t.prepare_identity().unwrap();
+        let helper = RemoteHelper::new(&t);
+        let remote_deploy = fake.remote_root.join("srv/deploy/ret-eacces");
+
+        // Two generations + a garbage tree, written through the REAL transport
+        // (the fake ssh shim runs the real perl lstat helper for reads).
+        let created = jiff::Timestamp::now();
+        let g1 = test_generation_id("g1");
+        let g2 = test_generation_id("g2");
+        let mk = |gid: &crate::identity::GenerationId, tree: &str| GenerationAssignment {
+            deployment_id: test_deployment_id("d1"),
+            generation_id: gid.clone(),
+            artifact: ArtifactRef {
+                release: test_release_id("rel-sha256-x"),
+                variant: VariantName::new("standard"),
+                tree: test_tree_digest(tree),
+            },
+            behavior_sha256: "b".into(),
+            prior_generation: None,
+            created_at: created.to_string(),
+            target: None,
+        };
+        helper.create_generation("op", &mk(&g1, "t1")).unwrap();
+        helper.create_generation("op", &mk(&g2, "t2")).unwrap();
+        for tree in ["t1", "t2"] {
+            let d = test_tree_digest(tree);
+            helper
+                .remote()
+                .create_dir_all(&crate::remote::layout::tree_root(d.as_str()))
+                .unwrap();
+        }
+        helper
+            .swap_current(&ExpectedCurrent::Absent, g2.as_str(), "op")
+            .unwrap();
+        let garbage = test_tree_digest("garbage");
+        helper
+            .remote()
+            .create_dir_all(&crate::remote::layout::tree_root(garbage.as_str()))
+            .unwrap();
+
+        // Inject EACCES ONLY on the generations-root lstat; every other
+        // metadata read (the `current` gate, status validation) delegates to
+        // the real perl helper, so the fault fires exactly where retention
+        // loads its inventory.
+        write_fake_bin(
+            &fake.bin,
+            "perl",
+            "#!/bin/sh\nfor last; do :; done\ncase \"$last\" in\n  */generations) printf 'E\\t13\\n'; exit 0 ;;\nesac\nexec /usr/bin/perl \"$@\"\n",
+        );
+
+        let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
+        let policy = RetentionConfig {
+            per_server: PerServerRetention {
+                keep_distinct_artifacts: 5,
+                keep_days: 14,
+                protect_previous: true,
+            },
+            deployment: DeploymentRetention {
+                protect_deployments: 2,
+            },
+        };
+        let before = snapshot_tree(&remote_deploy);
+        let err = compute_retained(&helper, &[], &store, &policy).unwrap_err();
+        assert!(
+            err.to_string().contains("errno 13"),
+            "EACCES on the generations root must abort retention naming the errno, got: {err}"
+        );
+
+        // ZERO DELETIONS: the remote state is byte-identical and every tree —
+        // both history trees AND the garbage — survives.
+        assert_eq!(
+            snapshot_tree(&remote_deploy),
+            before,
+            "the failed retention must leave the remote state byte-identical"
+        );
+        for tree in ["t1", "t2"] {
+            let d = test_tree_digest(tree);
+            assert!(
+                helper
+                    .remote()
+                    .exists(&crate::remote::layout::tree_root(d.as_str())),
+                "history tree {d} must survive the failed retention"
+            );
+        }
+        assert!(
+            helper
+                .remote()
+                .exists(&crate::remote::layout::tree_root(garbage.as_str())),
+            "the garbage tree must survive the failed retention"
         );
     }
 }
