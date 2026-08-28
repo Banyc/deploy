@@ -12,7 +12,7 @@ use crate::env::SysEnv;
 use crate::error::{Error, Result};
 use crate::identity::{DeploymentId, ReleaseId, valid_hex_digest};
 use crate::init::{InitOptions, init_project};
-use crate::ledger::{Observation, ObservedTarget};
+use crate::ledger::{ObservedAssignment, ObservedTarget};
 // The `deploy log` RENDERING lives in [`crate::ledger::log`]; cli.rs stays the
 // command wrapper (arg parsing + printing) and keeps the old
 // `crate::cli::render_log` path working via this thin re-export (the
@@ -497,22 +497,32 @@ fn render_status(observed: &ObservedTarget) -> Vec<String> {
     observed
         .slots
         .iter()
-        .map(|(slot_id, srv)| match &srv.observation {
-            Observation::Known(state) => format!(
+        .map(|(slot_id, srv)| match &srv.assignment {
+            ObservedAssignment::Known {
+                generation,
+                artifact,
+            } => format!(
                 "{}  generation={:?} release={:?} variant={:?} tree={:?}",
                 slot_id,
-                Some(state.generation.clone()),
-                Some(state.artifact.release.clone()),
-                Some(state.artifact.variant.clone()),
-                Some(state.artifact.tree.clone()),
+                Some(generation.clone()),
+                Some(artifact.release.clone()),
+                Some(artifact.variant.clone()),
+                Some(artifact.tree.clone()),
             ),
-            Observation::KnownAbsent => format!(
+            // A slot with no observed state (`Absent`), a failed status read
+            // (`Unknown`), or a generation whose ASSIGNMENT could not be read
+            // (`AssignmentUnknown`) all render `None` on every column — the
+            // error variants append the preserved error. An uncertain
+            // observation is NEVER rendered as if the slot were running
+            // something (no fabricated generation/artifact).
+            ObservedAssignment::Absent => format!(
                 "{}  generation=None release=None variant=None tree=None",
                 slot_id,
             ),
-            Observation::Unknown(e) => format!(
+            ObservedAssignment::AssignmentUnknown { error, .. }
+            | ObservedAssignment::Unknown { error } => format!(
                 "{}  generation=None release=None variant=None tree=None (observation failed: {})",
-                slot_id, e.message,
+                slot_id, error.message,
             ),
         })
         .collect()
@@ -873,24 +883,24 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // seed the ONE physical observed record per slot
         // (`slots/<slot-id>/observed.json`) with three slots: p1 has a full
         // assignment, p2 has NO known
-        // assignment (never observed / rotated away), and p3 has a FAILED
-        // observation (the assignment could not be read — recorded as an
-        // `Unknown` observation with its error preserved, never a forged
-        // artifact).
+        // assignment (a live read showing no state — `Absent`), and p3 has a
+        // FAILED observation (the assignment could not be read — recorded as
+        // an `AssignmentUnknown` observation with its error preserved, never
+        // a forged artifact).
         let store = LocalStore::with_base(crate::store::local::default_base(&env)).unwrap();
         store
             .write_slot_observed(
                 &SlotId::new("p1".to_string()),
                 &ObservedSlot {
-                    observation: Observation::Known(crate::ledger::ObservedState {
+                    assignment: crate::ledger::ObservedAssignment::Known {
                         generation: test_generation_id("gen-41da"),
                         artifact: crate::identity::ArtifactRef {
                             release: test_release_id("rel-sha256-status"),
                             variant: VariantName::new("standard".to_string()),
                             tree: test_tree_digest("tree-2c4f"),
                         },
-                        last_deployment: test_deployment_id("deploy-status-1"),
-                    }),
+                    },
+                    last_deployment: Some(test_deployment_id("deploy-status-1")),
                 },
             )
             .unwrap();
@@ -898,7 +908,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .write_slot_observed(
                 &SlotId::new("p2".to_string()),
                 &ObservedSlot {
-                    observation: Observation::KnownAbsent,
+                    assignment: crate::ledger::ObservedAssignment::Absent,
+                    last_deployment: None,
                 },
             )
             .unwrap();
@@ -906,9 +917,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .write_slot_observed(
                 &SlotId::new("p3".to_string()),
                 &ObservedSlot {
-                    observation: Observation::Unknown(crate::ledger::ObservationError {
-                        message: "assignment read failed: boom".to_string(),
-                    }),
+                    assignment: crate::ledger::ObservedAssignment::AssignmentUnknown {
+                        generation: test_generation_id("gen-p3"),
+                        error: crate::ledger::ObservationError {
+                            message: "assignment read failed: boom".to_string(),
+                        },
+                    },
+                    last_deployment: None,
                 },
             )
             .unwrap();
@@ -949,15 +964,16 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             p1.contains(test_tree_digest("tree-2c4f").as_str()),
             "tree digest rendered: {p1}"
         );
-        // p2: a slot with no observed state (KnownAbsent) renders as None on
+        // p2: a slot with no observed state (`Absent`) renders as None on
         // every column.
         assert_eq!(
             lines[1],
             "p2  generation=None release=None variant=None tree=None"
         );
-        // p3: a FAILED observation (Unknown) renders None on every column
-        // with the preserved error appended — an unknown observation is never
-        // rendered as if the slot were unchanged.
+        // p3: an ASSIGNMENT-UNKNOWN observation (the generation exists but
+        // the assignment could not be read) renders None on every column
+        // with the preserved error appended — the uncertain observation is
+        // never rendered as if the slot were running something.
         assert!(
             lines[2].contains("generation=None release=None variant=None tree=None"),
             "p3 line: {}",
@@ -1512,40 +1528,46 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
     #[test]
     fn observed_unknown_never_forged() {
-        // An UNKNOWN observation serializes as the tagged `state: "unknown"`
-        // variant with its preserved error — never as a forged ArtifactRef —
-        // and round-trips. The bare string "unknown" is NOT a valid
-        // Observation (the tagged three-state enum is the only wire form).
-        let unknown =
-            Observation::<crate::ledger::ObservedState>::Unknown(crate::ledger::ObservationError {
+        // An UNKNOWN observed assignment serializes as the tagged
+        // `state: "unknown"` variant with its preserved error — never as a
+        // forged ArtifactRef — and round-trips. The bare string "unknown" is
+        // NOT a valid ObservedAssignment (the tagged enum is the only wire
+        // form).
+        let unknown = crate::ledger::ObservedAssignment::Unknown {
+            error: crate::ledger::ObservationError {
                 message: "boom".to_string(),
-            });
+            },
+        };
         let json = serde_json::to_string(&unknown).unwrap();
         assert!(
             json.contains(r#""state":"unknown""#),
             "Unknown must serialize as the tagged unknown state, got: {json}"
         );
         assert_eq!(
-            serde_json::from_str::<Observation<crate::ledger::ObservedState>>(&json).unwrap(),
+            serde_json::from_str::<crate::ledger::ObservedAssignment>(&json).unwrap(),
             unknown
         );
         assert!(
-            serde_json::from_str::<Observation<crate::ledger::ObservedState>>("\"unknown\"")
-                .is_err(),
-            "the bare \"unknown\" string is not an Observation"
+            serde_json::from_str::<crate::ledger::ObservedAssignment>("\"unknown\"").is_err(),
+            "the bare \"unknown\" string is not an ObservedAssignment"
         );
-        // A slot with no observed state is KnownAbsent, not Unknown.
+        // A slot with no observed state is Absent, not Unknown.
         let slot_none = ObservedSlot {
-            observation: Observation::KnownAbsent,
+            assignment: crate::ledger::ObservedAssignment::Absent,
+            last_deployment: None,
         };
         let json_none = serde_json::to_string(&slot_none).unwrap();
         let back: ObservedSlot = serde_json::from_str(&json_none).unwrap();
-        assert_eq!(back.observation, Observation::KnownAbsent);
+        assert_eq!(back.assignment, crate::ledger::ObservedAssignment::Absent);
+        assert_eq!(back.last_deployment, None);
         // An unreadable observed state is Unknown, never a forged artifact.
         let slot_unknown = ObservedSlot {
-            observation: Observation::Unknown(crate::ledger::ObservationError {
-                message: "assignment read failed: boom".to_string(),
-            }),
+            assignment: crate::ledger::ObservedAssignment::Unknown {
+                error: crate::ledger::ObservationError {
+                    message: "assignment read failed: boom".to_string(),
+                },
+            },
+            last_deployment: None,
         };
         let lines = render_status(&ObservedTarget {
             target: crate::identity::TargetName::parse("production").unwrap(),
@@ -1560,6 +1582,36 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "Unknown must not render as a forged artifact: {}",
             lines[0]
         );
+        // An ASSIGNMENT-UNKNOWN state (generation known, artifact NOT read)
+        // likewise never renders a forged artifact — None on every column
+        // with the preserved error.
+        let slot_assign_unknown = ObservedSlot {
+            assignment: crate::ledger::ObservedAssignment::AssignmentUnknown {
+                generation: test_generation_id("gen-p3"),
+                error: crate::ledger::ObservationError {
+                    message: "assignment read failed: boom".to_string(),
+                },
+            },
+            last_deployment: None,
+        };
+        let lines = render_status(&ObservedTarget {
+            target: crate::identity::TargetName::parse("production").unwrap(),
+            slots: std::collections::BTreeMap::from([(
+                crate::identity::SlotId::parse("p3").unwrap(),
+                slot_assign_unknown,
+            )]),
+        });
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("generation=None release=None variant=None tree=None"),
+            "AssignmentUnknown must not render a fabricated generation/artifact: {}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("observation failed: assignment read failed: boom"),
+            "the preserved error must be rendered: {}",
+            lines[0]
+        );
     }
 
     #[test]
@@ -1572,9 +1624,12 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .write_slot_observed(
                 &crate::identity::SlotId::parse("p1").unwrap(),
                 &ObservedSlot {
-                    observation: Observation::Unknown(crate::ledger::ObservationError {
-                        message: "assignment read failed: boom".to_string(),
-                    }),
+                    assignment: crate::ledger::ObservedAssignment::Unknown {
+                        error: crate::ledger::ObservationError {
+                            message: "assignment read failed: boom".to_string(),
+                        },
+                    },
+                    last_deployment: None,
                 },
             )
             .unwrap();
@@ -1660,16 +1715,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 "wire ReleaseId: {s:?}"
             );
             // Unknown is never a forged artifact: the bare "unknown" string
-            // is NOT a valid Observation wire form (the tagged three-state
-            // enum expresses Unknown with its preserved error); a forged
-            // artifact would be a valid ArtifactRef JSON.
+            // is NOT a valid ObservedAssignment wire form (the tagged enum
+            // expresses Unknown with its preserved error); a forged artifact
+            // would be a valid ArtifactRef JSON.
             if s == "unknown" {
                 assert!(
-                    serde_json::from_str::<Observation<crate::ledger::ObservedState>>(
-                        "\"unknown\""
-                    )
-                    .is_err(),
-                    "bare \"unknown\" must not parse as an Observation"
+                    serde_json::from_str::<crate::ledger::ObservedAssignment>("\"unknown\"")
+                        .is_err(),
+                    "bare \"unknown\" must not parse as an ObservedAssignment"
                 );
             }
         }

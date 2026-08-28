@@ -1155,11 +1155,13 @@ pub(crate) mod preflight_tests {
         assert_eq!(h.store.read_attempts("t1").unwrap().len(), 1);
         assert_eq!(h.store.read_snapshots("t1").unwrap().len(), 1);
         let observed = h.store.read_observed("t1", &h.config).unwrap();
-        let Observation::Known(obs_state) = &observed.slots[&SlotId::new("p1")].observation else {
+        let crate::ledger::ObservedAssignment::Known { generation, .. } =
+            &observed.slots[&SlotId::new("p1")].assignment
+        else {
             panic!("observed p1 must be a successful read");
         };
         assert_eq!(
-            Some(obs_state.generation.clone()),
+            Some(generation.clone()),
             Some(s0_gen),
             "observed state untouched by the dry run"
         );

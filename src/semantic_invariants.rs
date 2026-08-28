@@ -1662,19 +1662,24 @@ impl Fixture {
                 .slots
                 .get(&slot_id)
                 .unwrap_or_else(|| panic!("{target}: observed {slot_id} entry must be present"));
-            let crate::ledger::Observation::Known(state) = &slot.observation else {
+            let crate::ledger::ObservedAssignment::Known {
+                generation,
+                artifact,
+            } = &slot.assignment
+            else {
                 panic!("{target}: observed {slot_id} must be a successful read");
             };
             assert_eq!(
-                &state.generation, &asn.generation_id,
+                generation, &asn.generation_id,
                 "{target}: observed generation must equal the remote generation"
             );
             assert_eq!(
-                &state.artifact, &asn.artifact,
+                artifact, &asn.artifact,
                 "{target}: observed artifact must equal the remote assignment"
             );
             assert_eq!(
-                &state.last_deployment, &asn.deployment_id,
+                slot.last_deployment.as_ref(),
+                Some(&asn.deployment_id),
                 "{target}: observed last_deployment must equal the LIVE assignment's OWN \
                  minting deployment — a skipped/unreachable slot's prior record is never \
                  re-stamped"
@@ -1936,19 +1941,24 @@ impl Fixture {
                      evaluated by check_invariants)"
                 ),
             };
-            let crate::ledger::Observation::Known(state) = &slot.observation else {
+            let crate::ledger::ObservedAssignment::Known {
+                generation,
+                artifact,
+            } = &slot.assignment
+            else {
                 panic!("{target}: observed {slot_id} must be a successful read");
             };
             assert_eq!(
-                &state.artifact, &asn.artifact,
+                artifact, &asn.artifact,
                 "{target}: observed projection must equal the remote assignment"
             );
             assert_eq!(
-                &state.generation, &asn.generation_id,
+                generation, &asn.generation_id,
                 "{target}: observed generation must equal the remote generation"
             );
             assert_eq!(
-                &state.last_deployment, &asn.deployment_id,
+                slot.last_deployment.as_ref(),
+                Some(&asn.deployment_id),
                 "{target}: observed last_deployment must equal the LIVE assignment's OWN \
                  minting deployment — a skipped/unreachable slot's prior record is never \
                  re-stamped by a deployment that did not touch it"
@@ -2875,10 +2885,10 @@ fn observed_scope_interleaved_push_fail_retry_rollback_sequence() {
         .slots
         .get(&SlotId::new("p1"))
         .expect("observed p1 exists from the earlier push")
-        .observation
+        .assignment
         .clone();
     let stale_gen = match &stale {
-        crate::ledger::Observation::Known(s) => Some(s.generation.clone()),
+        crate::ledger::ObservedAssignment::Known { generation, .. } => Some(generation.clone()),
         _ => None,
     };
     let id_c = test_deployment_id("si-obs-seq-crash");
@@ -3105,8 +3115,10 @@ fn run_failure_position_case(policy: FailurePolicy, position: usize) {
         let observed_gen = observed
             .slots
             .get(&SlotId::new(sid.to_string()))
-            .and_then(|o| match &o.observation {
-                crate::ledger::Observation::Known(s) => Some(s.generation.clone()),
+            .and_then(|o| match &o.assignment {
+                crate::ledger::ObservedAssignment::Known { generation, .. } => {
+                    Some(generation.clone())
+                }
                 _ => None,
             });
         assert_eq!(
@@ -3305,8 +3317,10 @@ fn run_remaining_changes_case(policy: FailurePolicy, position: usize) {
         .iter()
         .map(|s| SlotId::new(s.to_string()))
         .filter(|sid| {
-            let observed_gen = observed.slots.get(sid).and_then(|o| match &o.observation {
-                crate::ledger::Observation::Known(s) => Some(s.generation.clone()),
+            let observed_gen = observed.slots.get(sid).and_then(|o| match &o.assignment {
+                crate::ledger::ObservedAssignment::Known { generation, .. } => {
+                    Some(generation.clone())
+                }
                 _ => None,
             });
             let pre_gen = intent
@@ -5958,10 +5972,12 @@ fn assert_semantic_invariants(model: &Model, system: &Fixture) {
                     )
                 }
                 (Some((v, dep)), Some(slot)) => {
-                    let crate::ledger::Observation::Known(state) = &slot.observation else {
+                    let crate::ledger::ObservedAssignment::Known { artifact, .. } =
+                        &slot.assignment
+                    else {
                         panic!("{ctx}: {t} observed {slot_id} must be a successful read");
                     };
-                    let art = state.artifact.clone();
+                    let art = artifact.clone();
                     let want = learned.get(&v).cloned().unwrap_or_else(|| {
                         panic!(
                             "{ctx}: observed version {v} for {t} has no recorded artifact in the system"
@@ -5972,8 +5988,8 @@ fn assert_semantic_invariants(model: &Model, system: &Fixture) {
                         "{ctx}: {t} observed projection must match the model's expected version {v}"
                     );
                     assert_eq!(
-                        state.last_deployment.as_str(),
-                        dep.as_str(),
+                        slot.last_deployment.as_ref().map(|d| d.as_str()),
+                        Some(dep.as_str()),
                         "{ctx}: {t} observed last_deployment for {slot_id} must equal the LIVE \
                          assignment's minting deployment {dep} — a skipped/unreachable slot's \
                          prior record is never re-stamped by a deployment that did not touch it"

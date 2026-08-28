@@ -293,7 +293,7 @@ mod tests {
     use crate::identity::{
         ArtifactRef, SlotId, VariantName, test_deployment_id, test_generation_id, test_tree_digest,
     };
-    use crate::ledger::{Observation, ObservedSlot, ObservedState};
+    use crate::ledger::{ObservedAssignment, ObservedSlot};
     /// `sanitize` must neutralize path-traversal components. `.` and `..` are
     /// the one case the character filter lets through untouched (dots are
     /// legal in ids), and an unsuffixed component named `..` would make
@@ -328,15 +328,15 @@ mod tests {
             "a '..' slot must be confined to its own slot dir, not the store root"
         );
         let observed = ObservedSlot {
-            observation: Observation::Known(ObservedState {
+            assignment: ObservedAssignment::Known {
                 generation: test_generation_id("evil"),
                 artifact: ArtifactRef {
                     release: crate::identity::test_release_id("rel-sha256-evil"),
                     variant: VariantName::new("standard".to_string()),
                     tree: test_tree_digest("evil"),
                 },
-                last_deployment: test_deployment_id("evil"),
-            }),
+            },
+            last_deployment: Some(test_deployment_id("evil")),
         };
         store.write_slot_observed(&evil, &observed).unwrap();
         assert!(

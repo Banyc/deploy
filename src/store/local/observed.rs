@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[cfg(test)]
-use crate::ledger::Observation;
+use crate::ledger::ObservedAssignment;
 #[cfg(test)]
 use crate::testutil::test_faults::FaultKind;
 
@@ -43,8 +43,10 @@ impl LocalStore {
     /// exactly one slot's physical record.
     pub fn write_slot_observed(&self, slot: &SlotId, observed: &ObservedSlot) -> Result<()> {
         #[cfg(test)]
-        if let Some(d) = match &observed.observation {
-            Observation::Known(state) => Some(state.last_deployment.as_str()),
+        if let Some(d) = match &observed.assignment {
+            ObservedAssignment::Known { .. } => {
+                observed.last_deployment.as_ref().map(|d| d.as_str())
+            }
             _ => None,
         } && self
             .fault_registry
@@ -146,8 +148,10 @@ impl LocalStore {
             state
                 .last_observed
                 .as_ref()
-                .and_then(|o| match &o.observation {
-                    Observation::Known(s) => Some(s.last_deployment.as_str()),
+                .and_then(|o| match &o.assignment {
+                    ObservedAssignment::Known { .. } => {
+                        o.last_deployment.as_ref().map(|d| d.as_str())
+                    }
                     _ => None,
                 }),
             state.last_seen_target.as_ref(),

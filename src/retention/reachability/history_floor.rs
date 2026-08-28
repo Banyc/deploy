@@ -68,7 +68,7 @@ use crate::error::{Error, Result};
 // carries parsed entries) are both live imports — keep both.
 use super::gc::SweepStageStats;
 use crate::identity::DeploymentId;
-use crate::ledger::{LedgerEntry, Observation, TerminalDisposition};
+use crate::ledger::{LedgerEntry, Observation, ObservedAssignment, TerminalDisposition};
 use crate::store::atomic::{path_state, write_atomic_replace};
 use crate::store::local::LocalStore;
 use std::collections::BTreeSet;
@@ -419,28 +419,29 @@ impl LocalStore {
             }
         }
         for slot in observed.values() {
-            match &slot.observation {
-                Observation::Known(state) => {
-                    out.deployments
-                        .insert(state.last_deployment.as_str().to_string());
-                    out.releases
-                        .insert(state.artifact.release.as_str().to_string());
-                    out.trees.insert(state.artifact.tree.as_str().to_string());
+            match &slot.assignment {
+                ObservedAssignment::Known { artifact, .. } => {
+                    if let Some(d) = &slot.last_deployment {
+                        out.deployments.insert(d.as_str().to_string());
+                    }
+                    out.releases.insert(artifact.release.as_str().to_string());
+                    out.trees.insert(artifact.tree.as_str().to_string());
                 }
-                // FAIL CLOSED: an UNKNOWN observation means the slot's
-                // live assignment could not be read — the GC cannot verify
-                // what the slot is running, so it must NOT delete anything
-                // it cannot verify. The sweep aborts (an integrity error)
-                // BEFORE any deletion; the Unknown contributes nothing to
-                // the retained set.
-                Observation::Unknown(_) => {
+                // FAIL CLOSED: an UNKNOWN or ASSIGNMENT-UNKNOWN observation
+                // means the slot's live assignment could not be fully
+                // verified — the GC cannot verify what the slot is running,
+                // so it must NOT delete anything it cannot verify. The sweep
+                // aborts (an integrity error) BEFORE any deletion; the
+                // uncertainty contributes nothing to the retained set.
+                ObservedAssignment::AssignmentUnknown { .. }
+                | ObservedAssignment::Unknown { .. } => {
                     return Err(Error::integrity(
-                        "an observed slot records an UNKNOWN observation (its live assignment \
-                         could not be read): the GC cannot verify what the slot is running, \
-                         so the sweep aborts before any deletion",
+                        "an observed slot records an UNKNOWN or ASSIGNMENT-UNKNOWN assignment \
+                         (its live assignment could not be read): the GC cannot verify what \
+                         the slot is running, so the sweep aborts before any deletion",
                     ));
                 }
-                Observation::KnownAbsent => {}
+                ObservedAssignment::Absent => {}
             }
         }
         // Durable pins: a pin marks the WHOLE release — its record and every

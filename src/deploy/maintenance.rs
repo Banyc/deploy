@@ -25,7 +25,7 @@
 use crate::config::{ProjectConfig, RetentionConfig};
 use crate::error::Result;
 use crate::identity::{DeploymentId, OperationId, SlotId, TargetName};
-use crate::ledger::{Observation, ObservationError, ObservedSlot, ObservedState};
+use crate::ledger::{ObservationError, ObservedAssignment, ObservedSlot};
 use crate::remote::helper::RemoteHelper;
 use crate::retention::compute_retained;
 use crate::store::local::LocalStore;
@@ -271,48 +271,68 @@ pub(crate) fn refresh_observed_from_live(
                         observed_servers.insert(
                             slot_id.clone(),
                             ObservedSlot {
-                                observation: Observation::Known(ObservedState {
+                                assignment: ObservedAssignment::Known {
                                     generation: asn.generation_id.clone(),
                                     artifact: asn.artifact.clone(),
-                                    last_deployment: asn.deployment_id.clone(),
-                                }),
+                                },
+                                last_deployment: Some(asn.deployment_id.clone()),
                             },
                         );
                     }
                     Err(_) => {
                         // The generation is observed but its assignment
                         // cannot be read (missing/corrupt): the observed
-                        // state is UNKNOWN — never a fabricated artifact,
-                        // never a stale prior record presented as current.
+                        // state is `AssignmentUnknown` — the generation is
+                        // known, the artifact is NOT (never a fabricated
+                        // artifact, never a stale prior record presented as
+                        // current). The error preserves the read failure.
+                        let error = ObservationError {
+                            message: format!("assignment read failed for {g}"),
+                        };
                         observed_servers.insert(
                             slot_id.clone(),
                             ObservedSlot {
-                                observation: Observation::Unknown(ObservationError {
-                                    message: format!("assignment read failed for {g}"),
-                                }),
+                                assignment: ObservedAssignment::AssignmentUnknown {
+                                    generation: g,
+                                    error,
+                                },
+                                last_deployment: None,
                             },
                         );
                     }
                 },
                 None => {
                     // The read succeeded showing no state: the slot has no
-                    // observed state (never deployed) — keep it absent (an
-                    // explicit KnownAbsent would fabricate an entry for a slot
-                    // never observed; a stale prior record is never presented
-                    // as current).
+                    // observed state (never deployed, or rotated away). A
+                    // LIVE ABSENCE REPLACES a stale physical record — record
+                    // `Absent` EXPLICITLY so the write path below CLOBBERS
+                    // any prior generation/artifact/deployment: the slot has
+                    // no state, and a stale prior record must never be
+                    // presented as current.
+                    observed_servers.insert(
+                        slot_id.clone(),
+                        ObservedSlot {
+                            assignment: ObservedAssignment::Absent,
+                            last_deployment: None,
+                        },
+                    );
                 }
             },
             Err(e) => {
                 // THE OBSERVATION FAILED: a failed status read is NOT
                 // evidence of no change — the slot may have changed; the
-                // failure just means we cannot see it. Record `Unknown(error)`
-                // (never the prior record, which would claim "unchanged").
+                // failure just means we cannot see it. Record
+                // `Unknown(error)` (never the prior record, which would
+                // claim "unchanged").
                 observed_servers.insert(
                     slot_id.clone(),
                     ObservedSlot {
-                        observation: Observation::Unknown(ObservationError {
-                            message: format!("status read failed: {e}"),
-                        }),
+                        assignment: ObservedAssignment::Unknown {
+                            error: ObservationError {
+                                message: format!("status read failed: {e}"),
+                            },
+                        },
+                        last_deployment: None,
                     },
                 );
             }

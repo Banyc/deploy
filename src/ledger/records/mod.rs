@@ -108,7 +108,8 @@ mod wire;
 // `crate::ledger::records::X` paths keep compiling.
 pub use crate::ledger::tables::{NonEmptySlotTable, SlotTable};
 pub use observation::{
-    Observation, ObservationError, ObservedGeneration, ObservedSlot, ObservedState, ObservedTarget,
+    Observation, ObservationError, ObservedAssignment, ObservedGeneration, ObservedSlot,
+    ObservedTarget,
 };
 pub(crate) use validation::verify_successful_membership_equations;
 pub use validation::{FrozenSlotTopology, RebindingPlan, VerifiedReleaseRebinding, build_rollback};

@@ -86,11 +86,11 @@ pub use records::{
     BehaviorIndex, CompensationReport, CompleteRollback, DeploymentIntent, DeploymentPlan,
     DeploymentPlanWire, DeploymentStatus, DesiredGeneration, FrozenSlotTopology, IntentSlot,
     LedgerIntentReport, LedgerIntentWire, LedgerRollback, LedgerRollbackWire, LedgerTerminal,
-    LedgerTerminalWire, NonEmptySlotTable, Observation, ObservationError, ObservedGeneration,
-    ObservedSlot, ObservedState, ObservedTarget, PhysicalBinding, Pins, PlanOrigin, PlanSource,
-    PreviousGeneration, RebindingPlan, ServerState, SlotAttemptState, SlotOutcome, SlotOutcomeKind,
-    SlotPlan, SlotResult, SlotTable, SlotTransition, TerminalDisposition, VerifiedReleaseRebinding,
-    build_rollback,
+    LedgerTerminalWire, NonEmptySlotTable, Observation, ObservationError, ObservedAssignment,
+    ObservedGeneration, ObservedSlot, ObservedTarget, PhysicalBinding, Pins, PlanOrigin,
+    PlanSource, PreviousGeneration, RebindingPlan, ServerState, SlotAttemptState, SlotOutcome,
+    SlotOutcomeKind, SlotPlan, SlotResult, SlotTable, SlotTransition, TerminalDisposition,
+    VerifiedReleaseRebinding, build_rollback,
 };
 pub use refs::{
     PushRef, attempt_slot_ids, deployment_index, ref_name, resolve_deployment,

@@ -24,7 +24,8 @@ mod state;
 
 pub use mutation::copy_host_tree_to_remote;
 pub use observed::{
-    Observation, ObservationError, ObservedGeneration, ObservedSlot, ObservedState, ObservedTarget,
+    Observation, ObservationError, ObservedAssignment, ObservedGeneration, ObservedSlot,
+    ObservedTarget,
 };
 pub use state::GenerationAssignment;
 pub use state::current::{CurrentState, ExpectedCurrent};

@@ -268,16 +268,20 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
 
     let observed = store.read_observed("production", &config)?;
     let obs = &observed.slots[&deploy::identity::SlotId::parse("app-1").unwrap()];
-    let deploy::ledger::Observation::Known(state) = &obs.observation else {
+    let deploy::ledger::ObservedAssignment::Known {
+        generation: obs_gen,
+        artifact,
+    } = &obs.assignment
+    else {
         panic!("observed app-1 must be Known");
     };
     assert_eq!(
-        Some(&state.generation),
+        Some(obs_gen),
         Some(generation),
         "`deploy status` shows the deployed generation"
     );
-    assert_eq!(Some(state.artifact.variant.as_str()), Some("standard"));
-    assert_eq!(Some(&state.artifact.tree), Some(&known_artifact(srv).tree));
+    assert_eq!(Some(artifact.variant.as_str()), Some("standard"));
+    assert_eq!(Some(&artifact.tree), Some(&known_artifact(srv).tree));
 
     // A second push with identical content is a no-op (no new attempt).
     let r2 = push(

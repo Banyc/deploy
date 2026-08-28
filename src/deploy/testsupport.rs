@@ -21,8 +21,9 @@ pub(crate) use crate::identity::{
 };
 pub(crate) use crate::ledger::{
     self, DeploymentIntent, DeploymentPlan, DeploymentStatus, DesiredGeneration, IntentSlot,
-    LedgerEntry, LedgerIntentReport, LedgerTerminal, NonEmptySlotTable, Observation, RefExpr,
-    SlotAttemptState, SlotOutcomeKind, SlotResult, SlotTable, TerminalDisposition,
+    LedgerEntry, LedgerIntentReport, LedgerTerminal, NonEmptySlotTable, Observation,
+    ObservedAssignment, RefExpr, SlotAttemptState, SlotOutcomeKind, SlotResult, SlotTable,
+    TerminalDisposition,
 };
 pub(crate) use crate::remote::transport::{FsBytes, LocalTransport, Remote};
 pub(crate) use crate::store::local::LocalStore;

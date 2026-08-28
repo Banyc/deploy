@@ -17,10 +17,8 @@ use crate::identity::DeploymentId;
 use crate::identity::OperationId;
 use crate::identity::SlotId;
 use crate::ledger::BehaviorIndex;
-use crate::ledger::Observation;
-use crate::ledger::ObservedSlot;
-use crate::ledger::ObservedState;
 use crate::ledger::PushRef;
+use crate::ledger::{ObservedAssignment, ObservedSlot};
 use crate::remote::helper::GenerationAssignment;
 use crate::remote::helper::RemoteHelper;
 use crate::remote::helper::RemoteStatus;
@@ -207,11 +205,11 @@ pub(crate) fn check_up_to_date(
                 observed_servers.insert(
                     slot_id.clone(),
                     ObservedSlot {
-                        observation: Observation::Known(ObservedState {
+                        assignment: ObservedAssignment::Known {
                             generation: asn.generation_id.clone(),
                             artifact: asn.artifact.clone(),
-                            last_deployment: asn.deployment_id.clone(),
-                        }),
+                        },
+                        last_deployment: Some(asn.deployment_id.clone()),
                     },
                 );
             }
@@ -259,7 +257,7 @@ mod noop_tests {
         snapshot_files,
     };
     use crate::identity::{SlotId, test_deployment_id};
-    use crate::ledger::{DeploymentStatus, Observation};
+    use crate::ledger::DeploymentStatus;
     use crate::remote::helper::GenerationAssignment;
     use crate::remote::layout;
     use crate::remote::transport::{LocalTransport, Remote};
@@ -302,11 +300,13 @@ mod noop_tests {
         );
         // Observed still reflects the successful push.
         let observed = h.store.read_observed("t1", &h.config).unwrap();
-        let Observation::Known(obs_state) = &observed.slots[&SlotId::new("p1")].observation else {
+        let crate::ledger::ObservedAssignment::Known { generation, .. } =
+            &observed.slots[&SlotId::new("p1")].assignment
+        else {
             panic!("observed p1 must be a successful read");
         };
         assert_eq!(
-            Some(obs_state.generation.clone()),
+            Some(generation.clone()),
             r1.attempt.as_ref().unwrap().slots[&SlotId::new("p1")].generation
         );
     }
@@ -491,11 +491,13 @@ interval_seconds = 0
             "no new terminal event may be appended to the first deployment"
         );
         let observed = h.store.read_observed("t1", &h.config).unwrap();
-        let Observation::Known(obs_state) = &observed.slots[&SlotId::new("p1")].observation else {
+        let crate::ledger::ObservedAssignment::Known { generation, .. } =
+            &observed.slots[&SlotId::new("p1")].assignment
+        else {
             panic!("observed p1 must be a successful read");
         };
         assert_eq!(
-            Some(&obs_state.generation),
+            Some(generation),
             Some(&assignment.generation_id),
             "observed.json must be unchanged"
         );

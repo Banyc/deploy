@@ -2,5 +2,6 @@
 //! from `crate::ledger::records` for the remote layer's public surface.
 
 pub use crate::ledger::records::{
-    Observation, ObservationError, ObservedGeneration, ObservedSlot, ObservedState, ObservedTarget,
+    Observation, ObservationError, ObservedAssignment, ObservedGeneration, ObservedSlot,
+    ObservedTarget,
 };

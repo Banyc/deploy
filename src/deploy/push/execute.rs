@@ -449,11 +449,15 @@ pub(crate) mod execute_tests {
         // create.
         let observed = h.store.read_observed("t1", &h.config).unwrap();
         let os = &observed.slots[&SlotId::new("p1")];
-        let Observation::Known(obs_state) = &os.observation else {
+        let ObservedAssignment::Known {
+            generation,
+            artifact,
+        } = &os.assignment
+        else {
             panic!("observed p1 must be a successful read");
         };
-        assert_eq!(obs_state.generation, prior_gen.clone());
-        let oa = &obs_state.artifact;
+        assert_eq!(generation, &prior_gen);
+        let oa = artifact;
         assert_eq!(
             oa.tree, prior_tree,
             "observed tree must be the restored prior tree"
@@ -469,8 +473,8 @@ pub(crate) mod execute_tests {
             "observed must NOT reflect the desired (failed) v2 tree"
         );
         assert_eq!(
-            obs_state.last_deployment,
-            id1.clone(),
+            os.last_deployment.as_ref(),
+            Some(&id1),
             "observed last_deployment must be the LIVE assignment's OWN minting deployment \
              (id1), not the failed attempt id2"
         );
@@ -480,8 +484,8 @@ pub(crate) mod execute_tests {
             server_state
                 .last_observed
                 .as_ref()
-                .and_then(|o| match &o.observation {
-                    Observation::Known(s) => Some(s.generation.clone()),
+                .and_then(|o| match &o.assignment {
+                    ObservedAssignment::Known { generation, .. } => Some(generation.clone()),
                     _ => None,
                 }),
             Some(prior_gen.clone())
@@ -749,12 +753,24 @@ interval_seconds = 0
         // artifact: desired}` lie for a slot nothing deployed to, no
         // re-stamped `last_deployment`.
         let observed = store.read_observed("t1", &config).unwrap();
-        assert!(
-            observed.slots.is_empty(),
-            "slots without a live assignment (and without a prior record) must stay absent — \
-             never fabricated with the desired artifact: {:?}",
+        // Every member slot's projection now records its live state EXPLICITLY:
+        // with no live generation and no prior record, each is `Absent` — the
+        // explicit-absence projection that overwrites any stale physical
+        // record — never a fabricated Known with the desired artifact.
+        assert_eq!(
+            observed.slots.len(),
+            4,
+            "all four member slots must have an explicit projection: {:?}",
             observed.slots.keys().collect::<Vec<_>>()
         );
+        for (sid, slot) in &observed.slots {
+            assert!(
+                matches!(slot.assignment, crate::ledger::ObservedAssignment::Absent),
+                "slot {sid} with no live assignment must project Absent (never the desired artifact), got: {:?}",
+                slot.assignment
+            );
+            assert!(slot.last_deployment.is_none());
+        }
 
         assert!(
             store.read_snapshots("t1").unwrap().is_empty(),
@@ -1088,11 +1104,15 @@ interval_seconds = 0
         // did not leave live.
         let observed = h.store.read_observed("t1", &h.config).unwrap();
         let os = &observed.slots[&SlotId::new("p1")];
-        let Observation::Known(obs_state) = &os.observation else {
+        let ObservedAssignment::Known {
+            generation,
+            artifact,
+        } = &os.assignment
+        else {
             panic!("observed p1 must be a successful read");
         };
-        assert_eq!(obs_state.generation, prior_gen.clone());
-        let oa = &obs_state.artifact;
+        assert_eq!(generation, &prior_gen);
+        let oa = artifact;
         assert_eq!(
             oa.tree, prior_tree,
             "observed tree must be the restored prior tree"
@@ -1108,8 +1128,8 @@ interval_seconds = 0
             "observed must NOT reflect the desired (failed) v2 tree"
         );
         assert_eq!(
-            obs_state.last_deployment,
-            id1.clone(),
+            os.last_deployment.as_ref(),
+            Some(&id1),
             "observed last_deployment must be the LIVE assignment's OWN minting deployment \
              (id1), not the failed attempt id2"
         );
@@ -1219,11 +1239,15 @@ interval_seconds = 0
         );
         let observed = h.store.read_observed("t1", &h.config).unwrap();
         let os = &observed.slots[&SlotId::new("p1")];
-        let Observation::Known(obs_state) = &os.observation else {
+        let ObservedAssignment::Known {
+            generation,
+            artifact,
+        } = &os.assignment
+        else {
             panic!("observed p1 must be a successful read");
         };
-        assert_eq!(obs_state.generation, prior_gen.clone());
-        assert_eq!(obs_state.artifact.tree, prior_tree);
+        assert_eq!(generation, &prior_gen);
+        assert_eq!(artifact.tree, prior_tree);
     }
 
     // ---- First-deploy activation failure, preflight outcomes, observed
