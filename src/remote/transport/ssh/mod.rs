@@ -22,7 +22,10 @@ use crate::error::{Error, Result};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use super::{FsBytes, Remote, RemoteEntry, RemoteMeta, has_normal_component_below_root};
+use super::{
+    FsBytes, IMMUTABLE_RECORD_MODE, Remote, RemoteEntry, RemoteMeta,
+    has_normal_component_below_root,
+};
 use hostkey::pin_known_hosts;
 use runner::{OpKind, RunError, SSH_CONNECT_TIMEOUT_SECS, SshRunner};
 
@@ -48,6 +51,16 @@ use runner::{OpKind, RunError, SSH_CONNECT_TIMEOUT_SECS, SshRunner};
 /// ENOTDIR = 20.
 const LSTAT_ERRNO_ENOENT: i32 = 2;
 const LSTAT_ERRNO_ENOTDIR: i32 = 20;
+
+/// The reserved exit code the remote `try_write_new` script (`write_new_cmd`)
+/// exits with when the no-clobber `ln` hit an EXISTING destination — the
+/// conflict/lost-race verdict. It is the ONLY nonzero exit the transport maps
+/// to `Ok(false)`; every other nonzero exit (a failed pre-install step OR the
+/// final parent-directory sync) is a propagated error. `17` cannot collide
+/// with the pre-install steps' own failures (each exits nonzero, but the
+/// transport distinguishes the verdict by code, never by `exists`-sniffing),
+/// and it is deliberately distinct from `SSH_STAT_ABSENT_EXIT`.
+pub const SSH_TWRITE_CONFLICT_EXIT: i32 = 17;
 
 /// A transport that drives a real remote host over SSH.
 pub struct SshTransport {
@@ -400,61 +413,83 @@ fn shell_quote(s: &str) -> String {
 
 impl SshTransport {
     /// Build the remote shell command implementing the durability protocol
-    /// for an immutable record at `root.join(rel)`. Extracted so tests can
-    /// assert on the exact command shape without spawning ssh.
-    fn write_new_cmd(root: &Path, rel: &Path, payload: &str) -> String {
+    /// for an immutable record at `root.join(rel)` — the remote realization
+    /// of the ONE canonical create-new primitive (`durable_create_new` in
+    /// the parent module), with the IDENTICAL seven-step sequence:
+    ///
+    /// 1. Allocate the temporary file REMOTELY with `mktemp` (exclusive
+    ///    create, O_EXCL), so the name cannot collide with another
+    ///    controller's temp no matter its pid or host: no two invocations
+    ///    are ever handed the same name, and a stale temp left behind by a
+    ///    crashed controller is never selected — and therefore never
+    ///    truncated. The name is dot-prefixed and lives INSIDE the
+    ///    destination's parent directory, so a concurrent reader never sees
+    ///    a partial record and listing-based observers skip the temp name.
+    /// 2. Write the payload.
+    /// 3. Apply the FINAL MODE with `chmod` BEFORE the file fsync — the
+    ///    published inode carries the caller's mode, never the remote umask.
+    /// 4. `sync "$tmp"` — the file is durable.
+    /// 5. Install atomically WITHOUT replacement via `ln` — it fails if the
+    ///    destination exists, so no loser can clobber a winner. The loser's
+    ///    failure is reported through the reserved `SSH_TWRITE_CONFLICT_EXIT`
+    ///    exit code, NEVER by replacing the winner.
+    /// 6. Remove only the temporary file THIS invocation created (the
+    ///    cleanup runs on the conflict path too — the `rc` capture keeps it
+    ///    outside the `&&` chain).
+    /// 7. `sync <parent>` — the PARENT-DIRECTORY fsync whose failure
+    ///    PROPAGATES (the old script swallowed it with `2>/dev/null`): a
+    ///    failed sync is a failed install, never a silent success.
+    ///
+    /// The parent directory is created first (the remote layout is not
+    /// provisioned by SSH the way LocalTransport does it), so a fresh remote
+    /// root still allows the first lock acquisition. The chain is
+    /// `&&`-connected: if `mktemp` (or any pre-install step) fails, the
+    /// command exits non-zero without installing anything (fail closed). The
+    /// final `sync <parent>` runs ONLY on the install-success path, and its
+    /// exit status is the command's exit status — a real `sync <dir>`/fsync,
+    /// never a best-effort swallow.
+    //
+    // Portability notes: `mktemp TEMPLATE` accepts a template argument on
+    // both GNU and BSD/macOS, provided `XXXXXX` ends the final component
+    // (kept here), and `sync FILE` fsyncs the path on Linux (coreutils
+    // >= 8.24) and macOS (forces pending writes); the parent-dir sync is the
+    // real `sync <dir>` whose failure propagates.
+    fn write_new_cmd(root: &Path, rel: &Path, payload: &str, mode: u32) -> String {
         let remote_path = root.join(rel);
         let remote_path_str = remote_path.to_string_lossy().into_owned();
         let parent = Path::new(&remote_path_str)
             .parent()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| ".".to_string());
-        // Durability protocol (mirrors LocalTransport::try_write_new):
-        //
-        // 1. Allocate the temporary file REMOTELY with `mktemp` (exclusive
-        //    create, O_EXCL), so the name cannot collide with another
-        //    controller's temp no matter its pid or host: no two invocations
-        //    are ever handed the same name, and a stale temp left behind by a
-        //    crashed controller is never selected — and therefore never
-        //    truncated. The name is dot-prefixed and lives INSIDE the
-        //    destination's parent directory, so a concurrent reader never sees
-        //    a partial record and listing-based observers skip the temp name.
-        // 2. Write the payload, sync the file, then install atomically WITHOUT
-        //    replacement via `ln` — it fails if the destination exists, so no
-        //    loser can clobber a winner. Syncing BEFORE the install means a
-        //    reader can never observe an empty/partial hard link.
-        // 3. Remove only the temporary file THIS invocation created, then
-        //    best-effort `sync` so the installation survives a crash.
-        //
-        // The parent directory is created first (the remote layout is not
-        // provisioned by SSH the way LocalTransport does it), so a fresh remote
-        // root still allows the first lock acquisition. The whole chain is
-        // `&&`-connected: if `mktemp` (or anything else) fails, the command
-        // exits non-zero without installing anything (fail closed).
-        //
-        // Portability notes: `mktemp TEMPLATE` accepts a template argument on
-        // both GNU and BSD/macOS, provided `XXXXXX` ends the final component
-        // (kept here), and `sync FILE` is accepted on Linux (coreutils >= 8.24
-        // fsyncs that file) and macOS (forces pending writes); the trailing
-        // bare `sync 2>/dev/null` remains the best-effort directory sync, bare
-        // because `sync <dir>` is not portable.
+        // Durability protocol — the seven-step sequence is documented on
+        // this function; the comment here only notes the pieces that are
+        // invisible in the final string: the `&&` chain fails closed BEFORE
+        // the install (a failed pre-install step installs nothing), the `rc`
+        // capture keeps the temp cleanup outside the chain so it runs on the
+        // conflict path too, and the parent-dir sync runs ONLY after a
+        // successful install and its failure is the command's exit status.
         let basename = Path::new(&remote_path_str)
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "record".to_string());
         // The temp lives INSIDE the destination's parent directory and is
-        // dot-prefixed, exactly like LocalTransport::try_write_new. A sibling
-        // name (`{parent}.{basename}.tmp...`) would escape the managed remote
-        // root whenever the destination's parent IS the deployment root. The
-        // `XXXXXX` suffix is the mktemp template; it must survive shell quoting
-        // verbatim (single quotes are fine) so GNU and BSD mktemp both accept it.
+        // dot-prefixed, exactly like LocalTransport's durable_create_new. A
+        // sibling name (`{parent}.{basename}.tmp...`) would escape the
+        // managed remote root whenever the destination's parent IS the
+        // deployment root. The `XXXXXX` suffix is the mktemp template; it
+        // must survive shell quoting verbatim (single quotes are fine) so GNU
+        // and BSD mktemp both accept it.
         let tmp_template = format!("{}/.{}.tmp.XXXXXX", parent.trim_end_matches('/'), basename,);
+        let mode_str = format!("{:o}", mode & 0o7777);
         format!(
-            "mkdir -p {p} && tmp=$(mktemp {tpl}) && printf '%s' {payload} > \"$tmp\" && sync \"$tmp\" && ln \"$tmp\" {d}; rc=$?; rm -f \"$tmp\"; test \"$rc\" -eq 0 && sync 2>/dev/null || true; exit $rc",
+            "mkdir -p {p} && tmp=$(mktemp {tpl}) && printf '%s' {payload} > \"$tmp\" && chmod {mode} \"$tmp\" && sync \"$tmp\" && ln \"$tmp\" {d}; rc=$?; rm -f \"$tmp\"; if [ \"$rc\" -ne 0 ]; then exit {conflict}; fi; sync {parent}; exit $?",
             p = shell_quote(&parent),
             tpl = shell_quote(&tmp_template),
             payload = shell_quote(payload),
+            mode = mode_str,
             d = shell_quote(&remote_path_str),
+            conflict = SSH_TWRITE_CONFLICT_EXIT,
+            parent = shell_quote(&parent),
         )
     }
 
@@ -844,12 +879,20 @@ impl Remote for SshTransport {
 
     fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<bool> {
         let payload = String::from_utf8_lossy(data).into_owned();
-        let cmd = Self::write_new_cmd(&self.root, rel, &payload);
+        let cmd = Self::write_new_cmd(&self.root, rel, &payload, IMMUTABLE_RECORD_MODE);
         let out = self.run_remote(&cmd)?;
         if out.status.success() {
+            // All seven steps completed: the record is installed with the
+            // final mode and a parent-directory-sync'd durable entry.
             Ok(true)
-        } else if self.exists(rel) {
-            // Already present: treat as a lost race rather than a hard error.
+        } else if out.status.code() == Some(SSH_TWRITE_CONFLICT_EXIT) && self.exists(rel) {
+            // The no-clobber `ln` lost the race (or the destination was
+            // already present): the winner is untouched — NEVER replaced. The
+            // caller's read-back comparison (every try_write_new caller
+            // performs one) decides whether the retry converges (identical
+            // content) or is a genuine conflict; the reserved exit code
+            // guarantees a REAL failure — e.g. the parent-directory sync —
+            // is never misread as a lost race.
             Ok(false)
         } else {
             Err(Error::transport(format!(
@@ -1030,6 +1073,7 @@ mod tests_ssh {
             t.root(),
             &crate::remote::layout::operation_lock(),
             "op-proc",
+            IMMUTABLE_RECORD_MODE,
         );
         assert!(
             cmd.starts_with("mkdir -p '/srv/app/state'"),
@@ -1078,6 +1122,7 @@ mod tests_ssh {
             t.root(),
             &crate::remote::layout::operation_lock(),
             "op-proc",
+            IMMUTABLE_RECORD_MODE,
         );
         assert!(
             cmd.contains("mktemp '/srv/app/state/.operation.lock.tmp.XXXXXX'"),
@@ -1103,7 +1148,12 @@ mod tests_ssh {
     #[test]
     fn try_write_new_temp_stays_inside_root_for_root_level_dest() {
         let t = transport();
-        let cmd = SshTransport::write_new_cmd(t.root(), Path::new("files"), "payload-data");
+        let cmd = SshTransport::write_new_cmd(
+            t.root(),
+            Path::new("files"),
+            "payload-data",
+            IMMUTABLE_RECORD_MODE,
+        );
         assert!(
             cmd.contains("mktemp '/srv/app/.files.tmp.XXXXXX'"),
             "temp for a root-level destination must stay inside the root, got: {cmd}"
@@ -1153,7 +1203,7 @@ mod tests_ssh {
             // the same destination with a different payload.
             let mut writers = Vec::new();
             for payload in &payloads {
-                let cmd = SshTransport::write_new_cmd(&root, rel, payload);
+                let cmd = SshTransport::write_new_cmd(&root, rel, payload, IMMUTABLE_RECORD_MODE);
                 writers.push(s.spawn(move || run_sh(&cmd)));
             }
 
@@ -1222,7 +1272,7 @@ mod tests_ssh {
         let parent = dest.parent().unwrap();
 
         // First invocation: installs the record and cleans up its own temp.
-        let cmd1 = SshTransport::write_new_cmd(&root, rel, "gen-1");
+        let cmd1 = SshTransport::write_new_cmd(&root, rel, "gen-1", IMMUTABLE_RECORD_MODE);
         let out1 = run_sh(&cmd1);
         assert!(
             out1.status.success(),
@@ -1257,11 +1307,12 @@ mod tests_ssh {
 
         // Fresh invocation with a different payload: must fail (already
         // exists), leave dest and stale untouched, and clean up its own temp.
-        let cmd2 = SshTransport::write_new_cmd(&root, rel, "gen-2");
+        let cmd2 = SshTransport::write_new_cmd(&root, rel, "gen-2", IMMUTABLE_RECORD_MODE);
         let out2 = run_sh(&cmd2);
-        assert!(
-            !out2.status.success(),
-            "reinstall after a winner must report already-exists"
+        assert_eq!(
+            out2.status.code(),
+            Some(SSH_TWRITE_CONFLICT_EXIT),
+            "reinstall after a winner must exit the reserved conflict code"
         );
         assert_eq!(
             std::fs::read(&dest).unwrap(),
@@ -1284,6 +1335,149 @@ mod tests_ssh {
             left,
             vec![stale.file_name().unwrap().to_string_lossy().into_owned()],
             "only the stale temp may remain; the fresh invocation's own temp must be removed"
+        );
+    }
+
+    /// The remote script implements the canonical seven-step sequence: the
+    /// FINAL MODE is chmod'd onto the temp BEFORE the file fsync and the
+    /// no-clobber install, and the PARENT-DIRECTORY sync is a real
+    /// `sync <dir>` whose failure is never swallowed (`2>/dev/null` is gone).
+    #[test]
+    fn try_write_new_cmd_final_chmod_and_real_parent_sync() {
+        let t = transport();
+        let cmd = SshTransport::write_new_cmd(
+            t.root(),
+            &crate::remote::layout::operation_lock(),
+            "op-proc",
+            0o640,
+        );
+        // Step 3 (final chmod) BEFORE step 4 (file fsync) BEFORE step 5
+        // (no-replace install): the published inode carries the caller's
+        // mode, never the remote umask.
+        let chmod_pos = cmd
+            .find("chmod 640 \"$tmp\"")
+            .expect("the final chmod step must be present");
+        let fsync_pos = cmd
+            .find("sync \"$tmp\"")
+            .expect("the file fsync step must be present");
+        let ln_pos = cmd
+            .find("ln \"$tmp\"")
+            .expect("the no-replace install must be present");
+        assert!(
+            chmod_pos < fsync_pos && fsync_pos < ln_pos,
+            "step order must be chmod -> file fsync -> install, got: {cmd}"
+        );
+        // Step 7: a real `sync <dir>` — and no `2>/dev/null` swallow.
+        assert!(
+            cmd.contains("sync '/srv/app/state'"),
+            "the parent-dir sync must be a real sync <dir>, got: {cmd}"
+        );
+        assert!(
+            !cmd.contains("2>/dev/null"),
+            "the parent-dir sync failure must never be swallowed, got: {cmd}"
+        );
+    }
+
+    /// The final chmod step is EXECUTED before the install: under a
+    /// restrictive umask the published record still carries the intended
+    /// mode, never the umask-derived one.
+    #[test]
+    fn try_write_new_installs_final_mode_not_umask() {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let root = dir.path().to_path_buf();
+        let rel = Path::new("state/op.json");
+        let cmd = SshTransport::write_new_cmd(&root, rel, "payload-data", 0o644);
+        // `mktemp` under umask 077 creates the temp 0600; without the chmod
+        // step the installed record would keep 0600. The final chmod must
+        // make it 0644 before the install.
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("umask 077; {cmd}"))
+            .output()
+            .expect("spawn sh -c");
+        assert!(
+            out.status.success(),
+            "install failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let meta = std::fs::metadata(root.join(rel)).unwrap();
+        assert_eq!(
+            meta.mode() & 0o7777,
+            0o644,
+            "the published record must carry the intended final mode, not the umask"
+        );
+        assert_eq!(std::fs::read(root.join(rel)).unwrap(), b"payload-data");
+    }
+
+    /// The parent-directory sync failure PROPAGATES: a fake `sync` on PATH
+    /// that fsyncs regular files but fails on directories lets the file fsync
+    /// (step 4) pass, then the parent-dir sync (step 7) fails — the command
+    /// exits with the fake sync's status, never a swallowed success. The old
+    /// `sync 2>/dev/null` was exactly this bug.
+    #[test]
+    fn try_write_new_parent_sync_failure_propagates() {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let root = dir.path().to_path_buf();
+        let rel = Path::new("state/op.json");
+        let cmd = SshTransport::write_new_cmd(&root, rel, "payload-data", IMMUTABLE_RECORD_MODE);
+        let fakebin = dir.path().join("fakebin");
+        std::fs::create_dir_all(&fakebin).unwrap();
+        std::fs::write(
+            fakebin.join("sync"),
+            "#!/bin/sh\nif [ -d \"$1\" ]; then echo 'sync: dir sync failed' >&2; exit 9; fi\nexit 0\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(fakebin.join("sync"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "PATH={fake}:$PATH; {cmd}",
+                fake = shell_quote(&fakebin.to_string_lossy())
+            ))
+            .output()
+            .expect("spawn sh -c");
+        assert_eq!(
+            out.status.code(),
+            Some(9),
+            "the parent-dir sync failure must propagate (never swallowed)"
+        );
+        // The install itself succeeded (ln ran) — the propagated failure is
+        // EXACTLY the final durability step, and the record is complete.
+        assert_eq!(
+            std::fs::read(root.join(rel)).unwrap(),
+            b"payload-data",
+            "the record must be fully installed before the parent-dir sync"
+        );
+    }
+
+    /// The no-clobber conflict is reported through the reserved exit code and
+    /// NEVER replaces the winner: a second invocation with different content
+    /// exits `SSH_TWRITE_CONFLICT_EXIT` and the winner's bytes stay intact.
+    #[test]
+    fn try_write_new_conflict_exits_reserved_code_and_never_replaces() {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let root = dir.path().to_path_buf();
+        let rel = Path::new("state/op.json");
+        let cmd1 = SshTransport::write_new_cmd(&root, rel, "gen-1", IMMUTABLE_RECORD_MODE);
+        let out1 = run_sh(&cmd1);
+        assert!(
+            out1.status.success(),
+            "first install failed: {}",
+            String::from_utf8_lossy(&out1.stderr)
+        );
+        let cmd2 = SshTransport::write_new_cmd(&root, rel, "gen-2", IMMUTABLE_RECORD_MODE);
+        let out2 = run_sh(&cmd2);
+        assert_eq!(
+            out2.status.code(),
+            Some(SSH_TWRITE_CONFLICT_EXIT),
+            "a loser must exit the reserved conflict code"
+        );
+        assert_eq!(
+            std::fs::read(root.join(rel)).unwrap(),
+            b"gen-1",
+            "the conflict must NEVER replace the winner"
         );
     }
 }

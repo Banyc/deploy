@@ -75,10 +75,18 @@ pub trait Remote {
     fn root(&self) -> &Path;
     fn read(&self, rel: &Path) -> Result<Vec<u8>>;
     fn write(&self, rel: &Path, data: &[u8], mode: u32) -> Result<()>;
-    /// Atomically create `rel` with `data` only if it does not already exist.
-    /// Returns `Ok(true)` if the file was created, `Ok(false)` if it already
-    /// existed (the existing content is left untouched), or `Err` on other
-    /// failures. This is the non-racy primitive used for lock acquisition:
+    /// Atomically create `rel` with `data` only if it does not already exist,
+    /// and make the install DURABLE before returning: the create-new
+    /// primitive (`durable_create_new`) writes a unique temp inside the
+    /// destination directory, applies the FINAL MODE, fsyncs the file,
+    /// publishes WITHOUT replacement (a concurrent winner is never replaced),
+    /// removes the temp, and fsyncs the PARENT DIRECTORY — every failure
+    /// propagates. Returns `Ok(true)` if the file was created, `Ok(false)` if
+    /// it already existed (the existing content is left untouched; an
+    /// identical retry converges — the existing entry is verified
+    /// byte-and-mode identical — while a different winner is a conflict the
+    /// caller's read-back comparison decides), or `Err` on other failures.
+    /// This is the non-racy primitive used for lock acquisition:
     /// `exists`-then-`write` would let two controllers both observe "no lock"
     /// and both proceed.
     fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<bool>;
@@ -166,6 +174,264 @@ fn meta_to_remote(m: &std::fs::Metadata) -> RemoteMeta {
         size: m.len(),
         mode: m.mode(),
     }
+}
+
+/// The canonical FINAL MODE for immutable records installed through
+/// [`Remote::try_write_new`]: the same `0o644` every sibling JSON record is
+/// written with (the inventory, transactions, and the force-path lock rewrite
+/// all use `Remote::write(..., 0o644)`). The published inode must carry THIS
+/// mode — never the process umask the temp was created with — or the record's
+/// permissions would silently depend on the caller's umask.
+pub(crate) const IMMUTABLE_RECORD_MODE: u32 = 0o644;
+
+/// The verdict of one canonical create-new attempt ([`durable_create_new`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CreateNewVerdict {
+    /// The record was durably installed: exact bytes, the final mode, and a
+    /// parent-directory-fsync'd directory entry all hold.
+    Created,
+    /// The destination already existed with IDENTICAL bytes and final mode:
+    /// the identical retry converges — no error, no replace.
+    AlreadyPresent,
+    /// The destination already existed with DIFFERENT bytes or mode: a real
+    /// conflict. The winner is NEVER replaced or modified; the caller's
+    /// read-back comparison (every `try_write_new` caller performs one)
+    /// decides the semantic verdict — a same-operation retry converges, a
+    /// foreign winner is a genuine conflict.
+    Conflict,
+}
+
+/// The seven stages of the canonical create-new sequence — the crash/failure
+/// model's injection points. Test-only in practice (the proptest arms exactly
+/// one stage), but plain `pub(crate)` so the primitive can consult it in both
+/// build profiles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CreateNewStep {
+    CreateTemp,
+    Write,
+    Chmod,
+    FileFsync,
+    Publish,
+    Unlink,
+    ParentFsync,
+}
+
+/// One-shot stage failure injection for [`durable_create_new`]: armed for
+/// EXACTLY ONE step, fires ONCE (then disarms), per-fixture (never a
+/// process-global slot — two fixtures' faults can never consume each other).
+/// Production code never arms one (the `None` options path); the durability
+/// proptest arms exactly one stage to model a crash at that point.
+#[derive(Debug)]
+pub(crate) struct CreateNewFault {
+    step: CreateNewStep,
+    armed: std::sync::atomic::AtomicBool,
+}
+
+impl CreateNewFault {
+    /// Arm a one-shot fault for `step`. Test-only (production never arms a
+    /// fault); the type itself stays plain `pub(crate)` because the
+    /// primitive's options carry it in both build profiles.
+    #[cfg(test)]
+    pub(crate) fn new(step: CreateNewStep) -> Self {
+        Self {
+            step,
+            armed: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+
+    /// Consume the fault: fire exactly once when `step` matches the armed
+    /// stage (and never again).
+    pub(crate) fn consume(&self, step: CreateNewStep) -> bool {
+        use std::sync::atomic::Ordering;
+        self.step == step && self.armed.swap(false, Ordering::SeqCst)
+    }
+}
+
+/// Settings for one [`durable_create_new`] attempt: the FINAL MODE the
+/// published inode must carry, and (test-only) the one-shot stage fault.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CreateNewOptions<'a> {
+    pub(crate) mode: u32,
+    pub(crate) fault: Option<&'a CreateNewFault>,
+}
+
+/// THE ONE CANONICAL CREATE-NEW PRIMITIVE — the durable install protocol for
+/// immutable records (commit markers, locks, the protocol marker, assignment
+/// and release records). Realized by [`LocalTransport::try_write_new`] on
+/// this host and by the `SshTransport` remote script (`write_new_cmd`) with
+/// the IDENTICAL seven-step sequence:
+///
+/// 1. **create temp** — a unique, dot-prefixed temp name INSIDE the
+///    destination directory (so the no-replace publish is atomic within the
+///    same directory), created with create-new semantics;
+/// 2. **write** — all bytes;
+/// 3. **final chmod** — the caller's FINAL MODE is applied to the temp
+///    BEFORE the fsync, so the published inode carries the exact mode, never
+///    the process umask;
+/// 4. **file fsync** — the temp file is durable;
+/// 5. **no-replace publish** — `link(2)` under the final name: `EEXIST` is
+///    the conflict verdict (the winner is NEVER replaced), every other
+///    failure propagates;
+/// 6. **unlink temp** — the temp name is removed (best-effort cleanup — the
+///    ERROR path propagates the REAL failure);
+/// 7. **parent-directory fsync** — the PARENT DIRECTORY is fsync'd (the step
+///    the old code claimed but never performed) so the directory entry is
+///    durable; a FAILED parent fsync is a propagated error.
+///
+/// Every state failure in every step PROPAGATES as an error — `Ok(Created)`
+/// therefore implies exact bytes (the fully-written inode), the final mode,
+/// and a DURABLE directory entry. On a conflict (step 5's `EEXIST`) the
+/// existing entry is read back and compared byte-and-mode to the intended
+/// content: identical → [`CreateNewVerdict::AlreadyPresent`] (the identical
+/// retry converges — no error, no replace); different →
+/// [`CreateNewVerdict::Conflict`] (a genuine conflict — never replaced).
+/// `Ok(AlreadyPresent)` runs the parent fsync too, so the convergent path
+/// still returns with a durable entry.
+pub(crate) fn durable_create_new(
+    base: &Path,
+    rel: &Path,
+    data: &[u8],
+    options: CreateNewOptions<'_>,
+) -> Result<CreateNewVerdict> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let p = join(base, rel);
+    if let Some(parent) = p.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Error::transport(format!("mkdir {}: {e}", parent.display())))?;
+    }
+    // 1. create temp: a unique dot-prefixed name inside the destination
+    //    directory, with create-new semantics (never truncates a stale temp
+    //    a crashed controller left behind).
+    let tmp = p.with_file_name(format!(
+        ".{}.tmp.{}.{}",
+        p.file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default(),
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+    let fail = |step: CreateNewStep| options.fault.is_some_and(|f| f.consume(step));
+    if fail(CreateNewStep::CreateTemp) {
+        return Err(Error::transport(format!(
+            "test fault: create-new step {step:?} forced to fail (once)",
+            step = CreateNewStep::CreateTemp
+        )));
+    }
+    let mut f = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(Error::transport(format!("create {}: {e}", tmp.display())));
+        }
+    };
+    // 2. write — all bytes.
+    if fail(CreateNewStep::Write) {
+        return Err(Error::transport(format!(
+            "test fault: create-new step {step:?} forced to fail (once)",
+            step = CreateNewStep::Write
+        )));
+    }
+    f.write_all(data)
+        .map_err(|e| Error::transport(format!("write {}: {e}", tmp.display())))?;
+    // 3. final chmod — the FINAL MODE is applied to the temp BEFORE the
+    //    fsync, so the published inode carries the caller's mode, never the
+    //    process umask.
+    if fail(CreateNewStep::Chmod) {
+        return Err(Error::transport(format!(
+            "test fault: create-new step {step:?} forced to fail (once)",
+            step = CreateNewStep::Chmod
+        )));
+    }
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(options.mode & 0o7777))
+        .map_err(|e| Error::transport(format!("chmod {}: {e}", tmp.display())))?;
+    // 4. file fsync — the temp file is durable.
+    if fail(CreateNewStep::FileFsync) {
+        return Err(Error::transport(format!(
+            "test fault: create-new step {step:?} forced to fail (once)",
+            step = CreateNewStep::FileFsync
+        )));
+    }
+    f.sync_all()
+        .map_err(|e| Error::transport(format!("fsync {}: {e}", tmp.display())))?;
+    drop(f);
+    // 5. no-replace publish — link(2) fails with EEXIST when a concurrent
+    //    writer won; the winner is NEVER replaced. On EEXIST the existing
+    //    entry is VERIFIED (verify-on-retry): byte-and-mode identical →
+    //    AlreadyPresent (the identical retry converges), anything else →
+    //    Conflict (a genuine conflict).
+    if fail(CreateNewStep::Publish) {
+        return Err(Error::transport(format!(
+            "test fault: create-new step {step:?} forced to fail (once)",
+            step = CreateNewStep::Publish
+        )));
+    }
+    let verdict = match std::fs::hard_link(&tmp, &p) {
+        Ok(()) => CreateNewVerdict::Created,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let verify = (|| -> Result<CreateNewVerdict> {
+                let existing = std::fs::read(&p)
+                    .map_err(|e| Error::transport(format!("verify read {}: {e}", p.display())))?;
+                let meta = std::fs::metadata(&p)
+                    .map_err(|e| Error::transport(format!("verify stat {}: {e}", p.display())))?;
+                if existing == data && (meta.mode() & 0o7777) == (options.mode & 0o7777) {
+                    Ok(CreateNewVerdict::AlreadyPresent)
+                } else {
+                    Ok(CreateNewVerdict::Conflict)
+                }
+            })();
+            match verify {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(e);
+                }
+            }
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(Error::transport(format!("install {}: {e}", p.display())));
+        }
+    };
+    // 6. unlink temp — remove ONLY the temp this invocation created
+    //    (best-effort cleanup; the REAL failure above already propagated).
+    if fail(CreateNewStep::Unlink) {
+        return Err(Error::transport(format!(
+            "test fault: create-new step {step:?} forced to fail (once)",
+            step = CreateNewStep::Unlink
+        )));
+    }
+    let _ = std::fs::remove_file(&tmp);
+    // 7. parent-directory fsync — the step the old code CLAIMED but never
+    //    performed: fsync the PARENT DIRECTORY so the published directory
+    //    entry survives a crash. FAIL-CLOSED: a failed open OR a failed
+    //    fsync is a propagated error (never swallowed). Runs for a Created
+    //    install AND for an AlreadyPresent retry (the convergent entry is
+    //    made durable too); a Conflict's entry is not ours to bless — it is
+    //    only ever read, never modified.
+    if matches!(
+        verdict,
+        CreateNewVerdict::Created | CreateNewVerdict::AlreadyPresent
+    ) && let Some(parent) = p.parent()
+    {
+        if fail(CreateNewStep::ParentFsync) {
+            return Err(Error::transport(format!(
+                "test fault: create-new step {step:?} forced to fail (once)",
+                step = CreateNewStep::ParentFsync
+            )));
+        }
+        let dir = std::fs::File::open(parent)
+            .map_err(|e| Error::transport(format!("open dir {}: {e}", parent.display())))?;
+        dir.sync_all()
+            .map_err(|e| Error::transport(format!("fsync dir {}: {e}", parent.display())))?;
+    }
+    Ok(verdict)
 }
 
 /// A transport that operates on a local directory, executing commands on the
@@ -344,67 +610,23 @@ impl Remote for LocalTransport {
     }
 
     fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<bool> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-        let p = join(&self.base, rel);
-        if let Some(parent) = p.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| Error::transport(format!("mkdir {}: {e}", parent.display())))?;
+        // The ONE canonical create-new primitive (see `durable_create_new`):
+        // temp -> write -> final chmod -> file fsync -> no-replace publish ->
+        // unlink temp -> parent-directory fsync, every failure propagated, and
+        // verify-on-retry. The immutable records this installs carry the
+        // canonical final mode (`IMMUTABLE_RECORD_MODE`), never the umask.
+        match durable_create_new(
+            &self.base,
+            rel,
+            data,
+            CreateNewOptions {
+                mode: IMMUTABLE_RECORD_MODE,
+                fault: None,
+            },
+        )? {
+            CreateNewVerdict::Created => Ok(true),
+            CreateNewVerdict::AlreadyPresent | CreateNewVerdict::Conflict => Ok(false),
         }
-        // Durability protocol for immutable records:
-        //
-        // 1. Write into a UNIQUE temporary file in the destination directory,
-        //    then fsync it. A concurrent reader observing the filesystem at
-        //    this point sees no destination file at all — never a partial one.
-        // 2. Install atomically WITHOUT replacement: link(2) publishes the
-        //    fully written inode under the final name and fails with EEXIST if
-        //    another writer won, so no reader can ever observe a torn record
-        //    and no loser can clobber a winner.
-        // 3. Unlink the temporary name and fsync the parent directory so the
-        //    installation survives a crash.
-        let tmp = p.with_file_name(format!(
-            ".{}.tmp.{}.{}",
-            p.file_name()
-                .map(|n| n.to_string_lossy())
-                .unwrap_or_default(),
-            std::process::id(),
-            TMP_COUNTER.fetch_add(1, Ordering::Relaxed),
-        ));
-        {
-            use std::io::Write;
-            let mut f = match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp)
-            {
-                Ok(f) => f,
-                Err(e) => {
-                    let _ = std::fs::remove_file(&tmp);
-                    return Err(Error::transport(format!("create {}: {e}", tmp.display())));
-                }
-            };
-            f.write_all(data)
-                .map_err(|e| Error::transport(format!("write {}: {e}", tmp.display())))?;
-            f.sync_all()
-                .map_err(|e| Error::transport(format!("fsync {}: {e}", tmp.display())))?;
-        }
-        let installed = match std::fs::hard_link(&tmp, &p) {
-            Ok(()) => true,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(Error::transport(format!("install {}: {e}", p.display())));
-            }
-        };
-        let _ = std::fs::remove_file(&tmp);
-        if installed
-            && let Some(parent) = p.parent()
-            && let Ok(dir) = std::fs::File::open(parent)
-        {
-            let _ = dir.sync_all();
-        }
-        Ok(installed)
     }
 
     fn remove_dir_all(&self, rel: &Path) -> Result<()> {
@@ -641,5 +863,280 @@ mod tests {
         );
         let target = t.read_link(Path::new("current")).unwrap();
         assert_eq!(target, Path::new("generations/gen1"));
+    }
+
+    /// The transport-level contract of the shared primitive: `try_write_new`
+    /// reports `Ok(true)` for a fresh DURABLE install, `Ok(false)` for an
+    /// identical retry (convergent — the winner is verified byte-and-mode
+    /// identical, never replaced), and `Ok(false)` for a different-content
+    /// conflict (the winner is never touched; the caller's read-back
+    /// comparison decides the semantic verdict). The installed record carries
+    /// the canonical final mode, not the process umask.
+    #[test]
+    fn try_write_new_durable_install_and_conflict_contract() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let t = LocalTransport::new(&SysEnv::from_process(), dir.path().join("r")).unwrap();
+        let rel = Path::new("state/op.json");
+        let data = b"{\"op\":\"1\"}";
+
+        assert!(t.try_write_new(rel, data).unwrap(), "a fresh install wins");
+        let p = t.root().join(rel);
+        assert_eq!(std::fs::read(&p).unwrap(), data, "exact bytes installed");
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().mode() & 0o7777,
+            IMMUTABLE_RECORD_MODE & 0o7777,
+            "the record must carry the canonical final mode"
+        );
+        // Identical retry: convergent — Ok(false), no error, no replace.
+        assert!(
+            !t.try_write_new(rel, data).unwrap(),
+            "an identical retry converges to already-present"
+        );
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            data,
+            "the identical retry must not touch the winner"
+        );
+        // Different content: the conflict verdict — Ok(false), never replaced.
+        assert!(
+            !t.try_write_new(rel, b"other").unwrap(),
+            "a different-content conflict is the verdict"
+        );
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            data,
+            "the conflict must NEVER replace the winner"
+        );
+    }
+
+    /// The durability property's scenario dimension: the healthy install, a
+    /// one-shot crash/failure at one of the SEVEN stages, and the two
+    /// pre-existing-winner retry cases (identical / different).
+    #[derive(Clone, Copy, Debug)]
+    enum CreateNewScenario {
+        Healthy,
+        FailAt(CreateNewStep),
+        PreExistingIdentical,
+        PreExistingDifferent,
+        PreExistingDifferentMode,
+    }
+
+    fn create_new_scenario() -> impl Strategy<Value = CreateNewScenario> {
+        prop_oneof![
+            Just(CreateNewScenario::Healthy),
+            Just(CreateNewScenario::PreExistingIdentical),
+            Just(CreateNewScenario::PreExistingDifferent),
+            Just(CreateNewScenario::PreExistingDifferentMode),
+            Just(CreateNewScenario::FailAt(CreateNewStep::CreateTemp)),
+            Just(CreateNewScenario::FailAt(CreateNewStep::Write)),
+            Just(CreateNewScenario::FailAt(CreateNewStep::Chmod)),
+            Just(CreateNewScenario::FailAt(CreateNewStep::FileFsync)),
+            Just(CreateNewScenario::FailAt(CreateNewStep::Publish)),
+            Just(CreateNewScenario::FailAt(CreateNewStep::Unlink)),
+            Just(CreateNewScenario::FailAt(CreateNewStep::ParentFsync)),
+        ]
+    }
+
+    use proptest::prelude::*;
+    use proptest::test_runner::RngSeed;
+
+    proptest! {
+        // THE DURABILITY CRASH/FAILURE MODEL — one property, every case:
+        //
+        // * `Ok(Created)` implies EXACT BYTES, the FINAL MODE, and a DURABLE
+        //   DIRECTORY ENTRY — a fresh read of the destination directory (a
+        //   simulated crash-after-return) still sees the entry, because the
+        //   parent fsync established it;
+        // * CONFLICT NEVER REPLACES: a destination pre-existing with
+        //   DIFFERENT bytes (or a different mode over identical bytes) is
+        //   never modified — the primitive returns the conflict verdict and
+        //   the winner stays intact;
+        // * RETRIES CONVERGE: after a one-shot failure at ANY of the seven
+        //   stages, an IDENTICAL retry succeeds and leaves the destination
+        //   EITHER the fully-written identical content OR absent — never a
+        //   partial/torn record;
+        // * FAILURE PROPAGATION: the faulted attempt is an `Err` naming the
+        //   injected stage — never a swallowed `Ok` that claims durability.
+        //
+        // Bounded cases (full budget under `DEPLOY_FULL_TESTS=1`, fast
+        // default), fixed seed 0x5EED_5EED (house style), no persistence, and
+        // each case drives its OWN fixture (per-fixture one-shot fault,
+        // structurally isolated).
+        #![proptest_config(ProptestConfig {
+            cases: crate::testutil::proptest_cases(64),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn durable_create_new_crash_failure_model(
+            content in prop::collection::vec(any::<u8>(), 0..128),
+            mode in prop_oneof![
+                Just(0o600u32),
+                Just(0o644u32),
+                Just(0o755u32),
+                Just(0o640u32),
+            ],
+            scenario in create_new_scenario(),
+        ) {
+            let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+            let root = dir.path().to_path_buf();
+            let rel = Path::new("state/record.bin");
+            let dest = root.join(rel);
+            let dest_name = rel.file_name().unwrap().to_string_lossy().into_owned();
+
+            match scenario {
+                CreateNewScenario::Healthy => {
+                    let verdict = durable_create_new(
+                        &root,
+                        rel,
+                        &content,
+                        CreateNewOptions { mode, fault: None },
+                    )
+                    .expect("the healthy install must succeed");
+                    prop_assert_eq!(verdict, CreateNewVerdict::Created);
+                    // Ok(Created) implies EXACT BYTES ...
+                    prop_assert_eq!(
+                        std::fs::read(&dest).expect("installed record must be readable"),
+                        content,
+                        "Ok(Created) must imply exact bytes"
+                    );
+                    // ... the FINAL MODE (never the process umask) ...
+                    let meta = std::fs::metadata(&dest).expect("installed record must exist");
+                    prop_assert_eq!(
+                        meta.mode() & 0o7777,
+                        mode & 0o7777,
+                        "Ok(Created) must imply the final mode"
+                    );
+                    // ... and a DURABLE DIRECTORY ENTRY: the parent fsync
+                    // established it, so a fresh directory read (a simulated
+                    // crash-after-return) still sees the entry.
+                    let names: Vec<String> = std::fs::read_dir(dest.parent().unwrap())
+                        .expect("the parent must be readable")
+                        .flatten()
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect();
+                    prop_assert!(
+                        names.contains(&dest_name),
+                        "the parent fsync must have established the directory entry, dir has: {names:?}"
+                    );
+                }
+                CreateNewScenario::FailAt(step) => {
+                    let fault = CreateNewFault::new(step);
+                    // FAILURE PROPAGATION: the faulted attempt is an Err
+                    // naming the injected stage — never a swallowed Ok.
+                    let err = durable_create_new(
+                        &root,
+                        rel,
+                        &content,
+                        CreateNewOptions { mode, fault: Some(&fault) },
+                    )
+                    .expect_err("a failure at every stage must propagate as Err");
+                    prop_assert!(
+                        err.to_string().contains("forced to fail (once)"),
+                        "the injected fault must be the propagated failure, got: {err}"
+                    );
+                    // RETRIES CONVERGE: an identical retry (the fault is
+                    // one-shot, already consumed) must succeed and leave the
+                    // destination EITHER the fully-written identical content
+                    // OR absent — never a partial/torn file.
+                    let retry = durable_create_new(
+                        &root,
+                        rel,
+                        &content,
+                        CreateNewOptions { mode, fault: None },
+                    )
+                    .expect("the identical retry must converge");
+                    prop_assert!(
+                        matches!(
+                            retry,
+                            CreateNewVerdict::Created | CreateNewVerdict::AlreadyPresent
+                        ),
+                        "the identical retry must converge, got: {retry:?}"
+                    );
+                    if dest.exists() {
+                        prop_assert_eq!(
+                            std::fs::read(&dest).expect("installed record must be readable"),
+                            content,
+                            "the destination must be the fully-written identical content, never partial"
+                        );
+                        let meta = std::fs::metadata(&dest).expect("installed record must exist");
+                        prop_assert_eq!(
+                            meta.mode() & 0o7777,
+                            mode & 0o7777,
+                            "the converged record must carry the intended final mode"
+                        );
+                    }
+                }
+                CreateNewScenario::PreExistingIdentical => {
+                    // A previous successful publish (identical bytes + mode):
+                    // the identical retry converges — AlreadyPresent, no
+                    // error, no replace.
+                    durable_create_new(&root, rel, &content, CreateNewOptions { mode, fault: None })
+                        .expect("the first install must succeed");
+                    let verdict =
+                        durable_create_new(&root, rel, &content, CreateNewOptions { mode, fault: None })
+                            .expect("an identical retry must converge, not error");
+                    prop_assert_eq!(verdict, CreateNewVerdict::AlreadyPresent);
+                    prop_assert_eq!(
+                        std::fs::read(&dest).unwrap(),
+                        content,
+                        "the identical retry must not touch the winner"
+                    );
+                }
+                CreateNewScenario::PreExistingDifferent => {
+                    // A concurrent winner with DIFFERENT content: a genuine
+                    // conflict — the verdict, never a replace, and the
+                    // winner's bytes stay intact.
+                    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+                    let other: Vec<u8> = if content.is_empty() {
+                        vec![0u8]
+                    } else {
+                        content.iter().map(|b| b.wrapping_add(1)).collect()
+                    };
+                    prop_assert_ne!(&other, &content, "the winner must differ from the intent");
+                    std::fs::write(&dest, &other).unwrap();
+                    let verdict = durable_create_new(
+                        &root,
+                        rel,
+                        &content,
+                        CreateNewOptions { mode, fault: None },
+                    )
+                    .expect("a conflict is a verdict, not an I/O error");
+                    prop_assert_eq!(verdict, CreateNewVerdict::Conflict);
+                    prop_assert_eq!(
+                        std::fs::read(&dest).unwrap(),
+                        other,
+                        "the conflict must NEVER replace the winner"
+                    );
+                }
+                CreateNewScenario::PreExistingDifferentMode => {
+                    // Identical bytes but a DIFFERENT mode: still a genuine
+                    // conflict (the mode is part of the record) — the verdict,
+                    // never a replace.
+                    durable_create_new(&root, rel, &content, CreateNewOptions { mode, fault: None })
+                        .expect("the first install must succeed");
+                    let other_mode = if (mode & 0o7777) == 0o600 { 0o644 } else { 0o600 };
+                    std::fs::set_permissions(
+                        &dest,
+                        std::fs::Permissions::from_mode(other_mode),
+                    )
+                    .unwrap();
+                    let verdict =
+                        durable_create_new(&root, rel, &content, CreateNewOptions { mode, fault: None })
+                            .expect("a mode mismatch is a verdict, not an I/O error");
+                    prop_assert_eq!(verdict, CreateNewVerdict::Conflict);
+                    let meta = std::fs::metadata(&dest).unwrap();
+                    prop_assert_eq!(
+                        meta.mode() & 0o7777,
+                        other_mode,
+                        "the mode mismatch must never be replaced"
+                    );
+                }
+            }
+        }
     }
 }
