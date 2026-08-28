@@ -24,6 +24,16 @@
 //!   (success, timeout, error) happens only after the child was REAPED: the
 //!   runner waits synchronously on its owned handle, `try_wait` consumes the
 //!   exit status exactly once, and "proven dead" means the wait returned.
+//! * **Foreground-only** — after the direct child exits, the runner probes
+//!   its process group (`killpg(pgid, 0)` — the pure-detection real
+//!   syscall, never the fault-injected seam): if ANY member remains (a
+//!   background descendant the command left behind), the runner terminates
+//!   the WHOLE group (TERM, grace, KILL — the timeout path's escalation),
+//!   waits for the group to be gone (bounded), and returns an ERROR — a
+//!   command that leaves background processes is a contract violation, NEVER
+//!   a successful outcome. A CLEAN command (the group empty after the child
+//!   exits — the common case) pays only that single probe and its exit code
+//!   and captured output are exactly as before.
 //! * **A timeout-kill failure is an ERROR** — if the group kill fails (a real
 //!   failure, not the benign ESRCH of a group that is already gone), or the
 //!   escalated kill fails, or the reap cannot be confirmed within the bound,
@@ -84,6 +94,24 @@ pub(crate) fn kill_process_group(pgid: i32, sig: i32) -> std::io::Result<()> {
         Ok(())
     } else {
         Err(std::io::Error::last_os_error())
+    }
+}
+
+/// True when the process group `pgid` still has at least one member:
+/// `killpg(pgid, 0)` (the standard existence probe — signal 0 performs all
+/// error checking but sends nothing) succeeds iff a member remains, ESRCH iff
+/// the group is empty. This is the FOREGROUND-ONLY detection: after the
+/// direct child exits the runner asks this before producing an outcome, and a
+/// leftover member is a contract violation. The probe uses the REAL `killpg`
+/// directly — it is a pure detection primitive, never the fault-injected
+/// [`KillSeam`], so an injected kill fault cannot turn a clean group into a
+/// false "leftover". A non-ESRCH probe error (EPERM, ...) is treated
+/// conservatively as "members may remain": the termination path then re-probes
+/// until the group is confirmed gone or the reap bound expires.
+fn process_group_has_members(pgid: i32) -> bool {
+    match kill_process_group(pgid, 0) {
+        Ok(()) => true,
+        Err(e) => e.raw_os_error() != Some(libc::ESRCH),
     }
 }
 
@@ -181,6 +209,12 @@ pub(crate) enum RunError {
     Spawn(String),
     /// Waiting on the child failed (wait error, pipe read error).
     Wait(String),
+    /// The command exited but left members of its process group alive — a
+    /// background descendant the command spawned outlived it. The group was
+    /// terminated (TERM → KILL) and the violation is reported as an error:
+    /// commands are FOREGROUND-ONLY, a command that leaves background
+    /// processes is never a successful outcome.
+    Background(String),
     /// A timeout-termination signal could not be delivered (kill failure).
     Kill(String),
     /// The child was not collected within the reap bound after termination.
@@ -192,6 +226,7 @@ impl std::fmt::Display for RunError {
         match self {
             RunError::Spawn(m) => write!(f, "{m}"),
             RunError::Wait(m) => write!(f, "{m}"),
+            RunError::Background(m) => write!(f, "{m}"),
             RunError::Kill(m) => write!(f, "kill failure: {m}"),
             RunError::Reap(m) => write!(f, "reap failure: {m}"),
         }
@@ -283,10 +318,13 @@ impl ChildRunner {
 
     /// Execute `argv` (no shell) bounded by `timeout`. Returns
     /// [`RunOutcome::Exited`] when the child finishes in time (exit code +
-    /// captured stdout/stderr), [`RunOutcome::TimedOut`] ONLY after the child
-    /// and its process group were terminated AND the child was reaped, or an
-    /// error when the spawn, the wait, the termination kill, or the reap
-    /// failed — a failed timeout kill never yields a successful timeout
+    /// captured stdout/stderr) AND left no members of its process group
+    /// behind (commands are FOREGROUND-ONLY), [`RunOutcome::TimedOut`] ONLY
+    /// after the child and its process group were terminated AND the child
+    /// was reaped, or an error when the spawn, the wait, the termination
+    /// kill, or the reap failed — a failed timeout kill never yields a
+    /// successful timeout outcome, and a command that exited but left
+    /// background processes in its group is a violation, never a successful
     /// outcome.
     pub(crate) fn exec(
         &self,
@@ -403,6 +441,46 @@ impl ChildRunner {
         #[cfg(test)]
         if let Some(observer) = &self.config.reap_observer {
             observer(pid);
+        }
+        // FOREGROUND-ONLY: after the direct child exits, probe its process
+        // group — if ANY member remains, the command left a background
+        // descendant. Terminate the WHOLE group (TERM → grace → KILL, the
+        // timeout path's escalation) and report the violation as an ERROR,
+        // never a successful outcome; the essential contract — no live
+        // process of the group after the return — is enforced BEFORE the
+        // outcome escapes. A CLEAN command (the group empty after the child
+        // exits — the common case) pays only this single `killpg(pgid, 0)`
+        // probe and proceeds exactly as before.
+        if process_group_has_members(pgid) {
+            // Terminate the whole group; a kill failure is surfaced inside
+            // the violation error (the leftover member must not survive even
+            // when a kill fails — the fault-injected paths that cannot land
+            // a kill are covered by the caller's own cleanup, and the drop
+            // backstop remains the final resort for the owned child).
+            let mut term_error: Option<String> = None;
+            if let Err(e) = self.config.kill.kill_group(pgid, libc::SIGTERM) {
+                term_error = Some(format!("TERM group {pgid}: {e}"));
+            }
+            std::thread::sleep(self.config.term_to_kill_grace);
+            if let Err(e) = self.config.kill.kill_group(pgid, libc::SIGKILL)
+                && term_error.is_none()
+            {
+                term_error = Some(format!("KILL group {pgid}: {e}"));
+            }
+            // Confirm the group is gone (bounded): a killed descendant is
+            // reparented to init and reaped there; the poll covers the
+            // transient zombie window. On expiry (an injected inert kill) the
+            // error still names the violation — the fault IS the kill not
+            // working.
+            let verify_deadline = Instant::now() + self.config.reap_bound;
+            while process_group_has_members(pgid) && Instant::now() < verify_deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let detail = term_error.map(|e| format!(" ({e})")).unwrap_or_default();
+            return Err(RunError::Background(format!(
+                "command {argv:?} left background processes in its process group; \
+                 commands are foreground-only{detail}"
+            )));
         }
         // Bounded drain to EOF: the child is dead and its pipes hold the
         // remaining output. A grandchild that keeps a pipe open cannot hang
@@ -532,17 +610,18 @@ where
 }
 
 /// Property test for the lifecycle contract: real children (quick-exit,
-/// slow, TERM-ignoring, grandchild-spawning, late-marker-writing) driven
-/// through [`ChildRunner::exec`] under injected kill faults (missing kill,
-/// EPERM, ESRCH, an inert kill), asserting for EVERY returned outcome: ZERO
-/// live processes (no child or grandchild of the spawned group remains — a
-/// process that merely received a signal but was not reaped, a zombie, still
-/// answers `kill(pid, 0)`), EXACTLY ONE reap (the runner's single
-/// `try_wait`, tracked via the reap observer; only the injected-unkillable
-/// fault lets the test's own cleanup be that one reap), and NO post-return
-/// filesystem effects (a child/grandchild that would write a marker after
-/// its "timeout" must never get the chance — the group is proven dead before
-/// the outcome escapes).
+/// slow, TERM-ignoring, grandchild-spawning, detached-grandchild-leaving,
+/// late-marker-writing) driven through [`ChildRunner::exec`] under injected
+/// kill faults (missing kill, EPERM, ESRCH, an inert kill), asserting for
+/// EVERY returned outcome: ZERO live processes (no child or grandchild of
+/// the spawned group remains — a process that merely received a signal but
+/// was not reaped, a zombie, still answers `kill(pid, 0)`), EXACTLY ONE reap
+/// (the runner's single `try_wait`, tracked via the reap observer; only the
+/// injected-unkillable fault lets the test's own cleanup be that one reap),
+/// and NO post-return filesystem effects (a child/grandchild that would
+/// write a marker after its "timeout" — or after a normal exit that left it
+/// behind — must never get the chance — the group is proven dead before the
+/// outcome escapes).
 #[cfg(test)]
 mod runner_property_tests {
     use super::*;
@@ -575,6 +654,13 @@ mod runner_property_tests {
         IgnoreTerm,
         /// Spawns a background GRANDCHILD and waits: the group must die.
         Grandchild,
+        /// Exits ZERO immediately after forking a background GRANDCHILD that
+        /// sleeps 0.4s then would write a marker file: the FOREGROUND-ONLY
+        /// detection must catch the leftover group member, terminate it, and
+        /// return the "left background processes" error — never a successful
+        /// exit-0 outcome — leaving no live process and no post-return fs
+        /// effect.
+        DetachedGrandchild,
         /// Sleeps 0.25s then would write a marker file: the probe for
         /// post-return filesystem effects.
         LateMarker,
@@ -647,6 +733,21 @@ mod runner_property_tests {
                 format!(
                     "sh -c 'sleep 60; touch {}' & echo $! > {}; wait",
                     dir.join("gc-marker").display(),
+                    dir.join("gcpid").display()
+                ),
+            ],
+            // The parent exits 0 IMMEDIATELY after forking the grandchild
+            // (the pidfile is written before the exit, so the parent-side
+            // `read_gc_pid` never races): the runner's wait reaps the child,
+            // and the FOREGROUND-ONLY probe must find the sleeping grandchild
+            // still in the group, terminate it before its 0.4s marker write,
+            // and error.
+            ChildKind::DetachedGrandchild => vec![
+                "sh".into(),
+                "-c".into(),
+                format!(
+                    "sh -c 'sleep 0.4; touch {}' & echo $! > {}; exit 0",
+                    dir.join("marker").display(),
                     dir.join("gcpid").display()
                 ),
             ],
@@ -732,7 +833,7 @@ mod runner_property_tests {
             .unwrap()
             .first()
             .expect("the spawn observer must record the child pid at spawn time");
-        let gc_pid = (kind == ChildKind::Grandchild)
+        let gc_pid = matches!(kind, ChildKind::Grandchild | ChildKind::DetachedGrandchild)
             .then(|| read_gc_pid(&dir.path().join("gcpid")))
             .flatten();
 
@@ -743,6 +844,22 @@ mod runner_property_tests {
 
         // ---- outcome classification ----
         match (&outcome, times_out, fault) {
+            // DetachedGrandchild: the child exits ZERO immediately but a
+            // grandchild remains — the FOREGROUND-ONLY violation. The outcome
+            // must be an ERROR naming the left-behind background processes,
+            // never a successful exit-0 outcome (zero-live and no-post-return
+            // fs are asserted below).
+            (Err(e), false, _) if kind == ChildKind::DetachedGrandchild => {
+                assert!(
+                    e.to_string().contains("left background processes"),
+                    "{kind:?} × {fault:?}: the violation error must name the background processes, got {e}"
+                );
+            }
+            (Ok(_), false, _) if kind == ChildKind::DetachedGrandchild => {
+                panic!(
+                    "{kind:?} × {fault:?}: a command that left a background grandchild must error, got {outcome:?}"
+                );
+            }
             (Ok(RunOutcome::Exited { exit_code, .. }), false, _) => {
                 let expect = if kind == ChildKind::NonZero { 7 } else { 0 };
                 assert_eq!(
@@ -804,7 +921,16 @@ mod runner_property_tests {
             ),
             Err(_) => assert_eq!(
                 runner_reaps,
-                if fault == KillFault::Inert { 0 } else { 1 },
+                // DetachedGrandchild exits ZERO on its own (no kill involved),
+                // so even under the inert fault the runner's wait reaps it
+                // exactly once; every other error outcome reaps only when its
+                // kills were effective (the inert fault IS the kill not
+                // working — nothing to reap).
+                if fault == KillFault::Inert && kind != ChildKind::DetachedGrandchild {
+                    0
+                } else {
+                    1
+                },
                 "{kind:?} × {fault:?}: an error outcome must reap once when its kills were effective, and never fake a reap it did not do"
             ),
         }
@@ -832,9 +958,14 @@ mod runner_property_tests {
         // ---- NO POST-RETURN FILESYSTEM EFFECTS ----
         // The probe window lets any write that a (buggy) still-alive child or
         // grandchild would attempt after the outcome land and be caught: the
-        // marker scripts write 0.25s in, the probe outlives that.
+        // marker scripts write 0.25s in (LateMarker/Grandchild) or 0.4s in
+        // (DetachedGrandchild), and the probe outlives that — a buggy runner
+        // that returned while the descendant still lived would be caught
+        // writing AFTER the outcome.
         if matches!(kind, ChildKind::LateMarker | ChildKind::Grandchild) {
             std::thread::sleep(Duration::from_millis(300));
+        } else if kind == ChildKind::DetachedGrandchild {
+            std::thread::sleep(Duration::from_millis(500));
         }
         assert!(
             !dir.path().join("marker").exists(),
@@ -853,6 +984,7 @@ mod runner_property_tests {
             Just(ChildKind::Slow),
             Just(ChildKind::IgnoreTerm),
             Just(ChildKind::Grandchild),
+            Just(ChildKind::DetachedGrandchild),
             Just(ChildKind::LateMarker),
         ]
     }
@@ -874,12 +1006,16 @@ mod runner_property_tests {
         // spawning, and late-marker children time out — and a timeout outcome
         // appears ONLY after the child and its group were proven dead (kill-0
         // → ESRCH, the reaped proof, for the child AND any grandchild) and
-        // the child was reaped exactly once. A kill failure (missing binary,
-        // EPERM, unreachable group) or an ineffective kill surfaces as an
-        // ERROR — never a successful `timed out` outcome — and a TERM-
+        // the child was reaped exactly once. A command that EXITS but leaves
+        // a background grandchild in its process group (DetachedGrandchild)
+        // is a FOREGROUND-ONLY violation: the runner terminates the group and
+        // errors — never a successful exit-0 outcome. A kill failure (missing
+        // binary, EPERM, unreachable group) or an ineffective kill surfaces
+        // as an ERROR — never a successful `timed out` outcome — and a TERM-
         // ignoring child is escalated to a group KILL. No child or grandchild
-        // ever writes a file after the runner returned. FIXED SEED 0x5EED_5EED
-        // (repo style) + bounded cases keep the suite deterministic.
+        // ever writes a file after the runner returned. FIXED SEED
+        // 0x5EED_5EED (repo style) + bounded cases keep the suite
+        // deterministic.
         #![proptest_config(ProptestConfig {
             cases: proptest_cases(16),
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
