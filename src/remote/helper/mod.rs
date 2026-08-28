@@ -275,7 +275,8 @@ impl<'a> RemoteHelper<'a> {
             if !force {
                 return Err(Error::remote(format!(
                     "remote mutation lock held by '{}' (epoch {}), not '{op_id}' — no automatic \
-                     takeover; explicit recovery is required after confirming the holder died",
+                     takeover; explicit recovery is required after confirming the holder died \
+                     (recover via `deploy unlock <target> <slot> --yes`)",
                     held_rec.owner, held_rec.epoch
                 )));
             }
@@ -535,7 +536,10 @@ pub struct LockRecord {
 /// for genuine absence, the parsed record otherwise, `Err` for a transport
 /// fault or a present-but-not-a-record file. The typed `metadata_opt` probe
 /// means a failed read is NEVER indistinguishable from absence.
-fn read_lock_record(remote: &dyn Remote, p: &std::path::Path) -> Result<Option<LockRecord>> {
+pub(crate) fn read_lock_record(
+    remote: &dyn Remote,
+    p: &std::path::Path,
+) -> Result<Option<LockRecord>> {
     let Some(_) = remote.metadata_opt(p)? else {
         return Ok(None);
     };

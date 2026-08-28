@@ -477,7 +477,7 @@ pub(crate) fn run_preflight(
                 && held != op_id.as_str()
             {
                 return Err(Error::preflight(format!(
-                    "slot {slot_id} mutation lock held by '{held}'"
+                    "slot {slot_id} mutation lock held by '{held}' — recover via `deploy unlock {target_name} {slot_id} --yes` after confirming the holder died"
                 )));
             }
             for a in &assignments {

@@ -236,6 +236,11 @@ deploy status production
 deploy push production @-              # the previous successful deployment
 deploy push production 'parent(@, 3)'    # three deployments back
 deploy push production deploy-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b  # exact state of that deployment
+# Recover a stranded server mutation lock (no-expiry: a held lock never breaks on its own;
+# explicit recovery via --yes after confirming the holder died — inspects without --yes,
+# recovers with epoch+1 and releases leaving the slot free; idempotent):
+deploy unlock production p1             # inspect: free or held by '<owner>' (epoch N) with remedy
+deploy unlock production p1 --yes       # recover: replace held lock (epoch+1) and release — slot free
 # Establish a monotonic HISTORY FLOOR at a successful deployment
 # (IRREVERSIBLE — requires --yes; --dry-run previews the discard list):
 deploy checkpoint production deploy-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b --dry-run

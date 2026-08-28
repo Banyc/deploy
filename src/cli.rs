@@ -10,7 +10,7 @@ use crate::config::ProjectConfig;
 use crate::deploy::{PushOptions, PushReport, push};
 use crate::env::SysEnv;
 use crate::error::{Error, Result};
-use crate::identity::{DeploymentId, ReleaseId, valid_hex_digest};
+use crate::identity::{DeploymentId, ReleaseId, SlotId, valid_hex_digest};
 use crate::init::{InitOptions, init_project};
 use crate::ledger::{ObservedAssignment, ObservedTarget};
 // The `deploy log` RENDERING lives in [`crate::ledger::log`]; cli.rs stays the
@@ -289,6 +289,43 @@ A checkpoint does not deploy anything or contact remote servers.",
         #[arg(long)]
         yes: bool,
     },
+    /// Inspect and recover a stranded server mutation lock.
+    #[command(
+        long_about = "Inspect and recover a stranded server mutation lock.\n\
+\n\
+The server mutation lock is a create-once ownership record with NO\n\
+expiry (no lease, no clock): a held lock never becomes breakable on\n\
+its own and changes hands ONLY via explicit recovery. A transient\n\
+release failure (transport fault at drop) strands the slot forever\n\
+until an operator confirms the holding controller died and recovers.\n\
+This command is the explicit, evidence-requiring remedy: it inspects\n\
+the remote lock (typed read, never provisioning layout) and — with\n\
+--yes — replaces the dead holder's record with a successor (epoch+1)\n\
+under the authoritative local store lock, then releases, leaving the\n\
+slot free.\n\
+\n\
+Without --yes the command is a read-only preview: a free slot reports\n\
+free, a held slot is refused with the holder, epoch, and the remedy\n\
+command (the lock is never touched). With --yes the held lock is\n\
+recovered and released; the slot ends free. The operation is idempotent\n\
+(a free slot stays free) and a stale observed record is refused\n\
+(the lock changed; re-read and re-confirm).",
+        after_help = "Examples:\n\
+  deploy unlock production p1                 # inspect: free or held + remedy\n\
+  deploy unlock production p1 --yes           # recover (epoch+1) and release — slot free\n\
+  deploy push production                      # now succeeds (lock was freed)"
+    )]
+    Unlock {
+        /// The target whose member slot's mutation lock to inspect/recover.
+        target: String,
+        /// The member slot (one of the target's slots) whose server mutation lock is stuck.
+        slot: SlotId,
+        /// Recover the lock: confirm the holding operation died and replace it with a
+        /// successor record (epoch + 1), then release — leaving the slot free. Required
+        /// for the real operation; refused without it.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// CLI entry point: snapshot the process environment ONCE at the process
@@ -461,6 +498,13 @@ where
                 dry_run,
             )?;
             for line in crate::retention::checkpoint::render_checkpoint_report(&report) {
+                println!("{line}");
+            }
+        }
+        Command::Unlock { target, slot, yes } => {
+            let report =
+                crate::deploy::unlock::run_unlock(&store, &config, &factory, &target, &slot, yes)?;
+            for line in crate::deploy::unlock::render_unlock_report(&report) {
                 println!("{line}");
             }
         }
@@ -1680,6 +1724,159 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             ]),
             prop::collection::vec(prop::char::any(), 0..80).prop_map(|v| v.into_iter().collect()),
         ]
+    }
+
+    #[test]
+    fn unlock_cli_inspects_and_recovers() {
+        use crate::remote::helper::RemoteHelper;
+        use crate::remote::layout;
+        use crate::remote::transport::LocalTransport;
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let env = SysEnv::from_map(std::collections::BTreeMap::from([(
+            std::ffi::OsString::from("XDG_DATA_HOME"),
+            dir.path().join("store-root").into_os_string(),
+        )]));
+        let project = dir.path().join("proj");
+        let release_dir = project.join("releases").join("v1");
+        std::fs::create_dir_all(&release_dir).unwrap();
+        let slot_root = dir.path().join("unlock-remote");
+        std::fs::create_dir_all(&slot_root).unwrap();
+        let slot_root_str = slot_root.to_string_lossy().to_string();
+        std::fs::write(
+            release_dir.join("standard.toml"),
+            format!(
+                r#"[[slots]]
+id = "p1"
+server = "s1"
+target = "production"
+deploy_dir = "{slot_root_str}"
+
+[[artifact.mappings]]
+from = "artifacts/build/output/"
+to = "app/"
+recursive = true
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["true"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("deploy.toml"),
+            r#"schema_version = 2
+application = "unlock-cli"
+release = "v1"
+
+[[servers]]
+id = "s1"
+address = "local"
+user = "deploy"
+
+[targets.production]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+"#,
+        )
+        .unwrap();
+        let cfg_path = project.join("deploy.toml");
+        let config = ProjectConfig::load(&cfg_path).unwrap();
+        // Resolve slot's deploy_dir (the transport root): the slot's
+        // PhysicalBinding for p1 is the root LocalTransport uses. For the
+        // pathless local connection the slot deploy_dir IS the root.
+        let slot_deploy_dir = config
+            .target_slots("production")
+            .unwrap()
+            .into_iter()
+            .find(|(s, _)| s.id == "p1")
+            .unwrap()
+            .0
+            .deploy_dir()
+            .to_path_buf();
+        // Plant a hostile lock directly on the slot's remote (LocalTransport
+        // over the deploy_dir).
+        let remote =
+            LocalTransport::new(&crate::testutil::fixture_env(), slot_deploy_dir.clone()).unwrap();
+        let helper = RemoteHelper::new(&remote);
+        helper.acquire_lock("op-dead", false).unwrap();
+        // No --yes: refusal naming holder+epoch+--yes, lock byte-identical.
+        let before = remote.read(&layout::operation_lock()).unwrap();
+        let err = run_with(
+            [
+                "deploy",
+                "--config",
+                cfg_path.to_str().unwrap(),
+                "unlock",
+                "production",
+                "p1",
+            ],
+            &env,
+        )
+        .expect_err("unlock without --yes must refuse when held");
+        let msg = err.to_string();
+        assert!(msg.contains("op-dead"), "must name holder: {msg}");
+        assert!(msg.contains("epoch 1"), "must name epoch: {msg}");
+        assert!(msg.contains("--yes"), "must name remedy: {msg}");
+        let after = remote.read(&layout::operation_lock()).unwrap();
+        assert_eq!(before, after, "lock must be byte-identical after refusal");
+        // With --yes: prints recovered line and lock file gone.
+        run_with(
+            [
+                "deploy",
+                "--config",
+                cfg_path.to_str().unwrap(),
+                "unlock",
+                "production",
+                "p1",
+                "--yes",
+            ],
+            &env,
+        )
+        .expect("unlock with --yes must succeed");
+        assert!(
+            remote
+                .metadata_opt(&layout::operation_lock())
+                .unwrap()
+                .is_none(),
+            "lock file must be gone after --yes"
+        );
+        // Verify render output would contain recovered line (through helper directly).
+        let store =
+            LocalStore::with_base(crate::store::local::default_base(&env).join("unlock-cli"))
+                .unwrap();
+        // Re-plant and test via run_unlock rendering directly for recovered line.
+        let remote2 =
+            LocalTransport::new(&crate::testutil::fixture_env(), slot_deploy_dir.clone()).unwrap();
+        let helper2 = RemoteHelper::new(&remote2);
+        helper2.acquire_lock("op-dead2", false).unwrap();
+        let factory =
+            move |s: &crate::config::ServerDef,
+                  slot: &crate::config::SlotConfig|
+                  -> crate::error::Result<Box<dyn crate::remote::transport::Remote>> {
+                crate::remote::create_remote(&env, s, slot.deploy_dir())
+            };
+        let report = crate::deploy::unlock::run_unlock(
+            &store,
+            &config,
+            &factory,
+            "production",
+            &crate::identity::SlotId::parse("p1").unwrap(),
+            true,
+        )
+        .unwrap();
+        let lines = crate::deploy::unlock::render_unlock_report(&report);
+        assert!(
+            lines[0].contains("recovered"),
+            "rendered line: {}",
+            lines[0]
+        );
+        assert!(lines[0].contains("op-dead2"), "rendered line: {}", lines[0]);
     }
 
     proptest! {

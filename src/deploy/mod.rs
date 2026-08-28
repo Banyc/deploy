@@ -34,6 +34,7 @@ pub mod plan;
 pub mod push;
 pub mod refs;
 pub mod rollout;
+pub mod unlock;
 
 // The shared test fixtures for the push spine and its phase modules
 // (test-only; consumed by the phase modules' tests and by
