@@ -14,16 +14,21 @@
 //!
 //! # Submodules
 //!
+//! * `runner` — the shared bounded child-runner: synchronized child
+//!   ownership, process-group termination, and mandatory wait/reap before
+//!   every returned outcome (used by [`LocalTransport::exec`]).
 //! * `ssh` — the SSH transport group: the [`SshTransport`] itself plus
 //!   host-key verification (`ssh::hostkey`) and the bounded subprocess
 //!   runner (`ssh::runner`).
 
+mod runner;
 mod ssh;
 
 pub use ssh::SshTransport;
 
 use crate::env::SysEnv;
 use crate::error::{Error, Result};
+use runner::{ChildRunner, RunOutcome, RunnerConfig};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -438,13 +443,19 @@ pub(crate) fn durable_create_new(
 /// host. It mirrors the SSH remote layout exactly.
 pub struct LocalTransport {
     base: PathBuf,
-    /// The child environment snapshot: every spawned child (`exec`, `df`, the
-    /// timeout `kill`) receives THIS snapshot as its ENTIRE environment
+    /// The child environment snapshot: every spawned child (`exec`, `df`)
+    /// receives THIS snapshot as its ENTIRE environment
     /// ([`SysEnv::apply_to_command`]: `env_clear` first, then the snapshot's
     /// variables) — a deterministic HERMETIC environment resolved at the
     /// construction boundary, never whatever the parent env looks like at
     /// spawn time, and nothing else.
     env: SysEnv,
+    /// THE shared bounded child-runner every `exec` goes through: the runner
+    /// owns the child from spawn to the mandatory reap, terminates the whole
+    /// process GROUP on timeout (TERM, grace, KILL), and returns every
+    /// outcome — success, timeout, error — only after the child was reaped; a
+    /// timeout-kill failure is an error, never a successful timeout outcome.
+    runner: ChildRunner,
 }
 
 impl LocalTransport {
@@ -469,6 +480,7 @@ impl LocalTransport {
             )));
         }
         Ok(LocalTransport {
+            runner: ChildRunner::new(env, base.clone(), RunnerConfig::production()),
             base,
             env: env.clone(),
         })
@@ -668,43 +680,29 @@ impl Remote for LocalTransport {
         if argv.is_empty() {
             return Err(Error::transport("empty command"));
         }
-        let mut cmd = std::process::Command::new(&argv[0]);
-        self.env.apply_to_command(&mut cmd);
-        cmd.args(&argv[1..]);
-        cmd.current_dir(&self.base);
-        let child = cmd
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| Error::transport(format!("spawn {:?}: {e}", argv)))?;
-        let pid = child.id();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let res = child.wait_with_output();
-            let _ = tx.send(res);
-        });
-        let out = match rx.recv_timeout(timeout) {
-            Ok(Ok(o)) => o,
-            Ok(Err(e)) => {
-                return Err(Error::transport(format!("wait {:?}: {e}", argv)));
-            }
-            Err(_) => {
-                // Timed out: kill the child.
-                let mut kill_cmd = std::process::Command::new("kill");
-                self.env.apply_to_command(&mut kill_cmd);
-                let _ = kill_cmd.arg("-9").arg(pid.to_string()).status();
-                return Ok(ExecOutcome {
-                    exit_code: -1,
-                    stdout: String::new(),
-                    stderr: format!("timed out after {timeout:?}"),
-                });
-            }
-        };
-        Ok(ExecOutcome {
-            exit_code: out.status.code().unwrap_or(-1),
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        })
+        // THE bounded child-runner: the runner owns the child (spawned into
+        // its OWN process group), waits with the caller's timeout, and on
+        // timeout terminates the whole group (TERM, grace, KILL) then reaps
+        // before ANY outcome escapes — the timeout outcome is returned only
+        // after the child was proven dead and reaped, and a timeout-KILL
+        // failure surfaces as an error, never a successful timeout.
+        match self.runner.exec(argv, timeout) {
+            Ok(RunOutcome::Exited {
+                exit_code,
+                stdout,
+                stderr,
+            }) => Ok(ExecOutcome {
+                exit_code,
+                stdout,
+                stderr,
+            }),
+            Ok(RunOutcome::TimedOut { stderr }) => Ok(ExecOutcome {
+                exit_code: -1,
+                stdout: String::new(),
+                stderr,
+            }),
+            Err(e) => Err(Error::transport(e.to_string())),
+        }
     }
 
     fn filesystem_bytes(&self) -> Result<FsBytes> {

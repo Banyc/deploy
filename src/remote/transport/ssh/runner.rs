@@ -3,7 +3,9 @@
 //! after connection establishment.
 
 use crate::env::SysEnv;
+use crate::remote::transport::runner::{TERM_TO_KILL_GRACE, kill_process_group};
 use std::os::fd::AsRawFd;
+use std::os::unix::process::CommandExt;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -148,6 +150,11 @@ impl SshRunnerSeam for RealRunner {
         if stdin.is_some() {
             cmd.stdin(Stdio::piped());
         }
+        // The child becomes its OWN process-group leader (pgid == pid) — the
+        // shared bounded child-runner's spawn rule — so the deadline kill
+        // terminates the WHOLE group (killpg), and any local helper process
+        // the child spawned dies with it.
+        cmd.process_group(0);
         let child = cmd.spawn()?;
         // The parent reads the pid synchronously at spawn time and surfaces it
         // through the runner's spawn observer: the child never needs to write
@@ -157,18 +164,48 @@ impl SshRunnerSeam for RealRunner {
         // and the wait thread through this slot: the wait thread polls the
         // child (`try_wait`) with the slot locked and CONSUMES it on exit
         // (the slot becomes None), the deadline path locks the same slot and
-        // calls `Child::kill` on the OWNED handle — never a detached pid. A
-        // kill on a slot the wait thread already reaped (None) is a no-op by
-        // construction: a consumed handle cannot signal anything, so a pid
-        // the OS recycled to an unrelated process can never be hit.
+        // terminates the WHOLE process group (`killpg` TERM then KILL, with a
+        // fallback to `Child::kill` on the OWNED handle) — never a detached
+        // pid. A kill on a slot the wait thread already reaped (None) is a
+        // no-op by construction: a consumed handle cannot signal anything, so
+        // a pid the OS recycled to an unrelated process can never be hit.
         let child: Arc<Mutex<Option<std::process::Child>>> = Arc::new(Mutex::new(Some(child)));
         let kill_child = child.clone();
         let kill: Box<dyn Fn() -> std::io::Result<()> + Send> = Box::new(move || {
-            match kill_child.lock().unwrap().as_mut() {
-                // SAFETY is provided by std: `Child::kill` SIGKILLs the
-                // process this runner spawned and owns.
-                Some(child) => child.kill(),
-                None => Ok(()),
+            let mut guard = kill_child.lock().unwrap();
+            let Some(child) = guard.as_mut() else {
+                // The wait thread already reaped the child: a kill on the
+                // consumed handle is a NO-OP by construction — a pid the OS
+                // recycled to an unrelated process can never be signalled.
+                return Ok(());
+            };
+            // Terminate the WHOLE process group (shared with the local
+            // child-runner): graceful TERM first, then — after the shared
+            // grace — an escalated KILL, so a child that ignores TERM (and
+            // any grandchild in the group) still dies.
+            let pgid = child.id() as i32;
+            match kill_process_group(pgid, libc::SIGTERM) {
+                Ok(()) => {
+                    std::thread::sleep(TERM_TO_KILL_GRACE);
+                    match kill_process_group(pgid, libc::SIGKILL) {
+                        Ok(()) => Ok(()),
+                        // The group already died on TERM (the wait thread
+                        // reaps the child): nothing left to kill.
+                        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(()),
+                        // The escalated group kill failed: fall back to the
+                        // OWNED handle so the direct child still dies and the
+                        // join reaps it; the failure is surfaced.
+                        Err(e) => child.kill().or(Err(e)),
+                    }
+                }
+                // The group is already gone (the child exited, or escaped via
+                // setsid): fall back to the OWNED handle so a live direct
+                // child is still terminated.
+                Err(e) if e.raw_os_error() == Some(libc::ESRCH) => child.kill(),
+                // A real group-kill failure: fall back to the owned handle so
+                // the direct child still dies (the join then reaps it), and
+                // surface the failure.
+                Err(e) => child.kill().or(Err(e)),
             }
         });
         let wait_child = child.clone();
