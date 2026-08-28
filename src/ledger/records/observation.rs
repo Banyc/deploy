@@ -2,9 +2,12 @@
 //! area A3 "three-state observation"): [`ObservedAssignment`] (Absent |
 //! Known | AssignmentUnknown | Unknown), the generic tri-state
 //! [`Observation<T>`] (pre-push assignments, per-slot outcomes), and their
-//! payload types ([`ObservedGeneration`], [`ObservationError`]), plus the
-//! per-slot / per-target observed records ([`ObservedSlot`],
-//! [`ObservedTarget`]). Re-exported by [`crate::remote::observed`].
+//! payload types ([`ObservedGeneration`], [`ObservationError`]), the STRICT
+//! WIRE forms of the observation ([`ObservationWire`], [`ArtifactRefWire`],
+//! [`ObservedGenerationWire`] — the adjacently tagged, deny-unknown-fields
+//! shapes the PERSISTED ledger wire carries), plus the per-slot / per-target
+//! observed records ([`ObservedSlot`], [`ObservedTarget`]). Re-exported by
+//! [`crate::remote::observed`].
 //!
 //! An assignment is EXACTLY ONE tagged variant — never a parallel
 //! combination of independent generation/artifact/error fields that a raw
@@ -20,7 +23,10 @@
 //! the intent's [`crate::ledger::records::PreviousGeneration`], the per-slot
 //! outcomes, the rollback payload builder).
 
-use crate::identity::{ArtifactRef, DeploymentId, GenerationId, SlotId, TargetName};
+use crate::error::{Error, Result};
+use crate::identity::{
+    ArtifactRef, DeploymentId, GenerationId, ReleaseId, SlotId, TargetName, TreeDigest, VariantName,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 /// The THREE-STATE OBSERVATION of a slot's remote state: `KnownAbsent` (the
@@ -42,6 +48,158 @@ pub enum Observation<T> {
     Known(T),
     /// The read failed: the error is preserved. NOT evidence of no change.
     Unknown(ObservationError),
+}
+
+/// THE STRICT WIRE FORM of an [`Observation`] — the adjacently tagged
+/// representation the PERSISTED LEDGER WIRE carries (the pre-push
+/// assignments' artifact and the per-slot outcomes' observation), the shape
+/// where serde's `deny_unknown_fields` IS honored (the internally-tagged
+/// [`Observation<T>`] IGNORES it — a raw wire document could smuggle stray
+/// keys, or split/mix a variant's payload, into the permissive domain type).
+/// The persisted wire uses THIS type; the permissive in-memory
+/// [`Observation<T>`] stays the DOMAIN type. EXACTLY ONE representation per
+/// variant deserializes: a missing required field, an extra/unknown field,
+/// a wrong tag, a cross-variant field, or a wrong-typed value is REJECTED
+/// at deserialization (fail closed) — never read as a half-known state.
+///
+/// ADJACENTLY TAGGED (`state` + `value`): serde's internally-tagged
+/// representation ignores `deny_unknown_fields`, so a raw wire document
+/// could smuggle stray keys into the record; the adjacently tagged wire
+/// rejects any key that is not `state`/`value` AND, together with
+/// `deny_unknown_fields`, any key inside the value that is not one of the
+/// variant's OWN payload fields. The wire ↔ domain conversion is a BIJECTION
+/// for the representable values ([`From<&Observation<T>>`] /
+/// [`TryFrom<ObservationWire<T>>`]): every domain value has EXACTLY ONE wire
+/// form and every deserialized wire value maps back to the identical domain
+/// value.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "state",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum ObservationWire<T> {
+    /// The slot has no observed state (never deployed).
+    KnownAbsent,
+    /// A successful read of the slot's observed state.
+    Known(T),
+    /// The read failed: the error is preserved. NOT evidence of no change.
+    Unknown(ObservationError),
+}
+
+/// THE STRICT WIRE PAYLOAD of an [`ObservationWire::Known`] artifact
+/// observation — the persisted form of [`ArtifactRef`]: the (release,
+/// variant, tree) triple with `deny_unknown_fields`, so the persisted
+/// document rejects any field beyond the three. The DOMAIN [`ArtifactRef`]
+/// (the in-memory type everywhere else) is unchanged; the wire payload
+/// converts to/from it. The conversion is a bijection for the representable
+/// values — the fields are VALIDATED identities ([`ReleaseId`],
+/// [`VariantName`], [`TreeDigest`], all gated at deserialization), so every
+/// deserialized wire payload is representable; the [`TryFrom`] keeps the
+/// wire → domain boundary fail-closed by contract.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactRefWire {
+    pub release: ReleaseId,
+    pub variant: VariantName,
+    pub tree: TreeDigest,
+}
+
+/// THE STRICT WIRE PAYLOAD of an [`ObservationWire::Known`] generation
+/// observation — the persisted form of [`ObservedGeneration`]: the single
+/// `generation` field with `deny_unknown_fields`, so the persisted document
+/// rejects any extra field. The DOMAIN [`ObservedGeneration`] is unchanged;
+/// the wire payload converts to/from it (a bijection for the representable
+/// values — the generation is a validated identity).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservedGenerationWire {
+    pub generation: GenerationId,
+}
+
+impl From<&ArtifactRef> for ArtifactRefWire {
+    fn from(a: &ArtifactRef) -> Self {
+        ArtifactRefWire {
+            release: a.release.clone(),
+            variant: a.variant.clone(),
+            tree: a.tree.clone(),
+        }
+    }
+}
+
+impl TryFrom<ArtifactRefWire> for ArtifactRef {
+    type Error = Error;
+    fn try_from(w: ArtifactRefWire) -> Result<Self> {
+        // Fail closed by contract: the wire payload's fields are validated
+        // identities (gated by serde at deserialization), so a deserialized
+        // payload is always representable; a hand-constructed payload is
+        // still refused if it is not.
+        Ok(ArtifactRef {
+            release: w.release,
+            variant: w.variant,
+            tree: w.tree,
+        })
+    }
+}
+
+impl From<&ObservedGeneration> for ObservedGenerationWire {
+    fn from(g: &ObservedGeneration) -> Self {
+        ObservedGenerationWire {
+            generation: g.generation.clone(),
+        }
+    }
+}
+
+impl TryFrom<ObservedGenerationWire> for ObservedGeneration {
+    type Error = Error;
+    fn try_from(w: ObservedGenerationWire) -> Result<Self> {
+        Ok(ObservedGeneration {
+            generation: w.generation,
+        })
+    }
+}
+
+impl From<&Observation<ArtifactRef>> for ObservationWire<ArtifactRefWire> {
+    fn from(o: &Observation<ArtifactRef>) -> Self {
+        match o {
+            Observation::KnownAbsent => ObservationWire::KnownAbsent,
+            Observation::Known(a) => ObservationWire::Known(ArtifactRefWire::from(a)),
+            Observation::Unknown(e) => ObservationWire::Unknown(e.clone()),
+        }
+    }
+}
+
+impl TryFrom<ObservationWire<ArtifactRefWire>> for Observation<ArtifactRef> {
+    type Error = Error;
+    fn try_from(w: ObservationWire<ArtifactRefWire>) -> Result<Self> {
+        Ok(match w {
+            ObservationWire::KnownAbsent => Observation::KnownAbsent,
+            ObservationWire::Known(a) => Observation::Known(a.try_into()?),
+            ObservationWire::Unknown(e) => Observation::Unknown(e),
+        })
+    }
+}
+
+impl From<&Observation<ObservedGeneration>> for ObservationWire<ObservedGenerationWire> {
+    fn from(o: &Observation<ObservedGeneration>) -> Self {
+        match o {
+            Observation::KnownAbsent => ObservationWire::KnownAbsent,
+            Observation::Known(g) => ObservationWire::Known(ObservedGenerationWire::from(g)),
+            Observation::Unknown(e) => ObservationWire::Unknown(e.clone()),
+        }
+    }
+}
+
+impl TryFrom<ObservationWire<ObservedGenerationWire>> for Observation<ObservedGeneration> {
+    type Error = Error;
+    fn try_from(w: ObservationWire<ObservedGenerationWire>) -> Result<Self> {
+        Ok(match w {
+            ObservationWire::KnownAbsent => Observation::KnownAbsent,
+            ObservationWire::Known(g) => Observation::Known(g.try_into()?),
+            ObservationWire::Unknown(e) => Observation::Unknown(e),
+        })
+    }
 }
 
 /// The OBSERVED ASSIGNMENT of a placement slot's remote state — EXACTLY ONE
@@ -308,7 +466,7 @@ mod tests {
             "assignment_unknown" => value_present && gen_present && err && !art && !ld && !extra,
             _ => value_present && err && !gen_present && !art && !ld && !extra,
         };
-        let result: Result<ObservedSlot, _> = serde_json::from_value(doc.clone());
+        let result = serde_json::from_value::<ObservedSlot>(doc.clone());
         if valid {
             let slot = result.unwrap_or_else(|e| panic!("valid combo must deserialize {doc}: {e}"));
             let expected = match tag {
@@ -564,6 +722,446 @@ mod tests {
             sequence in prop::collection::vec(arbitrary_live_observation(), 1..=8),
         ) {
             run_sequence_case(sequence);
+        }
+    }
+
+    // ---- THE STRICT WIRE ([`ObservationWire`]) PROP TESTS ----------------
+
+    /// A RAW `ObservationWire<ObservedGenerationWire>` document as an
+    /// arbitrary JSON-ish map: a `state` tag plus an OPTIONAL `value` object
+    /// (adjacently tagged wire) whose OWN payload fields — generation,
+    /// error — are each optionally present, plus an extra key next to
+    /// `state`/`value` and an extra key inside the value. The tuple is (tag,
+    /// value present, generation present, error present, extra key next to
+    /// state/value, extra key in value); 3 tags x 32 field combos = the
+    /// 96-case space.
+    fn arbitrary_gen_wire_combo() -> impl Strategy<Value = (u8, bool, bool, bool, bool, bool)> {
+        (
+            0u8..3,
+            proptest::bool::ANY, // value present
+            proptest::bool::ANY, // generation present
+            proptest::bool::ANY, // error present
+            proptest::bool::ANY, // extra key next to state/value
+            proptest::bool::ANY, // extra key inside the value
+        )
+    }
+
+    /// A RAW `ObservationWire<ArtifactRefWire>` document: the `state` tag
+    /// plus an OPTIONAL `value` object whose OWN payload fields — release,
+    /// variant, tree, error — are each optionally present, plus an extra key
+    /// next to `state`/`value` and an extra key inside the value. The tuple
+    /// is (tag, value present, release present, variant present, tree
+    /// present, error present, extra key next to state/value, extra key in
+    /// value); 3 tags x 128 field combos = the 384-case space.
+    fn arbitrary_artifact_wire_combo()
+    -> impl Strategy<Value = (u8, bool, bool, bool, bool, bool, bool, bool)> {
+        (
+            0u8..3,
+            proptest::bool::ANY, // value present
+            proptest::bool::ANY, // release present
+            proptest::bool::ANY, // variant present
+            proptest::bool::ANY, // tree present
+            proptest::bool::ANY, // error present
+            proptest::bool::ANY, // extra key next to state/value
+            proptest::bool::ANY, // extra key inside the value
+        )
+    }
+
+    /// THE USER'S ONE-EXACT-REPRESENTATION PROPERTY (generation payload):
+    /// the strict adjacently tagged wire accepts ONLY the representation
+    /// that corresponds to EXACTLY ONE [`ObservationWire`] variant —
+    /// `known_absent` is a bare unit (no value, no extra key), `known`
+    /// carries the value object with the generation field and NOTHING else,
+    /// `unknown` carries the value object with the error field and NOTHING
+    /// else. EVERY other combination is REJECTED (fail closed): a missing
+    /// required field, an extra/unknown field, a wrong tag, a cross-variant
+    /// field, or a wrong-typed value can never deserialize into a half-known
+    /// or self-contradictory observation.
+    fn run_gen_wire_combo_case(
+        (tag_idx, value_present, gen_present, err, top_extra, value_extra): (
+            u8,
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+        ),
+    ) {
+        let tag = match tag_idx {
+            0 => "known_absent",
+            1 => "known",
+            _ => "unknown",
+        };
+        let mut doc = serde_json::Map::new();
+        doc.insert("state".to_string(), json!(tag));
+        if value_present {
+            let mut value = serde_json::Map::new();
+            if gen_present {
+                value.insert(
+                    "generation".to_string(),
+                    json!(test_generation_id("g").as_str()),
+                );
+            }
+            if err {
+                value.insert("message".to_string(), json!("status read failed: boom"));
+            }
+            if value_extra {
+                value.insert("bogus".to_string(), json!(1));
+            }
+            doc.insert("value".to_string(), serde_json::Value::Object(value));
+        }
+        if top_extra {
+            doc.insert("bogus".to_string(), json!(1));
+        }
+        let doc = serde_json::Value::Object(doc);
+
+        let valid = match tag {
+            "known_absent" => !value_present && !top_extra,
+            "known" => value_present && gen_present && !err && !value_extra && !top_extra,
+            _ => value_present && err && !gen_present && !value_extra && !top_extra,
+        };
+        let result = serde_json::from_value::<ObservationWire<ObservedGenerationWire>>(doc.clone());
+        if valid {
+            let wire = result.unwrap_or_else(|e| panic!("valid combo must deserialize {doc}: {e}"));
+            let expected = match tag {
+                "known_absent" => ObservationWire::KnownAbsent,
+                "known" => ObservationWire::Known(ObservedGenerationWire {
+                    generation: test_generation_id("g"),
+                }),
+                _ => ObservationWire::Unknown(ObservationError {
+                    message: "status read failed: boom".to_string(),
+                }),
+            };
+            assert_eq!(
+                wire, expected,
+                "the accepted representation is EXACTLY the tagged variant: {doc}"
+            );
+        } else {
+            assert!(
+                result.is_err(),
+                "a representation that is not EXACTLY one variant must be REJECTED (fail \
+                 closed), got: {doc}"
+            );
+        }
+    }
+
+    /// THE USER'S ONE-EXACT-REPRESENTATION PROPERTY (artifact payload):
+    /// like [`run_gen_wire_combo_case`] with the three-field strict payload
+    /// [`ArtifactRefWire`] — `known` requires release + variant + tree and
+    /// NOTHING else, `unknown` requires the error and NOTHING else,
+    /// `known_absent` is a bare unit. Every missing/extra/mixed field is
+    /// REJECTED.
+    fn run_artifact_wire_combo_case(
+        (tag_idx, value_present, release, variant, tree, err, top_extra, value_extra): (
+            u8,
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+        ),
+    ) {
+        let tag = match tag_idx {
+            0 => "known_absent",
+            1 => "known",
+            _ => "unknown",
+        };
+        let mut doc = serde_json::Map::new();
+        doc.insert("state".to_string(), json!(tag));
+        if value_present {
+            let mut value = serde_json::Map::new();
+            if release {
+                value.insert("release".to_string(), json!(test_release_id("r").as_str()));
+            }
+            if variant {
+                value.insert("variant".to_string(), json!("standard"));
+            }
+            if tree {
+                value.insert("tree".to_string(), json!(test_tree_digest("t").as_str()));
+            }
+            if err {
+                value.insert("message".to_string(), json!("status read failed: boom"));
+            }
+            if value_extra {
+                value.insert("bogus".to_string(), json!(1));
+            }
+            doc.insert("value".to_string(), serde_json::Value::Object(value));
+        }
+        if top_extra {
+            doc.insert("bogus".to_string(), json!(1));
+        }
+        let doc = serde_json::Value::Object(doc);
+
+        let valid = match tag {
+            "known_absent" => !value_present && !top_extra,
+            "known" => {
+                value_present && release && variant && tree && !err && !value_extra && !top_extra
+            }
+            _ => {
+                value_present && err && !release && !variant && !tree && !value_extra && !top_extra
+            }
+        };
+        let result = serde_json::from_value::<ObservationWire<ArtifactRefWire>>(doc.clone());
+        if valid {
+            let wire = result.unwrap_or_else(|e| panic!("valid combo must deserialize {doc}: {e}"));
+            let expected = match tag {
+                "known_absent" => ObservationWire::KnownAbsent,
+                "known" => ObservationWire::Known(ArtifactRefWire {
+                    release: test_release_id("r"),
+                    variant: VariantName::new("standard".to_string()),
+                    tree: test_tree_digest("t"),
+                }),
+                _ => ObservationWire::Unknown(ObservationError {
+                    message: "status read failed: boom".to_string(),
+                }),
+            };
+            assert_eq!(
+                wire, expected,
+                "the accepted representation is EXACTLY the tagged variant: {doc}"
+            );
+        } else {
+            assert!(
+                result.is_err(),
+                "a representation that is not EXACTLY one variant must be REJECTED (fail \
+                 closed), got: {doc}"
+            );
+        }
+    }
+
+    /// THE WIRE REJECTS UNKNOWN TAGS, WRONG-TYPED VALUES, AND MISSING
+    /// VALUES AT EVERY LEVEL: an unknown `state` tag, a value that is not an
+    /// object, a payload field with the wrong type, a unit variant carrying
+    /// a value, and a `known`/`unknown` variant missing its value are all
+    /// REJECTED — only the EXACT representation per variant deserializes.
+    #[test]
+    fn observation_wire_rejects_unknown_tags_and_wrong_typed_values() {
+        // An unknown tag is rejected.
+        assert!(
+            serde_json::from_value::<ObservationWire<ObservedGenerationWire>>(json!({
+                "state": "bogus",
+                "value": { "generation": test_generation_id("g").as_str() },
+            }))
+            .is_err(),
+            "an unknown tag must be REJECTED"
+        );
+        // A wrong-typed value (not an object) is rejected.
+        assert!(
+            serde_json::from_value::<ObservationWire<ObservedGenerationWire>>(json!({
+                "state": "known",
+                "value": 42,
+            }))
+            .is_err(),
+            "a wrong-typed value must be REJECTED"
+        );
+        // A wrong-typed payload field is rejected.
+        assert!(
+            serde_json::from_value::<ObservationWire<ObservedGenerationWire>>(json!({
+                "state": "known",
+                "value": { "generation": 42 },
+            }))
+            .is_err(),
+            "a wrong-typed payload field must be REJECTED"
+        );
+        // A unit variant carrying a value is rejected.
+        assert!(
+            serde_json::from_value::<ObservationWire<ObservedGenerationWire>>(json!({
+                "state": "known_absent",
+                "value": { "generation": test_generation_id("g").as_str() },
+            }))
+            .is_err(),
+            "a unit variant carrying a value must be REJECTED"
+        );
+        // A `known` variant missing its value is rejected.
+        assert!(
+            serde_json::from_value::<ObservationWire<ObservedGenerationWire>>(json!({
+                "state": "known",
+            }))
+            .is_err(),
+            "a known variant missing its value must be REJECTED"
+        );
+        // The strict artifact payload rejects an extra field beyond the
+        // (release, variant, tree) triple.
+        assert!(
+            serde_json::from_value::<ObservationWire<ArtifactRefWire>>(json!({
+                "state": "known",
+                "value": {
+                    "release": test_release_id("r").as_str(),
+                    "variant": "standard",
+                    "tree": test_tree_digest("t").as_str(),
+                    "bogus": 1,
+                },
+            }))
+            .is_err(),
+            "a strict artifact payload with an extra field must be REJECTED"
+        );
+        // A cross-variant field (error on a known artifact) is rejected.
+        assert!(
+            serde_json::from_value::<ObservationWire<ArtifactRefWire>>(json!({
+                "state": "known",
+                "value": {
+                    "release": test_release_id("r").as_str(),
+                    "variant": "standard",
+                    "tree": test_tree_digest("t").as_str(),
+                    "error": { "message": "boom" },
+                },
+            }))
+            .is_err(),
+            "a cross-variant field must be REJECTED"
+        );
+    }
+
+    /// A VALID DOMAIN artifact observation: all three [`Observation`]
+    /// variants — `Known` with a valid artifact, `KnownAbsent`, `Unknown`
+    /// with a preserved error.
+    fn arbitrary_domain_artifact_observation() -> impl Strategy<Value = Observation<ArtifactRef>> {
+        prop_oneof![
+            Just(Observation::KnownAbsent),
+            (0..3usize, 0..3usize).prop_map(|(i, j)| Observation::Known(ArtifactRef {
+                release: test_release_id(&format!("rel-seq-{i}")),
+                variant: VariantName::new("standard".to_string()),
+                tree: test_tree_digest(&format!("tree-seq-{i}-{j}")),
+            })),
+            (0..3usize).prop_map(|j| Observation::Unknown(ObservationError {
+                message: format!("status read failed: case {j}"),
+            })),
+        ]
+    }
+
+    /// A VALID DOMAIN generation observation: all three [`Observation`]
+    /// variants — `Known` with a valid generation, `KnownAbsent`, `Unknown`
+    /// with a preserved error.
+    fn arbitrary_domain_generation_observation()
+    -> impl Strategy<Value = Observation<ObservedGeneration>> {
+        prop_oneof![
+            Just(Observation::KnownAbsent),
+            (0..3usize).prop_map(|i| Observation::Known(ObservedGeneration {
+                generation: test_generation_id(&format!("gen-seq-{i}")),
+            })),
+            (0..3usize).prop_map(|j| Observation::Unknown(ObservationError {
+                message: format!("status read failed: case {j}"),
+            })),
+        ]
+    }
+
+    /// THE USER'S WIRE↔DOMAIN BIJECTION PROPERTY (artifact): every
+    /// generated DOMAIN [`Observation<ArtifactRef>`] maps to EXACTLY ONE
+    /// strict wire form ([`ObservationWire<ArtifactRefWire>`]) whose JSON
+    /// round-trips exactly through serde_json (the strict representation —
+    /// nothing added, nothing dropped), and which converts BACK to the
+    /// EXACT original domain value.
+    fn run_artifact_bijection_case(obs: Observation<ArtifactRef>) {
+        let wire = ObservationWire::from(&obs);
+        let json = serde_json::to_value(&wire).unwrap();
+        let wire_back: ObservationWire<ArtifactRefWire> = serde_json::from_value(json.clone())
+            .unwrap_or_else(|e| panic!("the strict wire JSON must deserialize {json}: {e}"));
+        assert_eq!(
+            wire_back, wire,
+            "the strict wire JSON must round-trip exactly: {json}"
+        );
+        let domain: Observation<ArtifactRef> = wire_back
+            .try_into()
+            .unwrap_or_else(|e| panic!("the strict wire must convert back to the domain: {e}"));
+        assert_eq!(
+            domain, obs,
+            "wire -> domain must reproduce the EXACT domain value"
+        );
+    }
+
+    /// THE USER'S WIRE↔DOMAIN BIJECTION PROPERTY (generation): every
+    /// generated DOMAIN [`Observation<ObservedGeneration>`] maps to EXACTLY
+    /// ONE strict wire form ([`ObservationWire<ObservedGenerationWire>`])
+    /// whose JSON round-trips exactly through serde_json, and which
+    /// converts BACK to the EXACT original domain value.
+    fn run_generation_bijection_case(obs: Observation<ObservedGeneration>) {
+        let wire = ObservationWire::from(&obs);
+        let json = serde_json::to_value(&wire).unwrap();
+        let wire_back: ObservationWire<ObservedGenerationWire> =
+            serde_json::from_value(json.clone())
+                .unwrap_or_else(|e| panic!("the strict wire JSON must deserialize {json}: {e}"));
+        assert_eq!(
+            wire_back, wire,
+            "the strict wire JSON must round-trip exactly: {json}"
+        );
+        let domain: Observation<ObservedGeneration> = wire_back
+            .try_into()
+            .unwrap_or_else(|e| panic!("the strict wire must convert back to the domain: {e}"));
+        assert_eq!(
+            domain, obs,
+            "wire -> domain must reproduce the EXACT domain value"
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 64,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+        // THE USER'S ONE-EXACT-REPRESENTATION PROPERTY (generation payload):
+        // every tag/value/field-presence/extra-field combination
+        // deserializes into the strict adjacently-tagged wire ONLY when it
+        // is EXACTLY one variant's representation.
+        #[test]
+        fn observation_wire_gen_combinations_accept_only_one_variant(
+            combo in arbitrary_gen_wire_combo(),
+        ) {
+            run_gen_wire_combo_case(combo);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 64,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+        // THE USER'S ONE-EXACT-REPRESENTATION PROPERTY (artifact payload):
+        // every tag/value/field-presence/extra-field combination with the
+        // strict three-field payload struct deserializes ONLY when it is
+        // EXACTLY one variant's representation.
+        #[test]
+        fn observation_wire_artifact_combinations_accept_only_one_variant(
+            combo in arbitrary_artifact_wire_combo(),
+        ) {
+            run_artifact_wire_combo_case(combo);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 64,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+        // THE USER'S WIRE↔DOMAIN BIJECTION PROPERTY (artifact): every valid
+        // DOMAIN observation maps to exactly one strict wire form that
+        // round-trips exactly and converts back to the EXACT domain value.
+        #[test]
+        fn observation_wire_artifact_bijection(obs in arbitrary_domain_artifact_observation()) {
+            run_artifact_bijection_case(obs);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 64,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+        // THE USER'S WIRE↔DOMAIN BIJECTION PROPERTY (generation): every
+        // valid DOMAIN observation maps to exactly one strict wire form that
+        // round-trips exactly and converts back to the EXACT domain value.
+        #[test]
+        fn observation_wire_generation_bijection(
+            obs in arbitrary_domain_generation_observation(),
+        ) {
+            run_generation_bijection_case(obs);
         }
     }
 }

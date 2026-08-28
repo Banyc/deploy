@@ -25,7 +25,7 @@ mod terminal;
 pub use entry::LedgerEntry;
 pub use intent::{
     DeploymentIntent, DesiredGeneration, IntentSlot, LedgerIntentReport, LedgerIntentWire,
-    PreviousGeneration,
+    PreviousGeneration, SlotAttemptStateWire,
 };
 pub use outcomes::{CompensationReport, SlotOutcome, SlotOutcomeKind, SlotResult, SlotTransition};
 pub use terminal::{LedgerTerminal, LedgerTerminalWire, TerminalDisposition};

@@ -22,8 +22,8 @@ pub(crate) use crate::identity::{
 pub(crate) use crate::ledger::{
     self, DeploymentIntent, DeploymentPlan, DeploymentStatus, DesiredGeneration, IntentSlot,
     LedgerEntry, LedgerIntentReport, LedgerTerminal, NonEmptySlotTable, Observation,
-    ObservedAssignment, RefExpr, SlotAttemptState, SlotOutcomeKind, SlotResult, SlotTable,
-    TerminalDisposition,
+    ObservationWire, ObservedAssignment, ObservedGenerationWire, RefExpr, SlotAttemptState,
+    SlotOutcome, SlotOutcomeKind, SlotResult, SlotTable, TerminalDisposition,
 };
 pub(crate) use crate::remote::transport::{FsBytes, LocalTransport, Remote};
 pub(crate) use crate::store::local::LocalStore;
@@ -376,14 +376,18 @@ pub(crate) fn seed_snapshot(
                             .map(|(k, g)| {
                                 (
                                     k.clone(),
-                                    SlotResult {
+                                    SlotOutcome::from_wire(SlotResult {
                                         slot_id: k.clone(),
                                         outcome: SlotOutcomeKind::Activated,
-                                        generation: Some(g.generation.clone()),
+                                        observation: ObservationWire::Known(
+                                            ObservedGenerationWire {
+                                                generation: g.generation.clone(),
+                                            },
+                                        ),
                                         compensated: false,
                                         error: None,
-                                        observation_error: None,
-                                    },
+                                    })
+                                    .unwrap(),
                                 )
                             })
                             .collect(),

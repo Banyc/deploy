@@ -558,8 +558,8 @@ mod plan_tests {
     };
     use crate::ledger::{
         DeploymentIntent, DesiredGeneration, IntentSlot, LedgerRollback, LedgerTerminal,
-        NonEmptySlotTable, PhysicalBinding, SlotOutcomeKind, SlotResult, SlotTable,
-        TerminalDisposition,
+        NonEmptySlotTable, ObservationWire, ObservedGenerationWire, PhysicalBinding, SlotOutcome,
+        SlotOutcomeKind, SlotResult, SlotTable, TerminalDisposition,
     };
     use crate::verify::release::RELEASE_RECORD_SCHEMA_VERSION;
     use proptest::prelude::*;
@@ -789,14 +789,18 @@ interval_seconds = 0
                                 .map(|(k, g)| {
                                     (
                                         k.clone(),
-                                        SlotResult {
+                                        SlotOutcome::from_wire(SlotResult {
                                             slot_id: k.clone(),
                                             outcome: SlotOutcomeKind::Activated,
-                                            generation: Some(g.generation.clone()),
+                                            observation: ObservationWire::Known(
+                                                ObservedGenerationWire {
+                                                    generation: g.generation.clone(),
+                                                },
+                                            ),
                                             compensated: false,
                                             error: None,
-                                            observation_error: None,
-                                        },
+                                        })
+                                        .unwrap(),
                                     )
                                 })
                                 .collect(),

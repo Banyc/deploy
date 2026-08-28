@@ -42,7 +42,8 @@ use crate::identity::{
 };
 use crate::ledger::{
     DeploymentIntent, DeploymentStatus, DesiredGeneration, IntentSlot, LedgerRollback,
-    LedgerTerminal, NonEmptySlotTable, SlotOutcomeKind, SlotResult, SlotTable, TerminalDisposition,
+    LedgerTerminal, NonEmptySlotTable, ObservationWire, ObservedGenerationWire, SlotOutcome,
+    SlotOutcomeKind, SlotResult, SlotTable, TerminalDisposition,
 };
 use crate::remote::helper::{GenerationAssignment, RemoteHelper};
 use crate::remote::layout;
@@ -268,14 +269,16 @@ fn terminal_for(release: &str, tree: &str) -> LedgerTerminal {
             },
             outcomes: SlotTable::from_map(BTreeMap::from([(
                 SlotId::new("p1".to_string()),
-                SlotResult {
+                SlotOutcome::from_wire(SlotResult {
                     slot_id: SlotId::new("p1".to_string()),
                     outcome: SlotOutcomeKind::Activated,
-                    generation: Some(test_generation_id("gen-1")),
+                    observation: ObservationWire::Known(ObservedGenerationWire {
+                        generation: test_generation_id("gen-1"),
+                    }),
                     compensated: false,
                     error: None,
-                    observation_error: None,
-                },
+                })
+                .unwrap(),
             )])),
             // THE EXACT-EQUAL MEMBERSHIPS: selected == full == the
             // one-slot membership (the rollback's slots / the outcomes'
@@ -296,14 +299,16 @@ fn failed_terminal() -> LedgerTerminal {
         disposition: TerminalDisposition::FailedRolledBack {
             outcomes: SlotTable::from_map(BTreeMap::from([(
                 SlotId::new("p1".to_string()),
-                SlotResult {
+                SlotOutcome::from_wire(SlotResult {
                     slot_id: SlotId::new("p1".to_string()),
                     outcome: SlotOutcomeKind::Restored,
-                    generation: Some(test_generation_id("gen-1")),
+                    observation: ObservationWire::Known(ObservedGenerationWire {
+                        generation: test_generation_id("gen-1"),
+                    }),
                     compensated: true,
                     error: None,
-                    observation_error: None,
-                },
+                })
+                .unwrap(),
             )])),
         },
         reason: None,

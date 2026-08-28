@@ -47,7 +47,8 @@ mod tests_entry {
     use crate::ledger::records::SlotOutcomeKind;
     use crate::ledger::records::{DeploymentIntent, LedgerIntentWire};
     use crate::ledger::records::{
-        DeploymentStatus, LedgerRollbackWire, PhysicalBinding, SlotAttemptState, SlotResult,
+        DeploymentStatus, LedgerRollbackWire, ObservationWire, ObservedGenerationWire,
+        PhysicalBinding, SlotAttemptStateWire, SlotResult,
     };
     use crate::ledger::records::{LedgerTerminal, LedgerTerminalWire, TerminalDisposition};
     use crate::store::local::LocalStore;
@@ -103,7 +104,7 @@ mod tests_entry {
     ) -> LedgerIntentWire {
         let desired: BTreeMap<SlotId, GenerationRef> =
             keys.iter().map(|k| (k.clone(), gen_ref_for(k))).collect();
-        let pre_push: BTreeMap<SlotId, Option<SlotAttemptState>> =
+        let pre_push: BTreeMap<SlotId, Option<SlotAttemptStateWire>> =
             keys.iter().map(|k| (k.clone(), None)).collect();
         LedgerIntentWire {
             deployment_schema_version: crate::ledger::LEDGER_SCHEMA_VERSION,
@@ -126,10 +127,11 @@ mod tests_entry {
         SlotResult {
             slot_id: key.clone(),
             outcome: kind,
-            generation: Some(test_generation_id(key.as_str())),
+            observation: ObservationWire::Known(ObservedGenerationWire {
+                generation: test_generation_id(key.as_str()),
+            }),
             compensated,
             error: None,
-            observation_error: None,
         }
     }
 
@@ -793,7 +795,7 @@ mod tests_entry {
         let keys: Vec<SlotId> = membership.iter().cloned().collect();
         let desired: BTreeMap<SlotId, GenerationRef> =
             keys.iter().map(|k| (k.clone(), gen_ref_for(k))).collect();
-        let pre_push: BTreeMap<SlotId, Option<SlotAttemptState>> =
+        let pre_push: BTreeMap<SlotId, Option<SlotAttemptStateWire>> =
             keys.iter().map(|k| (k.clone(), None)).collect();
         LedgerIntentWire {
             deployment_schema_version: intent.deployment_schema_version,

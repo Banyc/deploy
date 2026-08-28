@@ -83,12 +83,13 @@ pub mod tables;
 pub use finalize::{LedgerEntry, LedgerLine, finalize_successful_attempt, recovery_outcomes};
 pub use log::render_log;
 pub use records::{
-    BehaviorIndex, CompensationReport, CompleteRollback, DeploymentIntent, DeploymentPlan,
-    DeploymentPlanWire, DeploymentStatus, DesiredGeneration, FrozenSlotTopology, IntentSlot,
-    LedgerIntentReport, LedgerIntentWire, LedgerRollback, LedgerRollbackWire, LedgerTerminal,
-    LedgerTerminalWire, NonEmptySlotTable, Observation, ObservationError, ObservedAssignment,
-    ObservedGeneration, ObservedSlot, ObservedTarget, PhysicalBinding, Pins, PlanOrigin,
-    PlanSource, PreviousGeneration, RebindingPlan, ServerState, SlotAttemptState, SlotOutcome,
+    ArtifactRefWire, BehaviorIndex, CompensationReport, CompleteRollback, DeploymentIntent,
+    DeploymentPlan, DeploymentPlanWire, DeploymentStatus, DesiredGeneration, FrozenSlotTopology,
+    IntentSlot, LedgerIntentReport, LedgerIntentWire, LedgerRollback, LedgerRollbackWire,
+    LedgerTerminal, LedgerTerminalWire, NonEmptySlotTable, Observation, ObservationError,
+    ObservationWire, ObservedAssignment, ObservedGeneration, ObservedGenerationWire, ObservedSlot,
+    ObservedTarget, PhysicalBinding, Pins, PlanOrigin, PlanSource, PreviousGeneration,
+    RebindingPlan, ServerState, SlotAttemptState, SlotAttemptStateWire, SlotOutcome,
     SlotOutcomeKind, SlotPlan, SlotResult, SlotTable, SlotTransition, TerminalDisposition,
     VerifiedReleaseRebinding, build_rollback,
 };

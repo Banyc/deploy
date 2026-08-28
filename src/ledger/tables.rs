@@ -320,7 +320,7 @@ mod tests {
         test_deployment_id, test_generation_id, test_release_id, test_tree_digest,
     };
     use crate::ledger::records::LedgerIntentWire;
-    use crate::ledger::records::SlotAttemptState;
+    use crate::ledger::records::SlotAttemptStateWire;
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
 
@@ -356,7 +356,7 @@ mod tests {
     fn agreeing_intent(keys: &[SlotId]) -> LedgerIntentWire {
         let desired: BTreeMap<SlotId, GenerationRef> =
             keys.iter().map(|k| (k.clone(), gen_ref_for(k))).collect();
-        let pre_push: BTreeMap<SlotId, Option<SlotAttemptState>> =
+        let pre_push: BTreeMap<SlotId, Option<SlotAttemptStateWire>> =
             keys.iter().map(|k| (k.clone(), None)).collect();
         LedgerIntentWire {
             deployment_schema_version: crate::ledger::LEDGER_SCHEMA_VERSION,

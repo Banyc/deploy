@@ -579,8 +579,8 @@ mod tests {
     };
     use crate::ledger::{
         DeploymentIntent, DeploymentStatus, DesiredGeneration, IntentSlot, LedgerRollback,
-        LedgerTerminal, NonEmptySlotTable, ObservedSlot, SlotOutcomeKind, SlotResult, SlotTable,
-        TerminalDisposition,
+        LedgerTerminal, NonEmptySlotTable, ObservationWire, ObservedGenerationWire, ObservedSlot,
+        SlotOutcome, SlotOutcomeKind, SlotResult, SlotTable, TerminalDisposition,
     };
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
@@ -665,14 +665,16 @@ mod tests {
                 },
                 outcomes: SlotTable::from_map(BTreeMap::from([(
                     p1.clone(),
-                    SlotResult {
+                    SlotOutcome::from_wire(SlotResult {
                         slot_id: p1.clone(),
                         outcome: SlotOutcomeKind::Activated,
-                        generation: Some(test_generation_id("gen-1")),
+                        observation: ObservationWire::Known(ObservedGenerationWire {
+                            generation: test_generation_id("gen-1"),
+                        }),
                         compensated: false,
                         error: None,
-                        observation_error: None,
-                    },
+                    })
+                    .unwrap(),
                 )])),
                 // THE EXACT-EQUAL MEMBERSHIPS: selected == full == the
                 // one-slot membership (the rollback's slots / the outcomes'

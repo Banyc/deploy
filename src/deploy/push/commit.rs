@@ -128,7 +128,16 @@ pub(crate) fn run_commit(
         // the outcomes as its compensation report, Degraded owns the outcomes
         // its remaining changes are derived from — and refuses an
         // all-restored Degraded wire).
-        let outcomes: SlotTable<SlotOutcome> = SlotTable::from_map(outcomes_map);
+        // WIRE → DOMAIN (fail closed): each wire outcome converts through
+        // [`SlotOutcome::from_wire`] — deriving the per-slot TRANSITION
+        // STATE and converting the strict wire observation to the domain
+        // observation — and the redundant `slot_id` is DROPPED into the key.
+        let outcomes: SlotTable<SlotOutcome> = SlotTable::from_map(
+            outcomes_map
+                .into_iter()
+                .map(|(key, result)| Ok((key, SlotOutcome::from_wire(result)?)))
+                .collect::<Result<BTreeMap<SlotId, SlotOutcome>>>()?,
+        );
         let disposition =
             crate::deploy::rollout::disposition_for(&execution.commit_status, outcomes)?;
         store.append_terminal(

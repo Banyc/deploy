@@ -108,8 +108,8 @@ mod wire;
 // `crate::ledger::records::X` paths keep compiling.
 pub use crate::ledger::tables::{NonEmptySlotTable, SlotTable};
 pub use observation::{
-    Observation, ObservationError, ObservedAssignment, ObservedGeneration, ObservedSlot,
-    ObservedTarget,
+    ArtifactRefWire, Observation, ObservationError, ObservationWire, ObservedAssignment,
+    ObservedGeneration, ObservedGenerationWire, ObservedSlot, ObservedTarget,
 };
 pub(crate) use validation::verify_successful_membership_equations;
 pub use validation::{FrozenSlotTopology, RebindingPlan, VerifiedReleaseRebinding, build_rollback};
@@ -117,7 +117,8 @@ pub(crate) use validation::{LEDGER_SCHEMA_VERSION, PINS_SCHEMA_VERSION};
 pub use wire::{
     CompensationReport, DeploymentIntent, DesiredGeneration, IntentSlot, LedgerEntry,
     LedgerIntentReport, LedgerIntentWire, LedgerTerminal, LedgerTerminalWire, PreviousGeneration,
-    SlotOutcome, SlotOutcomeKind, SlotResult, SlotTransition, TerminalDisposition,
+    SlotAttemptStateWire, SlotOutcome, SlotOutcomeKind, SlotResult, SlotTransition,
+    TerminalDisposition,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -879,7 +880,7 @@ mod tests {
     ) -> LedgerIntentWire {
         let desired: BTreeMap<SlotId, GenerationRef> =
             keys.iter().map(|k| (k.clone(), gen_ref_for(k))).collect();
-        let pre_push: BTreeMap<SlotId, Option<SlotAttemptState>> =
+        let pre_push: BTreeMap<SlotId, Option<SlotAttemptStateWire>> =
             keys.iter().map(|k| (k.clone(), None)).collect();
         LedgerIntentWire {
             deployment_schema_version: crate::ledger::LEDGER_SCHEMA_VERSION,
@@ -902,10 +903,11 @@ mod tests {
         SlotResult {
             slot_id: key.clone(),
             outcome: kind,
-            generation: Some(test_generation_id(key.as_str())),
+            observation: ObservationWire::Known(ObservedGenerationWire {
+                generation: test_generation_id(key.as_str()),
+            }),
             compensated,
             error: None,
-            observation_error: None,
         }
     }
     fn agreeing_terminal(keys: &[SlotId], status_idx: u32) -> LedgerTerminalWire {
@@ -1190,8 +1192,8 @@ mod tests {
         let mut bad = wire.clone();
         bad.slots.insert(
             slot(9),
-            SlotAttemptState {
-                artifact: Observation::Unknown(ObservationError {
+            SlotAttemptStateWire {
+                artifact: ObservationWire::Unknown(ObservationError {
                     message: "fixture: unknown assignment".to_string(),
                 }),
                 generation: None,
@@ -1654,10 +1656,11 @@ mod tests {
         let outcome = || SlotResult {
             slot_id: slot(1),
             outcome: SlotOutcomeKind::Activated,
-            generation: Some(test_generation_id("gen-1")),
+            observation: ObservationWire::Known(ObservedGenerationWire {
+                generation: test_generation_id("gen-1"),
+            }),
             compensated: false,
             error: None,
-            observation_error: None,
         };
         let wire = LedgerTerminalWire {
             deployment_id: test_deployment_id("deploy-terminal"),
@@ -1884,10 +1887,10 @@ mod tests {
     /// error (`error` — an arbitrary failure reason, carried by the wire's
     /// `error` field) and the THREE-STATE OBSERVATION (`Known` with an
     /// arbitrary generation, `KnownAbsent`, or `Unknown` with its OWN
-    /// arbitrary preserved message — carried by the wire's
-    /// `observation_error` field). The wire has a separate field per fact,
-    /// so NO agreement is forced: every (operation_error, observation)
-    /// combination is a valid outcome that round-trips exactly.
+    /// arbitrary preserved message — carried by the wire's `observation`
+    /// field). The wire has a separate slot per fact, so NO agreement is
+    /// forced: every (operation_error, observation) combination is a valid
+    /// outcome that round-trips exactly.
     fn arbitrary_outcome() -> impl Strategy<Value = SlotOutcome> {
         (
             prop_oneof![
@@ -2163,7 +2166,7 @@ mod tests {
             .iter()
             .map(|k| (k.clone(), gen_ref_for(k)))
             .collect();
-        let pre_push: BTreeMap<SlotId, Option<SlotAttemptState>> =
+        let pre_push: BTreeMap<SlotId, Option<SlotAttemptStateWire>> =
             slot_ids.iter().map(|k| (k.clone(), None)).collect();
         LedgerIntentWire {
             deployment_schema_version: crate::ledger::LEDGER_SCHEMA_VERSION,
@@ -2789,8 +2792,8 @@ mod tests {
         for (k, g) in pre_push {
             intent_wire.pre_push.insert(
                 k,
-                Some(SlotAttemptState {
-                    artifact: Observation::Unknown(ObservationError {
+                Some(SlotAttemptStateWire {
+                    artifact: ObservationWire::Unknown(ObservationError {
                         message: "fixture: unknown assignment".to_string(),
                     }),
                     generation: g,
@@ -2801,7 +2804,15 @@ mod tests {
         let terminal = LedgerTerminal {
             recorded_at: "2026-01-01T00:00:00Z".to_string(),
             disposition: TerminalDisposition::Degraded {
-                outcomes: SlotTable::from_map(outcomes.into_iter().collect()),
+                // WIRE → DOMAIN (fail closed): the fixture's wire outcomes
+                // convert to the domain outcomes, deriving each slot's
+                // transition state ([`SlotOutcome::from_wire`]).
+                outcomes: SlotTable::from_map(
+                    outcomes
+                        .into_iter()
+                        .map(|(k, r)| (k, SlotOutcome::from_wire(r).unwrap()))
+                        .collect(),
+                ),
             },
             reason: None,
         };
@@ -2831,10 +2842,11 @@ mod tests {
                 SlotResult {
                     slot_id: slot(1),
                     outcome: SlotOutcomeKind::Skipped,
-                    generation: Some(GenerationId::new("pre-1".to_string())),
+                    observation: ObservationWire::Known(ObservedGenerationWire {
+                        generation: GenerationId::new("pre-1".to_string()),
+                    }),
                     compensated: false,
                     error: None,
-                    observation_error: None,
                 },
             )],
             vec![(slot(1), Some(GenerationId::new("pre-1".to_string())))],
@@ -2853,10 +2865,11 @@ mod tests {
                 SlotResult {
                     slot_id: slot(1),
                     outcome: SlotOutcomeKind::Activated,
-                    generation: Some(GenerationId::new("new-1".to_string())),
+                    observation: ObservationWire::Known(ObservedGenerationWire {
+                        generation: GenerationId::new("new-1".to_string()),
+                    }),
                     compensated: false,
                     error: None,
-                    observation_error: None,
                 },
             )],
             vec![(slot(1), Some(GenerationId::new("pre-1".to_string())))],
@@ -2879,10 +2892,11 @@ mod tests {
                 SlotResult {
                     slot_id: slot(1),
                     outcome: SlotOutcomeKind::Restored,
-                    generation: Some(GenerationId::new("new-1".to_string())),
+                    observation: ObservationWire::Known(ObservedGenerationWire {
+                        generation: GenerationId::new("new-1".to_string()),
+                    }),
                     compensated: true,
                     error: None,
-                    observation_error: None,
                 },
             )],
             vec![(slot(1), Some(GenerationId::new("pre-1".to_string())))],
@@ -2903,10 +2917,11 @@ mod tests {
                 SlotResult {
                     slot_id: slot(1),
                     outcome: SlotOutcomeKind::Failed,
-                    generation: Some(GenerationId::new("pre-1".to_string())),
+                    observation: ObservationWire::Known(ObservedGenerationWire {
+                        generation: GenerationId::new("pre-1".to_string()),
+                    }),
                     compensated: false,
                     error: None,
-                    observation_error: None,
                 },
             )],
             vec![(slot(1), Some(GenerationId::new("pre-1".to_string())))],
@@ -2925,10 +2940,11 @@ mod tests {
                 SlotResult {
                     slot_id: slot(1),
                     outcome: SlotOutcomeKind::Failed,
-                    generation: Some(GenerationId::new("new-1".to_string())),
+                    observation: ObservationWire::Known(ObservedGenerationWire {
+                        generation: GenerationId::new("new-1".to_string()),
+                    }),
                     compensated: false,
                     error: None,
-                    observation_error: None,
                 },
             )],
             vec![(slot(1), Some(GenerationId::new("pre-1".to_string())))],
@@ -2947,20 +2963,21 @@ mod tests {
         // post-mutation point returned an error) is `Unknown(error)` — the
         // slot may or may not have changed, so it is NEVER classified as
         // unchanged: it IS a remaining change, mapped to its `Unknown`
-        // observation (the wire's `generation: None` + preserved
-        // OBSERVATION error — `observation_error`, independent of the
-        // operation error — reads back as `Unknown`, never as a `None` that
-        // downstream code reads as "no change").
+        // observation (the wire's `Unknown` observation with the preserved
+        // OBSERVATION error — independent of the operation error — reads
+        // back as `Unknown`, never as a `None` that downstream code reads as
+        // "no change").
         let (intent, terminal) = degraded_terminal_with(
             vec![(
                 slot(1),
                 SlotResult {
                     slot_id: slot(1),
                     outcome: SlotOutcomeKind::Failed,
-                    generation: None,
+                    observation: ObservationWire::Unknown(ObservationError {
+                        message: "status read failed: boom".to_string(),
+                    }),
                     compensated: false,
                     error: Some("swap failed: boom".to_string()),
-                    observation_error: Some("status read failed: boom".to_string()),
                 },
             )],
             vec![(slot(1), Some(GenerationId::new("pre-1".to_string())))],
@@ -3001,9 +3018,9 @@ mod tests {
                 "assignment read failed: boom".to_string(),
             ]),
         ) {
-            // Every slot's post-mutation status read fails: the wire carries
-            // `generation: None` + the preserved OBSERVATION error in
-            // `observation_error` (independently of the slot's OPERATION
+            // Every slot's post-mutation status read fails: the wire
+            // carries the `Unknown` observation with the preserved
+            // OBSERVATION error (independently of the slot's OPERATION
             // error), which the domain reads as `Unknown(error)` — never as
             // KnownAbsent/unchanged.
             let results: Vec<(SlotId, SlotResult)> = slots
@@ -3014,14 +3031,15 @@ mod tests {
                         SlotResult {
                             slot_id: sid.clone(),
                             outcome: SlotOutcomeKind::Failed,
-                            generation: None,
+                            observation: ObservationWire::Unknown(ObservationError {
+                                message: err_msg.clone(),
+                            }),
                             compensated: false,
                             // A DISTINCT operation error: the pre-swap
                             // failure that stopped the slot (e.g. a swap
                             // failure) — must survive the observation
                             // untouched.
                             error: Some(format!("swap failed: {err_msg}")),
-                            observation_error: Some(err_msg.clone()),
                         },
                     )
                 })
@@ -3069,24 +3087,25 @@ mod tests {
             );
 
             // The wire round-trip preserves BOTH facts independently: the
-            // observation error survives via `observation_error` and reads
-            // back as `Unknown`, never as `KnownAbsent`; the operation error
-            // survives via `error` untouched.
+            // observation error survives as the `Unknown` wire observation
+            // and reads back as `Unknown`, never as `KnownAbsent`; the
+            // operation error survives via `error` untouched.
             for sid in &slots {
                 let outcome = terminal.outcomes().get(sid).unwrap();
                 let wire = SlotResult::from_outcome(sid, outcome);
-                assert_eq!(wire.generation, None);
+                assert_eq!(
+                    wire.observation,
+                    ObservationWire::Unknown(ObservationError {
+                        message: err_msg.clone(),
+                    }),
+                    "slot {sid}: the wire observation must carry the preserved observation error"
+                );
                 assert_eq!(
                     wire.error,
                     Some(format!("swap failed: {err_msg}")),
                     "slot {sid}: the operation error must survive the wire untouched"
                 );
-                assert_eq!(
-                    wire.observation_error,
-                    Some(err_msg.clone()),
-                    "slot {sid}: the observation error must survive the wire untouched"
-                );
-                let back = SlotOutcome::from_wire(wire);
+                let back = SlotOutcome::from_wire(wire).unwrap();
                 assert_eq!(
                     back.error,
                     Some(format!("swap failed: {err_msg}")),

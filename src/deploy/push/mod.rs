@@ -623,9 +623,14 @@ pub(crate) mod push_tests {
         let snapshots = h.store.read_snapshots("t1").unwrap();
         assert_eq!(snapshots.len(), 1);
         let snap = &snapshots[0];
+        let wire_observation = &results[&SlotId::new("p1")].observation;
+        let wire_generation = match wire_observation {
+            ObservationWire::Known(w) => w.generation.clone(),
+            _ => panic!("a successful outcome records a Known observation"),
+        };
         assert_eq!(
             rollback_of(snap).slots[&SlotId::new("p1")].generation,
-            results[&SlotId::new("p1")].generation.clone().unwrap()
+            wire_generation
         );
         let actual = &r.attempt.as_ref().unwrap().slots[&SlotId::new("p1")];
         assert_eq!(

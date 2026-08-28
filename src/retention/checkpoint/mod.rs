@@ -457,8 +457,9 @@ mod tests {
     };
     use crate::ledger::{
         DeploymentIntent, DesiredGeneration, IntentSlot, LedgerRollback, LedgerTerminal,
-        NonEmptySlotTable, ObservedAssignment, ObservedSlot, Pins, SlotOutcomeKind, SlotResult,
-        SlotTable, TerminalDisposition,
+        NonEmptySlotTable, ObservationWire, ObservedAssignment, ObservedGenerationWire,
+        ObservedSlot, Pins, SlotOutcome, SlotOutcomeKind, SlotResult, SlotTable,
+        TerminalDisposition,
     };
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
@@ -531,14 +532,16 @@ mod tests {
                 rollback: rollback_for(release),
                 outcomes: SlotTable::from_map(BTreeMap::from([(
                     SlotId::new("p1".to_string()),
-                    SlotResult {
+                    SlotOutcome::from_wire(SlotResult {
                         slot_id: SlotId::new("p1".to_string()),
                         outcome: SlotOutcomeKind::Activated,
-                        generation: Some(test_generation_id("gen-1")),
+                        observation: ObservationWire::Known(ObservedGenerationWire {
+                            generation: test_generation_id("gen-1"),
+                        }),
                         compensated: false,
                         error: None,
-                        observation_error: None,
-                    },
+                    })
+                    .unwrap(),
                 )])),
                 // THE EXACT-EQUAL MEMBERSHIPS: selected == full == the
                 // one-slot membership (the rollback's slots / the outcomes'
@@ -587,14 +590,18 @@ mod tests {
                             disposition: TerminalDisposition::FailedRolledBack {
                                 outcomes: SlotTable::from_map(BTreeMap::from([(
                                     SlotId::new("p1".to_string()),
-                                    SlotResult {
+                                    SlotOutcome::from_wire(SlotResult {
                                         slot_id: SlotId::new("p1".to_string()),
                                         outcome: SlotOutcomeKind::Restored,
-                                        generation: Some(test_generation_id("gen-1")),
+                                        observation: ObservationWire::Known(
+                                            ObservedGenerationWire {
+                                                generation: test_generation_id("gen-1"),
+                                            },
+                                        ),
                                         compensated: true,
                                         error: None,
-                                        observation_error: None,
-                                    },
+                                    })
+                                    .unwrap(),
                                 )])),
                             },
                             reason: None,

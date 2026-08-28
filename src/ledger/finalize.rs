@@ -28,8 +28,8 @@ use crate::error::{Error, Result};
 use crate::identity::SlotId;
 pub use crate::ledger::records::{
     DeploymentIntent, LedgerEntry, LedgerIntentWire, LedgerTerminal, LedgerTerminalWire,
-    PhysicalBinding, SlotAttemptState, SlotOutcome, SlotResult, SlotTable, TerminalDisposition,
-    build_rollback,
+    ObservationWire, ObservedGenerationWire, PhysicalBinding, SlotAttemptState, SlotOutcome,
+    SlotResult, SlotTable, TerminalDisposition, build_rollback,
 };
 use crate::store::local::LocalStore;
 use serde::{Deserialize, Serialize};
@@ -138,8 +138,8 @@ pub fn finalize_successful_attempt(
             outcomes: SlotTable::from_map(
                 outcomes
                     .iter()
-                    .map(|(k, r)| (k.clone(), SlotOutcome::from(r.clone())))
-                    .collect(),
+                    .map(|(k, r)| Ok((k.clone(), SlotOutcome::from_wire(r.clone())?)))
+                    .collect::<Result<BTreeMap<_, _>>>()?,
             ),
             selected_membership: outcomes.keys().cloned().collect(),
             full_membership: current,
@@ -173,10 +173,11 @@ pub fn recovery_outcomes(
             SlotResult {
                 slot_id: sid.clone(),
                 outcome: crate::ledger::records::SlotOutcomeKind::Activated,
-                generation: Some(slot.desired.generation.clone()),
+                observation: ObservationWire::Known(ObservedGenerationWire {
+                    generation: slot.desired.generation.clone(),
+                }),
                 compensated: false,
                 error: None,
-                observation_error: None,
             },
         );
         actuals.insert(
@@ -329,10 +330,11 @@ mod tests {
             SlotResult {
                 slot_id: SlotId::new("p1".to_string()),
                 outcome: crate::ledger::SlotOutcomeKind::Activated,
-                generation: Some(test_generation_id("gen-1")),
+                observation: ObservationWire::Known(ObservedGenerationWire {
+                    generation: test_generation_id("gen-1"),
+                }),
                 compensated: false,
                 error: None,
-                observation_error: None,
             },
         )]);
 

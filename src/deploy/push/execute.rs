@@ -412,7 +412,13 @@ pub(crate) mod execute_tests {
         let res = &results[&SlotId::new("p1")];
         assert_eq!(res.outcome, SlotOutcomeKind::Failed);
         assert!(res.compensated);
-        assert_eq!(res.generation, Some(prior_gen.clone()));
+        assert_eq!(
+            res.observation,
+            ObservationWire::Known(ObservedGenerationWire {
+                generation: prior_gen.clone(),
+            }),
+            "the wire outcome records the compensated slot's PRIOR generation"
+        );
 
         // The remote `current` points at the PRIOR generation, whose stored
         // assignment carries the PRIOR behavior digest (A), never B: the
@@ -1069,7 +1075,13 @@ interval_seconds = 0
         let res = &results[&SlotId::new("p1")];
         assert_eq!(res.outcome, SlotOutcomeKind::Failed);
         assert!(res.compensated, "activation failure must be compensated");
-        assert_eq!(res.generation, Some(prior_gen.clone()));
+        assert_eq!(
+            res.observation,
+            ObservationWire::Known(ObservedGenerationWire {
+                generation: prior_gen.clone(),
+            }),
+            "the wire outcome records the compensated slot's PRIOR generation"
+        );
 
         // The remote `current` points at the PRIOR generation, whose stored
         // assignment carries the PRIOR behavior digest: the prior behavior

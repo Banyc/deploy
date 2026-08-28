@@ -14,7 +14,7 @@ use crate::identity::{
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::super::observation::Observation;
+use super::super::observation::{ArtifactRefWire, Observation, ObservationWire};
 use super::super::{NonEmptySlotTable, SlotAttemptState};
 /// The WIRE shape of a durable intent line: the RAW serde form the ledger's
 /// JSONL carries, holding every redundant member the domain reconciles (the
@@ -72,19 +72,24 @@ pub struct LedgerIntentWire {
     /// its own map key.
     pub desired: BTreeMap<SlotId, GenerationRef>,
     /// Pre-push per-slot state before mutation (`None` if first deployment).
-    /// Each entry's assignment artifact is a THREE-STATE observation
-    /// ([`Observation<ArtifactRef>`]: `Known` / `KnownAbsent` / `Unknown`)
-    /// — an unreadable pre-push assignment is `Unknown(error)`, a distinct
-    /// value that can never be mistaken for a known artifact. The key set
-    /// must equal `slot_ids` EXACTLY.
-    pub pre_push: BTreeMap<SlotId, Option<SlotAttemptState>>,
-    /// Actual per-slot result after the attempt. The persisted ledger intent
+    /// Each entry's assignment artifact is a THREE-STATE observation in its
+    /// STRICT WIRE form ([`ObservationWire<ArtifactRefWire>`]: `Known` /
+    /// `KnownAbsent` / `Unknown`, adjacently tagged with
+    /// `deny_unknown_fields`) — an unreadable pre-push assignment is
+    /// `Unknown(error)`, a distinct value that can never be mistaken for a
+    /// known artifact, and the persisted document rejects any observation
+    /// shape that is not EXACTLY one variant. The key set must equal
+    /// `slot_ids` EXACTLY.
+    pub pre_push: BTreeMap<SlotId, Option<SlotAttemptStateWire>>,
+    /// Actual per-slot result after the attempt, in its STRICT WIRE form
+    /// ([`SlotAttemptStateWire`] — the artifact observation adjacently
+    /// tagged with `deny_unknown_fields`). The persisted ledger intent
     /// keeps this map EMPTY (outcomes are recorded in the terminal event's
     /// `outcomes` map); the in-memory REPORT ([`LedgerIntentReport`]) carries
     /// the observed actuals for display — the verified domain [`DeploymentIntent`]
     /// does NOT carry this map, so it is not part of the intent's key-set
     /// invariant. Every key must be a member of `slot_ids`.
-    pub slots: BTreeMap<SlotId, SlotAttemptState>,
+    pub slots: BTreeMap<SlotId, SlotAttemptStateWire>,
 }
 
 impl LedgerIntentWire {
@@ -251,36 +256,46 @@ impl LedgerIntentWire {
         // sorted-by-id order of the per-slot maps. The exact-key-set
         // equality verified above guarantees every member has its desired +
         // pre_push entry, so each member's facts are read by member id.
-        let slots: Vec<(SlotId, IntentSlot)> =
-            self.slot_ids
-                .iter()
-                .map(|key| {
-                    let desired = &self.desired[key];
-                    let pre_push = self.pre_push.get(key).and_then(|p| p.clone()).map(|p| {
-                        PreviousGeneration {
+        let slots: Result<Vec<(SlotId, IntentSlot)>> = self
+            .slot_ids
+            .iter()
+            .map(|key| {
+                let desired = &self.desired[key];
+                let pre_push = self
+                    .pre_push
+                    .get(key)
+                    .and_then(|p| p.clone())
+                    // WIRE → DOMAIN (fail closed): the strict wire
+                    // observation converts to the permissive domain
+                    // observation; a wire value that is not
+                    // representable is refused here, at the conversion.
+                    .map(|p| -> Result<PreviousGeneration> {
+                        let p: SlotAttemptState = p.into_domain()?;
+                        Ok(PreviousGeneration {
                             artifact: p.artifact,
                             generation: p.generation,
-                        }
-                    });
-                    (
-                        key.clone(),
-                        IntentSlot {
-                            desired: DesiredGeneration {
-                                generation: desired.generation.clone(),
-                                artifact: desired.assignment.artifact.clone(),
-                            },
-                            pre_push,
+                        })
+                    })
+                    .transpose()?;
+                Ok((
+                    key.clone(),
+                    IntentSlot {
+                        desired: DesiredGeneration {
+                            generation: desired.generation.clone(),
+                            artifact: desired.assignment.artifact.clone(),
                         },
-                    )
-                })
-                .collect();
+                        pre_push,
+                    },
+                ))
+            })
+            .collect();
         Ok(DeploymentIntent {
             deployment_id: self.deployment_id,
             target: self.target,
             group: self.group,
             behavior_sha256: self.behavior_sha256,
             attempted_at: self.attempted_at,
-            slots: NonEmptySlotTable::build(slots)?,
+            slots: NonEmptySlotTable::build(slots?)?,
             full_membership: full_membership
                 .into_iter()
                 .cloned()
@@ -326,6 +341,56 @@ pub struct DesiredGeneration {
 pub struct PreviousGeneration {
     pub artifact: Observation<ArtifactRef>,
     pub generation: Option<GenerationId>,
+}
+
+/// THE WIRE FORM of a [`SlotAttemptState`] — the pre-push / actuals entry
+/// the PERSISTED intent line carries: the shared-core shape with its
+/// artifact observation in the STRICT adjacently-tagged wire form
+/// ([`ObservationWire<ArtifactRefWire>`], `deny_unknown_fields`), so the
+/// raw wire document rejects any field beyond `artifact`/`generation` and
+/// any observation shape that is not EXACTLY one variant. The DOMAIN
+/// [`SlotAttemptState`] (and its domain sibling [`PreviousGeneration`])
+/// keeps the permissive in-memory [`Observation<ArtifactRef>`]; the wire →
+/// domain conversion ([`SlotAttemptStateWire::into_domain`], fail closed)
+/// and the domain → wire re-expansion ([`From<&SlotAttemptState>`])
+/// convert between the two — the wire ↔ domain bijection is EXACT.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SlotAttemptStateWire {
+    /// The slot's assignment as a THREE-STATE observation in its STRICT
+    /// wire form: `Known(artifact)` is a real artifact read from the remote,
+    /// `KnownAbsent` carries no artifact, and `Unknown(error)` preserves the
+    /// read failure.
+    pub artifact: ObservationWire<ArtifactRefWire>,
+    /// The generation this slot actually advanced to.
+    pub generation: Option<GenerationId>,
+}
+
+impl SlotAttemptStateWire {
+    /// WIRE → DOMAIN, FAIL CLOSED: the strict wire observation converts to
+    /// the permissive domain observation. A wire value that is not
+    /// representable is refused with an integrity error rather than read as
+    /// a half-known state (in practice the serde-gated wire types make the
+    /// conversion total — the refusal is the boundary's fail-closed
+    /// contract).
+    pub fn into_domain(self) -> Result<SlotAttemptState> {
+        Ok(SlotAttemptState {
+            artifact: self.artifact.try_into()?,
+            generation: self.generation,
+        })
+    }
+}
+
+impl From<&SlotAttemptState> for SlotAttemptStateWire {
+    /// DOMAIN → WIRE: the permissive in-memory observation converts to its
+    /// EXACT strict wire form (the bijection is exact — every domain value
+    /// has exactly one wire form).
+    fn from(s: &SlotAttemptState) -> Self {
+        SlotAttemptStateWire {
+            artifact: ObservationWire::from(&s.artifact),
+            generation: s.generation.clone(),
+        }
+    }
 }
 
 /// The durable INTENT of one deployment attempt, the VALIDATED DOMAIN form
@@ -442,14 +507,17 @@ impl From<&DeploymentIntent> for LedgerIntentWire {
                 )
             })
             .collect();
-        let pre_push: BTreeMap<SlotId, Option<SlotAttemptState>> = i
+        let pre_push: BTreeMap<SlotId, Option<SlotAttemptStateWire>> = i
             .slots
             .iter()
             .map(|(key, s)| {
                 (
                     key.clone(),
-                    s.pre_push.as_ref().map(|p| SlotAttemptState {
-                        artifact: p.artifact.clone(),
+                    // DOMAIN → WIRE: the permissive in-memory observation
+                    // converts to its EXACT strict wire form (the bijection
+                    // is exact — every domain value has one wire form).
+                    s.pre_push.as_ref().map(|p| SlotAttemptStateWire {
+                        artifact: ObservationWire::from(&p.artifact),
                         generation: p.generation.clone(),
                     }),
                 )
@@ -502,9 +570,11 @@ pub struct LedgerIntentReport {
     /// report is display-facing and keeps the wire's split shape).
     pub desired: BTreeMap<SlotId, GenerationRef>,
     /// Pre-push per-slot state before mutation, re-expanded from the domain
-    /// table (same observation-shaped [`SlotAttemptState`] as the wire — an
-    /// unknown assignment is `Observation::Unknown`, never a sentinel
-    /// artifact).
+    /// table (the report is IN-MEMORY and display-facing, so it carries the
+    /// DOMAIN [`SlotAttemptState`] with its permissive
+    /// [`Observation<ArtifactRef>`] — an unknown assignment is
+    /// `Observation::Unknown`, never a sentinel artifact — while the
+    /// PERSISTED wire carries the strict [`SlotAttemptStateWire`]).
     pub pre_push: BTreeMap<SlotId, Option<SlotAttemptState>>,
     /// Actual per-slot result after the attempt, for display. The report is
     /// in-memory only — the persisted intent never carries this map.

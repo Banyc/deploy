@@ -17,6 +17,7 @@ use crate::identity::OperationId;
 use crate::identity::SlotId;
 use crate::ledger::DeploymentStatus;
 use crate::ledger::Observation;
+use crate::ledger::ObservationWire;
 use crate::ledger::ObservedGeneration;
 use crate::ledger::SlotOutcomeKind;
 use crate::ledger::SlotPlan;
@@ -150,17 +151,16 @@ pub(crate) fn apply_failure_policy(
 /// remaining-changes derivation compares against pre_push, never the
 /// desired generation. The post-mutation status read reflects the true
 /// state: the slot never advanced, so it is still on its pre-push
-/// generation. The observation is written into the wire's OBSERVATION
-/// fields only, INDEPENDENTLY of the outcome's operation error (`error`,
-/// which already carries the failure that stopped the slot — e.g.
-/// "swap failed: ..."): a FAILED read is `Unknown(error)` — the state is
-/// unknown, and an unknown state is NOT evidence of no change — so the
-/// wire records `generation: None` with the observation error in
-/// `observation_error` (the wire → domain conversion reads that back as
-/// `Unknown`, never as "unchanged"); a successful read showing no state
-/// is `KnownAbsent` (generation `None`, no observation error). The
-/// operation error is NEVER rewritten by the observation. Skipped
-/// outcomes already record the reconciled current assignment.
+/// generation. The observation is written into the wire's OBSERVATION only,
+/// INDEPENDENTLY of the outcome's operation error (`error`, which already
+/// carries the failure that stopped the slot — e.g. "swap failed: ..."): a
+/// FAILED read is `Unknown(error)` — the state is unknown, and an unknown
+/// state is NOT evidence of no change — so the wire carries the `Unknown`
+/// wire observation (the wire → domain conversion reads that back as
+/// `Unknown`, never as "unchanged"); a successful read showing no state is
+/// `KnownAbsent` (a unit wire observation). The operation error is NEVER
+/// rewritten by the observation. Skipped outcomes already record the
+/// reconciled current assignment.
 pub(crate) fn record_never_advanced_outcomes(
     results: &mut BTreeMap<SlotId, SlotResult>,
     actual_observations: &BTreeMap<SlotId, Observation<ObservedGeneration>>,
@@ -170,18 +170,12 @@ pub(crate) fn record_never_advanced_outcomes(
         if let Some(r) = results.get_mut(sid)
             && r.outcome == SlotOutcomeKind::Failed
         {
+            // DOMAIN → WIRE (exact): the observed post-state's strict wire
+            // form; a missing observation reads back as `KnownAbsent` (the
+            // old `None` generation with no observation error).
             match actual_observations.get(sid) {
-                Some(Observation::Known(og)) => {
-                    r.generation = Some(og.generation.clone());
-                }
-                Some(Observation::Unknown(e)) => {
-                    r.generation = None;
-                    r.observation_error = Some(e.message.clone());
-                }
-                Some(Observation::KnownAbsent) | None => {
-                    r.generation = None;
-                    r.observation_error = None;
-                }
+                Some(obs) => r.observation = ObservationWire::from(obs),
+                None => r.observation = ObservationWire::KnownAbsent,
             }
         }
     }

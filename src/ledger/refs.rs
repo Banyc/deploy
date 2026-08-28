@@ -272,7 +272,10 @@ mod tests {
     };
     use crate::ledger::records::{DeploymentIntent, DesiredGeneration, IntentSlot};
     use crate::ledger::records::{LedgerTerminal, TerminalDisposition};
-    use crate::ledger::records::{NonEmptySlotTable, PhysicalBinding, SlotResult, SlotTable};
+    use crate::ledger::records::{
+        NonEmptySlotTable, ObservationWire, ObservedGenerationWire, PhysicalBinding, SlotOutcome,
+        SlotResult, SlotTable,
+    };
     use proptest::prelude::*;
     use proptest::test_runner::{FileFailurePersistence, RngSeed};
     use std::collections::{BTreeMap, BTreeSet};
@@ -351,14 +354,16 @@ mod tests {
                 },
                 outcomes: SlotTable::from_map(BTreeMap::from([(
                     SlotId::new("p1".to_string()),
-                    SlotResult {
+                    SlotOutcome::from_wire(SlotResult {
                         slot_id: SlotId::new("p1".to_string()),
                         outcome: crate::ledger::SlotOutcomeKind::Activated,
-                        generation: Some(test_generation_id(&format!("gen-{dep}"))),
+                        observation: ObservationWire::Known(ObservedGenerationWire {
+                            generation: test_generation_id(&format!("gen-{dep}")),
+                        }),
                         compensated: false,
                         error: None,
-                        observation_error: None,
-                    },
+                    })
+                    .unwrap(),
                 )])),
                 // THE EXACT-EQUAL MEMBERSHIPS: selected == full == the
                 // one-slot membership (the rollback's slots / the outcomes'
@@ -737,14 +742,18 @@ mod tests {
                             disposition: TerminalDisposition::FailedRolledBack {
                                 outcomes: SlotTable::from_map(BTreeMap::from([(
                                     SlotId::new("p1".to_string()),
-                                    SlotResult {
+                                    SlotOutcome::from_wire(SlotResult {
                                         slot_id: SlotId::new("p1".to_string()),
                                         outcome: crate::ledger::SlotOutcomeKind::Restored,
-                                        generation: Some(test_generation_id("gen-1")),
+                                        observation: ObservationWire::Known(
+                                            ObservedGenerationWire {
+                                                generation: test_generation_id("gen-1"),
+                                            },
+                                        ),
                                         compensated: true,
                                         error: None,
-                                        observation_error: None,
-                                    },
+                                    })
+                                    .unwrap(),
                                 )])),
                             },
                             reason: None,

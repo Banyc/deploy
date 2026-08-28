@@ -477,8 +477,9 @@ mod tests {
     };
     use crate::ledger::{
         DeploymentIntent, DesiredGeneration, IntentSlot, LedgerRollback, LedgerTerminal,
-        NonEmptySlotTable, Observation, ObservationError, ObservedAssignment, ObservedSlot, Pins,
-        PreviousGeneration, SlotOutcomeKind, SlotResult, SlotTable, TerminalDisposition,
+        NonEmptySlotTable, Observation, ObservationError, ObservationWire, ObservedAssignment,
+        ObservedGenerationWire, ObservedSlot, Pins, PreviousGeneration, SlotOutcome,
+        SlotOutcomeKind, SlotResult, SlotTable, TerminalDisposition,
     };
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
@@ -705,14 +706,16 @@ interval_seconds = 0
                 },
                 outcomes: SlotTable::from_map(BTreeMap::from([(
                     SlotId::new(SLOT.to_string()),
-                    SlotResult {
+                    SlotOutcome::from_wire(SlotResult {
                         slot_id: SlotId::new(SLOT.to_string()),
                         outcome: SlotOutcomeKind::Activated,
-                        generation: Some(test_generation_id("gen-1")),
+                        observation: ObservationWire::Known(ObservedGenerationWire {
+                            generation: test_generation_id("gen-1"),
+                        }),
                         compensated: false,
                         error: None,
-                        observation_error: None,
-                    },
+                    })
+                    .unwrap(),
                 )])),
                 // THE EXACT-EQUAL MEMBERSHIPS: selected == full == the
                 // one-slot membership (the rollback's slots / the outcomes'

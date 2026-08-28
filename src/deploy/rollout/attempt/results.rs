@@ -6,7 +6,9 @@ use crate::deploy::plan::PlannedAssignment;
 use crate::identity::SlotId;
 use crate::ledger::Observation;
 use crate::ledger::ObservationError;
+use crate::ledger::ObservationWire;
 use crate::ledger::ObservedGeneration;
+use crate::ledger::ObservedGenerationWire;
 use crate::ledger::SlotAttemptState;
 use crate::ledger::SlotOutcomeKind;
 use crate::ledger::SlotResult;
@@ -55,10 +57,14 @@ pub(crate) fn fill_skipped_slots(
                 SlotResult {
                     slot_id: a.placement_slot.clone(),
                     outcome: SlotOutcomeKind::Skipped,
-                    generation: cur,
+                    observation: match cur {
+                        Some(g) => ObservationWire::Known(ObservedGenerationWire { generation: g }),
+                        // No reconciled current assignment: a skipped slot
+                        // with no observed state reads back as `KnownAbsent`.
+                        None => ObservationWire::KnownAbsent,
+                    },
                     compensated: false,
                     error: None,
-                    observation_error: None,
                 },
             );
         }

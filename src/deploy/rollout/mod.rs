@@ -17,6 +17,8 @@ use crate::identity::GenerationId;
 use crate::identity::OperationId;
 use crate::identity::SlotId;
 use crate::ledger::BehaviorIndex;
+use crate::ledger::ObservationWire;
+use crate::ledger::ObservedGenerationWire;
 use crate::ledger::SlotOutcomeKind;
 use crate::ledger::SlotPlan;
 use crate::ledger::SlotResult;
@@ -121,13 +123,14 @@ pub(crate) fn run_batches(
                     SlotResult {
                         slot_id: sid.clone(),
                         outcome: SlotOutcomeKind::Failed,
-                        generation: Some(new_gen[sid].clone()),
+                        observation: ObservationWire::Known(ObservedGenerationWire {
+                            generation: new_gen[sid].clone(),
+                        }),
                         compensated: false,
                         error: Some(format!(
                             "internal: no behavior contract for variant '{}' after coverage check",
                             a.artifact.variant
                         )),
-                        observation_error: None,
                     },
                 );
                 if stop_on_failure {
@@ -193,10 +196,9 @@ pub(crate) fn run_batches(
                 SlotResult {
                     slot_id: sid.clone(),
                     outcome: kind,
-                    generation: Some(generation),
+                    observation: ObservationWire::Known(ObservedGenerationWire { generation }),
                     compensated: did_compensate,
                     error,
-                    observation_error: None,
                 },
             );
             if had_failure && stop_on_failure {

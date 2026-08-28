@@ -396,11 +396,18 @@ impl LedgerTerminalWire {
         }
         // The wire outcomes are converted to the DOMAIN outcomes, deriving
         // each slot's TRANSITION STATE from the wire's status/outcome fields
-        // ([`SlotOutcome::from_wire`]) and DROPPING the wire outcome's
-        // redundant `slot_id` into the key (the domain value carries no slot
-        // — the table key owns identity; the own-key agreement above
-        // verified the wire's claim before the drop).
-        let outcomes: SlotTable<SlotOutcome> = SlotTable::from_map(self.outcomes);
+        // ([`SlotOutcome::from_wire`], FAIL CLOSED — the strict wire
+        // observation converts to the domain observation; a wire value that
+        // is not representable is refused here) and DROPPING the wire
+        // outcome's redundant `slot_id` into the key (the domain value
+        // carries no slot — the table key owns identity; the own-key
+        // agreement above verified the wire's claim before the drop).
+        let outcomes: SlotTable<SlotOutcome> = SlotTable::from_map(
+            self.outcomes
+                .into_iter()
+                .map(|(key, result)| Ok((key, SlotOutcome::from_wire(result)?)))
+                .collect::<Result<BTreeMap<SlotId, SlotOutcome>>>()?,
+        );
         // STATUS → DISPOSITION: each status maps to exactly one disposition,
         // and a status whose payload does not match its disposition is a
         // conversion error (fail closed).
