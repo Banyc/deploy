@@ -32,28 +32,181 @@ The system must support:
 
 ## Core model
 The deployment core is deliberately ignorant of application semantics. It does not distinguish executables, configuration, static assets, scripts, or service definitions. It understands only filesystem entries, mappings, trees, artifacts, variants, releases, targets, activation adapters.
-The important identities are:
+### Glossary
+
+Every term below is defined ONCE, canonically, matching the code's types; the rest of this document uses only these definitions.
 
 ```text
-tree        = immutable filesystem content, identified only by its tree digest
-variant     = a name bound to one tree within a release
-artifact    = the immutable release + variant + tree binding
-release     = an immutable map of every declared variant to a tree digest plus the release's own canonical per-variant slot declarations (the slot snapshot, folded into the ReleaseId)
-server      = a durable machine identity: a stable ID plus its current address
-deployment slot = a binding of one top-level server to one variant under an ID, with an absolute deploy_dir, declared inside the variant file that owns the workload; its `targets` list binds it to one or more targets
-physical binding = a slot's `{server, deploy_dir}` pair at a point in time: the exact on-host deployment location; snapshots record it so exact rollback can verify a slot still lives where it was deployed
-target      = a named group of slots (derived from the slots' `targets` lists) plus its ROLLOUT policy; retention is SLOT-OWNED (see "Protection and retention")
-deployment  = an attempted push and its exact per-server assignments
-generation  = one placement slot's durable activation record for one assignment
+tree            = immutable filesystem content, identified only by its tree digest
+                  (TreeDigest). Trees carry no release- or variant-specific
+                  metadata, so identical trees deduplicate safely.
+variant         = a name bound to one tree within a release. The variant file
+                  that declares the name also owns the artifact mappings, the
+                  activation/verification behavior contract, the deployment
+                  slots, and the slot-owned retention policy.
+artifact        = an ArtifactRef: the immutable (release, variant, tree) binding a
+                  slot runs. Every per-slot assignment map is keyed by slot id
+                  and carries each slot's OWN artifact ref.
+release         = an immutable record binding every declared variant to a tree
+                  digest plus the release's OWN canonical per-variant slot
+                  declarations (the slot snapshot), folded into the ReleaseId
+                  (`rel-sha256-<digest>`). Capacity is never part of a release.
+server          = a durable machine identity (ServerDef): a stable server id plus
+                  EXACTLY ONE connection form — `local` (pathless; the slot's
+                  typed deploy_dir is the SOLE physical root) or `ssh` (host,
+                  user, port, and EXACTLY ONE host identity: a dedicated
+                  known_hosts file or a pinned `SHA256:` fingerprint) — plus the
+                  per-server capacity policy (live configuration, never
+                  snapshotted). The server id is the transport-addressing
+                  identity; deployment history is keyed by slot id, never by
+                  server id.
+deployment slot = a binding of one server to one workload under an id, with an
+                  absolute typed deploy_dir, declared inside the variant file
+                  that owns the workload. A slot belongs to EXACTLY ONE owning
+                  target (its `target` field); optional `groups` add rollout
+                  selection for `deploy push <target> --group <name>`. The
+                  declaring variant file IS the slot's variant binding.
+physical binding= a slot's `{server, deploy_dir}` pair at deployment time
+                  (PhysicalBinding): the exact on-host deployment location. The
+                  ledger's intent and rollback payloads record it so exact
+                  rollback can verify a slot still lives where it was deployed.
+target          = a named selection view: a top-level `[targets.<name>]` entry
+                  carrying ROLLOUT behavior ONLY. Its member slots are DERIVED
+                  by scanning every variant's `[[slots]]` entries for that
+                  target name; it has no storage of its own beyond its ONE
+                  history ledger and its retention-debt marker. Retention is
+                  SLOT-OWNED (the owning variant's policy), never per-target.
+deployment      = an attempt: one push of one reference to one target, recorded
+                  in the target's ONE ledger as an intent line plus (eventually)
+                  one terminal event, keyed by its deployment id (DeploymentId,
+                  `deploy-<uuidv7>`). "Attempt" and "deployment" name the same
+                  record: the intent line is the attempt; the merged entry is
+                  the deployment.
+generation      = one placement slot's durable activation record on a server
+                  (`generations/<gen>/assignment.json` + a `root` symlink): the
+                  deployment id, the placement slot, the artifact ref, the
+                  behavior snapshot, and the prior generation. `current` points
+                  at exactly one generation. Generation ids are fresh UUIDv7
+                  values minted under the operation lock.
+ledger line     = one physical JSONL line of `targets/<target>/ledger.jsonl`.
+                  Exactly two kinds exist: the INTENT (appended BEFORE any
+                  remote mutation: deployment id, target, group, the frozen
+                  memberships, the frozen physical bindings, the behavior
+                  digest, and the desired / pre_push per-slot maps — no status,
+                  no outcomes) and the TERMINAL EVENT (appended once at
+                  completion: the status, the per-slot outcomes, and — when
+                  successful — the rollback payload). A merged entry (intent +
+                  optional terminal) is the deployment's full record; an entry
+                  WITHOUT a terminal is the CURRENT/INCOMPLETE state the next
+                  push reconciles.
+snapshot        = the ROLLBACK PAYLOAD of a successful deployment: the complete
+                  per-slot generation refs + physical bindings carried by the
+                  successful terminal event. A successful deployment IS a
+                  snapshot keyed by its deployment id; there is no separate
+                  snapshot log, no stored index, and no `refs/last-successful`
+                  — positions in the successful chain are DERIVED from the
+                  ledger's append order. (The release record's "slot snapshot"
+                  and "behavior snapshot" are DIFFERENT frozen inputs — the
+                  release's canonical per-variant slot declarations and its
+                  frozen mapping/behavior files — never deployment snapshots.)
+outcome         = one slot's terminal result (SlotResult): its outcome kind
+                  (`activated` / `failed` / `skipped` / `restored`), its
+                  post-mutation observation, and whether compensation
+                  succeeded. Outcomes live in the terminal event's per-slot
+                  map; there is no separate outcomes file.
+observed record = the ONE physical observed state of a placement slot
+                  (`slots/<slot-id>/observed.json`), written EXACTLY ONCE per
+                  slot. Targets are SELECTION VIEWS over the global slot map:
+                  `read_observed(target)` filters the physical records of the
+                  target's member slots — never a per-target copy.
+commit marker   = the write-once remote marker
+                  `state/commits/<deployment-id>.json` recording that the
+                  deployment id, generation, and placement-slot set committed
+                  on a server. A deployment is successful only when every
+                  participant's marker exists; an existing marker is never
+                  altered (it must match byte-for-byte).
+retention debt  = the durable post-commit maintenance markers:
+                  `targets/<target>/retention-debt.json` (the receiver-side
+                  rotation was deferred for a slot; the next push retries it
+                  under the slot's mutation lock) and `<store>/sweep-debt.json`
+                  (the checkpoint's global sweep did not complete; the next
+                  push recomputes reachability fresh and finishes it). Both are
+                  NON-FALLIBLE maintenance: marker read/write failures are
+                  warnings, never errors.
+sweep           = the best-effort reclamation pass that serves the "no disk
+                  usage leak" rule, one per side: the RECEIVER rotation
+                  (mark-and-sweep of tree objects + abandoned incoming
+                  directories under the slot's single owning-variant policy)
+                  and the PUSHER checkpoint sweep (the global reachability GC
+                  of deployment dirs, release records, and tree objects). Both
+                  are POST-COMMIT MAINTENANCE, never corrections; neither is
+                  secure erasure.
+checkpoint      = `deploy checkpoint <target> <deployment-id>`: retain the
+                  target's history suffix at a successful deployment (an atomic
+                  ledger replacement — the only logical commit) and best-effort
+                  sweep the globally unreachable content. See "Checkpoint and
+                  garbage collection".
 ```
 
 Deployment, operation, and generation IDs are opaque collision-resistant IDs (UUIDv7 in schema version 1). They identify events and are never used as content identity.
 
+### Topology model
+
+The configuration is ONE graph, declared in exactly two places:
+
+* `deploy.toml` declares the SERVERS (`[[servers]]`: id, connection, the
+  exactly-one host identity, the per-server capacity policy), the TARGETS
+  (`[targets.<name>]`: rollout behavior ONLY — no storage, no retention, no
+  per-target policy), and the optional `[[pins]]` (durable retention anchors
+  for release content).
+* The variant files (`releases/<release>/<variant>.toml`, one file per
+  variant, named by file stem) declare the ARTIFACT MAPPINGS, the activation
+  and verification behavior, the slot-owned RETENTION policy, and the
+  DEPLOYMENT SLOTS (`[[slots]]`: id, server, deploy_dir, target, groups).
+
+All membership is DERIVED, never stored:
+
+* A target's member slots are the slots whose `target` field names it, scanned
+  across every variant. A slot has EXACTLY ONE owning target, so the same slot
+  can never be a member of two targets. Two slots may share one server in
+  different targets, but within a single target each server appears at most
+  once (one running generation per server).
+* A slot's `groups` list selects a subset of the owning target's slots for
+  `deploy push <target> --group <name>`; groups never own state, policy,
+  history, or checkpoints. A duplicate group name is rejected at load.
+* A release's OWN slot snapshot is the frozen per-variant canonical slot
+  declarations (`id`/`server`/`deploy_dir`/`target`/`groups`, `deploy_dir`
+  lexically normalized, `groups` sorted and deduplicated) folded into the
+  release id; historical and rollback pushes resolve slot→variant from the
+  snapshot, never from the caller's current variant files. Reference kinds
+  consult exactly ONE temporal source: HEAD reads the CURRENT slot
+  declarations, `release:<id>` the release's frozen topology bound onto the
+  current physical slots (logical membership must match), a deployment ref
+  the deployment's exact per-slot artifact + physical binding, and the
+  current server configuration contributes connectivity and live capacity
+  only (it never contributes topology).
+
+Observed state is stored ONCE PER SLOT (`slots/<slot-id>/observed.json` — the
+slot's ONE physical record, never replicated per target); the engine's
+observed refresh writes each advanced slot's record EXACTLY ONCE, and targets
+are SELECTION VIEWS over the global slot map: `read_observed(target)` returns
+the physical records of the target's member slots, so a target's view always
+agrees with each member slot's single physical record.
+
+History is stored ONE LEDGER PER TARGET: `targets/<target>/ledger.jsonl`
+holds the target's ENTIRE deployment history (see "ONE history ledger per
+target"), and `targets/<target>/retention-debt.json` holds its deferred
+receiver-side retention markers. The store-global records are the slot map
+(`slots/`), the server records (`servers/`), the deployment plans
+(`deployments/<id>/plan.json`), the content-addressed release records
+(`releases/<release-id>/`) and tree objects (`objects/sha256/<digest>/`), the
+store pins (`pins.json`), and the sweep-debt marker (`sweep-debt.json`).
+
 Tree objects contain no release- or variant-specific metadata, so identical trees can be deduplicated safely. Release records bind variants to trees and freeze the release's own canonical per-variant slot declarations (the slot snapshot).
 
-The canonical release ID is derived from a versioned canonical identity payload covering the name-sorted per-variant mapping digests, the name-sorted per-variant SLOT DECLARATION digest (each variant's `[[slots]]` entries canonicalized to their identity fields `id`/`server`/`deploy_dir`/`target` (the slot's ONE owning target, kept verbatim), with `groups` sorted and DEDUPLICATED, so duplicate group names never shift identity — `deploy_dir` lexically normalized — and sorted by slot id), all declared `variant → tree digest` bindings, and the name-sorted per-variant activation and verification behavior-contract digest. It explicitly excludes the resulting release ID, creation time, display name, and provenance, avoiding a circular hash. Two variants may share tree bytes while still requiring different activation and verification behavior, so behavior is captured per variant rather than once per release. A slot-only change — rebinding a slot to another server, moving its `deploy_dir`, or changing its target membership — produces a NEW release ID: the canonical slot declarations are part of the identity, and the release record persists them as its slot snapshot. Capacity is NOT part of the release identity: it is a per-server policy declared on the server entry and resolved from the caller's current configuration at preflight time, so a server-capacity change never produces a new release. Its stored form is `rel-sha256-<release-digest>`; the CLI may display and accept an unambiguous digest prefix. Git revision and creation time are provenance only because mapped inputs can include generated or untracked files. The digest is never trusted from the stored `release_sha256` field: every read (`store.read_release`) and every publish (`helper.publish_release`) recomputes the canonical digest from the record's own content (slot snapshot, bindings, provenance digests) and verifies it against BOTH `release_sha256` and `release_id`, failing closed with an integrity error on any mismatch — a record whose content was edited while the digest fields were left unchanged is rejected. An EMPTY slot snapshot is rejected outright: a current-format record must persist its canonical slot declarations, so a tampered record whose `slots` map was emptied can no longer bypass verification (no legacy escape hatch). `store.write_release` verifies the INCOMING record from its content before creating anything, and re-verifies the EXISTING record from its content before comparing identities, so a same-id record with different content always fails between two content-verified records — never by trusting the stored digest fields. `store.read_release(id)` additionally binds the record to the read path: the stored `release_id` must equal the requested `id`, else an integrity error names both (a record swapped into the wrong release directory is refused, not returned).
+The canonical release ID is derived from a versioned canonical identity payload covering the name-sorted per-variant mapping digests, the name-sorted per-variant SLOT DECLARATION digest (each variant's `[[slots]]` entries canonicalized to their identity fields `id`/`server`/`deploy_dir`/`target` (the slot's ONE owning target, kept verbatim), with `groups` sorted and DEDUPLICATED, so duplicate group names never shift identity — `deploy_dir` lexically normalized — and sorted by the canonical total order over those fields), all declared `variant → tree digest` bindings, and the name-sorted per-variant activation and verification behavior-contract digest. It explicitly excludes the resulting release ID, creation time, display name, and provenance, avoiding a circular hash. Two variants may share tree bytes while still requiring different activation and verification behavior, so behavior is captured per variant rather than once per release. A slot-only change — rebinding a slot to another server, moving its `deploy_dir`, or changing its target membership — produces a NEW release ID: the canonical slot declarations are part of the identity, and the release record persists them as its slot snapshot. Capacity is NOT part of the release identity: it is a per-server policy declared on the server entry and resolved from the caller's current configuration at preflight time, so a server-capacity change never produces a new release. Its stored form is `rel-sha256-<release-digest>`; the CLI may display and accept an unambiguous digest prefix. Git revision and creation time are provenance only because mapped inputs can include generated or untracked files. The digest is never trusted from the stored `release_sha256` field: every read (`store.read_release`) and every publish (`helper.publish_release`) recomputes the canonical digest from the record's own content (slot snapshot, bindings, provenance digests) and verifies it against BOTH `release_sha256` and `release_id`, failing closed with an integrity error on any mismatch — a record whose content was edited while the digest fields were left unchanged is rejected. An EMPTY slot snapshot is rejected outright: a current-format record must persist its canonical slot declarations, so a tampered record whose `slots` map was emptied can no longer bypass verification (no legacy escape hatch). `store.write_release` verifies the INCOMING record from its content before creating anything, and re-verifies the EXISTING record from its content before comparing identities, so a same-id record with different content always fails between two content-verified records — never by trusting the stored digest fields. `store.read_release(id)` additionally binds the record to the read path: the stored `release_id` must equal the requested `id`, else an integrity error names both (a record swapped into the wrong release directory is refused, not returned).
 
-Mapping and behavior digests are computed from versioned canonical data after schema defaults, path normalization, and validation, not from TOML formatting, comments, or key order. The original configuration remains available as provenance, while `behavior.json` records the canonical behavior contract. Snapshot files are written atomically and immutably with create-or-compare semantics: an identical rewrite is an idempotent no-op, and replacing an existing release's `behavior.json` with different content fails. A historical deployment restores the variant's original activation and verification behavior from this snapshot (so a variant renamed or removed after the release was created still rolls back exactly), and resolution fails closed: a missing or corrupt historical behavior snapshot aborts the attempt during preflight rather than silently substituting the caller's current configuration or defaults. The snapshot is cross-checked against the release identity on every read and publish: `store.read_release_behaviors` and the remote behavior publication parse the serialized `behavior.json`, recompute the canonical name-sorted per-variant contract digest (`release.variant_behaviors_digest`), and compare it against the release record's provenance `behavior_sha256` (itself folded into `release_sha256`); a snapshot whose canonical contract set digests to anything else — a deleted or changed identity-bearing field, a removed variant, or unparseable bytes — fails closed with an integrity error naming the release and the expected vs recomputed digest, so a tampered `behavior.json` is never returned as the historical contract and never published. Only a payload that parses to the SAME canonical contract set (e.g. JSON key reordering that deserializes identically) passes — that is the "unless the canonical behavior digest remains equal" clause. Capacity headroom, by contrast, is a per-server policy that is never snapshotted: servers have no per-release history, so every push — HEAD or historical — resolves it from the caller's current `deploy.toml`. Retention is SLOT-OWNED configuration declared inside the VARIANT FILE that declares the slot (each slot has exactly ONE policy — its owning variant's — never a per-target policy and never a union across the slot's member targets), and is read from the caller's current configuration on every push.
+Mapping and behavior digests are computed from versioned canonical data after schema defaults, path normalization, and validation, not from TOML formatting, comments, or key order. The original configuration remains available as provenance, while `behavior.json` records the canonical behavior contract. Snapshot files are written atomically and immutably with create-or-compare semantics: an identical rewrite is an idempotent no-op, and replacing an existing release's `behavior.json` with different content fails. A historical deployment restores the variant's original activation and verification behavior from this snapshot (so a variant renamed or removed after the release was created still rolls back exactly), and resolution fails closed: a missing or corrupt historical behavior snapshot aborts the attempt during preflight rather than silently substituting the caller's current configuration or defaults. The snapshot is cross-checked against the release identity on every read and publish: `store.read_release_behaviors` and the remote behavior publication parse the serialized `behavior.json`, recompute the canonical name-sorted per-variant contract digest (`release.variant_behaviors_digest`), and compare it against the release record's provenance `behavior_sha256` (itself folded into `release_sha256`); a snapshot whose canonical contract set digests to anything else — a deleted or changed identity-bearing field, a removed variant, or unparseable bytes — fails closed with an integrity error naming the release and the expected vs recomputed digest, so a tampered `behavior.json` is never returned as the historical contract and never published. Only a payload that parses to the SAME canonical contract set (e.g. JSON key reordering that deserializes identically) passes — that is the "unless the canonical behavior digest remains equal" clause. Capacity headroom, by contrast, is a per-server policy that is never snapshotted: servers have no per-release history, so every push — HEAD or historical — resolves it from the caller's current `deploy.toml`. Retention is SLOT-OWNED configuration declared inside the VARIANT FILE that declares the slot (each slot has exactly ONE policy — its owning variant's — never a per-target policy and never a union; a slot has exactly one owning target), and is read from the caller's current configuration on every push.
 
 The first materialization fixes the immutable release record's `created_at` and first-seen provenance. Reusing the same release later does not rewrite that record; the new deployment attempt records its own current provenance.
 
@@ -212,8 +365,8 @@ Each variant is described by its own file inside the release directory (e.g.
 `releases/v1/standard.toml`); there is no explicit variant list to keep in
 sync. A variant file owns its artifact mappings, its deployment policies
 (activation, verification), AND its deployment slots — the `[[slots]]`
-entries of the file, whose `targets` list binds each slot to one or more
-top-level targets; retention is declared once per slot — inside
+entries of the file, each binding its slot to its ONE owning target via its
+`target` field; retention is declared once per slot — inside
 the owning variant file:
 
 ```toml
@@ -346,7 +499,7 @@ Materialization uses a canonical tree format:
 - ACLs, extended attributes, and platform-specific metadata are not part of schema version 1 and are stripped from materialized trees;
 - modes are recorded, with an explicit mapping mode overriding the source;
 ## Local storage
-The local store contains the exact immutable trees sent to servers, immutable release bindings, and the observed state of each target:
+The local store contains the exact immutable trees sent to servers, immutable release bindings, and the observed state of each slot:
 
 ```text
 ~/.local/share/simple-deploy/example/
@@ -364,7 +517,6 @@ The local store contains the exact immutable trees sent to servers, immutable re
       release.json
   targets/
     production/
-      observed.json
       retention-debt.json
       ledger.jsonl              # ONE ordered history ledger (see below)
   slots/
@@ -412,44 +564,155 @@ is GONE: the ledger replaces all of it. `deploy log` renders the ledger;
 `deploy push <target> <deployment-id>` resolves the ledger entry; `@-`,
 `parent(...)` walk the ledger's successful entries.
 
-### Checkpoints (retained-suffix replacement + global sweep)
+### Checkpoint and garbage collection
 
-A checkpoint (`deploy checkpoint <target> <deployment-id>`) retains the
-target's history suffix at the checkpoint deployment and sweeps the
-unreachable rest. It is exactly three steps:
+`deploy checkpoint <target> <deployment-id>` retains the target's history
+suffix at the checkpoint deployment and sweeps the globally unreachable
+rest. It is exactly three steps:
 
 1. CALCULATE THE RETAINED SUFFIX — everything at/after the checkpoint
-   deployment's position in the ledger. The floor is IMPLICIT: the ledger's
-   first entry is the oldest retained rollback state; there is NO separate
-   floor marker. The checkpoint deployment must be a SUCCESSFUL deployment
-   of the target (its entry carries a rollback state).
+   deployment's position in the target's ONE ledger (`ledger_suffix`: the
+   physical lines from the checkpoint entry's intent line onward). The floor
+   is IMPLICIT: the ledger's first entry is the oldest retained rollback
+   state; there is NO separate floor marker. The checkpoint deployment must
+   be a SUCCESSFUL deployment of the target (its entry carries a rollback
+   state); everything strictly before it — older entries, failed attempts
+   included, and their `deployments/<id>/` directories — is discarded.
 2. ATOMICALLY REPLACE the ledger with that suffix — temp + fsync +
-   chmod-private + rename + parent-directory fsync. THIS is the checkpoint's
-   ONLY LOGICAL COMMIT: a reader never observes a torn ledger (wholly old
-   or wholly new). IF THE REPLACEMENT FAILS, NO DELETION HAPPENS — the
-   checkpoint is a plain error and the full history stands untouched.
-3. BEST-EFFORT GLOBAL SWEEP of the unreachable deployment directories
-   (`deployments/<id>/`), release records (`releases/<release-id>/`), and
-   tree objects (`objects/sha256/<digest>/`). The reachability scan is
-   recomputed FRESH on every retry and keeps everything reachable from
-   ANOTHER target's ledger, the current/incomplete state (observed
-   artifacts, pending intent-only entries, in-flight deployment dirs), or a
-   PIN (a release pin marks every variant/tree of its release). A failed
-   sweep is retried by RECOMPUTING reachability — no persisted deletion
-   worklist, no cleanup-pending debt flag, no backup. Sweeps are
+   chmod-private + rename + parent-directory fsync
+   (`write_ledger_suffix`). THIS is the checkpoint's ONLY LOGICAL COMMIT: a
+   reader never observes a torn ledger (wholly old or wholly new). IF THE
+   REPLACEMENT FAILS, NO DELETION HAPPENS — the checkpoint is a plain error
+   and the full history stands untouched. From the moment the replacement
+   succeeds the checkpoint is IRREVERSIBLY committed, and no post-commit
+   sweep failure may surface as an error (each is converted into a report
+   with the sweep retry-required and a warning).
+3. BEST-EFFORT GLOBAL SWEEP (`run_sweep`) of the unreachable deployment
+   directories (`deployments/<id>/`), release records
+   (`releases/<release-id>/`), and tree objects (`objects/sha256/<digest>/`).
+   The reachability scan (`reachable_set`) is recomputed FRESH on every
+   retry — no persisted deletion worklist, no backup. An incomplete sweep
+   records a durable sweep-debt marker (`<store>/sweep-debt.json`) so the
+   NEXT PUSH (not just the next checkpoint) retries it, recomputing
+   reachability fresh; a completed sweep clears the marker. Sweeps are
    best-effort and are NOT secure erasure.
 
-Because the atomic replacement is the only logical commit, a failed
-checkpoint leaves EXACTLY the pre-call state; a failed sweep leaves the
-ledger compacted (the commit stands) with the sweep retry-required, and the
-next same-deployment checkpoint recomputes the same suffix (the ledger
-already IS it) and re-runs the sweep to convergence. The report carries at
-most: the logical commit status + sweep completed / retry-required. The
-old floor-marker/backup/restore/torn-advance machinery and the
-cleanup-pending debt flag with its three report flags are UNNECESSARY and
-were REMOVED. The CLI requires an explicit deployment id and `--yes` for the
-real operation; `--dry-run` enumerates exactly what would be discarded and
-touches nothing.
+THE RETAINED SET is computed GLOBALLY — release records and tree objects are
+content-addressed and SHARED across targets, so the retained set cannot be
+per-target. It is the union of:
+
+1. EVERY TARGET'S CURRENT LEDGER (for the checkpointed target, the retained
+   suffix AS-IF the atomic replacement already happened — the same
+   `LedgerOverride` the dry-run preview and the real execution share, so the
+   preview enumerates EXACTLY what the real checkpoint deletes): each
+   entry's deployment id (its `deployments/<id>/` dir), the artifacts its
+   intent references (`desired` + `pre_push`), and the release + per-slot
+   trees of its terminal's rollback payload. A terminal-less entry (pending
+   / in-progress) is retained WITH its intent references — the deployment
+   is recoverable and its artifacts must stay.
+2. THE CURRENT/INCOMPLETE STATE: every slot's physical observed record
+   (`slots/<slot-id>/observed.json` — the slot's ONE physical record, never
+   replicated per target) — its artifact and its `last_deployment` id. The
+   sweep can never delete content a server still runs, because the current
+   observed artifact of every target is always in the retained set.
+3. EVERY CONFIGURED PIN — the store-level `<store>/pins.json` AND the
+   project-file `deploy.toml` `[[pins]]` (the checkpoint loads the caller's
+   config for pins only; it never contacts servers). A RELEASE pin marks
+   every variant/tree in that release record (the record is read and its
+   `variants` map is expanded at GC time; a pin whose record is missing or
+   unverifiable closes the pass — the content it might protect is never
+   deleted). An EXACT-BINDING pin keeps the `(release, variant, tree)`
+   triple directly. A pin NEVER keeps an old deployment, attempt, or
+   snapshot in history — the retained set is the LEDGER SUFFIX alone, so
+   pinning the artifacts of a pre-checkpoint deployment keeps the bytes but
+   never the history — and never raises or removes the implicit floor.
+
+PINS (`<store>/pins.json`) are store-global retention anchors for ARTIFACT
+CONTENT ONLY:
+
+```json
+{
+  "schema_version": 1,
+  "releases": ["rel-sha256-..."],                       // whole-release pins
+  "bindings": [{"release": "...", "variant": "...", "tree": "..."}]  // exact-binding pins
+}
+```
+
+FAIL CLOSED: the retained-set computation is a pure read over the WHOLE
+store, and every read failure aborts the pass BEFORE any unlink — an
+unreadable ledger, observed record, pins file, or release record (a pin
+whose record is missing or unverifiable cannot be expanded) must never
+produce a PARTIAL retained set, and an UNKNOWN pre-push assignment or
+UNKNOWN observed assignment (the slot's live assignment could not be read)
+closes the pass with an integrity error — the GC can never delete anything
+it cannot verify. A failed pass leaves extra garbage on disk (never less),
+which the retry reclaims once the store is readable again.
+
+THE DELETION STAGES are three: deployment directories (`deployments/<id>/`),
+release records (`releases/<id>/`), and tree objects (`objects/sha256/<d>/`).
+Each stage is TRI-STATE (an already-removed dir from a previous interrupted
+pass is a skip) and FAIL CLOSED: any stat, unlink, or fsync failure stops
+the stage — the removed counts report exactly the successful unlinks and the
+remaining candidates stay pending (planned, never reported as removed). The
+reported removal counts are the filesystem delta, never a claim. "Disk
+cleanup" means unlinking the unreachable directories and fsyncing the
+affected parents (`deployments/`, `releases/`, `objects/sha256/`) so the
+space can be reclaimed; it is NOT secure physical erasure (SSD firmware,
+copy-on-write filesystems, snapshots, journals, and backups may retain old
+blocks after the unlink).
+
+REPORT AND RETRY: because the atomic replacement is the only logical commit,
+a failed checkpoint leaves EXACTLY the pre-call state; a failed sweep leaves
+the ledger compacted (the commit stands) with the sweep retry-required, and
+the next same-deployment checkpoint recomputes the same suffix (the ledger
+already IS it — the replacement is an identical rewrite) and re-runs the
+sweep to convergence. The report carries at most: the logical commit status
++ sweep completed / retry-required (plus the sweep-debt warning when the
+marker could not be persisted). The CLI requires an explicit deployment id
+and `--yes` for the real operation; `--dry-run` takes NO locks, writes
+NOTHING, and enumerates exactly what would be discarded and touches nothing.
+
+THE TWO-SIDED NO-LEAK CONTRACT: the Constitution's "No disk usage leak" rule
+is served by TWO sweep mechanisms, one per side of the push. The RECEIVER
+side (every server's deployment root) is swept by ROTATION: the slot's
+single owning-variant retention policy computes the retained digest set
+(`retention::compute_retained`); the mark-and-sweep pass
+(`RemoteHelper::rotate`) deletes every tree object NOT in the retained set
+and every abandoned incoming directory. Generation/release/commit metadata
+is small and kept by design (it continues to explain unavailable historical
+states); the disk usage — the tree content — is reclaimed. A receiver
+retention failure records a durable retention-debt marker
+(`targets/<target>/retention-debt.json`) and the NEXT PUSH (real or no-op)
+retries the retention under the slot's mutation lock and clears the marker
+once it succeeds. The PUSHER side (the local store) is swept by the
+checkpoint above; an incomplete sweep records `<store>/sweep-debt.json` and
+the next push retries it. BOTH sweeps are POST-COMMIT MAINTENANCE, never
+corrections: a sweep failure (or a sweep that has not run) never blocks or
+rolls back the operation that triggered it, and both reports surface a
+pending sweep as a WARNING, never an error.
+
+The checkpoint/GC path is pinned by property tests with the house fixed seed
+0x5EED_5EED and bounded cases (`crate::retention::checkpoint`,
+`crate::retention::reachability::gc`, `crate::retention::sweep_tests`): the
+EXPLICIT COMMIT BOUNDARY (a pre-commit fault — the replacement itself — is a
+plain error and the full history stands; a post-commit fault at ANY sweep
+stage is converted into an established report with the sweep retry-required
+— never an error); the visible ledger is always WHOLY OLD or WHOLY NEW (the
+atomic replace); retained and pinned content survives every failure; a
+corrupted or unreadable retention anchor (ledger, observed record, pins
+file, pinned release record, torn deployment record) aborts the sweep with
+ZERO deletions and the repaired retry deletes exactly the unreachable set;
+reported removals equal the filesystem delta, pending candidates stay on
+disk, and retries converge; an unknown pre-push or observed assignment
+fails the sweep closed; another target's references protect shared content;
+repeating a completed checkpoint is idempotent; advancing one target never
+truncates another target's history; and after a retention pass the receiver
+retains exactly the policy-retained trees while after a checkpoint the
+pusher retains exactly the reachable artifacts, with the two sides
+independent (retention never touches the pusher's ledger; the checkpoint
+never touches the receiver's generations) and sweep faults injected the
+operation still succeeds, debt is recorded, and the next push converges the
+sweep.
 
 Tree metadata is identity-neutral. For example,
 
@@ -503,99 +766,14 @@ metadata lives outside the tree object. For example, `release.json` is:
 }
 ```
 
-This separation allows two releases or variants with identical bytes to share one tree safely. The `slots` member is the release's OWN canonical per-variant slot snapshot — each variant's `[[slots]]` declarations in canonical form (`id`/`server`/`deploy_dir`/`targets`, `deploy_dir` lexically normalized, `targets` sorted, slots sorted by id) — frozen into the record and folded into the release digest. Historical and rollback pushes resolve slot→variant bindings from this snapshot rather than the caller's current variant files. A record with an EMPTY slot snapshot (the pre-snapshot shape) is rejected at the store boundary: `write_release` refuses to persist it and `read_release` refuses to return it, so the old current-config fallback for `slots`-less records is unreachable for any verified record (fail closed). Release records and tree objects are immutable; attempts to replace an existing ID or digest with different content fail.
+This separation allows two releases or variants with identical bytes to share one tree safely. The `slots` member is the release's OWN canonical per-variant slot snapshot — each variant's `[[slots]]` declarations in canonical form (`id`/`server`/`deploy_dir`/`target`/`groups`, `deploy_dir` lexically normalized, `groups` sorted and deduplicated, slots sorted by the canonical total order) — frozen into the record and folded into the release digest. Historical and rollback pushes resolve slot→variant bindings from this snapshot rather than the caller's current variant files. A record with an EMPTY slot snapshot (the pre-snapshot shape) is rejected at the store boundary: `write_release` refuses to persist it and `read_release` refuses to return it, so the old current-config fallback for `slots`-less records is unreachable for any verified record (fail closed). Release records and tree objects are immutable; attempts to replace an existing ID or digest with different content fail.
 
 Local target state is a mirror and cache, not unquestioned authority. Before a mutating operation, the tool reconciles it with the actual remote generation, object inventory, and in-progress transaction state. If a remote retains a
-verified tree that is missing locally, reconciliation downloads it into local staging, verifies its canonical digest, and republishes it into the local object store. Remote artifact cleanup remains ROTATION's responsibility (per server, under the mutation lock); the checkpoint's local GC (below) never contacts servers. The only LOCAL artifact deletion path is the checkpoint's reachability-based garbage collection: it deletes release records and tree objects that are unreachable from every target's retained history, observed state, retained deployment records, and pins — a checkpoint can never delete content a server still runs, because the current observed artifact of every target is always in the retained set.
+verified tree that is missing locally, reconciliation downloads it into local staging, verifies its canonical digest, and republishes it into the local object store. Remote artifact cleanup remains ROTATION's responsibility (per server, under the mutation lock); the checkpoint's local GC (see "Checkpoint and garbage collection") never contacts servers. The only LOCAL artifact deletion path is the checkpoint's reachability-based garbage collection: it deletes release records and tree objects that are unreachable from every target's retained history, observed state, retained deployment records, and pins — a checkpoint can never delete content a server still runs, because the current observed artifact of every target is always in the retained set.
 
 The local store is created with permissions accessible only to its owning user. The system treats all tree bytes as confidential because it cannot know which files contain sensitive material. It never logs file contents; manifests and logs contain paths, modes, and digests only.
 
 
-### Local artifact garbage collection (checkpoints) and pins
-
-A checkpoint's post-commit maintenance ends with a GLOBAL, best-effort
-ARTIFACT GARBAGE COLLECTION pass (`src/store/gc.rs`): after the history
-floor + compaction succeed, it scans the WHOLE local store, computes the
-RETAINED SET of complete artifact bindings `(release_id, variant,
-tree_digest)`, and unlinks every `releases/<release-id>/` directory and
-`objects/sha256/<digest>/` directory that is NOT in it. Retaining a binding
-keeps BOTH its release record and its tree object.
-
-GC is GLOBAL because release records and tree objects are content-addressed
-and SHARED: the same release or tree can be referenced by many targets, so
-the retained set cannot be computed per target. It is derived from:
-
-1. Every snapshot at/above every target's history floor — and, for a target
-   WITHOUT a floor, its complete history (the same floor-gated suffix every
-   read path exposes).
-2. Every attempt in the same retained suffix (its `desired` assignments).
-3. Every retained deployment record, including unfinished operations — every
-   `deployments/<id>/` directory the retained history names (and every
-   orphaned/torn directory no log names at all), whose `plan.json` carries
-   the per-slot artifact references, the `desired_release`, and the plan
-   source. A pending/in-progress operation whose deployment is retained
-   stays recoverable: its plan's references are retained with it. A
-   deployment record BELOW a floor is discarded with the rest of the
-   below-floor history (its artifacts are garbage unless another source
-   references them).
-4. Every target's CURRENT OBSERVED artifact (`observed.json`).
-5. Every configured pin (below).
-6. Recovery-required local state — the retained deployment plans, the
-   observed artifacts, and the release records/tree objects they name; the
-   staging area is rebuildable and never retained.
-
-"Disk cleanup" means unlinking the unreachable files/directories and syncing
-the affected parent directories (`releases/`, `objects/sha256/`) so the
-space can be reclaimed. It is NOT secure physical erasure: SSD firmware,
-copy-on-write filesystems, snapshots, journals, and backups may retain old
-blocks after the unlink.
-
-The pass is POST-COMMIT MAINTENANCE with the checkpoint's failure contract:
-a failure never moves or removes the established floor and never deletes
-anything in the retained set — the scan fails CLOSED before any unlink it
-cannot prove safe (an unreadable floor, log, plan, observed record, pins
-file, or pinned release record aborts the pass) — the durable
-`cleanup-pending.json` debt flag records the outstanding cleanup, and the
-report says "cleanup incomplete" (the re-run of the same checkpoint retries
-and converges). Reachability is RECOMPUTED fresh on every run: no deletion
-worklist is ever persisted.
-
-PINS (`<store>/pins.json`) are store-global retention anchors for ARTIFACT
-CONTENT ONLY:
-
-```json
-{
-  "schema_version": 1,
-  "releases": ["rel-sha256-..."],                       // whole-release pins
-  "bindings": [{"release": "...", "variant": "...", "tree": "..."}]  // exact-binding pins
-}
-```
-
-A RELEASE pin marks every variant/tree in that release record (the record is
-read and its `variants` map is expanded at GC time; a pin whose record is
-missing or unverifiable closes the pass — the content it might protect is
-never deleted). An EXACT-BINDING pin keeps the `(release, variant, tree)`
-triple directly. A pin NEVER keeps an old deployment, attempt, or snapshot
-in history — the floor-gated reads and ref resolution stay keyed on the
-history floor alone, so pinning a pre-floor deployment's artifacts keeps the
-bytes but never the history — and never raises or removes a floor. These
-STORE-LEVEL pins are DISTINCT from the retention subsystem's project-file
-`[[pins]]` (retention pins protect the REMOTE retained set and are evaluated
-only by retention, never by the local GC): the checkpoint flow is store-only
-by construction — it never loads `deploy.toml` and never contacts servers —
-so its retention anchors live in the store.
-
-The property test (`artifact_gc_properties`, fixed seed 0x5EED_5EED,
-bounded cases) drives the whole path over generated targets, histories,
-SHARED releases, SHARED trees, pins, incomplete operations, and injected GC
-faults and asserts: no reachable/pinned artifact is ever deleted; a pin
-never keeps pre-floor history visible; another target's references protect
-shared content; without faults every unreachable release/tree is removed;
-with faults extra garbage may remain but required content never disappears;
-repeating cleanup converges; repeating a completed checkpoint is idempotent;
-advancing one target never truncates another target's history.
-
-## Remote storage
 ## Remote storage
 Each server stores only variants it has actually received:
 
@@ -684,7 +862,7 @@ excluded: it is per-server live configuration, not a release property.
    *Guarantee*: the marker is write-once: `helper.write_commit_marker` installs it by exclusive create, and if a marker already exists it must match byte-for-byte (the payload is deterministic in the deployment ID, generation, and participating placement-slot set) or the rewrite fails integrity. A retried or concurrent commit can therefore never alter a recorded fact; a `pending_commit` recovery reusing the original deployment ID either creates the missing marker or confirms the recorded one byte-for-byte.
 6. **Deployment plan** — local `deployments/<id>/plan.json`.
    *Semantic*: what an attempt intended is fixed once recorded.
-   *Guarantee*: written once per unique deployment ID through `write_atomic_cas`; a same-ID conflicting rewrite fails instead of silently rewriting history (`store.write_plan`). The deployment's status is NOT part of this record and has NO separate transition stream: it is carried by the ledger's TERMINAL EVENT line, appended once per deployment — the terminal IS the status record, so there is no `results.json` and no `transitions.jsonl`. The attempt INTENT (the ledger's intent line, step 7) is persisted BEFORE any server mutation; the per-slot OUTCOMES live in the terminal event's `outcomes` map, never in a separate outcomes file.
+   *Guarantee*: written once per unique deployment ID through `write_atomic_cas`; a same-ID conflicting rewrite fails instead of silently rewriting history (`store.write_plan`). The deployment's status is NOT part of this record and has NO separate transition stream: it is carried by the ledger's TERMINAL EVENT line, appended once per deployment — the terminal IS the status record, so there is no `results.json` and no `transitions.jsonl`. The attempt INTENT (the ledger's intent line, step 14) is persisted BEFORE any server mutation; the per-slot OUTCOMES live in the terminal event's `outcomes` map, never in a separate outcomes file.
 7. **Deployment history and rollback snapshots** — `targets/<target>/ledger.jsonl`.
    *Semantic*: recorded attempts (immutable intent lines, no status, no outcomes) and terminal events (the status, the per-slot outcomes, and — when successful — the complete rollback snapshot) are append-only facts; entries are never edited or reordered.
    *Guarantee*: crash-atomic whole-ledger appends under the target lock (`store.append_intent`, `store.append_terminal` — one atomic line per deployment, temp + fsync + rename). The terminal event carries the deployment's status (there is no separate status-transition stream); the LATEST status is the terminal's status (`store.latest_status`, DERIVED from the ledger — never a mutable marker file). Snapshots are KEYED BY DEPLOYMENT ID: a successful terminal's rollback payload IS the snapshot, and `deploy push <target> <deployment-id>` resolves it from the ledger. There is no `refs/last-successful` (the latest successful entry is DERIVED from the ledger) and no separate snapshot log.
@@ -692,7 +870,7 @@ Mutable by design (excluded from these guarantees): observed target state, per-s
 
 Publishing renames a verified incoming directory into `objects/` on the same filesystem. A generation binds a deployment ID, an artifact (release ID + `variant` + tree digest) for a placement slot, the behavior snapshot, and the prior generation. After its files and a durable transaction record have been written and synced, activation creates a temporary symlink beside `current`, atomically renames it over `current`, and syncs the parent directory. This single durable pointer replacement is the per-slot commit point.
 
-There is no independently updated `previous` symlink. The previous successful generation is derived from the immutable generation chain and history. This avoids pretending that two reference updates can be atomic. PLANNED, not yet implemented: on startup or the next connection, the remote helper would reconcile any unfinished transaction with the actual `current` target and either complete its record or restore the prior generation before accepting another mutation. Today the durable transaction records are WRITTEN but never read back: unfinished-attempt recovery is driven by the controller's local attempt and transition records on the next push.
+There is no independently updated `previous` symlink. The previous successful generation is derived from the immutable generation chain and history. This avoids pretending that two reference updates can be atomic. PLANNED, not yet implemented: on startup or the next connection, the remote helper would reconcile any unfinished transaction with the actual `current` target and either complete its record or restore the prior generation before accepting another mutation. Today the durable transaction records are WRITTEN but never read back: unfinished-attempt recovery is driven by the controller's local records — the target's ledger, whose durable intent lines and reconciling finalizer carry the attempt — on the next push.
 
 Atomicity is per server, not across a deployment. Deployment consistency is provided by the rollout and compensation policy described below.
 
@@ -712,7 +890,7 @@ verification.
 11. On per-server activation or verification failure, atomically restore the prior generation, reconcile the prior activation contract, verify the restored service, and record both the failure and compensation result. Compensation renders the restored contract with the PRIOR assignment's identity — the prior artifact's `release`/`variant`/`tree` AND the prior deployment's `deployment_id`/`generation` move together — so a restored unit/argv never mixes the prior artifact with the failed generation's identities. On a first deployment with no prior generation, compensation removes `current` and reverses only adapter resources created by that attempt.
 12. If `stop_on_failure` is enabled, do not start another batch after any failure.
 13. Under the default `failure_policy: rollback_changed`, compensate every server already advanced by this deployment. Compensation uses a compare-and-swap and restores a server only if `current` still names the generation created by this attempt. If all compensation succeeds, mark the attempt `failed_rolled_back`; otherwise mark it `degraded` and retain the actual mixed per-server state. An optional `leave_changed` policy may retain successful advances deliberately; any attempt with failures under that policy is `degraded`.
-14. Append the attempt's INTENT LINE to the target's ONE ledger (`targets/<target>/ledger.jsonl`, `store.append_intent`) — the immutable INTENT (deployment id, membership, the frozen physical bindings, desired assignments, pre-push state; no status, no outcomes) — and refresh `observed.json` from the actual slot generations. The intent is persisted BEFORE any server mutation (right after the plan is written), so a crash after servers advanced to new generations can never lose the deployment: without the durable intent the next push would see every server already at the desired generation and report "Everything up to date" with no attempt ever recorded. There is no separate outcomes file (`results.json` is GONE) and no status-transition stream (`transitions.jsonl` is GONE): the per-slot OUTCOMES and the final STATUS are carried by the TERMINAL EVENT line appended when the deployment completes (steps 15-16), never by the intent record. A slot may be a member of SEVERAL targets (its on-server `deploy_dir` state is shared). Observed state is stored ONCE PER SLOT (`slots/<slot-id>/observed.json` — the slot's ONE physical record, never replicated per target); the engine's observed refresh writes each advanced slot's record EXACTLY ONCE, and targets are SELECTION VIEWS over the global slot map: `read_observed(target)` returns the physical records of the target's member slots, so every member target's view of a shared slot always agrees with the single physical record (e.g. `deploy status <other>` after a push to a sibling target shows the current generation/artifact for the shared slot).
+14. Append the attempt's INTENT LINE to the target's ONE ledger (`targets/<target>/ledger.jsonl`, `store.append_intent`) — the immutable INTENT (deployment id, membership, the frozen physical bindings, desired assignments, pre-push state; no status, no outcomes) — and refresh `observed.json` from the actual slot generations. The intent is persisted BEFORE any server mutation (right after the plan is written), so a crash after servers advanced to new generations can never lose the deployment: without the durable intent the next push would see every server already at the desired generation and report "Everything up to date" with no attempt ever recorded. There is no separate outcomes file (`results.json` is GONE) and no status-transition stream (`transitions.jsonl` is GONE): the per-slot OUTCOMES and the final STATUS are carried by the TERMINAL EVENT line appended when the deployment completes (steps 15-16), never by the intent record. A slot belongs to EXACTLY ONE owning target (its single `target` field); a target's member slots are derived from the slots' declarations, and the same slot can never be a member of two targets. Observed state is stored ONCE PER SLOT (`slots/<slot-id>/observed.json` — the slot's ONE physical record, never replicated per target); the engine's observed refresh writes each advanced slot's record EXACTLY ONCE, and targets are SELECTION VIEWS over the global slot map: `read_observed(target)` returns the physical records of the target's member slots, so every target's view always agrees with the single physical record (e.g. `deploy status <target>` after a push shows the current generation/artifact for exactly that target's member slots).
 15. After every slot's server verifies, write an idempotent, write-once commit marker under each participating server's mutation lock (exclusive create; an existing marker must match byte-for-byte). The marker carries the deployment ID, the generation, and the full placement-slot set of the commit. If this metadata phase is interrupted by a transient failure, mark the attempt `pending_commit`; the next push reconciles it before its own no-op check. Reconciliation also covers INTENT-ONLY ledger entries — the intent durable (persisted before mutation, step 14) but the terminal event never appended (a crash between `append_intent` and the finalize marker). It loads the eligible entries (oldest first — an entry with NO terminal event is the recoverable `InProgress`/`PendingCommit` state), verifies that every recorded participant slot still belongs to the target and that each slot's current generation still equals the generation the attempt recorded (fresh status reads), and only then writes the missing markers (under each server's mutation lock, with the original deployment ID) and finalizes the attempt as `successful` through the SAME replay-safe finalizer the normal success path uses (step 16): APPEND THE TERMINAL `Successful` EVENT LAST, so a crash mid-finalization leaves the entry terminal-less and therefore re-eligible. The verification is read-only; recovery never reactivates or restarts healthy servers. Any membership or generation mismatch changes the attempt to `degraded` (a `Degraded` terminal). An existing marker whose content differs (an integrity conflict — a concurrent controller recorded a different fact, or the remote state diverged) is likewise NOT transient: the conflicting marker is left untouched and the attempt is finalized `degraded` (terminal only), never stranded `pending_commit` forever. Only transient failures — lock acquisition, status reads, or transport-level marker writes — leave the attempt `pending_commit` for a later retry rather than falsely reporting `successful` or `degraded`.
 16. Only an attempt whose commit markers are complete becomes `successful`. Both the normal success path and recovery finalize through ONE replay-safe finalizer that APPENDS THE TERMINAL `Successful` EVENT to the target's ledger (one atomic line, `store.append_terminal`; replay-idempotent — a repeated finalize for the same deployment id is a no-op). The terminal event carries the status, the per-slot outcomes, AND the COMPLETE ROLLBACK STATE — that rollback payload IS the deployment's snapshot, KEYED BY ITS DEPLOYMENT ID: `deploy push <target> <deployment-id>` restores exactly that deployment's stored state, and there is no separate snapshot log and no `refs/last-successful` ref (the latest successful entry is DERIVED from the ledger). The snapshot is built from the attempt's OUTCOMES — the per-slot actuals the engine observed on the main path, or the verified desired state during recovery — never from the intent record, which carries no outcomes.
 17. Apply retention under each server's mutation lock using the protection set defined below. The lock is held by an RAII guard for the whole per-slot retention block (retained-set computation plus mark-and-sweep) and released on drop, so an error mid-retention can never leak the lock and block later operations on that slot. Retention is POST-COMMIT MAINTENANCE: by this point the deployment has already committed (servers advanced, snapshot and attempt recorded), so a per-slot retention failure must NOT change the reported outcome — the push still succeeds. Instead the failure is recorded as a persistent debt marker (per target+slot, under the local store) and surfaced as a warning on the push report; later pushes — including no-ops — retry the maintenance under the same lock-guarded retention block and clear the marker once the retention succeeds. The same rule covers a CONTENDED slot lock: if another operation holds the slot's mutation lock when step 17 runs, the retention cannot run now, and the maintenance is deferred exactly like a retention failure — best-effort debt marker (persistence faults are warning-only) plus a warning naming the slot — never silently skipped, never an `Err`. The deferral's debt read/write is NON-FALLIBLE post-commit maintenance: if the marker cannot be read or persisted (a debt-file fault coinciding with the contention), the failure is an explicit warning — "retention debt maintenance deferred: failed to read/write retention debt" — that says the marker was NOT persisted, so no automatic retryability is claimed and a later push re-deferrals; the committed outcome is unchanged either way. After a successful push every slot is therefore either rotated, or carries debt plus a warning, or the deferral is explicitly warned as unpersisted, and the next unlocked push services any marker. The capacity-preflight retention (step 8) is likewise best-effort; only a real capacity shortage fails the push.
@@ -721,7 +899,7 @@ The tool never claims target-wide atomicity. It reports `successful`, `pending_c
 
 The local target lock prevents competing pushes from the same local store. Expected-generation and compensation compare-and-swap checks prevent a second controller from being silently overwritten. Concurrent controllers can still cause a visible failed or degraded attempt, but cannot create a lost update on an individual server.
 
-If materialization produces an existing release and reconciliation finds the exact desired generation healthy on every server, the command prints `Everything up to date` without creating a deployment attempt. The no-op still verifies the running services, and that verification renders the EXISTING generation's identities — the deployment id, generation id, and tree from the running generation's stored assignment — never the new deployment/generation ids, which would be fabricated because the no-op creates no records. The no-op path ALSO refreshes the per-slot physical observed records (the same shared refresh as the real-push path, built from the existing generation's assignment): a crash-window push that aborted AFTER the remote advanced but BEFORE the observed refresh is finalized by the reconcile and matched here as up to date, so without the refresh a shared slot's physical record — and every member target's view of it — would stay stale/absent. After ANY completed or recovered mutation — a real push, a rollback, or a no-op retry — every member target's observed projection therefore equals the remote assignment (generation and artifact), never a stale or absent entry. The no-op's observed refresh is best-effort post-commit maintenance: a refresh failure warns but never converts the no-op into an error. Existing local
+If materialization produces an existing release and reconciliation finds the exact desired generation healthy on every server, the command prints `Everything up to date` without creating a deployment attempt. The no-op still verifies the running services, and that verification renders the EXISTING generation's identities — the deployment id, generation id, and tree from the running generation's stored assignment — never the new deployment/generation ids, which would be fabricated because the no-op creates no records. The no-op path ALSO refreshes the per-slot physical observed records (the same shared refresh as the real-push path, built from the existing generation's assignment): a crash-window push that aborted AFTER the remote advanced but BEFORE the observed refresh is finalized by the reconcile and matched here as up to date, so without the refresh the slot's physical record — and its target's view of it — would stay stale/absent. After ANY completed or recovered mutation — a real push, a rollback, or a no-op retry — every target's observed projection therefore equals the remote assignment (generation and artifact), never a stale or absent entry. The no-op's observed refresh is best-effort post-commit maintenance: a refresh failure warns but never converts the no-op into an error. Existing local
 content never suppresses required remote repair.
 
 `--dry-run` materializes and inspects local content and performs read-only remote status queries in disposable staging. It does not publish local objects, recover remote transactions, upload, publish remotely, activate, execute application verification, write history, or rotate. Instead, it reports any recovery that a real push would have to perform.
@@ -966,7 +1144,7 @@ are DERIVED from that order, never stored. The old `sN` snapshot-index forms
 deployment id of that snapshot's deployment (`deploy log` shows it), and
 reference a release only via `release:<id>`.
 
-The DIRECT release form `release:<id>` (shell-safe: the token starts with the literal `release:` prefix, no slash; the id is a full `rel-sha256-...` id or a hex digest) deploys the named release to the CURRENT target's slots as they are — each slot's variant from the release's OWN stored slot-variant snapshot, each tree from the release's own variant bindings — but ONLY onto a target whose CURRENT slot membership EXACTLY matches the slot set the release record froze for it: the release-versioned membership is derived from the record's canonical slot snapshot as the union over every variant of the slots whose `targets` list contains the destination target (deduplicated by slot id), and compared for set equality with the target's current slot-id membership at PLAN time, before any remote access. Membership drift — a slot added, removed, or renamed since the release was built — is rejected with a rollback error naming the release and the expected vs current slot sets; the comparison is LOGICAL membership only, so physical bindings (`server`/`deploy_dir`) are intentionally allowed to differ. Because the frozen topology is applied onto the CURRENT physical slots, the rebinding is recorded EXPLICITLY: every `release:<id>` plan carries a `RebindingPlan` — the release, the destination target, the frozen slot→variant/group topology (complete, even under a `--group` selection, which narrows only the planned assignments), the logical membership check, and the current physical slots the topology binds onto. The one historically IMPLICIT exception (a historical topology onto current physical slots) is now an explicit, typed artifact in the plan. It is deliberately NOT a snapshot ref: no snapshot-chain stepping, no deployment-snapshot exact physical-binding checks, and NO target snapshot history required — the release may have been built and pushed anywhere (another target, another machine), and a destination with zero snapshots is fully deployable (as long as its current membership matches the release's frozen set). This is the cross-target / direct-release-deployment path; scripts and persistent configuration use the full id.
+The DIRECT release form `release:<id>` (shell-safe: the token starts with the literal `release:` prefix, no slash; the id is a full `rel-sha256-...` id or a hex digest) deploys the named release to the CURRENT target's slots as they are — each slot's variant from the release's OWN stored slot-variant snapshot, each tree from the release's own variant bindings — but ONLY onto a target whose CURRENT slot membership EXACTLY matches the slot set the release record froze for it: the release-versioned membership is derived from the record's canonical slot snapshot as the union over every variant of the slots whose `target` field names the destination target (deduplicated by slot id), and compared for set equality with the target's current slot-id membership at PLAN time, before any remote access. Membership drift — a slot added, removed, or renamed since the release was built — is rejected with a rollback error naming the release and the expected vs current slot sets; the comparison is LOGICAL membership only, so physical bindings (`server`/`deploy_dir`) are intentionally allowed to differ. Because the frozen topology is applied onto the CURRENT physical slots, the rebinding is recorded EXPLICITLY: every `release:<id>` plan carries a `RebindingPlan` — the release, the destination target, the frozen slot→variant/group topology (complete, even under a `--group` selection, which narrows only the planned assignments), the logical membership check, and the current physical slots the topology binds onto. The one historically IMPLICIT exception (a historical topology onto current physical slots) is now an explicit, typed artifact in the plan. It is deliberately NOT a snapshot ref: no snapshot-chain stepping, no deployment-snapshot exact physical-binding checks, and NO target snapshot history required — the release may have been built and pushed anywhere (another target, another machine), and a destination with zero snapshots is fully deployable (as long as its current membership matches the release's frozen set). This is the cross-target / direct-release-deployment path; scripts and persistent configuration use the full id.
 
 A deployment-id ref resolves to THAT deployment's stored rollback payload (the snapshot keyed by its id — a failed deployment id never resolves), and the ancestor steps walk N POSITIONS back from it in the deployment history (N = 0 is the deployment itself; positions are DERIVED from the log order, never stored). Every resolution fails closed with a ref error — an empty chain, an unresolvable deployment id, or stepping before the start of the chain — never underflows and never guesses. A deployment ref restores the snapshot's OWN historical per-slot artifacts (variant and tree together); the caller's current variant files never re-map them.
 
@@ -977,7 +1155,7 @@ A target-history ref resolves only against the target whose history it came from
 Rollback never rebuilds a tree. It uses the retained immutable object with the recorded digest. All required objects are checked locally and staged remotely before the first server changes. If an object is missing locally, reconciliation first attempts to recover it from a target server that retains the verified digest. If no verified copy can be recovered, preflight fails and leaves every `current` pointer unchanged.
 
 ## Protection and retention
-A slot has EXACTLY ONE retention policy, owned by the slot itself: the policy of the slot's OWNING VARIANT (the variant file whose `[[slots]]` entry declares the slot). Targets carry rollout behavior only — there is NO per-target retention policy and NO union across a shared slot's member targets, so different targets cannot make a shared slot retain differently, and changing a slot's target membership never changes its retention. Retention is evaluated per server because servers may have different release and variant histories. A successful deployment is committed back to each server before retention, allowing its generation history to record the deployment ID. Retention does not run if those commit markers cannot be reconciled.
+A slot has EXACTLY ONE retention policy, owned by the slot itself: the policy of the slot's OWNING VARIANT (the variant file whose `[[slots]]` entry declares the slot). Targets carry rollout behavior only — there is NO per-target retention policy and NO union: retention belongs to the slot alone, so changing a slot's target membership (or its rollout groups) never changes its retention. Retention is evaluated per server because servers may have different release and variant histories. A successful deployment is committed back to each server before retention, allowing its generation history to record the deployment ID. Retention does not run if those commit markers cannot be reconciled.
 
 Every generation record (`generations/<gen>/assignment.json`) and commit marker carries the target that created it (the originating target; legacy records written before this attribution existed carry none) — but retention no longer consults attribution: the slot's single owning-variant policy is applied to ALL of the server's generation records, and a tree object is swept only when that one policy does not retain it. Membership is never a retention input.
 
@@ -988,7 +1166,6 @@ For each server, the retained content set is exactly this union:
 ```text
 - the artifact referenced by the current generation
 - the prior distinct successful artifact when protect_previous is true
-- artifacts referenced by incomplete transactions
 - releases selected by durable pins
 - the newest keep_distinct_artifacts distinct successful artifact bindings
 - artifacts successfully activated less than keep_days ago
@@ -1001,16 +1178,13 @@ Pins are controller-side configuration (top-level `[[pins]]` entries in the proj
 Distinct artifacts are ordered by their most recent successful activation. `keep_distinct_artifacts` and `keep_days` are union rules, not conditions that must both match. Age is measured from the binding's most recent successful activation rather than release creation time.
 
 Retention is a mark-and-sweep operation under the remote mutation lock:
-1. Reconcile `current`, unfinished transactions, pins, and commit markers.
-2. Mark tree objects referenced by the retained artifact bindings.
+1. `status()` validates the complete `current` layout (current → generation → assignment.json → generation id); a missing or corrupt live assignment fails closed with an integrity error BEFORE any sweep decision — the tree behind an unreadable `current` is never deleted, because nothing is ever swept.
+2. Mark tree objects referenced by the retained artifact bindings (the union above, computed over the server's generation inventory under the slot's single policy, plus the durable pins).
 3. Keep generation, release, and commit metadata by default; metadata is small and continues to explain unavailable historical states.
 4. Delete a tree object only when no retained binding or applicable pin on that server references it. A release or generation record may continue to describe a tree that is no longer installed and must report it as unavailable.
-5. Remove abandoned operation-specific incoming directories only after their owner transaction has expired and is known not to be running.
+5. Remove abandoned operation-specific incoming directories — every `incoming/<deployment-id>/` directory EXCEPT the current deployment's active one, which stays for the in-flight operation.
 
-Local-store retention is PLANNED, not yet implemented: it would protect the complete set of variants for every release selected by the same count, age, current, prior, deployment-window, pin, remote-inventory, or unfinished-attempt rules across all targets.
-
-Successful snapshot metadata may be
-kept indefinitely, but only entries inside the configured protection windows retain release and tree content. An older snapshot entry whose content was rotated remains auditable but is reported as unavailable for rollback. A local tree object is deleted only after no retained release or known remote inventory requires it — today nothing performs that deletion: the local object store is a cache that retention never sweeps, so a tree that is missing locally is always recovered from a retaining server, never deleted out from under a known remote inventory.
+The local store is NEVER swept by the receiver-side retention: the only LOCAL artifact deletion path is the checkpoint's global reachability garbage collection (see "Checkpoint and garbage collection"). Successful snapshot metadata may be kept indefinitely, but only entries inside the configured protection windows retain release and tree content. An older snapshot entry whose content was rotated remains auditable but is reported as unavailable for rollback. A local tree object is deleted only after no retained ledger, observed state, deployment record, or pin requires it — never out from under a known remote inventory; a tree that is missing locally is always recovered from a retaining server.
 
 Retention runs automatically after a successful, fully recorded push, and is post-commit maintenance: a
 retention failure never changes a deployment's reported outcome (the push stays `Ok` with the committed status)
@@ -1034,63 +1208,14 @@ marker is NOT persisted and the report says so explicitly ("retention debt maint
 read/write retention debt ..."); no automatic retryability is claimed for a deferral without a marker, so a
 user can tell a marker-persisted deferral (retried automatically by a later push) from an unpersisted one
 (re-deferred by a later push). The committed outcome is unchanged either way. The same
-post-commit rule covers the observed projection refresh (which runs right after the terminal status
-post-commit rule covers the observed projection refresh (which runs right after the terminal status
-transition, before retention): every store operation there — `write_server`, the per-other-target
-`read_observed`/`write_observed` propagation, and the push's own `write_observed` — is non-fatal maintenance,
-surfaced as a warning, and a store fault never turns a committed push into an error. The observed maps are
-projections of already-durable facts, so no debt marker is needed: the next real push to any member target
-rebuilds the projections from current state, and retries converge without duplicate history.
+post-commit rule covers the observed refresh (which runs right after the terminal status
+transition, before retention): every store operation there — `write_server` (the per-server
+record) and `write_slot_observed` (each slot's ONE physical observed record) — is non-fatal maintenance,
+surfaced as a warning, and a store fault never turns a committed push into an error. The observed records are
+projections of already-durable facts, so no debt marker is needed: the next real push — or no-op —
+re-projects them from current state, and retries converge without duplicate history.
 
 Retention may later be exposed as an explicit maintenance command without changing these safety rules.
-
-## Sweep: the two-sided no-leak contract
-
-The Constitution's "No disk usage leak" rule is served by TWO sweep
-mechanisms, one per side of the push:
-
-- RECEIVER side (every server's deployment root): swept by ROTATION. The
-  slot's single owning-variant retention policy computes the retained digest
-  set (`retention::compute_retained`); the mark-and-sweep pass
-  (`RemoteHelper::rotate`) deletes every tree object NOT in the retained set
-  and every abandoned incoming directory. Generation/release/commit
-  metadata is small and kept by design (it continues to explain unavailable
-  historical states); the disk usage — the tree content — is reclaimed.
-  Pins and retained content survive.
-- PUSHER side (the local store): swept by CHECKPOINT. The checkpoint
-  atomically replaces the target's ONE ledger with the retained suffix (the
-  only logical commit) and then runs the GLOBAL reachability sweep
-  (`LocalStore::run_sweep`): unreachable deployment directories, release
-  records, and tree objects are unlinked; everything reachable from a
-  retained ledger, the current/incomplete state, or a pin survives. The
-  checkpoint is a MEANS — the pusher-side sweep — not a Constitution rule.
-
-BOTH sweeps are POST-COMMIT MAINTENANCE, never corrections. A sweep failure
-(or a sweep that has not run) never blocks or rolls back the operation that
-triggered it and never reports an ordinary failure:
-
-- The receiver's retention runs after the deployment already committed; a
-  failure records a durable retention-debt marker
-  (`targets/<target>/retention-debt.json`) plus a warning, and the NEXT PUSH
-  (real or no-op) retries the retention under the slot's mutation lock and
-  clears the marker once it succeeds.
-- The pusher's checkpoint sweep is best-effort; an incomplete sweep records
-  a durable sweep-debt marker (`<store>/sweep-debt.json`) and the report
-  says sweep retry-required, and the NEXT PUSH (not just the next
-  checkpoint) retries the sweep — recomputing reachability FRESH, no
-  persisted deletion worklist — and clears the marker once it completes.
-
-Both reports surface a pending sweep as a WARNING, never an error: the
-checkpoint report's "sweep did not complete" line and the push report's
-"post-commit maintenance deferred" warning. The no-leak property
-(`sweep::two_sided_sweep_no_leak`, fixed seed 0x5EED_5EED) asserts: after a
-retention pass the receiver retains exactly the policy-retained trees (stale
-ones gone, pins/retained content survive); after a checkpoint the pusher
-retains exactly the reachable artifacts (unreachable releases/objects/
-deployment dirs gone, pins survive); the two sides are independent (retention
-never touches the pusher's ledger; checkpoint never touches the receiver's
-generations); and with sweep faults injected the operation still succeeds,
-debt is recorded, and the next push converges the sweep.
 
 ## systemd adapter
 Systemd support is an optional adapter outside the generic artifact engine. The mapped unit remains an ordinary artifact file whose CONTENT is rendered through the template module (see “Mapping semantics” and “Activation”) with the slot's template context at activation time — `ExecStart={{ deploy_dir }}/current/app/server` resolves per slot, and the tree itself stays slot-independent (content-addressed and shared across slots). The adapter alone knows how to register and activate it. The activation and verification definitions are canonicalized, hashed into the release identity, and copied into each deployment and generation record. A historical push therefore uses its historical behavior contract rather than the caller's current configuration.
@@ -1115,7 +1240,7 @@ For a system service, an administrator installs a root-owned wrapper unit whose 
 ## Transport and remote helper
 The initial transport is SSH with strict host-key verification (per-server `known_hosts` or pinned `host_key_fingerprint` — exactly one source per SSH server, enforced at config validation and re-checked defensively at transport construction). A `local` server address instead selects the pathless LOCAL connection kind, whose transport is rooted at the referencing slot's deploy_dir — the one authoritative physical root (there is no server-side endpoint to parse or compare, so the config graph cannot accept a local server whose root diverges from a slot's deploy_dir; construction and transport creation are equivalent, verified by the graph proptest). It exists for tests and for local targets. Server IDs, target names, variant names, release IDs, and paths are validated data and are never concatenated into remote shell commands. Bulk tree transfer is a plain bounded ssh stdin channel: each file's bytes are piped to a remote `cat > <path>` command (the target path is shell-quoted, so a path can never smuggle shell metacharacters out of the forced namespace), never a framed binary protocol. Every ssh operation runs through ONE bounded subprocess runner: every `ssh` connection carries `-o ConnectTimeout=10`, which bounds only the CONNECTION phase, and the runner imposes a hard deadline on the whole operation AFTER connection establishment — so nothing is unbounded. The `ssh-keyscan` key-pin step keeps the 10-second bound (native `-T` plus the runner's process-level deadline); every remote command and upload gets a distinct 60-second default (`SSH_COMMAND_TIMEOUT_SECS`: slower than connection establishment, which a slow-but-healthy remote legitimately needs, but bounded so a hung remote cannot stall the push); `exec` keeps its caller-supplied timeout. On deadline the runner KILLS the child (SIGKILL) and then deterministically REAPS it (joins the wait thread that owns the child) before returning a Timeout — an unreachable or dead host fails fast, no operation can hang the transport indefinitely, and no child is ever left uncollected (no kill-vs-wait race, no zombies, no return-before-reap). The stdin payload is written inside the same bounded wait: a >pipe-buffer upload to a remote that stops reading blocks the write, the deadline fires, and the kill closes the pipe (EPIPE, SIGPIPE ignored). A stdin-write failure follows the same rule as the deadline — the wait closure SAVES the write error, always drains and collects the child (`wait_with_output`), and only then returns the saved error — so a timed-out or write-failed upload is killed AND reaped, never an un-collected child (no return-before-reap on the write-error path either).
 
-A small versioned remote helper owns status inspection, locking, object publication, generation switching, transaction-record keeping, adapter invocation, and retention. Client and helper perform a protocol-version handshake before mutation (the negotiated version is recorded under `control/`; schema version 1 speaks protocol 1). Every mutating request carries an operation ID and is idempotent, and each operation's durable per-server transaction record (`transactions/<operation-id>.json`, advanced `prepared` → `committed`/`compensated` by the helper) is written on every mutation. Two items here are PLANNED, not yet implemented: (a) reading those transaction records back so a disconnected client can reconnect and learn whether the operation prepared, committed, compensated, or never began — records are written, but nothing reconciles them on reconnect (unfinished-attempt recovery is driven by the controller's LOCAL attempt/transition records on the next push); and (b) packaging these operations as a single versioned helper binary uploaded beneath each slot's `deploy_dir` — the planned evolution. Neither changes this contract.
+A small versioned remote helper owns status inspection, locking, object publication, generation switching, transaction-record keeping, adapter invocation, and retention. Client and helper perform a protocol-version handshake before mutation (the negotiated version is recorded under `control/`; schema version 1 speaks protocol 1). Every mutating request carries an operation ID and is idempotent, and each operation's durable per-server transaction record (`transactions/<operation-id>.json`, advanced `prepared` → `committed`/`compensated` by the helper) is written on every mutation. Two items here are PLANNED, not yet implemented: (a) reading those transaction records back so a disconnected client can reconnect and learn whether the operation prepared, committed, compensated, or never began — records are written, but nothing reconciles them on reconnect (unfinished-attempt recovery is driven by the controller's local records — the target's ledger, whose durable intent lines and reconciling finalizer carry the attempt — on the next push); and (b) packaging these operations as a single versioned helper binary uploaded beneath each slot's `deploy_dir` — the planned evolution. Neither changes this contract.
 
 If the deployment account cannot create a slot's `deploy_dir`, an administrator must provision that directory once. Privileged systemd control must likewise be provisioned through the fixed, root-owned wrapper and narrowly scoped restart permission described above; `push` does not grant itself privileges.
 
