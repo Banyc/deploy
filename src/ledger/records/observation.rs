@@ -9,9 +9,11 @@
 //! An assignment is EXACTLY ONE tagged variant — never a parallel
 //! combination of independent generation/artifact/error fields that a raw
 //! wire document could combine into a half-known, self-contradictory state.
-//! [`ObservedSlot`] carries the assignment plus the ORTHOGONAL
-//! `last_deployment` fact (the deployment that minted the LIVE assignment),
-//! which lives ON THE SLOT RECORD, not inside the assignment.
+//! The deployment that minted a live assignment (`last_deployment`) is a
+//! fact of the [`ObservedAssignment::Known`] variant ITSELF — there is NO
+//! slot-level `last_deployment` field, so a raw wire document can never pair
+//! a deployment with an `Absent`/`Unknown` assignment and never strip one
+//! from a `Known`.
 //!
 //! The single CONCERN of this module is the observed assignment itself;
 //! every other facet consumes it (the shared core's pre-push assignments,
@@ -50,8 +52,11 @@ pub enum Observation<T> {
 /// * `Absent` — the live status read succeeded and showed NO state: the slot
 ///   has no assignment (never deployed, or rotated away). A live absence
 ///   REPLACES a stale physical record.
-/// * `Known { generation, artifact }` — a successful status + assignment
-///   read: the slot is running this generation/artifact.
+/// * `Known { generation, artifact, last_deployment }` — a successful
+///   status + assignment read: the slot is running this generation/artifact,
+///   and `last_deployment` is the deployment that MINTED the live
+///   assignment — a fact of the KNOWN assignment ITSELF (never a parallel
+///   slot-level field a raw document could pair with a different variant).
 /// * `AssignmentUnknown { generation, error }` — the status read succeeded
 ///   (this generation EXISTS) but the ASSIGNMENT read failed: the generation
 ///   is known, the artifact is NOT — the preserved error records why. This
@@ -59,17 +64,33 @@ pub enum Observation<T> {
 /// * `Unknown { error }` — the STATUS read failed: the slot's state is
 ///   entirely unknown. NOT evidence of no change — the slot may have
 ///   changed; the failure just means we cannot see it.
+///
+/// ADJACENTLY TAGGED (`state` + `value`): serde's internally-tagged
+/// representation ignores `deny_unknown_fields`, so a raw wire document
+/// could smuggle stray keys into the record; the adjacently tagged wire
+/// rejects any key that is not `state`/`value` AND, together with
+/// `deny_unknown_fields`, any key inside the value that is not one of the
+/// variant's OWN fields.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
+#[serde(
+    tag = "state",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum ObservedAssignment {
     /// The live read succeeded showing no state: the slot has no assignment.
     #[default]
     Absent,
     /// A successful status + assignment read: the slot is running this
-    /// generation/artifact.
+    /// generation/artifact, minted by `last_deployment`.
     Known {
         generation: GenerationId,
         artifact: ArtifactRef,
+        /// The deployment that minted the LIVE assignment — a fact of the
+        /// KNOWN assignment ONLY; there is no slot-level field a raw
+        /// document could pair with another variant.
+        last_deployment: DeploymentId,
     },
     /// The status read succeeded but the ASSIGNMENT read failed: the
     /// generation is known, the artifact is not — the error is preserved.
@@ -90,30 +111,48 @@ pub struct ObservedGeneration {
     pub generation: GenerationId,
 }
 
-/// The preserved error of a FAILED observation.
+/// The preserved error of a FAILED observation. The wire rejects any key
+/// beyond `message`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObservationError {
     pub message: String,
 }
 
-/// Observed remote state for one placement slot: the tagged assignment PLUS
-/// the ORTHOGONAL minting deployment (`last_deployment` — the deployment
-/// that minted the LIVE assignment, `Known` only). The assignment and the
-/// minting deployment are independent facts: `last_deployment` rides the
-/// SLOT RECORD (never inside the assignment, where a raw wire document could
-/// split or recombine it with the assignment fields).
+/// Observed remote state for one placement slot: the tagged assignment. The
+/// minting deployment of a live assignment (`last_deployment`) is a field of
+/// the [`ObservedAssignment::Known`] variant ITSELF — the slot record has NO
+/// parallel field, so a raw wire document can never pair a deployment with
+/// an `Absent`/`Unknown` assignment (a self-contradictory state) and never
+/// strip one from a `Known`. The wire rejects any key beyond `assignment`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ObservedSlot {
     /// The tagged observed assignment (Absent | Known | AssignmentUnknown |
     /// Unknown).
     pub assignment: ObservedAssignment,
-    /// The deployment that minted the LIVE assignment (`Known` only).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_deployment: Option<DeploymentId>,
 }
 
-/// Observed remote state for a whole target (`observed.json`).
+impl ObservedSlot {
+    /// The deployment that minted the LIVE assignment — the
+    /// [`ObservedAssignment::Known`] variant's OWN `last_deployment` field,
+    /// projected for consumers that only need that fact. `None` for every
+    /// other variant: an `Absent`/`AssignmentUnknown`/`Unknown` assignment
+    /// carries no minting deployment.
+    pub fn last_deployment(&self) -> Option<&DeploymentId> {
+        match &self.assignment {
+            ObservedAssignment::Known {
+                last_deployment, ..
+            } => Some(last_deployment),
+            _ => None,
+        }
+    }
+}
+
+/// Observed remote state for a whole target (`observed.json`). The wire
+/// rejects any key beyond `target`/`slots`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObservedTarget {
     pub target: TargetName,
     #[serde(default)]
@@ -150,89 +189,124 @@ mod tests {
         }
     }
 
-    /// A RAW observed record as an arbitrary JSON-ish map: the parallel
-    /// presence/absence of the PREVIOUS flat shape's fields — generation,
-    /// artifact, error, and the slot-level last_deployment — next to a
-    /// `state` tag. The tuple is (state tag, generation present, artifact
-    /// present, error present, last_deployment present); 4 tags x 16 field
-    /// combos = the 64-case space.
-    fn arbitrary_raw_combo() -> impl Strategy<Value = (u8, bool, bool, bool, bool)> {
+    /// The EXACT wire representation of a valid `Known` assignment: the
+    /// adjacently tagged value carrying generation + artifact +
+    /// last_deployment and NOTHING else.
+    fn known_value(g: &str, art: &str, dep: &str) -> serde_json::Value {
+        json!({
+            "generation": test_generation_id(g).as_str(),
+            "artifact": {
+                "release": test_release_id(art).as_str(),
+                "variant": "standard",
+                "tree": test_tree_digest(art).as_str(),
+            },
+            "last_deployment": test_deployment_id(dep).as_str(),
+        })
+    }
+
+    /// A RAW observed record as an arbitrary JSON-ish map: a `state` tag
+    /// plus an OPTIONAL `value` object (adjacently tagged wire) whose OWN
+    /// fields — generation, artifact, error, last_deployment — are each
+    /// optionally present, plus possibly an extra key inside the value. The
+    /// tuple is (tag, value present, generation present, artifact present,
+    /// error present, last_deployment present, extra key in value); 4 tags x
+    /// 64 field combos = the 256-case space.
+    fn arbitrary_raw_combo() -> impl Strategy<Value = (u8, bool, bool, bool, bool, bool, bool)> {
         (
             0u8..4,
-            proptest::bool::ANY,
-            proptest::bool::ANY,
-            proptest::bool::ANY,
-            proptest::bool::ANY,
+            proptest::bool::ANY, // value present
+            proptest::bool::ANY, // generation present
+            proptest::bool::ANY, // artifact present
+            proptest::bool::ANY, // error present
+            proptest::bool::ANY, // last_deployment present
+            proptest::bool::ANY, // extra key inside the value
         )
     }
 
-    /// THE RAW-FIELD-COMBINATION PROPERTY: the new tagged wire accepts ONLY
+    /// THE RAW-FIELD-COMBINATION PROPERTY: the wire accepts ONLY
     /// representations that correspond to EXACTLY ONE [`ObservedAssignment`]
-    /// variant — `Known` needs generation+artifact, `AssignmentUnknown`
-    /// needs generation+error, `Unknown` needs error, `Absent` needs none.
-    /// EVERY other combination is REJECTED (fail closed): a raw document can
-    /// never deserialize into a half-known assignment (a generation without
-    /// an artifact, an artifact without a generation, an uncertainty without
-    /// its preserved error) — serde's internally-tagged enum requires the
-    /// variant's OWN fields, and a stray field is dropped rather than
-    /// recombined into a partial state.
-    fn run_raw_combo_case((tag_idx, gen_present, art, err, ld): (u8, bool, bool, bool, bool)) {
+    /// variant — `Known` needs generation + artifact + last_deployment,
+    /// `AssignmentUnknown` needs generation + error, `Unknown` needs error,
+    /// `Absent` needs NO value at all. EVERY other combination is REJECTED
+    /// (fail closed): a raw document can never deserialize into a half-known
+    /// assignment (a generation without an artifact, an uncertainty without
+    /// its preserved error) and never into a self-contradictory one (a
+    /// `Known` carrying a stray `error`, an `Absent` carrying any fields at
+    /// all) — the adjacently tagged wire + `deny_unknown_fields` reject any
+    /// missing required field, any extra/unknown field, and any field from
+    /// another variant.
+    fn run_raw_combo_case(
+        (tag_idx, value_present, gen_present, art, err, ld, extra): (
+            u8,
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+        ),
+    ) {
         let tag = match tag_idx {
             0 => "absent",
             1 => "known",
             2 => "assignment_unknown",
             _ => "unknown",
         };
-        // The assignment half of the raw document: the flat fields next to
-        // the state tag.
-        let mut assignment = serde_json::Map::new();
-        assignment.insert("state".to_string(), json!(tag));
-        if gen_present {
-            assignment.insert(
-                "generation".to_string(),
-                json!(test_generation_id("g").as_str()),
-            );
+        // The raw document: the `state` tag plus the optional `value`
+        // object; inside the value every variant's field may or may not be
+        // present, plus an extra key.
+        let mut doc = serde_json::Map::new();
+        doc.insert("state".to_string(), json!(tag));
+        if value_present {
+            let mut value = serde_json::Map::new();
+            if gen_present {
+                value.insert(
+                    "generation".to_string(),
+                    json!(test_generation_id("g").as_str()),
+                );
+            }
+            if art {
+                value.insert(
+                    "artifact".to_string(),
+                    json!({
+                        "release": test_release_id("a").as_str(),
+                        "variant": "standard",
+                        "tree": test_tree_digest("a").as_str(),
+                    }),
+                );
+            }
+            if err {
+                value.insert(
+                    "error".to_string(),
+                    json!({ "message": "assignment read failed: boom" }),
+                );
+            }
+            if ld {
+                value.insert(
+                    "last_deployment".to_string(),
+                    json!(test_deployment_id("d").as_str()),
+                );
+            }
+            if extra {
+                value.insert("bogus".to_string(), json!(1));
+            }
+            doc.insert("value".to_string(), serde_json::Value::Object(value));
         }
-        if art {
-            assignment.insert(
-                "artifact".to_string(),
-                json!({
-                    "release": test_release_id("a").as_str(),
-                    "variant": "standard",
-                    "tree": test_tree_digest("a").as_str(),
-                }),
-            );
-        }
-        if err {
-            assignment.insert(
-                "error".to_string(),
-                json!({ "message": "assignment read failed: boom" }),
-            );
-        }
-        // The full slot record: the assignment plus the orthogonal
-        // last_deployment at the SLOT level (its presence is always a valid
-        // orthogonal fact — it never changes the assignment variant).
+        // The full slot record wraps the assignment document under the
+        // slot's `assignment` key.
         let mut slot = serde_json::Map::new();
-        slot.insert(
-            "assignment".to_string(),
-            serde_json::Value::Object(assignment),
-        );
-        if ld {
-            slot.insert(
-                "last_deployment".to_string(),
-                json!(test_deployment_id("d").as_str()),
-            );
-        }
+        slot.insert("assignment".to_string(), serde_json::Value::Object(doc));
         let doc = serde_json::Value::Object(slot);
 
-        // Accepted iff the tag names a variant whose OWN fields are all
-        // present. `Absent` needs none (stray fields are dropped by serde,
-        // never recombined into a half-known state).
+        // Accepted iff the value object carries EXACTLY the variant's OWN
+        // fields — nothing missing, nothing extra (no other variant's field,
+        // no unknown key). `Absent` accepts NO value at all (a unit cannot
+        // take an object).
         let valid = match tag {
-            "absent" => true,
-            "known" => gen_present && art,
-            "assignment_unknown" => gen_present && err,
-            _ => err,
+            "absent" => !value_present,
+            "known" => value_present && gen_present && art && ld && !err && !extra,
+            "assignment_unknown" => value_present && gen_present && err && !art && !ld && !extra,
+            _ => value_present && err && !gen_present && !art && !ld && !extra,
         };
         let result: Result<ObservedSlot, _> = serde_json::from_value(doc.clone());
         if valid {
@@ -242,6 +316,7 @@ mod tests {
                 "known" => ObservedAssignment::Known {
                     generation: test_generation_id("g"),
                     artifact: artifact_ref("a"),
+                    last_deployment: test_deployment_id("d"),
                 },
                 "assignment_unknown" => ObservedAssignment::AssignmentUnknown {
                     generation: test_generation_id("g"),
@@ -259,17 +334,80 @@ mod tests {
                 slot.assignment, expected,
                 "the accepted representation is EXACTLY the tagged variant: {doc}"
             );
-            assert_eq!(
-                slot.last_deployment.is_some(),
-                ld,
-                "last_deployment round-trips as the orthogonal slot-level fact: {doc}"
-            );
         } else {
             assert!(
                 result.is_err(),
-                "a half-known assignment must be REJECTED (fail closed), got: {doc}"
+                "a representation that is not EXACTLY one variant must be REJECTED (fail \
+                 closed), got: {doc}"
             );
         }
+    }
+
+    /// THE WIRE REJECTS UNKNOWN FIELDS AT EVERY LEVEL: the adjacently tagged
+    /// enum denies any key next to `state`/`value`, the variant payload
+    /// denies any key that is not one of its OWN fields, and the
+    /// slot/target/error records deny any key beyond their declared fields.
+    #[test]
+    fn wire_rejects_unknown_fields_at_every_level() {
+        let valid_known = json!({
+            "state": "known",
+            "value": known_value("g", "a", "d"),
+        });
+        // Positive control: the exact serialized shape round-trips.
+        let parsed: ObservedAssignment = serde_json::from_value(valid_known.clone()).unwrap();
+        assert_eq!(
+            parsed,
+            ObservedAssignment::Known {
+                generation: test_generation_id("g"),
+                artifact: artifact_ref("a"),
+                last_deployment: test_deployment_id("d"),
+            }
+        );
+        // An extra field NEXT TO the tag/content pair is rejected.
+        let mut top_extra = valid_known.clone();
+        if let serde_json::Value::Object(map) = &mut top_extra {
+            map.insert("bogus".to_string(), json!(1));
+        }
+        assert!(
+            serde_json::from_value::<ObservedAssignment>(top_extra).is_err(),
+            "a key next to state/value must be REJECTED"
+        );
+        // An extra field INSIDE the variant's value is rejected.
+        let mut value_extra = valid_known.clone();
+        if let serde_json::Value::Object(map) = &mut value_extra
+            && let Some(serde_json::Value::Object(value)) = map.get_mut("value")
+        {
+            value.insert("bogus".to_string(), json!(1));
+        }
+        assert!(
+            serde_json::from_value::<ObservedAssignment>(value_extra).is_err(),
+            "a key inside the variant value must be REJECTED"
+        );
+        // A slot record with an extra key is rejected.
+        let slot_extra = json!({
+            "assignment": valid_known,
+            "bogus": 1,
+        });
+        assert!(
+            serde_json::from_value::<ObservedSlot>(slot_extra).is_err(),
+            "a key next to assignment must be REJECTED"
+        );
+        // A target record with an extra key is rejected.
+        let target_extra = json!({
+            "target": "production",
+            "slots": {},
+            "bogus": 1,
+        });
+        assert!(
+            serde_json::from_value::<ObservedTarget>(target_extra).is_err(),
+            "a key next to target/slots must be REJECTED"
+        );
+        // An error payload with an extra key is rejected.
+        let error_extra = json!({ "message": "boom", "bogus": 1 });
+        assert!(
+            serde_json::from_value::<ObservationError>(error_extra).is_err(),
+            "a key inside the error payload must be REJECTED"
+        );
     }
 
     /// A single LIVE observation: one of the four states the observed
@@ -281,14 +419,13 @@ mod tests {
         prop_oneof![
             Just(ObservedSlot {
                 assignment: ObservedAssignment::Absent,
-                last_deployment: None,
             }),
             (0..3usize, 0..3usize).prop_map(|(i, j)| ObservedSlot {
                 assignment: ObservedAssignment::Known {
                     generation: test_generation_id(&format!("gen-seq-{i}")),
                     artifact: artifact_ref(&format!("art-seq-{i}-{j}")),
+                    last_deployment: test_deployment_id(&format!("dep-seq-{i}-{j}")),
                 },
-                last_deployment: Some(test_deployment_id(&format!("dep-seq-{i}-{j}"))),
             }),
             (0..3usize, 0..3usize).prop_map(|(i, j)| ObservedSlot {
                 assignment: ObservedAssignment::AssignmentUnknown {
@@ -297,7 +434,6 @@ mod tests {
                         message: format!("assignment read failed: case {j}"),
                     },
                 },
-                last_deployment: None,
             }),
             (0..3usize).prop_map(|j| ObservedSlot {
                 assignment: ObservedAssignment::Unknown {
@@ -305,9 +441,37 @@ mod tests {
                         message: format!("status read failed: case {j}"),
                     },
                 },
-                last_deployment: None,
             }),
         ]
+    }
+
+    /// THE BIJECTIVITY PROPERTY for a VALID observation: every generated
+    /// [`ObservedAssignment`] (all four variants — `Known` with all three
+    /// fields, `Absent`, `AssignmentUnknown`, `Unknown`) and every
+    /// generated [`ObservedSlot`] round-trips EXACTLY: `to_value` then
+    /// `from_value` reproduces the identical value.
+    fn run_bijectivity_case(obs: ObservedSlot) {
+        let assignment_json = serde_json::to_value(&obs.assignment).unwrap();
+        let assignment_back: ObservedAssignment = serde_json::from_value(assignment_json.clone())
+            .unwrap_or_else(|e| {
+                panic!(
+                    "to_value -> from_value must round-trip the assignment {assignment_json}: {e}"
+                )
+            });
+        assert_eq!(
+            assignment_back, obs.assignment,
+            "ObservedAssignment must round-trip bijectively (exact value)"
+        );
+
+        let slot_json = serde_json::to_value(&obs).unwrap();
+        let slot_back: ObservedSlot =
+            serde_json::from_value(slot_json.clone()).unwrap_or_else(|e| {
+                panic!("to_value -> from_value must round-trip the slot {slot_json}: {e}")
+            });
+        assert_eq!(
+            slot_back, obs,
+            "ObservedSlot must round-trip bijectively (exact value)"
+        );
     }
 
     /// THE SEQUENCE PROPERTY: apply a generated sequence of live observations
@@ -316,8 +480,8 @@ mod tests {
     /// [`LocalStore::read_slot_observed`] — not a model). After every step
     /// the STORED projection equals the LATEST observation exactly: a live
     /// `Absent` overwrites a stale prior `Known` (the old generation /
-    /// artifact / deployment are gone), a later `Known` overwrites an
-    /// earlier `Absent`, and `Unknown` / `AssignmentUnknown` record the
+    /// artifact / minting deployment are gone), a later `Known` overwrites
+    /// an earlier `Absent`, and `Unknown` / `AssignmentUnknown` record the
     /// uncertainty — the stored record never retains stale state from an
     /// older observation.
     fn run_sequence_case(sequence: Vec<ObservedSlot>) {
@@ -354,14 +518,32 @@ mod tests {
             ..ProptestConfig::default()
         })]
         // THE USER'S RAW-FIELD-COMBINATION PROPERTY: every raw combination of
-        // the previous flat shape's parallel fields deserializes into the new
-        // tagged wire ONLY when it corresponds to exactly one variant —
-        // everything else is rejected, never a half-known assignment.
+        // tag and fields deserializes into the adjacently tagged wire ONLY
+        // when the value carries EXACTLY one variant's own fields — missing
+        // required fields, extra/unknown fields, and fields from other
+        // variants are all REJECTED (fail closed).
         #[test]
         fn raw_field_combinations_accept_only_one_variant(
             combo in arbitrary_raw_combo(),
         ) {
             run_raw_combo_case(combo);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 64,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+        // THE USER'S BIJECTIVITY PROPERTY: every VALID observation — all four
+        // variants (Known with all three fields, Absent, AssignmentUnknown,
+        // Unknown) — serializes and deserializes back to the EXACT original
+        // value, at both the assignment and the slot level.
+        #[test]
+        fn serialization_is_bijective(obs in arbitrary_live_observation()) {
+            run_bijectivity_case(obs);
         }
     }
 

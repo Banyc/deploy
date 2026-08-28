@@ -1665,6 +1665,7 @@ impl Fixture {
             let crate::ledger::ObservedAssignment::Known {
                 generation,
                 artifact,
+                ..
             } = &slot.assignment
             else {
                 panic!("{target}: observed {slot_id} must be a successful read");
@@ -1678,7 +1679,7 @@ impl Fixture {
                 "{target}: observed artifact must equal the remote assignment"
             );
             assert_eq!(
-                slot.last_deployment.as_ref(),
+                slot.last_deployment(),
                 Some(&asn.deployment_id),
                 "{target}: observed last_deployment must equal the LIVE assignment's OWN \
                  minting deployment — a skipped/unreachable slot's prior record is never \
@@ -1944,6 +1945,7 @@ impl Fixture {
             let crate::ledger::ObservedAssignment::Known {
                 generation,
                 artifact,
+                ..
             } = &slot.assignment
             else {
                 panic!("{target}: observed {slot_id} must be a successful read");
@@ -1957,7 +1959,7 @@ impl Fixture {
                 "{target}: observed generation must equal the remote generation"
             );
             assert_eq!(
-                slot.last_deployment.as_ref(),
+                slot.last_deployment(),
                 Some(&asn.deployment_id),
                 "{target}: observed last_deployment must equal the LIVE assignment's OWN \
                  minting deployment — a skipped/unreachable slot's prior record is never \
@@ -6083,7 +6085,7 @@ fn assert_semantic_invariants(model: &Model, system: &Fixture) {
                         "{ctx}: {t} observed projection must match the model's expected version {v}"
                     );
                     assert_eq!(
-                        slot.last_deployment.as_ref().map(|d| d.as_str()),
+                        slot.last_deployment().map(|d| d.as_str()),
                         Some(dep.as_str()),
                         "{ctx}: {t} observed last_deployment for {slot_id} must equal the LIVE \
                          assignment's minting deployment {dep} — a skipped/unreachable slot's \

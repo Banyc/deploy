@@ -44,9 +44,9 @@ impl LocalStore {
     pub fn write_slot_observed(&self, slot: &SlotId, observed: &ObservedSlot) -> Result<()> {
         #[cfg(test)]
         if let Some(d) = match &observed.assignment {
-            ObservedAssignment::Known { .. } => {
-                observed.last_deployment.as_ref().map(|d| d.as_str())
-            }
+            ObservedAssignment::Known {
+                last_deployment, ..
+            } => Some(last_deployment.as_str()),
             _ => None,
         } && self
             .fault_registry
@@ -149,9 +149,9 @@ impl LocalStore {
                 .last_observed
                 .as_ref()
                 .and_then(|o| match &o.assignment {
-                    ObservedAssignment::Known { .. } => {
-                        o.last_deployment.as_ref().map(|d| d.as_str())
-                    }
+                    ObservedAssignment::Known {
+                        last_deployment, ..
+                    } => Some(last_deployment.as_str()),
                     _ => None,
                 }),
             state.last_seen_target.as_ref(),

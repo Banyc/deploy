@@ -501,6 +501,7 @@ fn render_status(observed: &ObservedTarget) -> Vec<String> {
             ObservedAssignment::Known {
                 generation,
                 artifact,
+                ..
             } => format!(
                 "{}  generation={:?} release={:?} variant={:?} tree={:?}",
                 slot_id,
@@ -900,8 +901,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                             variant: VariantName::new("standard".to_string()),
                             tree: test_tree_digest("tree-2c4f"),
                         },
+                        last_deployment: test_deployment_id("deploy-status-1"),
                     },
-                    last_deployment: Some(test_deployment_id("deploy-status-1")),
                 },
             )
             .unwrap();
@@ -910,7 +911,6 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &SlotId::new("p2".to_string()),
                 &ObservedSlot {
                     assignment: crate::ledger::ObservedAssignment::Absent,
-                    last_deployment: None,
                 },
             )
             .unwrap();
@@ -924,7 +924,6 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                             message: "assignment read failed: boom".to_string(),
                         },
                     },
-                    last_deployment: None,
                 },
             )
             .unwrap();
@@ -1555,12 +1554,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // A slot with no observed state is Absent, not Unknown.
         let slot_none = ObservedSlot {
             assignment: crate::ledger::ObservedAssignment::Absent,
-            last_deployment: None,
         };
         let json_none = serde_json::to_string(&slot_none).unwrap();
         let back: ObservedSlot = serde_json::from_str(&json_none).unwrap();
         assert_eq!(back.assignment, crate::ledger::ObservedAssignment::Absent);
-        assert_eq!(back.last_deployment, None);
+        assert_eq!(back.last_deployment(), None);
         // An unreadable observed state is Unknown, never a forged artifact.
         let slot_unknown = ObservedSlot {
             assignment: crate::ledger::ObservedAssignment::Unknown {
@@ -1568,7 +1566,6 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     message: "assignment read failed: boom".to_string(),
                 },
             },
-            last_deployment: None,
         };
         let lines = render_status(&ObservedTarget {
             target: crate::identity::TargetName::parse("production").unwrap(),
@@ -1593,7 +1590,6 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     message: "assignment read failed: boom".to_string(),
                 },
             },
-            last_deployment: None,
         };
         let lines = render_status(&ObservedTarget {
             target: crate::identity::TargetName::parse("production").unwrap(),
@@ -1630,7 +1626,6 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                             message: "assignment read failed: boom".to_string(),
                         },
                     },
-                    last_deployment: None,
                 },
             )
             .unwrap();

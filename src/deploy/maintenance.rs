@@ -274,8 +274,8 @@ pub(crate) fn refresh_observed_from_live(
                                 assignment: ObservedAssignment::Known {
                                     generation: asn.generation_id.clone(),
                                     artifact: asn.artifact.clone(),
+                                    last_deployment: asn.deployment_id.clone(),
                                 },
-                                last_deployment: Some(asn.deployment_id.clone()),
                             },
                         );
                     }
@@ -296,7 +296,6 @@ pub(crate) fn refresh_observed_from_live(
                                     generation: g,
                                     error,
                                 },
-                                last_deployment: None,
                             },
                         );
                     }
@@ -313,7 +312,6 @@ pub(crate) fn refresh_observed_from_live(
                         slot_id.clone(),
                         ObservedSlot {
                             assignment: ObservedAssignment::Absent,
-                            last_deployment: None,
                         },
                     );
                 }
@@ -332,7 +330,6 @@ pub(crate) fn refresh_observed_from_live(
                                 message: format!("status read failed: {e}"),
                             },
                         },
-                        last_deployment: None,
                     },
                 );
             }

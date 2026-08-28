@@ -1488,8 +1488,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                             variant: VariantName::new("standard".to_string()),
                             tree: test_tree_digest(PROPERTY_TREES[0]),
                         },
+                        last_deployment: test_deployment_id(&format!("dep-t1-{at}")),
                     },
-                    last_deployment: Some(test_deployment_id(&format!("dep-t1-{at}"))),
                 },
             )
             .unwrap();

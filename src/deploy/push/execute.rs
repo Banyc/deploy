@@ -452,6 +452,7 @@ pub(crate) mod execute_tests {
         let ObservedAssignment::Known {
             generation,
             artifact,
+            ..
         } = &os.assignment
         else {
             panic!("observed p1 must be a successful read");
@@ -473,7 +474,7 @@ pub(crate) mod execute_tests {
             "observed must NOT reflect the desired (failed) v2 tree"
         );
         assert_eq!(
-            os.last_deployment.as_ref(),
+            os.last_deployment(),
             Some(&id1),
             "observed last_deployment must be the LIVE assignment's OWN minting deployment \
              (id1), not the failed attempt id2"
@@ -769,7 +770,7 @@ interval_seconds = 0
                 "slot {sid} with no live assignment must project Absent (never the desired artifact), got: {:?}",
                 slot.assignment
             );
-            assert!(slot.last_deployment.is_none());
+            assert!(slot.last_deployment().is_none());
         }
 
         assert!(
@@ -1107,6 +1108,7 @@ interval_seconds = 0
         let ObservedAssignment::Known {
             generation,
             artifact,
+            ..
         } = &os.assignment
         else {
             panic!("observed p1 must be a successful read");
@@ -1128,7 +1130,7 @@ interval_seconds = 0
             "observed must NOT reflect the desired (failed) v2 tree"
         );
         assert_eq!(
-            os.last_deployment.as_ref(),
+            os.last_deployment(),
             Some(&id1),
             "observed last_deployment must be the LIVE assignment's OWN minting deployment \
              (id1), not the failed attempt id2"
@@ -1242,6 +1244,7 @@ interval_seconds = 0
         let ObservedAssignment::Known {
             generation,
             artifact,
+            ..
         } = &os.assignment
         else {
             panic!("observed p1 must be a successful read");

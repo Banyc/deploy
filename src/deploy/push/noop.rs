@@ -208,8 +208,8 @@ pub(crate) fn check_up_to_date(
                         assignment: ObservedAssignment::Known {
                             generation: asn.generation_id.clone(),
                             artifact: asn.artifact.clone(),
+                            last_deployment: asn.deployment_id.clone(),
                         },
-                        last_deployment: Some(asn.deployment_id.clone()),
                     },
                 );
             }

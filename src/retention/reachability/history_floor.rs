@@ -420,10 +420,12 @@ impl LocalStore {
         }
         for slot in observed.values() {
             match &slot.assignment {
-                ObservedAssignment::Known { artifact, .. } => {
-                    if let Some(d) = &slot.last_deployment {
-                        out.deployments.insert(d.as_str().to_string());
-                    }
+                ObservedAssignment::Known {
+                    artifact,
+                    last_deployment,
+                    ..
+                } => {
+                    out.deployments.insert(last_deployment.as_str().to_string());
                     out.releases.insert(artifact.release.as_str().to_string());
                     out.trees.insert(artifact.tree.as_str().to_string());
                 }

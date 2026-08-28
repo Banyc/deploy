@@ -335,8 +335,8 @@ mod tests {
                     variant: VariantName::new("standard".to_string()),
                     tree: test_tree_digest("evil"),
                 },
+                last_deployment: test_deployment_id("evil"),
             },
-            last_deployment: Some(test_deployment_id("evil")),
         };
         store.write_slot_observed(&evil, &observed).unwrap();
         assert!(

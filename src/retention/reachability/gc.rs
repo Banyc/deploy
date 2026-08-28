@@ -833,8 +833,8 @@ interval_seconds = 0
                     variant: VariantName::new("standard".to_string()),
                     tree: test_tree_digest("tree-obs"),
                 },
+                last_deployment: test_deployment_id("deploy-obs"),
             },
-            last_deployment: Some(test_deployment_id("deploy-obs")),
         };
         store
             .write_slot_observed(&SlotId::new(SLOT.to_string()), &observed)

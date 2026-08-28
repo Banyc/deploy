@@ -271,6 +271,7 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
     let deploy::ledger::ObservedAssignment::Known {
         generation: obs_gen,
         artifact,
+        ..
     } = &obs.assignment
     else {
         panic!("observed app-1 must be Known");

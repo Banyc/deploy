@@ -4586,6 +4586,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     let deploy::ledger::ObservedAssignment::Known {
         generation,
         artifact,
+        ..
     } = &os.assignment
     else {
         panic!("observed p1 must be Known");
@@ -4646,6 +4647,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     let deploy::ledger::ObservedAssignment::Known {
         generation,
         artifact,
+        ..
     } = &os.assignment
     else {
         panic!("observed p2 must be Known");
@@ -4683,6 +4685,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     let deploy::ledger::ObservedAssignment::Known {
         generation,
         artifact,
+        ..
     } = &restored_prod.slots[&SlotId::parse("p1").unwrap()].assignment
     else {
         panic!("observed p1 must be Known");
