@@ -1333,10 +1333,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // release record is REPAIRED, the retry deletes EXACTLY the genuinely
         // unretained trees (the pin-only trees survive; the garbage is
         // removed) and the debt marker is cleared.
-        // removed) and the debt marker is cleared. Bounded 4 cases, fixed
-        // seed 0x5EED_5EED (house style), no persistence.
         #![proptest_config(ProptestConfig {
-            cases: 2,
+            cases: crate::testutil::proptest_cases(16),
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
             failure_persistence: None,
             ..ProptestConfig::default()

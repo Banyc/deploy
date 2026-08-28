@@ -69,6 +69,27 @@ pub(crate) fn fixture_tmpdir(env: &crate::env::SysEnv) -> std::io::Result<tempfi
     tempfile::Builder::new().tempdir_in(env.temp_dir())
 }
 
+/// `true` when the FULL proptest budgets are requested (`DEPLOY_FULL_TESTS=1`).
+/// The default (no env var) runs the FAST budgets: the same semantic
+/// dimensions (all failure classes, all matrix arms, full sequence lengths),
+/// but FEWER random draws per property.
+#[cfg(test)]
+pub(crate) fn full_proptest_suites() -> bool {
+    std::env::var_os("DEPLOY_FULL_TESTS").is_some_and(|v| v != "0")
+}
+
+/// The proptest `cases:` budget: the full budget when full suites are
+/// requested, else a FAST budget (full/4, clamped to at least 2 — the same
+/// semantic dimensions, fewer samples).
+#[cfg(test)]
+pub(crate) fn proptest_cases(full: u32) -> u32 {
+    if full_proptest_suites() {
+        full
+    } else {
+        (full / 4).max(2)
+    }
+}
+
 /// Test-only one-shot fault injection for crash-mid-finalization tests.
 ///
 /// A fault is a one-shot arm keyed by the DEPLOYMENT ID of the attempt under

@@ -1711,7 +1711,7 @@ mod runner_property_tests {
         // Timeout, success, write error, wait error, spawn error — leaves
         // zero live waiters and the spawned child reaped exactly once.
         #![proptest_config(ProptestConfig {
-            cases: 2,
+            cases: crate::testutil::proptest_cases(16),
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
             failure_persistence: None,
             ..ProptestConfig::default()
