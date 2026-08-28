@@ -36,7 +36,7 @@ use crate::verify::systemd::run_activation;
 // the allow documents the deliberate choice).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compensate_server_locked(
-    _held: &HeldSlotLock<'_>,
+    held: &HeldSlotLock<'_>,
     _store: &LocalStore,
     remote: &dyn Remote,
     helper: &RemoteHelper,
@@ -71,6 +71,7 @@ pub(crate) fn compensate_server_locked(
             // it and we must not clobber their state.
             if helper
                 .swap_current(
+                    &held,
                     &crate::remote::helper::ExpectedCurrent::Generation(advanced_gen.clone()),
                     prior.as_str(),
                     op_id.as_str(),
@@ -103,9 +104,10 @@ pub(crate) fn compensate_server_locked(
             // First deploy: remove `current` only if it still points at the
             // generation we advanced (compare-and-swap style).
             Ok(helper
-                .remove_current_if(&crate::remote::helper::ExpectedCurrent::Generation(
-                    advanced_gen.clone(),
-                ))
+                .remove_current_if(
+                    &held,
+                    &crate::remote::helper::ExpectedCurrent::Generation(advanced_gen.clone()),
+                )
                 .unwrap_or(false))
         }
     }
@@ -358,7 +360,7 @@ mod compensation_tests {
         let g2 = GenerationId::generate();
         helper
             .create_generation(
-                "op2",
+                &helper.acquire_lock_guard("op2").unwrap(),
                 &crate::remote::helper::GenerationAssignment {
                     deployment_id: test_deployment_id("d2"),
                     generation_id: g2.clone(),
@@ -376,6 +378,7 @@ mod compensation_tests {
             .unwrap();
         helper
             .swap_current(
+                &helper.acquire_lock_guard("op2").unwrap(),
                 &crate::remote::helper::ExpectedCurrent::Generation(first.generation.clone()),
                 g2.as_str(),
                 "op2",
@@ -386,7 +389,7 @@ mod compensation_tests {
         let g3 = GenerationId::generate();
         helper
             .create_generation(
-                "op3",
+                &helper.acquire_lock_guard("op3").unwrap(),
                 &crate::remote::helper::GenerationAssignment {
                     deployment_id: test_deployment_id("d3"),
                     generation_id: g3.clone(),
@@ -404,6 +407,7 @@ mod compensation_tests {
             .unwrap();
         helper
             .swap_current(
+                &helper.acquire_lock_guard("op3").unwrap(),
                 &crate::remote::helper::ExpectedCurrent::Generation(g2.clone()),
                 g3.as_str(),
                 "op3",

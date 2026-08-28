@@ -107,6 +107,7 @@ pub(crate) fn decide_commit_status(
                 continue;
             }
             match helper.write_commit_marker(
+                &_guard,
                 deployment_id.as_str(),
                 new_gen[sid].as_str(),
                 &slot_ids,

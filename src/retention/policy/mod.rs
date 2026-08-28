@@ -368,7 +368,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .unwrap();
         helper
             .create_generation(
-                "op",
+                &helper.acquire_lock_guard("op").unwrap(),
                 &GenerationAssignment {
                     deployment_id: test_deployment_id("d1"),
                     generation_id: test_generation_id("g1"),
@@ -386,7 +386,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .unwrap();
         helper
             .create_generation(
-                "op",
+                &helper.acquire_lock_guard("op").unwrap(),
                 &GenerationAssignment {
                     deployment_id: test_deployment_id("d2"),
                     generation_id: test_generation_id("g2"),
@@ -404,6 +404,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .unwrap();
         helper
             .swap_current(
+                &helper.acquire_lock_guard("op").unwrap(),
                 &crate::remote::helper::ExpectedCurrent::Absent,
                 test_generation_id("g2").as_str(),
                 "op",
@@ -523,7 +524,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .unwrap();
         helper
             .create_generation(
-                "op",
+                &helper.acquire_lock_guard("op").unwrap(),
                 &crate::remote::helper::GenerationAssignment {
                     deployment_id: test_deployment_id(deployment_id),
                     generation_id: test_generation_id(generation_id),
@@ -581,6 +582,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         );
         helper
             .swap_current(
+                &helper.acquire_lock_guard("op").unwrap(),
                 &crate::remote::helper::ExpectedCurrent::Absent,
                 test_generation_id("g3").as_str(),
                 "op",
@@ -641,6 +643,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         make_gen(&helper, "d2", "g2", "t-recent", &recent, Some("g1"), None);
         helper
             .swap_current(
+                &helper.acquire_lock_guard("op").unwrap(),
                 &crate::remote::helper::ExpectedCurrent::Absent,
                 test_generation_id("g2").as_str(),
                 "op",
@@ -729,6 +732,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         );
         helper
             .swap_current(
+                &helper.acquire_lock_guard("op").unwrap(),
                 &crate::remote::helper::ExpectedCurrent::Absent,
                 test_generation_id("g3").as_str(),
                 "op",
@@ -803,6 +807,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // current -> g2, whose assignment records g1 as prior.
         helper
             .swap_current(
+                &helper.acquire_lock_guard("op").unwrap(),
                 &crate::remote::helper::ExpectedCurrent::Absent,
                 test_generation_id("g2").as_str(),
                 "op",
@@ -868,6 +873,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         );
         helper
             .swap_current(
+                &helper.acquire_lock_guard("op").unwrap(),
                 &crate::remote::helper::ExpectedCurrent::Absent,
                 test_generation_id("g1").as_str(),
                 "op",
@@ -975,6 +981,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         );
         helper
             .swap_current(
+                &helper.acquire_lock_guard("op").unwrap(),
                 &crate::remote::helper::ExpectedCurrent::Absent,
                 test_generation_id("g3").as_str(),
                 "op",
@@ -1106,6 +1113,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         );
         helper
             .swap_current(
+                &helper.acquire_lock_guard("op").unwrap(),
                 &crate::remote::helper::ExpectedCurrent::Absent,
                 test_generation_id("g3").as_str(),
                 "op",
@@ -1196,6 +1204,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         );
         helper
             .swap_current(
+                &helper.acquire_lock_guard("op").unwrap(),
                 &crate::remote::helper::ExpectedCurrent::Absent,
                 test_generation_id("g2").as_str(),
                 "op",
@@ -1807,12 +1816,12 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     created_at: g.created_at.to_string(),
                     target: None,
                 };
-                helper.create_generation("op", &asn).unwrap();
+                helper.create_generation(&helper.acquire_lock_guard("op").unwrap(), &asn).unwrap();
                 assignments.push(asn);
             }
             let current = history.last().unwrap().clone();
             helper
-                .swap_current(
+                .swap_current(&helper.acquire_lock_guard("op").unwrap(),
                     &crate::remote::helper::ExpectedCurrent::Absent,
                     current.id.as_str(),
                     "op",
@@ -2395,12 +2404,12 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     created_at: g.created_at.to_string(),
                     target: None,
                 };
-                helper.create_generation("op", &asn).unwrap();
+                helper.create_generation(&helper.acquire_lock_guard("op").unwrap(), &asn).unwrap();
                 assignments.push(asn);
             }
             let current = history.last().unwrap().clone();
             helper
-                .swap_current(
+                .swap_current(&helper.acquire_lock_guard("op").unwrap(),
                     &crate::remote::helper::ExpectedCurrent::Absent,
                     current.id.as_str(),
                     "op",

@@ -39,14 +39,18 @@ impl<'a> RemoteHelper<'a> {
     }
 
     /// Create a generation record and its `root` symlink. Does not move
-    /// `current`.
+    /// `current`. Requires the slot-mutation capability (`_lock`).
     ///
     /// The assignment record is immutable and installed with create-or-compare
     /// semantics: a generation ID colliding with different content fails
     /// integrity instead of silently rewriting history. Generation IDs are
-    /// fresh UUIDv7 values minted under the operation lock, so this can only
-    /// fire on corruption or retry-after-crash with divergent state.
-    pub fn create_generation(&self, op_id: &str, assignment: &GenerationAssignment) -> Result<()> {
+    /// fresh UUIDv7 values minted while holding the slot lock, so this can
+    /// only fire on corruption or retry-after-crash with divergent state.
+    pub fn create_generation(
+        &self,
+        _lock: &super::super::LockGuard<'_>,
+        assignment: &GenerationAssignment,
+    ) -> Result<()> {
         let gen_dir = layout::generation(assignment.generation_id.as_str());
         self.remote.create_dir_all(&gen_dir)?;
         let json = serde_json::to_vec_pretty(assignment)
@@ -105,7 +109,7 @@ impl<'a> RemoteHelper<'a> {
             let root_link = layout::generation_root_link(assignment.artifact.tree.as_str());
             self.remote.symlink(&root_link, &root_link_path)?;
         }
-        let _ = op_id;
+        let _ = _lock;
         Ok(())
     }
 }
@@ -142,18 +146,19 @@ mod tests_assignment {
             LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
                 .unwrap();
         let helper = RemoteHelper::new(&remote);
+        let _guard = helper.acquire_lock_guard("op").unwrap();
 
         helper
-            .create_generation("op", &assignment("gen-1", "tree-a"))
+            .create_generation(&_guard, &assignment("gen-1", "tree-a"))
             .expect("first create");
         // Identical recreation (retry after crash) is idempotent.
         helper
-            .create_generation("op", &assignment("gen-1", "tree-a"))
+            .create_generation(&_guard, &assignment("gen-1", "tree-a"))
             .expect("identical recreation is idempotent");
 
         // Divergent content for the same generation ID fails integrity...
         let err = helper
-            .create_generation("op", &assignment("gen-1", "tree-TAMPERED"))
+            .create_generation(&_guard, &assignment("gen-1", "tree-TAMPERED"))
             .expect_err("divergent generation rewrite must fail");
         assert!(
             err.to_string().contains("different content"),

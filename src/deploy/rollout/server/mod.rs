@@ -128,7 +128,9 @@ pub(crate) fn process_server(
     }
 
     // 1. Publish the staged tree (from incoming), reusing an existing object.
-    if let Err(e) = helper.publish_from_incoming(deployment_id.as_str(), artifact.tree.as_str()) {
+    if let Err(e) =
+        helper.publish_from_incoming(&held, deployment_id.as_str(), artifact.tree.as_str())
+    {
         return Ok(ServerProc {
             kind: SlotOutcomeKind::Failed,
             generation: new_gen.clone(),
@@ -221,7 +223,7 @@ pub(crate) fn process_server(
         created_at: crate::remote::helper::now_rfc3339(),
         target: Some(TargetName::parse(target_name).expect("target name is a safe segment")),
     };
-    if let Err(e) = helper.create_generation(op_id.as_str(), &assignment) {
+    if let Err(e) = helper.create_generation(&held, &assignment) {
         return Ok(ServerProc {
             kind: SlotOutcomeKind::Failed,
             generation: new_gen.clone(),
@@ -230,7 +232,7 @@ pub(crate) fn process_server(
             error: Some(format!("create generation failed: {e}")),
         });
     }
-    if let Err(e) = helper.transaction_record(op_id.as_str(), "prepared") {
+    if let Err(e) = helper.transaction_record(&held, op_id.as_str(), "prepared") {
         return Ok(ServerProc {
             kind: SlotOutcomeKind::Failed,
             generation: new_gen.clone(),
@@ -242,6 +244,7 @@ pub(crate) fn process_server(
 
     // Atomically move `current` (the per-slot commit point).
     let swap = helper.swap_current(
+        &held,
         &match expected_gen {
             Some(g) => crate::remote::helper::ExpectedCurrent::Generation(g.clone()),
             None => crate::remote::helper::ExpectedCurrent::Absent,
@@ -289,7 +292,7 @@ pub(crate) fn process_server(
             config,
             template_vars,
         );
-        let _ = helper.transaction_record(op_id.as_str(), "compensated");
+        let _ = helper.transaction_record(&held, op_id.as_str(), "compensated");
         let did_comp = matches!(comp, Ok(true));
         let generation = if did_comp {
             expected_gen.cloned().unwrap_or_else(|| new_gen.clone())
@@ -324,7 +327,7 @@ pub(crate) fn process_server(
             config,
             template_vars,
         );
-        let _ = helper.transaction_record(op_id.as_str(), "compensated");
+        let _ = helper.transaction_record(&held, op_id.as_str(), "compensated");
         let did_comp = matches!(comp, Ok(true));
         let generation = if did_comp {
             expected_gen.cloned().unwrap_or_else(|| new_gen.clone())
@@ -349,7 +352,7 @@ pub(crate) fn process_server(
     // A later push's `reconcile_pending_commits` completes the marker set
     // without touching the healthy server when its generation still matches.
     if helper
-        .transaction_record(op_id.as_str(), "committed")
+        .transaction_record(&held, op_id.as_str(), "committed")
         .is_err()
     {
         return Ok(ServerProc {

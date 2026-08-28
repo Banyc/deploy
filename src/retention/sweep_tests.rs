@@ -170,7 +170,7 @@ fn make_gen(
         .unwrap();
     helper
         .create_generation(
-            "op",
+            &helper.acquire_lock_guard("op").unwrap(),
             &GenerationAssignment {
                 deployment_id: test_deployment_id(deployment_id),
                 generation_id: test_generation_id(generation_id),
@@ -399,6 +399,7 @@ fn run_no_leak_case(
     }
     helper
         .swap_current(
+            &helper.acquire_lock_guard("op").unwrap(),
             &crate::remote::helper::ExpectedCurrent::Absent,
             test_generation_id(&format!("g{}", n - 1)).as_str(),
             "op",

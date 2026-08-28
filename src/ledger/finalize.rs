@@ -244,10 +244,12 @@ pub fn finalize_successful_locked(
         .keys()
         .map(|s| s.as_str().to_string())
         .collect();
-    for sid in &selected {
+    for (idx, sid) in selected.iter().enumerate() {
         let helper = &helpers[*sid];
+        let guard = &guards[idx];
         let slot = &attempt.slots[*sid];
         match helper.write_commit_marker(
+            guard,
             attempt.deployment_id.as_str(),
             slot.desired.generation.as_str(),
             &slot_ids,
@@ -709,7 +711,7 @@ mod tests {
             .unwrap();
         helper
             .create_generation(
-                "op-seed",
+                &helper.acquire_lock_guard("op-seed").unwrap(),
                 &crate::remote::helper::GenerationAssignment {
                     deployment_id: attempt.deployment_id.clone(),
                     generation_id: test_generation_id("gen-1"),
@@ -727,6 +729,7 @@ mod tests {
             .unwrap();
         helper
             .swap_current(
+                &helper.acquire_lock_guard("op-seed").unwrap(),
                 &ExpectedCurrent::Absent,
                 test_generation_id("gen-1").as_str(),
                 "op-seed",
@@ -828,7 +831,7 @@ mod tests {
             .unwrap();
         helper
             .create_generation(
-                "op-seed",
+                &helper.acquire_lock_guard("op-seed").unwrap(),
                 &crate::remote::helper::GenerationAssignment {
                     deployment_id: attempt.deployment_id.clone(),
                     generation_id: test_generation_id("gen-1"),
@@ -846,6 +849,7 @@ mod tests {
             .unwrap();
         helper
             .swap_current(
+                &helper.acquire_lock_guard("op-seed").unwrap(),
                 &ExpectedCurrent::Absent,
                 test_generation_id("gen-1").as_str(),
                 "op-seed",

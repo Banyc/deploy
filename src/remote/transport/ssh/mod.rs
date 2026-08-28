@@ -1505,7 +1505,7 @@ impl Remote for SshTransport {
         match String::from_utf8_lossy(&out.stdout).trim() {
             "OK" => Ok(Some(())),
             "MISMATCH" => Err(Error::transport(
-                "recovery refused: the lock no longer carries the observed record — a successor's newer epoch is never removed; re-read and re-confirm",
+                "recovery refused: the lock no longer carries the observed record — a successor is never removed; re-read and re-confirm",
             )),
             "ABSENT" => Err(Error::transport(
                 "no lock to recover: the slot is already free (the observed record is gone) — no recovery needed",
@@ -1734,10 +1734,10 @@ mod tests_ssh {
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let root = dir.path().join("remote");
         let rel = Path::new("state/operation.lock");
-        // The mutation-lock record: owner + persisted monotonic epoch (no
+        // The mutation-lock record: operation_id + unique acquisition id (no
         // time anywhere in the protocol — create-once ownership with no
         // lease/expiry).
-        let payload = "{\"owner\":\"a\",\"epoch\":1}";
+        let payload = "{\"operation_id\":\"a\",\"acquisition_id\":\"acq-0192a3b4-c5d6-7e7f-8a9b-0c1d2e3f4a5b6\"}";
 
         // Genuinely absent: the Absent frame.
         let cmd = SshTransport::remove_file_if_cmd(&root, rel, payload.as_bytes());
@@ -1760,7 +1760,11 @@ mod tests_ssh {
         // Reinstall, then compare against a DIFFERENT expected record: the
         // Mismatch frame and the entry is restored byte-for-byte.
         std::fs::write(root.join(rel), payload).unwrap();
-        let cmd2 = SshTransport::remove_file_if_cmd(&root, rel, b"{\"owner\":\"b\",\"epoch\":2}");
+        let cmd2 = SshTransport::remove_file_if_cmd(
+            &root,
+            rel,
+            b"{\"operation_id\":\"b\",\"acquisition_id\":\"acq-0192a3b4-c5d6-7e7f-8a9b-0c1d2e3f4a5b7\"}",
+        );
         let out = run_sh_stdin(&cmd2, &[]);
         assert!(out.status.success(), "script must exit 0: {out:?}");
         assert_eq!(String::from_utf8_lossy(&out.stdout), "M");
@@ -3111,9 +3115,13 @@ exec /bin/mv "$@"
                     std::fs::read_link(&link).unwrap(),
                 );
                 let helper = RemoteHelper::new(&t);
-                let err = helper
-                    .swap_current(&ExpectedCurrent::Absent, "gen-gate", "op")
-                    .unwrap_err();
+                let guard = helper.acquire_lock_guard("op");
+                let err = match guard {
+                    Ok(g) => helper
+                        .swap_current(&g, &ExpectedCurrent::Absent, "gen-gate", "op")
+                        .unwrap_err(),
+                    Err(e) => e,
+                };
                 assert!(
                     err.to_string().contains("ssh"),
                     "{outcome:?}: a failed lstat must propagate, got: {err}"
@@ -3185,8 +3193,12 @@ exec /bin/mv "$@"
             created_at: created.to_string(),
             target: None,
         };
-        helper.create_generation("op", &mk(&g1, "t1")).unwrap();
-        helper.create_generation("op", &mk(&g2, "t2")).unwrap();
+        helper
+            .create_generation(&helper.acquire_lock_guard("op").unwrap(), &mk(&g1, "t1"))
+            .unwrap();
+        helper
+            .create_generation(&helper.acquire_lock_guard("op").unwrap(), &mk(&g2, "t2"))
+            .unwrap();
         for tree in ["t1", "t2"] {
             let d = test_tree_digest(tree);
             helper
@@ -3195,7 +3207,12 @@ exec /bin/mv "$@"
                 .unwrap();
         }
         helper
-            .swap_current(&ExpectedCurrent::Absent, g2.as_str(), "op")
+            .swap_current(
+                &helper.acquire_lock_guard("op").unwrap(),
+                &ExpectedCurrent::Absent,
+                g2.as_str(),
+                "op",
+            )
             .unwrap();
         let garbage = test_tree_digest("garbage");
         helper

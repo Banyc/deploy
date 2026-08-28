@@ -3231,7 +3231,7 @@ fn pending_commit_diverged_generation_is_degraded_not_successful() -> Result<()>
         .create_dir_all(&deploy::remote::layout::tree_root(foreign_tree.as_str()))?;
     let foreign_gen = deploy::identity::GenerationId::generate();
     foreign_helper.create_generation(
-        "op-foreign",
+        &foreign_helper.acquire_lock_guard("op-foreign").unwrap(),
         &GenerationAssignment {
             deployment_id: deploy::identity::DeploymentId::generate(),
             generation_id: foreign_gen.clone(),
@@ -3250,6 +3250,7 @@ fn pending_commit_diverged_generation_is_degraded_not_successful() -> Result<()>
         },
     )?;
     foreign_helper.swap_current(
+        &foreign_helper.acquire_lock_guard("op-foreign").unwrap(),
         &deploy::remote::helper::ExpectedCurrent::Absent,
         foreign_gen.as_str(),
         "op-foreign",

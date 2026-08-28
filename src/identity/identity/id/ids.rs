@@ -49,6 +49,10 @@ fn valid_operation_id(s: &str) -> bool {
     valid_uuid_v7_id(s, "op-")
 }
 
+fn valid_acquisition_id(s: &str) -> bool {
+    valid_uuid_v7_id(s, "acq-")
+}
+
 id_newtype!(
     DeploymentId,
     valid_deployment_id,
@@ -67,6 +71,12 @@ id_newtype!(
     "An operation identity: `op-<uuid-v7>` (the exact form \
      [`OperationId::generate`] produces)."
 );
+id_newtype!(
+    AcquisitionId,
+    valid_acquisition_id,
+    "A lock acquisition identity: `acq-<uuid-v7>` (the exact form \
+     [`AcquisitionId::generate`] produces)."
+);
 
 impl DeploymentId {
     pub fn generate() -> Self {
@@ -83,6 +93,12 @@ impl GenerationId {
 impl OperationId {
     pub fn generate() -> Self {
         OperationId(format!("op-{}", new_uuid_v7()))
+    }
+}
+
+impl AcquisitionId {
+    pub fn generate() -> Self {
+        AcquisitionId(format!("acq-{}", new_uuid_v7()))
     }
 }
 
@@ -124,6 +140,12 @@ pub(crate) fn test_generation_id(tag: &str) -> GenerationId {
 #[cfg(test)]
 pub(crate) fn test_operation_id(tag: &str) -> OperationId {
     OperationId::parse(&format!("op-{}", test_uuid_v7(tag))).expect("canonical test id")
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn test_acquisition_id(tag: &str) -> AcquisitionId {
+    AcquisitionId::parse(&format!("acq-{}", test_uuid_v7(tag))).expect("canonical test id")
 }
 
 #[cfg(test)]

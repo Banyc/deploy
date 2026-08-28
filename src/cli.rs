@@ -300,19 +300,19 @@ release failure (transport fault at drop) strands the slot forever\n\
 until an operator confirms the holding controller died and recovers.\n\
 This command is the explicit, evidence-requiring remedy: it inspects\n\
 the remote lock (typed read, never provisioning layout) and — with\n\
---yes — replaces the dead holder's record with a successor (epoch+1)\n\
-under the authoritative local store lock, then releases, leaving the\n\
-slot free.\n\
+--yes — replaces the dead holder's record with a successor (fresh\n\
+acquisition id) under the authoritative local store lock, then\n\
+releases, leaving the slot free.\n\
 \n\
 Without --yes the command is a read-only preview: a free slot reports\n\
-free, a held slot is refused with the holder, epoch, and the remedy\n\
-command (the lock is never touched). With --yes the held lock is\n\
+free, a held slot is refused with the holder, acquisition id, and the\n\
+remedy command (the lock is never touched). With --yes the held lock is\n\
 recovered and released; the slot ends free. The operation is idempotent\n\
 (a free slot stays free) and a stale observed record is refused\n\
 (the lock changed; re-read and re-confirm).",
         after_help = "Examples:\n\
   deploy unlock production p1                 # inspect: free or held + remedy\n\
-  deploy unlock production p1 --yes           # recover (epoch+1) and release — slot free\n\
+  deploy unlock production p1 --yes           # recover (fresh acquisition) and release — slot free\n\
   deploy push production                      # now succeeds (lock was freed)"
     )]
     Unlock {
@@ -321,7 +321,7 @@ recovered and released; the slot ends free. The operation is idempotent\n\
         /// The member slot (one of the target's slots) whose server mutation lock is stuck.
         slot: SlotId,
         /// Recover the lock: confirm the holding operation died and replace it with a
-        /// successor record (epoch + 1), then release — leaving the slot free. Required
+        /// successor record (fresh acquisition id), then release — leaving the slot free. Required
         /// for the real operation; refused without it.
         #[arg(long)]
         yes: bool,
@@ -1805,7 +1805,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             LocalTransport::new(&crate::testutil::fixture_env(), slot_deploy_dir.clone()).unwrap();
         let helper = RemoteHelper::new(&remote);
         helper.acquire_lock("op-dead", false).unwrap();
-        // No --yes: refusal naming holder+epoch+--yes, lock byte-identical.
+        // No --yes: refusal naming holder+acquisition+--yes, lock byte-identical.
         let before = remote.read(&layout::operation_lock()).unwrap();
         let err = run_with(
             [
@@ -1821,7 +1821,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         .expect_err("unlock without --yes must refuse when held");
         let msg = err.to_string();
         assert!(msg.contains("op-dead"), "must name holder: {msg}");
-        assert!(msg.contains("epoch 1"), "must name epoch: {msg}");
+        assert!(
+            msg.contains("acquisition"),
+            "must name acquisition id: {msg}"
+        );
         assert!(msg.contains("--yes"), "must name remedy: {msg}");
         let after = remote.read(&layout::operation_lock()).unwrap();
         assert_eq!(before, after, "lock must be byte-identical after refusal");

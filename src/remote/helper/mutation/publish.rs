@@ -188,9 +188,15 @@ impl<'a> RemoteHelper<'a> {
         copy_host_tree_to_remote(host_src, &dest, self.remote)
     }
 
-    /// Publish a previously staged incoming tree into the object store. Reuses an
-    /// existing, verified object.
-    pub fn publish_from_incoming(&self, deployment_id: &str, digest: &str) -> Result<()> {
+    /// Publish a previously staged incoming tree into the object store. Requires
+    /// the slot-mutation capability (`_lock`). Reuses an existing, verified
+    /// object.
+    pub fn publish_from_incoming(
+        &self,
+        _lock: &super::super::LockGuard<'_>,
+        deployment_id: &str,
+        digest: &str,
+    ) -> Result<()> {
         if self.tree_exists(digest)? {
             return Ok(());
         }

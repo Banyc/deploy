@@ -7,7 +7,7 @@
 //! recovery. This module is the production entry point for that recovery:
 //! it inspects the remote lock (typed read, never provisioning layout),
 //! previews the state without `--yes`, and — with `--yes` under the
-//! authoritative local store lock — recovers (epoch+1) and releases, leaving
+//! authoritative local store lock — recovers (fresh acquisition id) and releases, leaving
 //! the slot free.
 
 use crate::config::ProjectConfig;
@@ -84,12 +84,12 @@ pub(crate) fn run_unlock(
             if !yes {
                 // Without --yes: preflight refusal, lock untouched.
                 return Err(Error::preflight(format!(
-                    "slot '{}' mutation lock held by '{}' (epoch {}) — pass --yes to recover (confirm the holding controller died) via `deploy unlock {} {} --yes`",
-                    slot_id, record.owner, record.epoch, target_name, slot_id
+                    "slot '{}' mutation lock held by '{}' (acquisition {}) — pass --yes to recover (confirm the holding controller died) via `deploy unlock {} {} --yes`",
+                    slot_id, record.operation_id, record.acquisition_id, target_name, slot_id
                 )));
             }
             // With --yes: acquire authoritative local store lock, re-read,
-            // recover (epoch+1), release.
+            // recover (fresh acquisition), release.
             let op_id = OperationId::generate();
             let _local_guard =
                 FileLock::acquire(&store.base().join("operation.lock"), op_id.as_str())?;
@@ -111,7 +111,7 @@ pub(crate) fn run_unlock(
                 Some(o) => o,
             };
 
-            // Explicit recovery: epoch+1, then explicit release leaving slot free.
+            // Explicit recovery: fresh acquisition id, then explicit release leaving slot free.
             let successor = helper.recover_lock(&observed, op_id.as_str())?;
             helper.release_lock(&successor)?;
 
@@ -122,8 +122,12 @@ pub(crate) fn run_unlock(
                 target: target_name.to_string(),
                 slot: slot_id.clone(),
                 message: format!(
-                    "slot '{}' mutation lock recovered: '{}' (epoch {}) replaced by '{}' (epoch {}) and released — the slot is free",
-                    slot_id, observed.owner, observed.epoch, successor.owner, successor.epoch
+                    "slot '{}' mutation lock recovered: '{}' (acquisition {}) replaced by '{}' (acquisition {}) and released — the slot is free",
+                    slot_id,
+                    observed.operation_id,
+                    observed.acquisition_id,
+                    successor.operation_id,
+                    successor.acquisition_id
                 ),
             })
         }
@@ -283,7 +287,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
         let msg = err.to_string();
         assert!(msg.contains("op-dead"), "must name holder: {msg}");
-        assert!(msg.contains("epoch 1"), "must name epoch: {msg}");
+        assert!(
+            msg.contains("acquisition"),
+            "must name acquisition id: {msg}"
+        );
         assert!(msg.contains("--yes"), "must name remedy: {msg}");
 
         let after = remote.read(&layout::operation_lock()).unwrap();
@@ -336,11 +343,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 .is_none(),
             "lock file must be gone after recover+release"
         );
-        // Follow-up acquire succeeds.
+        // Follow-up acquire succeeds with a fresh unique acquisition id.
         let rec = helper.acquire_lock("op-after", false).unwrap();
-        assert_eq!(
-            rec.epoch, 1,
-            "fresh lock after free restarts at epoch 1 (slot free semantics)"
+        assert!(
+            !rec.acquisition_id.as_str().is_empty(),
+            "fresh lock after free carries an acquisition id"
         );
         helper.release_lock(&rec).unwrap();
     }
