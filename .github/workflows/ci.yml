@@ -26,7 +26,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-nextest
+        uses: taiki-e/install-nextest@v2
       - name: Build
         run: cargo build --all-targets
       - name: Test
-        run: cargo test
+        run: cargo nextest run
+
+  full-proptests:
+    name: Full proptest budgets
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-nextest
+        uses: taiki-e/install-nextest@v2
+      - name: Full proptest budgets
+        run: DEPLOY_FULL_TESTS=1 cargo nextest run
