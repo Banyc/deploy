@@ -2166,12 +2166,10 @@ fn bounds_grid() -> Vec<(u64, u64, u64)> {
 /// Identity mutant killer: the early "Everything up to date" comparison must
 /// be sensitive to EVERY ArtifactRef component. We tamper the CURRENT
 /// generation's stored assignment on the remote, changing exactly one
-/// component (variant / tree) and keeping the other two identical, then push
-/// HEAD: the push must be a REAL push, never a no-op. A tree+release
+/// component (release / variant / tree) and keeping the other two identical,
+/// then push HEAD: the push must be a REAL push, never a no-op. A tree+release
 /// comparison would falsely no-op on the VARIANT tamper (release and tree are
-/// untouched), silently keeping the service "claimed up to date". (The
-/// release-tamper arm of this matrix is exercised by the randomized
-/// state-machine property's `Tamper(AssignmentRelease)` action.)
+/// untouched), silently keeping the service "claimed up to date".
 #[test]
 fn identity_artifact_component_change_prevents_noop() {
     // (a) VARIANT: release + tree identical, only the variant differs — the
@@ -2179,6 +2177,8 @@ fn identity_artifact_component_change_prevents_noop() {
     let f = Fixture::new();
     let r1 = f.push("t1").expect("first push succeeds");
     assert_eq!(r1.status, Some(DeploymentStatus::Successful));
+    let noop = f.push("t1").expect("unchanged push succeeds");
+    assert_eq!(noop.message, "Everything up to date");
     f.apply(Action::Tamper(TamperKind::AssignmentVariant));
     let r2 = f.push("t1").expect("a variant tamper forces a real push");
     assert_ne!(
@@ -2212,6 +2212,18 @@ fn identity_artifact_component_change_prevents_noop() {
         err.to_string().contains("integrity"),
         "the tampered chain must fail with an integrity error, got: {err}"
     );
+
+    // (c) RELEASE: tamper the stored release id.
+    let f = Fixture::new();
+    f.push("t1").expect("first push");
+    f.apply(Action::Tamper(TamperKind::AssignmentRelease));
+    let r2 = f.push("t1").expect("a release tamper forces a real push");
+    assert_ne!(
+        r2.message, "Everything up to date",
+        "changing the release component must prevent a no-op"
+    );
+    assert!(r2.attempt.is_some());
+    f.check_invariants();
 }
 
 /// Scope: interleaved pushes over the shared slot; after EVERY action the
@@ -2222,7 +2234,15 @@ fn identity_artifact_component_change_prevents_noop() {
 #[test]
 fn state_machine_scope_projection_and_retention_union() {
     let f = Fixture::new();
-    for (version, target) in [(1u32, "t1"), (2, "t2"), (3, "t1")] {
+    for (version, target) in [
+        (1u32, "t1"),
+        (2, "t2"),
+        (3, "t1"),
+        (4, "t2"),
+        (5, "t1"),
+        (6, "t2"),
+        (7, "t1"),
+    ] {
         f.apply(Action::Build(version));
         let r = f.apply(Action::Push(target));
         let Outcome::Push(res) = r else {
@@ -2527,6 +2547,13 @@ fn state_machine_lifecycle_pending_commit_recovery_no_duplicate_history() {
         Some(DeploymentStatus::Successful)
     );
     f.check_invariants();
+
+    // A further retry is fully idempotent: no duplicate history.
+    let r3 = f.push("t1").expect("third push succeeds");
+    assert_eq!(r3.status, None);
+    assert_eq!(f.store.read_snapshots("t1").unwrap().len(), 1);
+    assert_eq!(f.store.read_attempts("t1").unwrap().len(), 1);
+    f.check_invariants();
 }
 
 /// One SHORT mixed sequence: build -> push -> rollback -> rotate -> retry,
@@ -2547,6 +2574,13 @@ fn state_machine_mixed_sequence_invariants() {
         panic!("expected push")
     };
     res.expect("push t2 succeeds");
+
+    // Rollback t1 to its own s0 (tree v1) and t2 to s0 (tree v2).
+    let r = f.apply(Action::Rollback("t1", 0));
+    let Outcome::Push(res) = r else {
+        panic!("expected push")
+    };
+    res.expect("rollback t1 succeeds");
 
     let r = f.apply(Action::Rotate);
     assert!(matches!(r, Outcome::Ok));
@@ -2819,20 +2853,18 @@ fn observed_scope_preflight_failure_leaves_observed_equal() {
 }
 
 /// (d) A LONGER interleaved sequence mixing every action across the two
-/// shared targets: push t1 -> push t2 -> crash before the observed refresh
-/// -> no-op retry recovery -> push t2 -> rotate. After EVERY completed
-/// action and after EVERY recovery the property holds: each member target's
-/// observed slot for `p1` equals the remote assignment (generation +
-/// artifact) — no absent or stale entries.
+/// shared targets: push t1 -> push t2 -> preflight failure -> rollback ->
+/// crash before the observed refresh -> no-op retry recovery -> no-op retry
+/// -> mid-flight failure that still returns `Ok` (PendingCommit) -> recovery
+/// -> rotate. After EVERY completed action and after EVERY recovery the
+/// property holds: each member target's observed slot for `p1` equals the
+/// remote assignment (generation + artifact) — no absent or stale entries.
 /// The faulted pushes use `push_with_id` directly (the fixture never
 /// evaluates invariants inside the crash window), and every recovery asserts
 /// the property explicitly. The faulted attempts use fixed `si-…` ids that
 /// sort AFTER the engine's auto-generated `deploy-…` ids, so once a fixed-id
 /// attempt is finalized on a target no later auto-id push runs on that target
 /// (the lifecycle "newest successful" check orders ids lexicographically).
-/// The preflight-failure, rollback, and pending-commit legs of the longer
-/// sequence are pinned by their DEDICATED tests (`observed_scope_preflight_`,
-/// `observed_scope_rollback_`, the pending-commit lifecycle tests).
 #[test]
 fn observed_scope_interleaved_push_fail_retry_rollback_sequence() {
     let f = Fixture::new();
@@ -2873,11 +2905,32 @@ fn observed_scope_interleaved_push_fail_retry_rollback_sequence() {
     );
     f.assert_observed_scope_property();
 
-    // (a) Crash mid-flight on t1: HEAD advances to v3 (a REAL push — the
-    // artifact is bumped so the t1 push is never an up-to-date no-op), the
-    // remote advances p1/p2 to v3 but the observed refresh never runs — t1's
-    // projections go stale (they still show the pre-crash v2 assignment).
+    // (c) Preflight failure on t2: HEAD advances to v3 so the t2 push is a
+    // real one; it fails at the intent persist BEFORE any remote mutation, so
+    // t2's observed projection stays equal to the unchanged v2 assignment.
     f.apply(Action::Build(3));
+    let id_p = test_deployment_id("si-obs-seq-preflight");
+    let err = {
+        f.arm_store_fault(FailureStep::IntentPersist, &id_p);
+        f.push_with_id("t2", &id_p)
+            .expect_err("the preflight push aborts before mutation")
+    };
+    assert!(err.to_string().contains("append_attempt"), "{err}");
+    f.assert_observed_scope_property();
+
+    // (b) Rollback t1 to its own `s0` (tree v1): a real push whose refresh
+    // lands the restored assignment in t1's OWN projection.
+    let r = f.apply(Action::Rollback("t1", 0));
+    let Outcome::Push(res) = r else {
+        panic!("expected a push outcome");
+    };
+    let report = res.expect("rollback t1 succeeds");
+    assert_eq!(report.status, Some(DeploymentStatus::Successful));
+    f.assert_observed_scope_property();
+
+    // (a) Crash mid-flight on t1: the remote advances p1/p2 to v3 but the
+    // observed refresh never runs — t1's projections go stale (they still
+    // show the rolled-back v1 assignment).
     let stale = f
         .store
         .read_observed("t1", &f.config)
@@ -2929,6 +2982,40 @@ fn observed_scope_interleaved_push_fail_retry_rollback_sequence() {
     assert_eq!(
         res.expect("push t2 succeeds").status,
         Some(DeploymentStatus::Successful)
+    );
+    f.assert_observed_scope_property();
+
+    // A no-op retry on t2 (p3 already at v3): the projection refreshes again.
+    let r = f.apply(Action::Retry("t2"));
+    let Outcome::Push(res) = r else {
+        panic!("expected a push outcome");
+    };
+    assert_eq!(
+        res.expect("the no-op retry succeeds").message,
+        "Everything up to date"
+    );
+    f.assert_observed_scope_property();
+
+    // A mid-flight failure that STILL returns Ok: the commit marker
+    // write fails on a fresh t2 push (v4) -> PendingCommit. The observed
+    // refresh has already run on that push, so the next retry finalizes and
+    // keeps the projections current.
+    f.apply(Action::InjectFailure(FailureStep::CommitMarkerWrite));
+    f.apply(Action::Build(4));
+    let r = f.apply(Action::Push("t2"));
+    let Outcome::Push(res) = r else {
+        panic!("expected a push outcome");
+    };
+    let report = res.expect("the pending-commit push succeeds");
+    assert_eq!(report.status, Some(DeploymentStatus::PendingCommit));
+    f.assert_observed_scope_property();
+    let r = f.apply(Action::Retry("t2"));
+    let Outcome::Push(res) = r else {
+        panic!("expected a push outcome");
+    };
+    assert_eq!(
+        res.expect("the recovery retry succeeds").message,
+        "Everything up to date"
     );
     f.assert_observed_scope_property();
 
@@ -3196,18 +3283,22 @@ fn run_failure_position_case(policy: FailurePolicy, position: usize) {
 }
 
 /// The `rollback_changed` postcondition (deterministic): a failure at batch
-/// 1 compensates batch 0 back to its pre-push state (`FailedRolledBack`).
+/// 1 compensates batch 0 back to its pre-push state (`FailedRolledBack`),
+/// and a failure at batch 0 (nothing advanced) still ends `FailedRolledBack`
+/// with the later batch skipped.
 #[test]
 fn failure_policy_rollback_changed_rolls_back_earlier_batches() {
     run_failure_position_case(FailurePolicy::RollbackChanged, 1);
+    run_failure_position_case(FailurePolicy::RollbackChanged, 0);
 }
 
 /// The `leave_changed` postcondition (deterministic): earlier batches stay
 /// at the NEW state after a later batch fails (`Degraded`, no compensation
-/// pass).
+/// pass); a failure at batch 0 (nothing earlier) also ends `Degraded`.
 #[test]
 fn failure_policy_leave_changed_retains_earlier_batches() {
     run_failure_position_case(FailurePolicy::LeaveChanged, 1);
+    run_failure_position_case(FailurePolicy::LeaveChanged, 0);
 }
 
 /// Both supported policies — the `policy` dimension of the failure-position
@@ -3227,12 +3318,13 @@ proptest! {
     // fault at that position must leave exactly the policy's postcondition —
     // `RollbackChanged` rolls earlier batches back to their pre-push state
     // (ledger shows the restoration, attempt `FailedRolledBack`),
-    // `LeaveChanged` keeps them at the new state (`Degraded`). Bounded 1
-    // case, fixed seed 0x5EED_5EED (house style), no persistence — the
-    // identical vector on every run; the case drives its OWN fixture
+    // `LeaveChanged` keeps them at the new state (`Degraded`). Bounded
+    // `proptest_cases(16)` (full 16 with `DEPLOY_FULL_TESTS=1`, fast
+    // default), fixed seed 0x5EED_5EED (house style), no persistence — the
+    // identical vectors on every run; each case drives its OWN fixture
     // (per-fixture fault registry, structurally isolated).
     #![proptest_config(ProptestConfig {
-        cases: 1,
+        cases: crate::testutil::proptest_cases(16),
         rng_seed: RngSeed::Fixed(0x5EED_5EED),
         failure_persistence: None,
         ..ProptestConfig::default()
@@ -3358,12 +3450,13 @@ proptest! {
     // every batch position of the multi-server fixture push, a fault at that
     // position must leave `remaining_changes()` EQUAL EXACTLY the slots
     // whose FINAL OBSERVED STATE differs from their pre_push state
-    // (compared against the observed records). Bounded 1 case, fixed seed
-    // 0x5EED_5EED (house style), no persistence — the identical vector on
-    // every run; the case drives its OWN fixture (per-fixture fault
+    // (compared against the observed records). Bounded `proptest_cases(16)`
+    // (full 16 with `DEPLOY_FULL_TESTS=1`, fast default), fixed seed
+    // 0x5EED_5EED (house style), no persistence — the identical vectors on
+    // every run; each case drives its OWN fixture (per-fixture fault
     // registry, structurally isolated).
     #![proptest_config(ProptestConfig {
-        cases: 1,
+        cases: crate::testutil::proptest_cases(16),
         rng_seed: RngSeed::Fixed(0x5EED_5EED),
         failure_persistence: None,
         ..ProptestConfig::default()
@@ -3551,7 +3644,7 @@ fn identity_canonical_serialization_round_trips() {
 fn scope_retained_is_the_owning_variants_single_policy() {
     let f = Fixture::new();
     // Build history interleaved across both targets.
-    for (v, t) in [(1u32, "t1"), (2, "t2")] {
+    for (v, t) in [(1u32, "t1"), (2, "t2"), (3, "t1"), (4, "t2"), (5, "t1")] {
         f.apply(Action::Build(v));
         f.apply(Action::Push(t));
     }
@@ -3592,7 +3685,7 @@ fn scope_retained_is_the_owning_variants_single_policy() {
 #[test]
 fn scope_strengthening_policy_never_reduces_retained() {
     let f = Fixture::new();
-    for (v, t) in [(1u32, "t1"), (2, "t2")] {
+    for (v, t) in [(1u32, "t1"), (2, "t2"), (3, "t1"), (4, "t2")] {
         f.apply(Action::Build(v));
         f.apply(Action::Push(t));
     }
@@ -3679,7 +3772,6 @@ fn lifecycle_store_fault_matrix_recovers_without_duplicate_history() {
         FailureStep::TransitionPending,
     ]
     .into_iter()
-    .take(1)
     .enumerate()
     {
         let f = Fixture::new();
@@ -3730,6 +3822,10 @@ fn lifecycle_store_fault_matrix_recovers_without_duplicate_history() {
             1,
             "{step:?}: the replay must not record a new attempt"
         );
+        // Idempotent replay: no duplicate history.
+        let r3 = f.push("t1").unwrap();
+        assert_eq!(r3.status, None);
+        assert_eq!(f.store.read_snapshots("t1").unwrap().len(), 1);
         f.check_invariants();
     }
 }
@@ -3762,7 +3858,6 @@ fn lifecycle_observed_refresh_faults_never_fail_after_commit() {
         FailureStep::ObservedOtherWrite,
     ]
     .into_iter()
-    .take(1)
     .enumerate()
     {
         let f = Fixture::new();
@@ -3868,12 +3963,10 @@ fn lifecycle_observed_refresh_faults_never_fail_after_commit() {
 /// Lifecycle: the retention-debt maintenance I/O is POST-COMMIT maintenance —
 /// every debt read/write/remove failure must never turn a push into an `Err`
 /// once the deployment is durably committed. The matrix generates
-/// {real push, no-op} × {debt read, debt write} × {empty debt} — the
-/// existing-debt and debt-remove arms of the matrix are covered by the
-/// `step17_contention_debt_property` generated leg (arbitrary preexisting
-/// reasons) and the step-17 exhaustive matrix. The "debt remove" arm is the
-/// same `write_retention_debt` call as the write (the cleared marker's
-/// removal is the empty-map write), so it shares the write arm.
+/// {real push, no-op} × {debt read, debt write, debt remove} × {empty,
+/// existing debt}. The "debt remove" arm is the same `write_retention_debt`
+/// call as the write (the cleared marker's removal is the empty-map write), so
+/// it shares the write arm — the matrix keeps the third column explicit.
 ///
 /// ORACLE per combination:
 /// (a) the push returns `Ok` with the committed status — `Successful` for the
@@ -3907,10 +4000,9 @@ fn lifecycle_debt_fault_matrix_never_fails_after_commit() {
         FailureStep::DebtRemove,
     ]
     .into_iter()
-    .take(1)
     .enumerate()
     {
-        for (j, have_debt) in [false].into_iter().enumerate() {
+        for (j, have_debt) in [false, true].into_iter().enumerate() {
             let ctx = format!("{step:?} x have_debt={have_debt}");
             // ---- REAL push: the first push to `debtfx` commits, then the
             // maintenance block retries any pre-seeded debt and runs step 17
@@ -4417,7 +4509,10 @@ fn integrity_stored_release_schema_version_tamper_fails_closed() {
     };
     let versions = [
         0u32,
+        crate::verify::release::RELEASE_RECORD_SCHEMA_VERSION.wrapping_sub(1),
         crate::verify::release::RELEASE_RECORD_SCHEMA_VERSION.wrapping_add(1),
+        3,
+        u32::MAX,
     ];
     for v in versions {
         write_version(v);
@@ -6388,12 +6483,12 @@ proptest! {
     // `_1` runs the same generator + assertions under its fixed seed. A
     // failing vector still writes to the regression file; the case count
     // stays bounded (each case drives a full fixture; the state-machine
-    // action vectors are capped at two actions — every action type and
+    // action vectors are capped at six actions — every action type and
     // every prefix stays asserted, and the persisted regression vectors
     // replay regardless of length). The FIXED-SEED regression leg below
     // stays ONE test (the deterministic floor).
     #![proptest_config(ProptestConfig {
-        cases: 1,
+        cases: crate::testutil::proptest_cases(2),
         rng_seed: RngSeed::Fixed(0x5EED_0001),
         failure_persistence: Some(Box::new(FileFailurePersistence::default())),
         ..ProptestConfig::default()
@@ -6401,7 +6496,7 @@ proptest! {
 
     #[test]
     fn semantic_state_machine_0(
-        steps in prop::collection::vec((action_strategy(), failure_class_strategy()), 1..2)
+        steps in prop::collection::vec((action_strategy(), failure_class_strategy()), 1..6)
     ) {
         run_semantic_state_case(steps);
     }
@@ -6416,7 +6511,7 @@ proptest! {
     // regression file's vectors are replayed by `_0` (per-source-file
     // persistence would duplicate the replay for no coverage gain).
     #![proptest_config(ProptestConfig {
-        cases: 1,
+        cases: crate::testutil::proptest_cases(2),
         rng_seed: RngSeed::Fixed(0x5EED_0002),
         failure_persistence: None,
         ..ProptestConfig::default()
@@ -6424,7 +6519,7 @@ proptest! {
 
     #[test]
     fn semantic_state_machine_1(
-        steps in prop::collection::vec((action_strategy(), failure_class_strategy()), 1..2)
+        steps in prop::collection::vec((action_strategy(), failure_class_strategy()), 1..6)
     ) {
         run_semantic_state_case(steps);
     }
@@ -6436,11 +6531,11 @@ proptest! {
     // the IDENTICAL vectors on every invocation, so the suite stays
     // reproducible even when no failure has ever been persisted by the main
     // test. The case count is bounded so the suite stays fast (and the
-    // action vectors are capped at two actions); the persisted regression
+    // action vectors are capped at six actions); the persisted regression
     // vectors in `proptest-regressions/semantic_invariants.txt` replay
     // regardless of count and length.
     #![proptest_config(ProptestConfig {
-        cases: 1,
+        cases: crate::testutil::proptest_cases(4),
         rng_seed: RngSeed::Fixed(0x5EED_5EED),
         failure_persistence: None,
         ..ProptestConfig::default()
@@ -6448,7 +6543,7 @@ proptest! {
 
     #[test]
     fn semantic_state_machine_fixed_seed_regression(
-        steps in prop::collection::vec((action_strategy(), failure_class_strategy()), 1..2)
+        steps in prop::collection::vec((action_strategy(), failure_class_strategy()), 1..6)
     ) {
         run_semantic_state_case(steps);
     }
@@ -6642,14 +6737,15 @@ proptest! {
     // when preexisting debt exists, and no marker appears when it does not
     // exist and persistence failed.
     //
-    // Bounded cases (1) keep the suite fast (each case is a fresh fixture
+    // Bounded `proptest_cases(4)` (full 4 with `DEPLOY_FULL_TESTS=1`, fast
+    // default) keep the suite fast (each case is a fresh fixture
     // with a real push); a fixed seed keeps CI deterministic (no persistence
     // file) — the project's fixed-seed leg, mirroring
     // `semantic_state_machine_fixed_seed_regression` (the
     // randomized-with-persistence leg lives in the main
     // `semantic_state_machine`).
     #![proptest_config(ProptestConfig {
-        cases: 1,
+        cases: crate::testutil::proptest_cases(4),
         rng_seed: RngSeed::Fixed(0x5EED_17DE),
         failure_persistence: None,
         ..ProptestConfig::default()
@@ -6955,10 +7051,11 @@ fn assert_membership_never_changes_retention(
 
 proptest! {
     // THE SLOT-VIEW PROPERTY: overlapping targets + interleaved pushes.
-    // Bounded 1 case, fixed seed 0x5EED_5EED (house style), no failure
+    // Bounded `proptest_cases(4)` (full 4 with `DEPLOY_FULL_TESTS=1`, fast
+    // default), fixed seed 0x5EED_5EED (house style), no failure
     // persistence — deterministic for CI.
     #![proptest_config(ProptestConfig {
-        cases: 1,
+        cases: crate::testutil::proptest_cases(4),
         rng_seed: RngSeed::Fixed(0x5EED_5EED),
         failure_persistence: None,
         ..ProptestConfig::default()
@@ -6970,7 +7067,7 @@ proptest! {
             prop::collection::vec(prop::bool::ANY, 3),
             3,
         ),
-        pushes in prop::collection::vec(prop::sample::select([0usize, 1, 2].as_slice()), 1..2),
+        pushes in prop::collection::vec(prop::sample::select([0usize, 1, 2].as_slice()), 1..4),
     ) {
         run_slot_view_property(memberships, pushes);
     }

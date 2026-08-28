@@ -1277,8 +1277,9 @@ interval_seconds = 0
 
     proptest! {
         #![proptest_config(ProptestConfig {
-            // Bounded 1 case, fixed seed per house style.
-            cases: 1,
+            // Bounded `proptest_cases(4)` (full 4 with `DEPLOY_FULL_TESTS=1`,
+            // fast default), fixed seed per house style.
+            cases: crate::testutil::proptest_cases(4),
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
             failure_persistence: None,
             ..ProptestConfig::default()
@@ -1674,8 +1675,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     /// 1.. and all of t2's entries (t1's entry 0 is the reserved (3, 3)
     /// pre-suffix-only pair).
     fn parity_case_strategy() -> impl Strategy<Value = ParityCase> {
-        (2usize..=3usize)
-            .prop_flat_map(|t1_len| (Just(t1_len), 1usize..t1_len, 1usize..=2usize))
+        (2usize..=4usize)
+            .prop_flat_map(|t1_len| (Just(t1_len), 1usize..t1_len, 1usize..=3usize))
             .prop_flat_map(|(t1_len, at, t2_len)| {
                 (
                     Just(t1_len),
@@ -1689,8 +1690,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
     proptest! {
         #![proptest_config(ProptestConfig {
-            // Bounded 1 case, fixed seed per house style.
-            cases: 1,
+            // Bounded `proptest_cases(4)` (full 4 with `DEPLOY_FULL_TESTS=1`,
+            // fast default), fixed seed per house style.
+            cases: crate::testutil::proptest_cases(4),
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
             failure_persistence: None,
             ..ProptestConfig::default()

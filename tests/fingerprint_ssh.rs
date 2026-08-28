@@ -144,6 +144,10 @@ while (@ARGV) {
     elsif ($a =~ /^-/) { }
     else { @rest = ($a, @ARGV); last; }
 }
+if (($rest[0] // "") ne "" && !-e $rest[0] && !-l $rest[0]) {
+    print STDERR "stat: cannot stat '$rest[0]': No such file or directory\n";
+    exit 1;
+}
 if ($fmt eq "%f") {
     my @s = lstat($rest[0]);
     printf "%x\n", $s[2] & 0xffff;

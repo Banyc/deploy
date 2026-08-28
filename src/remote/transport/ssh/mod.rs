@@ -610,7 +610,7 @@ impl Remote for SshTransport {
 
     fn metadata(&self, rel: &Path) -> Result<RemoteMeta> {
         self.metadata_opt(rel)?.ok_or_else(|| {
-            Error::transport(format!(
+            Error::NotFound(format!(
                 "ssh stat {}: no such entry",
                 self.root.join(rel).to_string_lossy()
             ))
@@ -1313,6 +1313,10 @@ while [ $# -gt 0 ]; do
     *) break ;;
   esac
 done
+if [ ! -e "$1" ] && [ ! -L "$1" ]; then
+  echo "stat: cannot stat '$1': No such file or directory" >&2
+  exit 1
+fi
 case "$fmt" in
   "%f")
     perl -e 'my @s = lstat($ARGV[0]); printf "%x\n", $s[2] & 0xffff;' "$1"

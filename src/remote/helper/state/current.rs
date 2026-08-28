@@ -1201,11 +1201,12 @@ mod tests_current {
         //   malformed-present layout fails with an integrity error and the
         //   `current` entry is left byte-identical.
         //
-        // Bounded 16 cases, fixed seed 0x5EED_5EED (house style), no
+        // Bounded `proptest_cases(64)` (full 64 with `DEPLOY_FULL_TESTS=1`,
+        // fast default), fixed seed 0x5EED_5EED (house style), no
         // persistence. `catch_unwind` turns a panic into a test failure at
         // the `.expect`.
         #![proptest_config(ProptestConfig {
-            cases: 16,
+            cases: crate::testutil::proptest_cases(64),
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
             failure_persistence: None,
             ..ProptestConfig::default()
@@ -1581,7 +1582,10 @@ mod tests_current {
             }
             self.inner.exists(rel)
         }
-        fn metadata_opt(&self, rel: &std::path::Path) -> crate::error::Result<Option<crate::remote::transport::RemoteMeta>> {
+        fn metadata_opt(
+            &self,
+            rel: &std::path::Path,
+        ) -> crate::error::Result<Option<crate::remote::transport::RemoteMeta>> {
             if rel == crate::remote::layout::current() {
                 return match self.meta {
                     MetaOutcome::Present => self.inner.metadata_opt(rel),
@@ -1593,11 +1597,16 @@ mod tests_current {
             }
             self.inner.metadata_opt(rel)
         }
-        fn metadata(&self, rel: &std::path::Path) -> crate::error::Result<crate::remote::transport::RemoteMeta> {
+        fn metadata(
+            &self,
+            rel: &std::path::Path,
+        ) -> crate::error::Result<crate::remote::transport::RemoteMeta> {
             if rel == crate::remote::layout::current() {
                 return match self.meta {
                     MetaOutcome::Present => self.inner.metadata(rel),
-                    MetaOutcome::Absent => Err(crate::error::Error::transport("current stat: not found")),
+                    MetaOutcome::Absent => {
+                        Err(crate::error::Error::transport("current stat: not found"))
+                    }
                     MetaOutcome::Err => Err(crate::error::Error::transport(
                         "current metadata read failed: injected transport fault",
                     )),
@@ -1626,13 +1635,20 @@ mod tests_current {
         fn set_mode(&self, rel: &std::path::Path, mode: u32) -> crate::error::Result<()> {
             self.inner.set_mode(rel, mode)
         }
-        fn list(&self, rel: &std::path::Path) -> crate::error::Result<Vec<crate::remote::transport::RemoteEntry>> {
+        fn list(
+            &self,
+            rel: &std::path::Path,
+        ) -> crate::error::Result<Vec<crate::remote::transport::RemoteEntry>> {
             self.inner.list(rel)
         }
         fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> crate::error::Result<()> {
             self.inner.rename(from, to)
         }
-        fn symlink(&self, target: &std::path::Path, link: &std::path::Path) -> crate::error::Result<()> {
+        fn symlink(
+            &self,
+            target: &std::path::Path,
+            link: &std::path::Path,
+        ) -> crate::error::Result<()> {
             self.inner.symlink(target, link)
         }
         fn remove_file(&self, rel: &std::path::Path) -> crate::error::Result<()> {
@@ -1641,7 +1657,11 @@ mod tests_current {
         fn remove_dir_all(&self, rel: &std::path::Path) -> crate::error::Result<()> {
             self.inner.remove_dir_all(rel)
         }
-        fn exec(&self, argv: &[String], timeout: std::time::Duration) -> crate::error::Result<crate::remote::transport::ExecOutcome> {
+        fn exec(
+            &self,
+            argv: &[String],
+            timeout: std::time::Duration,
+        ) -> crate::error::Result<crate::remote::transport::ExecOutcome> {
             self.inner.exec(argv, timeout)
         }
         fn filesystem_bytes(&self) -> crate::error::Result<crate::remote::transport::FsBytes> {
@@ -1755,5 +1775,4 @@ mod tests_current {
             }
         }
     }
-
 }

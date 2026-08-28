@@ -1399,7 +1399,7 @@ mod tests_materialize {
         // (commit it so CI keeps reproducing the regression until fixed). The
         // case count is bounded so the suite stays fast.
         #![proptest_config(ProptestConfig {
-            cases: 4,
+            cases: crate::testutil::proptest_cases(16),
             failure_persistence: Some(Box::new(FileFailurePersistence::default())),
             ..ProptestConfig::default()
         })]
@@ -1417,7 +1417,7 @@ mod tests_materialize {
         // reproducible even when no failure has ever been persisted by the
         // main test. The case count is bounded so the suite stays fast.
         #![proptest_config(ProptestConfig {
-            cases: 4,
+            cases: crate::testutil::proptest_cases(16),
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
             failure_persistence: None,
             ..ProptestConfig::default()
@@ -1573,7 +1573,7 @@ mod tests_materialize {
         // Main property: ORDINARY RANDOMIZED SEEDS with FAILURE PERSISTENCE
         // (house style). Bounded count keeps the suite fast.
         #![proptest_config(ProptestConfig {
-            cases: 4,
+            cases: crate::testutil::proptest_cases(16),
             failure_persistence: Some(Box::new(FileFailurePersistence::default())),
             ..ProptestConfig::default()
         })]
@@ -1589,7 +1589,7 @@ mod tests_materialize {
         // invalid vectors on every run, so CI always exercises the rejections
         // even with no persisted failure.
         #![proptest_config(ProptestConfig {
-            cases: 4,
+            cases: crate::testutil::proptest_cases(16),
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
             failure_persistence: None,
             ..ProptestConfig::default()
@@ -1733,7 +1733,7 @@ mod tests_materialize {
         // `proptest-regressions/mapper.txt` and replayed until fixed. Bounded
         // count keeps it fast.
         #![proptest_config(ProptestConfig {
-            cases: 4,
+            cases: crate::testutil::proptest_cases(16),
             failure_persistence: Some(Box::new(FileFailurePersistence::default())),
             ..ProptestConfig::default()
         })]
@@ -1749,7 +1749,7 @@ mod tests_materialize {
         // every run, so CI always exercises the fail-closed symlink paths even
         // with no persisted failure.
         #![proptest_config(ProptestConfig {
-            cases: 4,
+            cases: crate::testutil::proptest_cases(16),
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
             failure_persistence: None,
             ..ProptestConfig::default()
