@@ -72,7 +72,7 @@ impl<'a> RemoteHelper<'a> {
         // deterministically from the (now-verified) assignment, so recreating
         // it after a crash is safe.
         let root_link_path = gen_dir.join("root");
-        if !self.remote.exists(&root_link_path) {
+        if self.remote.metadata_opt(&root_link_path)?.is_none() {
             let root_link = layout::generation_root_link(assignment.artifact.tree.as_str());
             self.remote.symlink(&root_link, &root_link_path)?;
         }

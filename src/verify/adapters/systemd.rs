@@ -260,7 +260,7 @@ pub fn validate_artifact_paths(
 ) -> Result<()> {
     for u in &cfg.units {
         let p = generation_root_rel.join(&u.artifact_path);
-        if !remote.exists(&p) {
+        if remote.metadata_opt(&p)?.is_none() {
             return Err(Error::remote(format!(
                 "declared artifact path '{}' missing in desired tree",
                 u.artifact_path

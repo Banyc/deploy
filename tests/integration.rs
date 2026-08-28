@@ -2589,11 +2589,14 @@ fn capacity_retention_compute_retained_failure_releases_lock() -> Result<()> {
             "the lock file must be removed when the guard drops ({server})"
         );
         let helper = RemoteHelper::new(&remote);
-        assert!(
-            helper.acquire_lock("op-after", false).is_ok(),
-            "another operation must be able to acquire the lock after the failure ({server})"
+        // Another operation must be able to acquire the lock after the
+        // failure; the probe lock is then released with the record the
+        // acquire returned (the release is a compare-and-delete against that
+        // EXACT record).
+        let record = helper.acquire_lock("op-after", false).expect(
+            "another operation must be able to acquire the lock after the failure ({server})",
         );
-        helper.release_lock("op-after")?;
+        helper.release_lock(&record)?;
     }
     Ok(())
 }
@@ -2709,12 +2712,15 @@ fn step17_retention_failure_defers_maintenance_until_noop_retry() -> Result<()> 
             "the lock file must be removed when the guard drops ({server})"
         );
         let helper = RemoteHelper::new(&remote);
-        assert!(
-            helper.acquire_lock("op-after", false).is_ok(),
-            "another operation must be able to acquire the lock after the failure ({server})"
+        // Another operation must be able to acquire the lock after the
+        // failure; the probe lock is then released with the record the
+        // acquire returned (the release is a compare-and-delete against that
+        // EXACT record).
+        let record = helper.acquire_lock("op-after", false).expect(
+            "another operation must be able to acquire the lock after the failure ({server})",
         );
         // Release the probe lock so the end-to-end re-push below starts clean.
-        helper.release_lock("op-after")?;
+        helper.release_lock(&record)?;
     }
 
     // Push 2: unchanged content, so this is an up-to-date NO-OP — but the

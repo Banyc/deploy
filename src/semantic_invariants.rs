@@ -82,7 +82,9 @@ use crate::ledger;
 use crate::ledger::DeploymentStatus;
 use crate::ledger::LedgerEntry;
 use crate::ledger::SlotOutcomeKind;
-use crate::remote::helper::{GenerationAssignment, RemoteHelper};
+use crate::remote::helper::{
+    FakeClock, GenerationAssignment, LEASE_DURATION_MS, LockRecord, RemoteHelper,
+};
 use crate::remote::layout;
 use crate::remote::transport::{
     CreateNewVerdict, ExecOutcome, FsBytes, LocalTransport, Remote, RemoteEntry, RemoteMeta,
@@ -1212,31 +1214,32 @@ impl Fixture {
     }
 
     /// Acquire the slot's mutation lock via a SECOND `RemoteHelper` (its own
-    /// operation id) and return that id plus the server it was acquired on;
-    /// [`Fixture::release_contention_lock`] must be called with the same
-    /// server when the contended action is done. The lock is a single
-    /// advisory file per server, so while it is held the push's own preflight
-    /// lock check fails. The lock is held on the PUSHED target's FIRST
-    /// slot's server (a slot has exactly one owning target, so a `t1` push
-    /// contends on `s1` and a `t2` push on `s3`) — the engine's mutation-lock
-    /// preflight checks each selected slot's server in order, so the first
-    /// slot's server is the one that must be held for the contention to fire.
-    fn hold_contention_lock(&self, t: &str) -> (String, String) {
+    /// operation id) and return its LOCK RECORD plus the server it was
+    /// acquired on; [`Fixture::release_contention_lock`] must be called with
+    /// the same record and server when the contended action is done. The
+    /// lock is a single advisory file per server, so while it is held the
+    /// push's own preflight lock check fails. The lock is held on the PUSHED
+    /// target's FIRST slot's server (a slot has exactly one owning target, so
+    /// a `t1` push contends on `s1` and a `t2` push on `s3`) — the engine's
+    /// mutation-lock preflight checks each selected slot's server in order,
+    /// so the first slot's server is the one that must be held for the
+    /// contention to fire.
+    fn hold_contention_lock(&self, t: &str) -> (LockRecord, String) {
         let first_slot = Model::target_slots(t)[0].clone();
         let server = self.server_for_slot(first_slot.as_str()).to_string();
         let remote = self.remote_for(&server);
         let helper = RemoteHelper::new(remote.as_ref());
         let op = format!("si-contend-{}", OperationId::generate().as_str());
-        helper
+        let record = helper
             .acquire_lock(&op, false)
             .expect("the contention lock must be free at the start of the step");
-        (op, server)
+        (record, server)
     }
 
-    fn release_contention_lock(&self, op: &str, server: &str) {
+    fn release_contention_lock(&self, record: &LockRecord, server: &str) {
         let remote = self.remote_for(server);
         let helper = RemoteHelper::new(remote.as_ref());
-        let _ = helper.release_lock(op);
+        let _ = helper.release_lock(record);
     }
 
     /// Simulate STEP-17 lock contention (the post-commit retention the action
@@ -1370,8 +1373,8 @@ impl Fixture {
             ),
             None => self.push_with_id(t, &id),
         };
-        if let Some((op, server)) = contend {
-            self.release_contention_lock(&op, &server);
+        if let Some((record, server)) = contend {
+            self.release_contention_lock(&record, &server);
         }
         self.disarm_prop_faults();
         Outcome::Push(Box::new(res))
@@ -7090,5 +7093,409 @@ proptest! {
         pushes in prop::collection::vec(prop::sample::select([0usize, 1, 2].as_slice()), 1..4),
     ) {
         run_slot_view_property(memberships, pushes);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Two-controller mutation-lock lease/fencing proptest
+// ---------------------------------------------------------------------------
+//
+// The per-slot mutation lock is a LEASE-carrying record (owner + fencing
+// token + expiry) removed only by atomic compare-and-delete. This property
+// drives a TWO-CONTROLLER state machine over ONE slot with one-shot faults
+// injected at the four seams — acquire (try_write_new), read (winner read),
+// remove (compare-and-delete), drop (the RAII drop release) — and a
+// deterministic fake clock shared by both controllers so lease expiry is
+// testable. After EVERY step it asserts:
+//
+// * MUTUAL EXCLUSION: at no point do two controllers hold the same slot's
+//   lock with a VALID lease — a holder's lease may EXPIRE (the expiry is
+//   what makes the slot recoverable), but two valid holdings never overlap;
+//   and a present valid-lease record is held by EXACTLY one controller.
+// * STALE RELEASES CANNOT DELETE SUCCESSOR LOCKS: a release that FAILS
+//   (compare-and-delete mismatch or transport fault) never leaves the file
+//   absent — the current lock (a successor's record, or our own record that
+//   the failed release could not remove) survives the failed release.
+// * CRASHED OWNERS EVENTUALLY BECOME RECOVERABLE: whenever the lock holds an
+//   EXPIRED record, a fresh contender's acquire always succeeds (the break
+//   removes the expired record via compare-and-delete) — a crash or a
+//   failed drop-time release leaves a lease that expires and is broken, so
+//   the slot never blocks forever (also asserted at end of run with all
+//   leases expired).
+
+/// One step of the two-controller lock state machine: which controller acts
+/// (0 or 1) and what it does. `Acquire` takes the lock; `Release` releases
+/// explicitly (surfacing the outcome); `Drop` releases via the RAII drop
+/// path (best-effort — the outcome is swallowed, exactly like
+/// [`LockGuard`](crate::remote::helper::LockGuard)'s Drop); `Crash`
+/// abandons the lock WITHOUT any release (the owner dies; the lease is the
+/// only backstop — the controller may still act later, e.g. its DELAYED
+/// release arriving after a successor took the lock); `Advance` moves the
+/// shared fake clock (a lease expires once `now` passes it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LockAction {
+    Acquire(u8),
+    Release(u8),
+    Drop(u8),
+    Crash(u8),
+    Advance(i64),
+}
+
+/// The four fault seams of the state machine: a one-shot fault armed at the
+/// named stage of the NEXT action. `Acquire` fails the atomic create
+/// (try_write_new), `Read` fails the winner read, `Remove` fails the
+/// compare-and-delete, and `Drop` fails the drop-time release (the release
+/// fails and the LEASE must be the backstop — the slot stays recoverable).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LockFault {
+    None,
+    Acquire,
+    Read,
+    Remove,
+    Drop,
+}
+
+/// The one-shot fault registry shared by the fault-injecting transport.
+#[derive(Default)]
+struct LockFaultState {
+    fail_acquire: bool,
+    fail_read: bool,
+    fail_remove: bool,
+}
+
+/// A transport that injects ONE-SHOT faults at the mutation lock's
+/// acquire/read/remove seams, then passes through to `LocalTransport` (which
+/// realizes the atomic compare-and-delete). Deterministic, no sleeps; a
+/// fault is consumed by the FIRST matching operation, so it can never leak
+/// into a later step.
+struct LockFaultRemote {
+    inner: LocalTransport,
+    faults: Arc<Mutex<LockFaultState>>,
+}
+
+impl LockFaultRemote {
+    fn hits_lock(rel: &Path) -> bool {
+        rel == layout::operation_lock()
+    }
+}
+
+impl Remote for LockFaultRemote {
+    fn root(&self) -> &Path {
+        self.inner.root()
+    }
+    fn read(&self, rel: &Path) -> crate::error::Result<Vec<u8>> {
+        if Self::hits_lock(rel) && self.faults.lock().unwrap().fail_read {
+            self.faults.lock().unwrap().fail_read = false;
+            return Err(crate::error::Error::transport(
+                "injected lock read failure".to_string(),
+            ));
+        }
+        self.inner.read(rel)
+    }
+    fn write(&self, rel: &Path, data: &[u8], mode: u32) -> crate::error::Result<()> {
+        self.inner.write(rel, data, mode)
+    }
+    fn try_write_new(&self, rel: &Path, data: &[u8]) -> crate::error::Result<CreateNewVerdict> {
+        if Self::hits_lock(rel) && self.faults.lock().unwrap().fail_acquire {
+            self.faults.lock().unwrap().fail_acquire = false;
+            return Err(crate::error::Error::transport(
+                "injected lock acquire failure".to_string(),
+            ));
+        }
+        self.inner.try_write_new(rel, data)
+    }
+    fn create_dir(&self, rel: &Path) -> crate::error::Result<()> {
+        self.inner.create_dir(rel)
+    }
+    fn create_dir_all(&self, rel: &Path) -> crate::error::Result<()> {
+        self.inner.create_dir_all(rel)
+    }
+    fn set_mode(&self, rel: &Path, mode: u32) -> crate::error::Result<()> {
+        self.inner.set_mode(rel, mode)
+    }
+    fn list(&self, rel: &Path) -> crate::error::Result<Vec<RemoteEntry>> {
+        self.inner.list(rel)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> crate::error::Result<()> {
+        self.inner.rename(from, to)
+    }
+    fn symlink(&self, target: &Path, link: &Path) -> crate::error::Result<()> {
+        self.inner.symlink(target, link)
+    }
+    fn read_link(&self, rel: &Path) -> crate::error::Result<PathBuf> {
+        self.inner.read_link(rel)
+    }
+    fn remove_file(&self, rel: &Path) -> crate::error::Result<()> {
+        self.inner.remove_file(rel)
+    }
+    fn remove_file_if(
+        &self,
+        rel: &Path,
+        expected: &[u8],
+    ) -> crate::error::Result<crate::remote::transport::RemoveIfVerdict> {
+        if Self::hits_lock(rel) && self.faults.lock().unwrap().fail_remove {
+            self.faults.lock().unwrap().fail_remove = false;
+            return Err(crate::error::Error::transport(
+                "injected lock remove failure".to_string(),
+            ));
+        }
+        self.inner.remove_file_if(rel, expected)
+    }
+    fn remove_dir_all(&self, rel: &Path) -> crate::error::Result<()> {
+        self.inner.remove_dir_all(rel)
+    }
+    fn exists(&self, rel: &Path) -> bool {
+        self.inner.exists(rel)
+    }
+    fn metadata(&self, rel: &Path) -> crate::error::Result<RemoteMeta> {
+        self.inner.metadata(rel)
+    }
+    fn metadata_opt(&self, rel: &Path) -> crate::error::Result<Option<RemoteMeta>> {
+        self.inner.metadata_opt(rel)
+    }
+    fn exec(
+        &self,
+        argv: &[String],
+        timeout: std::time::Duration,
+    ) -> crate::error::Result<ExecOutcome> {
+        self.inner.exec(argv, timeout)
+    }
+    fn filesystem_bytes(&self) -> crate::error::Result<FsBytes> {
+        self.inner.filesystem_bytes()
+    }
+}
+
+fn controller_op(c: u8) -> &'static str {
+    if c == 0 { "ctrl-A" } else { "ctrl-B" }
+}
+
+/// The current on-disk lock record (typed): `None` for genuine absence, the
+/// parsed record otherwise. The lock file is ONLY ever written by this
+/// protocol (a valid record), so a parse failure is a test bug — panic.
+fn read_lock_record(remote: &dyn Remote) -> Option<LockRecord> {
+    match remote
+        .metadata_opt(&layout::operation_lock())
+        .expect("lock metadata_opt must succeed")
+    {
+        None => None,
+        Some(_) => {
+            let data = remote
+                .read(&layout::operation_lock())
+                .expect("lock read must succeed");
+            Some(serde_json::from_slice(&data).expect("the lock file must carry a lease record"))
+        }
+    }
+}
+
+/// One bounded case of the two-controller lock state machine: apply each
+/// (action, fault) step and assert the three invariants after every step.
+fn run_lock_state_case(
+    steps: Vec<(LockAction, LockFault)>,
+) -> std::result::Result<(), proptest::test_runner::TestCaseError> {
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+    // A fixed epoch start: both controllers share ONE deterministic timeline.
+    let clock = Arc::new(FakeClock::new(1_700_000_000_000));
+    let inner =
+        LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote")).unwrap();
+    let faults = Arc::new(Mutex::new(LockFaultState::default()));
+    let remote = LockFaultRemote {
+        inner,
+        faults: faults.clone(),
+    };
+    let helper_a = RemoteHelper::with_clock(&remote, clock.clone());
+    let helper_b = RemoteHelper::with_clock(&remote, clock.clone());
+    let mut a_held: Option<LockRecord> = None;
+    let mut b_held: Option<LockRecord> = None;
+
+    for (action, fault) in steps {
+        // Arm the step's one-shot fault at the named seam (Drop and Remove
+        // both fault the compare-and-delete; Drop's release is additionally
+        // swallowed by the action below).
+        {
+            let mut f = faults.lock().unwrap();
+            f.fail_acquire = fault == LockFault::Acquire;
+            f.fail_read = fault == LockFault::Read;
+            f.fail_remove = fault == LockFault::Remove || fault == LockFault::Drop;
+        }
+
+        match action {
+            LockAction::Acquire(c) => {
+                let helper = if c == 0 { &helper_a } else { &helper_b };
+                let held = if c == 0 { &mut a_held } else { &mut b_held };
+                // A successful acquire installs (or converges on) OUR
+                // record: the belief is the record returned (the file's
+                // authoritative record for a same-owner retry). A failed
+                // acquire (fault, or a VALID foreign holder) changes
+                // nothing: the belief survives.
+                if let Ok(rec) = helper.acquire_lock(controller_op(c), false) {
+                    *held = Some(rec);
+                }
+            }
+            LockAction::Release(c) => {
+                let helper = if c == 0 { &helper_a } else { &helper_b };
+                let held = if c == 0 { &mut a_held } else { &mut b_held };
+                if let Some(rec) = held.take() {
+                    match helper.release_lock(&rec) {
+                        Ok(()) => {}
+                        Err(e) => {
+                            // A FAILED release never deleted the current
+                            // lock: the file must still carry SOME record —
+                            // our own (a transport fault, the lease is the
+                            // backstop) or a SUCCESSOR's (a stale release:
+                            // compare-and-delete refused to delete it). The
+                            // successor's lock survives.
+                            let file = read_lock_record(&remote);
+                            prop_assert!(
+                                file.is_some(),
+                                "a failed release must never delete the current lock (stale \
+                                 release {rec:?} failed: {e})"
+                            );
+                            // Re-derive the belief: if the file still carries
+                            // our record, the release failed mid-way and we
+                            // STILL hold (until the lease expires); otherwise
+                            // the lock passed to a successor and we no longer
+                            // hold.
+                            if file.as_ref() == Some(&rec) {
+                                *held = Some(rec);
+                            }
+                        }
+                    }
+                }
+            }
+            LockAction::Drop(c) => {
+                // The RAII drop path: release best-effort, outcome swallowed
+                // (exactly like LockGuard's Drop). If the release fails (the
+                // Drop fault), our record stays and the LEASE is the
+                // backstop — asserted by the recoverability probe below.
+                let helper = if c == 0 { &helper_a } else { &helper_b };
+                let held = if c == 0 { &mut a_held } else { &mut b_held };
+                if let Some(rec) = held.take() {
+                    let _ = helper.release_lock(&rec);
+                    if read_lock_record(&remote).as_ref() == Some(&rec) {
+                        // The drop-time release failed: we still hold (the
+                        // record is in the file with its lease) until the
+                        // lease expires and a contender breaks it.
+                        *held = Some(rec);
+                    }
+                }
+            }
+            LockAction::Crash(c) => {
+                // The owner dies WITHOUT any release: the record stays in the
+                // file with its lease. The belief is kept so a later DELAYED
+                // release by this controller (after a successor broke the
+                // expired lease) exercises the stale-release path. The lease
+                // expiry is what makes the slot recoverable (asserted by the
+                // probe below).
+                let _ = c;
+            }
+            LockAction::Advance(ms) => {
+                // Move the shared clock: a lease expires once `now` passes it.
+                clock.advance(ms);
+            }
+        }
+
+        // Disarm any unconsumed one-shot fault (step-scoped, never leaked).
+        {
+            let mut f = faults.lock().unwrap();
+            f.fail_acquire = false;
+            f.fail_read = false;
+            f.fail_remove = false;
+        }
+
+        // ---- THE THREE INVARIANTS (after every step) ----
+        let now = clock.read();
+
+        // 1a. MUTUAL EXCLUSION: never two controllers with a VALID lease
+        // belief on the same slot.
+        let a_valid = a_held.as_ref().is_some_and(|r| r.expires_at_ms > now);
+        let b_valid = b_held.as_ref().is_some_and(|r| r.expires_at_ms > now);
+        prop_assert!(
+            !(a_valid && b_valid),
+            "mutual exclusion violated after (action {action:?}, fault {fault:?}): A holds \
+             {a_held:?} and B holds {b_held:?} at now {now}"
+        );
+
+        // 1b. A present VALID-lease record is held by EXACTLY ONE controller
+        // (its belief matches the on-disk record; the other's does not).
+        let file = read_lock_record(&remote);
+        if let Some(f) = &file {
+            if f.expires_at_ms > now {
+                let matches_a = a_held.as_ref() == Some(f);
+                let matches_b = b_held.as_ref() == Some(f);
+                prop_assert!(
+                    matches_a != matches_b,
+                    "the on-disk lock {f:?} is not held by exactly one controller at now {now}: \
+                     A={a_held:?} B={b_held:?}"
+                );
+            }
+            // 3. RECOVERABILITY PROBE: an EXPIRED record is always breakable
+            // by a fresh contender — a crashed owner's residue (or a failed
+            // drop-time release's residue) never blocks the slot forever.
+            if f.expires_at_ms <= now {
+                let probe = RemoteHelper::with_clock(&remote, clock.clone());
+                let rec = probe.acquire_lock("probe", false).expect(
+                    "an expired lease must be breakable by a fresh contender \
+                     (the slot never blocks forever)",
+                );
+                probe
+                    .release_lock(&rec)
+                    .expect("probe release must succeed");
+            }
+        }
+    }
+
+    // End of run: even with every lease expired, the slot is never blocked —
+    // a crashed owner's residue is always breakable and re-acquirable.
+    clock.advance(LEASE_DURATION_MS * 2);
+    let rec = helper_a
+        .acquire_lock("ctrl-A", false)
+        .expect("after all leases expire the slot must be acquirable (never blocked forever)");
+    helper_a
+        .release_lock(&rec)
+        .expect("final release must succeed");
+    Ok(())
+}
+
+fn lock_step_strategy() -> impl Strategy<Value = (LockAction, LockFault)> {
+    let controller = prop::sample::select(vec![0u8, 1u8]);
+    let fault = prop_oneof![
+        6 => Just(LockFault::None),
+        1 => Just(LockFault::Acquire),
+        1 => Just(LockFault::Read),
+        1 => Just(LockFault::Remove),
+        1 => Just(LockFault::Drop),
+    ];
+    let action = prop_oneof![
+        4 => controller.clone().prop_map(LockAction::Acquire),
+        3 => controller.clone().prop_map(LockAction::Release),
+        3 => controller.clone().prop_map(LockAction::Drop),
+        1 => controller.clone().prop_map(LockAction::Crash),
+        2 => (0..=LEASE_DURATION_MS * 2).prop_map(LockAction::Advance),
+    ];
+    (action, fault)
+}
+
+proptest! {
+    // THE TWO-CONTROLLER LOCK LEASE/FENCING PROPERTY: bounded cases
+    // (`proptest_cases(64)`: fast default 16, full 64 under
+    // `DEPLOY_FULL_TESTS=1`), fixed seed 0x5EED_5EED (house style), no
+    // failure persistence — deterministic for CI. Each case drives its own
+    // fixture (structurally isolated), and each step's fault is one-shot and
+    // step-scoped.
+    #![proptest_config(ProptestConfig {
+        cases: crate::testutil::proptest_cases(64),
+        rng_seed: RngSeed::Fixed(0x5EED_5EED),
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
+
+    #[test]
+    fn two_controller_lock_lease_fencing(
+        steps in prop::collection::vec(
+            lock_step_strategy(),
+            1..=crate::testutil::proptest_steps(40),
+        ),
+    ) {
+        run_lock_state_case(steps)?;
     }
 }

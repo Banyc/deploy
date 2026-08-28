@@ -62,7 +62,7 @@ pub(crate) fn capacity_preflight(
         let reserve_bytes = capacity.reserve_bytes;
         let reserve_percent = capacity.reserve_percent.get() as u64;
         let helper = helpers.get(&a.placement_slot).expect("helper present");
-        if helper.tree_exists(a.artifact.tree.as_str()) {
+        if helper.tree_exists(a.artifact.tree.as_str())? {
             continue;
         }
         let need = tree_size_on_host(&store.object_root(&a.artifact.tree));

@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use super::{
     CreateNewVerdict, FsBytes, IMMUTABLE_RECORD_MODE, Remote, RemoteEntry, RemoteMeta,
-    has_normal_component_below_root,
+    RemoveIfVerdict, has_normal_component_below_root,
 };
 use hostkey::pin_known_hosts;
 use runner::{OpKind, RunError, SSH_CONNECT_TIMEOUT_SECS, SshRunner};
@@ -537,6 +537,46 @@ impl SshTransport {
         )
     }
 
+    /// Build the remote shell command implementing the atomic compare-and-
+    /// delete (the ssh mirror of `LocalTransport::remove_file_if`): CLAIM the
+    /// entry with `mv` to a mktemp-allocated same-directory name (the lock is
+    /// always a regular file, so plain `mv` — portable GNU and BSD — moves it
+    /// without the `-T` the symlink-to-directory `current` swap needs; only
+    /// ONE contender can win the claim; a failed mv with the destination
+    /// still present is a Mismatch verdict, with the destination absent an
+    /// Absent verdict), VERIFY with `cmp`, then either DELETE the claim
+    /// (match → frame `R`) or RESTORE it no-replace with `ln` (mismatch →
+    /// frame `M`; a concurrent install makes `ln` fail — the winner is never
+    /// replaced and the claim is discarded). The single stdout frame is
+    /// parsed strictly; a malformed frame is an error, never a silent
+    /// verdict.
+    fn remove_file_if_cmd(root: &Path, rel: &Path, expected: &[u8]) -> String {
+        let remote_path_str = root.join(rel).to_string_lossy().into_owned();
+        let parent = Path::new(&remote_path_str)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ".".to_string());
+        let basename = Path::new(&remote_path_str)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "record".to_string());
+        // The claim temp lives INSIDE the destination's parent directory and
+        // is dot-prefixed, exactly like write_new_cmd's temp.
+        let tmp_template = format!(
+            "{}/.{}.claim.XXXXXX",
+            parent.trim_end_matches('/'),
+            basename
+        );
+        let expected_str = String::from_utf8_lossy(expected).into_owned();
+        format!(
+            "mkdir -p {p} && tmp=$(mktemp {tpl}) && rm -f \"$tmp\" && if mv {d} \"$tmp\" 2>/dev/null; then if printf '%s' {exp} | cmp -s \"$tmp\" -; then rm -f \"$tmp\"; printf 'R'; else ln \"$tmp\" {d} 2>/dev/null; rm -f \"$tmp\"; printf 'M'; fi; else if [ -e {d} ] || [ -L {d} ]; then printf 'M'; else printf 'A'; fi; fi",
+            p = shell_quote(&parent),
+            tpl = shell_quote(&tmp_template),
+            d = shell_quote(&remote_path_str),
+            exp = shell_quote(&expected_str),
+        )
+    }
+
     /// Build the remote framed `lstat` helper for `rel`: ONE remote exec
     /// whose single stdout frame reports the OUTCOME WITH THE ERRNO (see the
     /// [`LSTAT_ERRNO_ENOENT`] protocol doc on this module). The helper is a
@@ -803,6 +843,25 @@ impl Remote for SshTransport {
             }
         }
         Ok(())
+    }
+
+    fn remove_file_if(&self, rel: &Path, expected: &[u8]) -> Result<RemoveIfVerdict> {
+        let cmd = Self::remove_file_if_cmd(&self.root, rel, expected);
+        let out = self.run_remote(&cmd)?;
+        if !out.status.success() {
+            return Err(Error::transport(format!(
+                "ssh remove_file_if failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            )));
+        }
+        match String::from_utf8_lossy(&out.stdout).trim() {
+            "R" => Ok(RemoveIfVerdict::Removed),
+            "M" => Ok(RemoveIfVerdict::Mismatch),
+            "A" => Ok(RemoveIfVerdict::Absent),
+            other => Err(Error::transport(format!(
+                "ssh remove_file_if: malformed verdict frame {other:?}"
+            ))),
+        }
     }
 
     fn remove_dir_all(&self, rel: &Path) -> Result<()> {
@@ -1185,6 +1244,50 @@ mod tests_ssh {
         assert!(
             cmd.ends_with("'/srv/app/current'"),
             "destination is the deployment root's `current` symlink, got: {cmd}"
+        );
+    }
+
+    /// The remote compare-and-delete script (`remove_file_if_cmd`), executed
+    /// locally with `sh -c`: it CLAIMS the entry with `mv`, deletes it on a
+    /// byte match (frame `R`), RESTORES it no-replace on mismatch (frame `M`
+    /// — the winner survives byte-for-byte), and reports genuine absence
+    /// (frame `A`).
+    #[test]
+    fn remove_file_if_script_frames() {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let root = dir.path().join("remote");
+        let rel = Path::new("state/operation.lock");
+        let payload = "{\"owner\":\"a\",\"token\":1,\"expires_at_ms\":1700000000000}";
+
+        // Genuinely absent: the Absent frame.
+        let cmd = SshTransport::remove_file_if_cmd(&root, rel, payload.as_bytes());
+        let out = run_sh_stdin(&cmd, &[]);
+        assert!(out.status.success(), "script must exit 0: {out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "A");
+
+        // Install the record, then remove on a byte match: the Removed frame
+        // and the entry is gone.
+        std::fs::create_dir_all(root.join("state")).unwrap();
+        std::fs::write(root.join(rel), payload).unwrap();
+        let out = run_sh_stdin(&cmd, &[]);
+        assert!(out.status.success(), "script must exit 0: {out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "R");
+        assert!(
+            !root.join(rel).exists(),
+            "the matched entry must be removed"
+        );
+
+        // Reinstall, then compare against a DIFFERENT expected record: the
+        // Mismatch frame and the entry is restored byte-for-byte.
+        std::fs::write(root.join(rel), payload).unwrap();
+        let cmd2 = SshTransport::remove_file_if_cmd(&root, rel, b"{\"owner\":\"b\",\"token\":2}");
+        let out = run_sh_stdin(&cmd2, &[]);
+        assert!(out.status.success(), "script must exit 0: {out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "M");
+        assert_eq!(
+            std::fs::read(root.join(rel)).unwrap(),
+            payload.as_bytes(),
+            "the mismatch must restore the winner byte-for-byte"
         );
     }
 

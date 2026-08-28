@@ -9,7 +9,7 @@ use crate::identity::GenerationId;
 use crate::remote::layout;
 use std::path::Path;
 
-use super::super::{RemoteHelper, RemoteStatus};
+use super::super::{LockRecord, RemoteHelper, RemoteStatus};
 
 /// The ACTUAL resolved state of the top-level `current` link: genuine absence
 /// or the exact canonical generation it points at. Produced ONLY by
@@ -76,7 +76,7 @@ impl<'a> RemoteHelper<'a> {
             // with an integrity error rather than reporting a current
             // generation that cannot be verified.
             let gen_dir = layout::generation(gid.as_str());
-            if !self.remote.exists(&gen_dir) {
+            if self.remote.metadata_opt(&gen_dir)?.is_none() {
                 return Err(Error::integrity(format!(
                     "current symlink points at missing generation directory {}",
                     gen_dir.display()
@@ -96,18 +96,18 @@ impl<'a> RemoteHelper<'a> {
             // generation/root: `generations/<gen>/root` must exist, be a
             // symlink, and its target must be byte-exactly the CANONICAL
             // relative target for the assignment's tree (the exact form
-            // `create_generation` writes).
+            // `create_generation` writes). `metadata_opt` is an LSTAT: a
+            // DANGLING `root` symlink (whose target does not resolve) is
+            // still PRESENT — the link itself is seen — so a reported
+            // absence is GENUINE, never a failed follow; a transport
+            // failure is an `Err`, never a silent absence.
             let root_link = gen_dir.join("root");
-            let root_meta = self.remote.metadata(&root_link);
-            let root_present =
-                self.remote.exists(&root_link) || matches!(&root_meta, Ok(m) if m.is_symlink);
-            if !root_present {
+            let Some(root_meta) = self.remote.metadata_opt(&root_link)? else {
                 return Err(Error::integrity(format!(
                     "current generation {gid} has no root symlink at {}",
                     root_link.display()
                 )));
-            }
-            let root_meta = root_meta?;
+            };
             if !root_meta.is_symlink {
                 return Err(Error::integrity(format!(
                     "generation {gid} root entry at {} is not a symlink",
@@ -126,7 +126,7 @@ impl<'a> RemoteHelper<'a> {
             // Object tree: the tree object directory the `root` link names
             // must exist on the remote.
             let tree_root = layout::tree_root(a.artifact.tree.as_str());
-            if !self.remote.exists(&tree_root) {
+            if self.remote.metadata_opt(&tree_root)?.is_none() {
                 return Err(Error::integrity(format!(
                     "current generation {gid} tree object {} is missing",
                     tree_root.display()
@@ -138,7 +138,7 @@ impl<'a> RemoteHelper<'a> {
 
         // Object inventory.
         let obj_root = layout::objects();
-        if self.remote.exists(obj_root) {
+        if self.remote.metadata_opt(obj_root)?.is_some() {
             for e in self.remote.list(obj_root)? {
                 if e.is_dir {
                     status.inventory.push(e.name);
@@ -146,15 +146,25 @@ impl<'a> RemoteHelper<'a> {
             }
         }
 
-        // Lock holder.
-        if self.remote.exists(&layout::operation_lock()) {
+        // Lock holder: the mutation lock is a [`LockRecord`]; the reported
+        // holder is its OWNER (a non-record/legacy lock file is reported
+        // verbatim — status is read-only inspection and the preflight gate
+        // compares the string against the caller's op id, failing closed).
+        if self
+            .remote
+            .metadata_opt(&layout::operation_lock())?
+            .is_some()
+        {
             let data = self.remote.read(&layout::operation_lock())?;
-            status.lock = Some(String::from_utf8_lossy(&data).trim().to_string());
+            status.lock = Some(match serde_json::from_slice::<LockRecord>(&data) {
+                Ok(rec) => rec.owner,
+                Err(_) => String::from_utf8_lossy(&data).trim().to_string(),
+            });
         }
 
         // Pending incoming.
         let inc = layout::incoming();
-        if self.remote.exists(inc) {
+        if self.remote.metadata_opt(inc)?.is_some() {
             for e in self.remote.list(inc)? {
                 if e.is_dir {
                     status.pending_incoming.push(e.name);

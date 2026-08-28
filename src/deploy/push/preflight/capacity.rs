@@ -37,7 +37,13 @@ pub(crate) fn run_capacity_and_staging(
     // Stage every needed tree into operation-unique incoming paths.
     for a in assignments {
         let helper = &helpers[&a.placement_slot];
-        if !helper.tree_exists(a.artifact.tree.as_str()) {
+        if !helper
+            .tree_exists(a.artifact.tree.as_str())
+            .map_err(|source| PreflightFailure {
+                reason: "staging failed",
+                source,
+            })?
+        {
             let host_obj = store.object_root(&a.artifact.tree);
             if let Err(source) =
                 helper.stage_incoming(deployment_id.as_str(), a.artifact.tree.as_str(), &host_obj)

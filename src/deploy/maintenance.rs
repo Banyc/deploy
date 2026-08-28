@@ -77,11 +77,12 @@ pub(crate) fn run_step17_retention(
         // Clean up this deployment's incoming directory. Best-effort by
         // design: the push already succeeded, so a leftover here cannot change
         // the reported outcome, and the next push's reconciliation removes
-        // abandoned incoming dirs explicitly. Same for the (already released)
-        // lock file: releasing the advisory lock again is a no-op, and a
-        // stale lock file is re-acquired harmlessly next time.
+        // abandoned incoming dirs explicitly. The mutation lock itself needs
+        // no cleanup here: `retain_slot_post_commit` held it through its own
+        // RAII guard (released on every return path), and a stale lock file
+        // is a LEASE that expires and is broken harmlessly next time — it can
+        // never block the slot.
         helpers[sid].remove_incoming(deployment_id.as_str()).ok();
-        helpers[sid].release_lock(op_id.as_str()).ok();
     }
 }
 

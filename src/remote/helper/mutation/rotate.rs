@@ -17,7 +17,7 @@ impl<'a> RemoteHelper<'a> {
         active_incoming: &HashSet<String>,
     ) -> Result<()> {
         let obj_root = layout::objects();
-        if self.remote.exists(obj_root) {
+        if self.remote.metadata_opt(obj_root)?.is_some() {
             for e in self.remote.list(obj_root)? {
                 if e.is_dir && !retained.contains(&e.name) {
                     self.remote.remove_dir_all(&obj_root.join(&e.name))?;
@@ -25,7 +25,7 @@ impl<'a> RemoteHelper<'a> {
             }
         }
         let inc = layout::incoming();
-        if self.remote.exists(inc) {
+        if self.remote.metadata_opt(inc)?.is_some() {
             for e in self.remote.list(inc)? {
                 if e.is_dir && !active_incoming.contains(&e.name) {
                     self.remote.remove_dir_all(&inc.join(&e.name))?;

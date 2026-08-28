@@ -14,14 +14,21 @@ use walkdir::WalkDir;
 use super::super::RemoteHelper;
 
 impl<'a> RemoteHelper<'a> {
-    pub fn tree_exists(&self, digest: &str) -> bool {
-        self.remote.exists(&layout::tree_root(digest))
+    /// Whether the tree object exists on the remote — a typed probe: a
+    /// transport failure is an `Err`, never a silent false (the boolean
+    /// `exists` collapses NotFound and errors into one false and could mask
+    /// a real failure).
+    pub fn tree_exists(&self, digest: &str) -> Result<bool> {
+        Ok(self
+            .remote
+            .metadata_opt(&layout::tree_root(digest))?
+            .is_some())
     }
 
     /// Copy a host-local tree into the remote object store, verifying the
     /// digest after publication. Reuses an existing, verified object.
     pub fn publish_tree(&self, digest: &str, host_src: &Path) -> Result<()> {
-        if self.tree_exists(digest) {
+        if self.tree_exists(digest)? {
             // Best-effort verification already trusted on first publish.
             return Ok(());
         }
@@ -74,7 +81,7 @@ impl<'a> RemoteHelper<'a> {
         // idempotent re-publication. Two records with the same recomputed
         // digest are the same release.
         let rel = dir.join("release.json");
-        if !self.remote.exists(&rel) {
+        if self.remote.metadata_opt(&rel)?.is_none() {
             self.publish_release_file(&rel, release_json.as_bytes())?;
         } else {
             // The remote already carries a record under this release id.
@@ -148,7 +155,7 @@ impl<'a> RemoteHelper<'a> {
     /// Publish a previously staged incoming tree into the object store. Reuses an
     /// existing, verified object.
     pub fn publish_from_incoming(&self, deployment_id: &str, digest: &str) -> Result<()> {
-        if self.tree_exists(digest) {
+        if self.tree_exists(digest)? {
             return Ok(());
         }
         let from = layout::staged_tree(deployment_id, digest);

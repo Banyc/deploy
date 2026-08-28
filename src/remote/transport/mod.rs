@@ -113,6 +113,33 @@ pub trait Remote {
     fn read_link(&self, rel: &Path) -> Result<PathBuf>;
     fn remove_file(&self, rel: &Path) -> Result<()>;
     fn remove_dir_all(&self, rel: &Path) -> Result<()>;
+    /// Atomically remove `rel` ONLY IF its content is byte-identical to
+    /// `expected` — the compare-and-delete primitive that makes stale
+    /// releases and expired-lease breaks safe. Returns the TYPED verdict
+    /// ([`RemoveIfVerdict`]); every transport failure propagates as `Err`
+    /// (never a fabricated verdict, never a silent no-op). The production
+    /// transports ([`LocalTransport`], [`SshTransport`]) realize it
+    /// ATOMICALLY: the entry is CLAIMED by an atomic rename to a unique
+    /// same-directory temp (only one contender can win), verified against
+    /// `expected`, and either deleted (match) or RESTORED no-replace
+    /// (mismatch — a successor's lock is never removed, never replaced).
+    /// The DEFAULT implementation is the NON-ATOMIC read-compare-remove
+    /// fallback: adequate for single-process test wrappers that never race
+    /// the lock, and only those; production must override it.
+    fn remove_file_if(&self, rel: &Path, expected: &[u8]) -> Result<RemoveIfVerdict> {
+        // Typed absence probe first: a transport failure is an `Err`, never
+        // a silent `Absent`.
+        let Some(_) = self.metadata_opt(rel)? else {
+            return Ok(RemoveIfVerdict::Absent);
+        };
+        let cur = self.read(rel)?;
+        if cur == expected {
+            self.remove_file(rel)?;
+            Ok(RemoveIfVerdict::Removed)
+        } else {
+            Ok(RemoveIfVerdict::Mismatch)
+        }
+    }
     fn exists(&self, rel: &Path) -> bool;
     fn metadata(&self, rel: &Path) -> Result<RemoteMeta>;
     /// The TYPED replacement for the `exists`/`metadata` pair: `Ok(Some(meta))`
@@ -192,6 +219,28 @@ fn meta_to_remote(m: &std::fs::Metadata) -> RemoteMeta {
 /// mode — never the process umask the temp was created with — or the record's
 /// permissions would silently depend on the caller's umask.
 pub(crate) const IMMUTABLE_RECORD_MODE: u32 = 0o644;
+
+/// The verdict of one atomic compare-and-delete attempt
+/// ([`Remote::remove_file_if`]): the entry was removed because it carried
+/// EXACTLY the expected bytes ([`RemoveIfVerdict::Removed`]), the entry
+/// existed but did NOT match ([`RemoveIfVerdict::Mismatch`] — it is never
+/// removed, and a no-replace restore put it back), or the entry was
+/// GENUINELY absent ([`RemoveIfVerdict::Absent`]). `pub` because it crosses
+/// the [`Remote`] trait boundary: every transport's `remove_file_if` returns
+/// it, and every caller (and external test crate) branches on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoveIfVerdict {
+    /// The entry existed with content byte-identical to `expected` and was
+    /// removed: the slot is now free.
+    Removed,
+    /// The entry existed but its content differed from `expected`: it was
+    /// restored (or left as the winner's), NEVER removed. A stale release or
+    /// a stale break lands here — the successor's lock survives.
+    Mismatch,
+    /// The entry was genuinely absent: nothing to remove (an idempotent
+    /// success for a release, a free slot for an acquire).
+    Absent,
+}
 
 /// The verdict of one canonical create-new attempt ([`durable_create_new`]).
 /// `pub` because it crosses the [`Remote`] trait boundary: every transport's
@@ -628,6 +677,76 @@ impl Remote for LocalTransport {
             .map_err(|e| Error::transport(format!("remove {}: {e}", p.display())))
     }
 
+    fn remove_file_if(&self, rel: &Path, expected: &[u8]) -> Result<RemoveIfVerdict> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CLAIM_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        let p = join(&self.base, rel);
+        // The atomic CLAIM target: a unique dot-prefixed name INSIDE the
+        // destination's parent directory (same filesystem, same directory
+        // namespace as the lock), exactly like durable_create_new's temps.
+        let tmp = p.with_file_name(format!(
+            ".{}.claim.{}.{}",
+            p.file_name()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_default(),
+            std::process::id(),
+            CLAIM_COUNTER.fetch_add(1, Ordering::Relaxed),
+        ));
+        // CLAIM: rename the entry to the temp — atomic, so only ONE
+        // contender can ever win the claim; every other breaker's rename
+        // fails with NotFound (the slot was already claimed or free).
+        match std::fs::rename(&p, &tmp) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(RemoveIfVerdict::Absent);
+            }
+            Err(e) => {
+                return Err(Error::transport(format!("claim {}: {e}", p.display())));
+            }
+        }
+        // VERIFY the claimed entry against the expectation.
+        let content = match std::fs::read(&tmp) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(Error::transport(format!("verify {}: {e}", tmp.display())));
+            }
+        };
+        if content == expected {
+            // MATCH: the claimed entry was EXACTLY the expected record —
+            // delete it; the slot is now free.
+            let _ = std::fs::remove_file(&tmp);
+            return Ok(RemoveIfVerdict::Removed);
+        }
+        // MISMATCH: the entry changed under the reader (a successor's newer
+        // generation). RESTORE it no-replace — the moved record is
+        // re-created with the canonical final mode only while the path is
+        // still free; a CONCURRENT install is never replaced (Conflict) and
+        // the moved claim is discarded, never destroying the winner. Either
+        // way a successor's lock survives untouched.
+        let restored = durable_create_new(
+            &self.base,
+            rel,
+            &content,
+            CreateNewOptions {
+                mode: IMMUTABLE_RECORD_MODE,
+                fault: None,
+            },
+        );
+        let _ = std::fs::remove_file(&tmp);
+        match restored {
+            // Created (restored), AlreadyPresent (a concurrent identical
+            // restore), or Conflict (a different winner is in place): the
+            // lock is intact — the compare failed, never a delete.
+            Ok(_) => Ok(RemoveIfVerdict::Mismatch),
+            // A transport failure on the no-replace restore propagates
+            // EXPLICITLY (the moved claim was the only thing lost; the slot
+            // is not blocked — the lease is the backstop).
+            Err(e) => Err(e),
+        }
+    }
+
     fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<CreateNewVerdict> {
         // The ONE canonical create-new primitive (see `durable_create_new`):
         // temp -> write -> final chmod -> file fsync -> no-replace publish ->
@@ -921,6 +1040,51 @@ mod tests {
             std::fs::read(&p).unwrap(),
             data,
             "the conflict must NEVER replace the winner"
+        );
+    }
+
+    /// The compare-and-delete primitive's contract: `Removed` for a
+    /// byte-identical match (the entry is gone), `Mismatch` for different
+    /// content (the winner is RESTORED — never removed, never replaced),
+    /// and `Absent` for genuine absence. This is the primitive the mutation
+    /// lock's stale-release/expired-break safety rests on.
+    #[test]
+    fn remove_file_if_compare_and_delete_verdicts() {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let t = LocalTransport::new(&SysEnv::from_process(), dir.path().join("r")).unwrap();
+        let rel = Path::new("state/op.lock");
+        let data = b"{\"owner\":\"a\",\"token\":1}";
+
+        // Absent: nothing to remove — the idempotent verdict.
+        assert_eq!(
+            t.remove_file_if(rel, data).unwrap(),
+            RemoveIfVerdict::Absent,
+            "a genuinely absent entry is Absent, never an error"
+        );
+        // Match: the entry carried EXACTLY the expected bytes — removed.
+        t.try_write_new(rel, data).unwrap();
+        assert_eq!(
+            t.remove_file_if(rel, data).unwrap(),
+            RemoveIfVerdict::Removed,
+            "a byte-identical match is removed"
+        );
+        assert!(
+            t.metadata_opt(rel).unwrap().is_none(),
+            "the matched entry must be gone"
+        );
+        // Mismatch: different content — the winner is restored untouched,
+        // NEVER removed, NEVER replaced.
+        t.try_write_new(rel, data).unwrap();
+        assert_eq!(
+            t.remove_file_if(rel, b"{\"owner\":\"b\",\"token\":2}")
+                .unwrap(),
+            RemoveIfVerdict::Mismatch,
+            "different content is a Mismatch, never a delete"
+        );
+        assert_eq!(
+            t.read(rel).unwrap(),
+            data,
+            "the mismatch must restore the winner byte-for-byte"
         );
     }
 
