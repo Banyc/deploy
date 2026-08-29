@@ -526,12 +526,26 @@ impl<'a> HeldSlotLock<'a> {
     /// FAILED — a stale release whose record no longer matches the on-disk
     /// lock (a successor holds it; it is NEVER deleted) or a transport
     /// fault. Idempotent: releasing twice is a no-op success.
+    ///
+    /// `active` is cleared ONLY after confirmed success; on the error path the
+    /// guard drops while still `active` so `Drop` performs ONE final
+    /// best-effort `release_lock`. That retry is safe because `release_lock`
+    /// is a compare-and-delete against the complete acquisition record:
+    /// (a) request deleted the lock but the response was lost → retry sees
+    /// absence and succeeds idempotently; (b) request failed before deletion →
+    /// retry removes the original lock; (c) a successor owns the lock → both
+    /// attempts see a mismatch and never delete it.
     pub fn release(mut self) -> Result<()> {
         if !self.active {
             return Ok(());
         }
-        self.active = false;
-        self.helper.release_lock(&self.record)
+        match self.helper.release_lock(&self.record) {
+            Ok(()) => {
+                self.active = false;
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -1986,6 +2000,246 @@ mod barrier_proptest {
         #[test]
         fn barrier_race_exactly_one_winner(first_arriver in 0u8..=1) {
             run_barrier_race_case(first_arriver)?;
+        }
+    }
+}
+
+/// Guard active-release retry: explicit `HeldSlotLock::release` clears
+/// `active` ONLY after confirmed success; on error the guard drops while
+/// still active so `Drop` performs ONE best-effort retry. The retry is
+/// idempotent/safe per compare-and-delete (ErrorBeforeDelete → retry deletes;
+/// ErrorAfterDelete → retry sees Absence → idempotent Ok; SuccessorMismatch →
+/// both see Mismatch and never delete successor).
+#[cfg(test)]
+mod guard_release_retry {
+    use super::*;
+    use crate::error::Result as RemoteResult;
+    use crate::remote::layout;
+    use crate::remote::transport::{
+        CreateNewVerdict, ExecOutcome, FsBytes, LocalTransport, Remote, RemoteEntry, RemoteMeta,
+        RemoveIfVerdict,
+    };
+    use proptest::prelude::*;
+    use proptest::test_runner::RngSeed;
+    use std::path::{Path, PathBuf};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum GuardFaultOutcome {
+        Success,
+        ErrorBeforeDelete,
+        ErrorAfterDelete,
+        SuccessorMismatch,
+    }
+
+    struct GuardFaultRemote {
+        inner: LocalTransport,
+        fault: Arc<Mutex<Option<GuardFaultOutcome>>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Remote for GuardFaultRemote {
+        fn root(&self) -> &Path {
+            self.inner.root()
+        }
+        fn read(&self, rel: &Path) -> RemoteResult<Vec<u8>> {
+            self.inner.read(rel)
+        }
+        fn write(&self, rel: &Path, data: &[u8], mode: u32) -> RemoteResult<()> {
+            self.inner.write(rel, data, mode)
+        }
+        fn try_write_new(&self, rel: &Path, data: &[u8]) -> RemoteResult<CreateNewVerdict> {
+            self.inner.try_write_new(rel, data)
+        }
+        fn try_write_new_with(
+            &self,
+            rel: &Path,
+            data: &[u8],
+            equivalence: crate::remote::transport::ContentEquivalence,
+        ) -> RemoteResult<CreateNewVerdict> {
+            self.inner.try_write_new_with(rel, data, equivalence)
+        }
+        fn create_dir(&self, rel: &Path) -> RemoteResult<()> {
+            self.inner.create_dir(rel)
+        }
+        fn create_dir_all(&self, rel: &Path) -> RemoteResult<()> {
+            self.inner.create_dir_all(rel)
+        }
+        fn set_mode(&self, rel: &Path, mode: u32) -> RemoteResult<()> {
+            self.inner.set_mode(rel, mode)
+        }
+        fn list(&self, rel: &Path) -> RemoteResult<Vec<RemoteEntry>> {
+            self.inner.list(rel)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> RemoteResult<()> {
+            self.inner.rename(from, to)
+        }
+        fn symlink(&self, target: &Path, link: &Path) -> RemoteResult<()> {
+            self.inner.symlink(target, link)
+        }
+        fn read_link(&self, rel: &Path) -> RemoteResult<PathBuf> {
+            self.inner.read_link(rel)
+        }
+        fn remove_file(&self, rel: &Path) -> RemoteResult<()> {
+            self.inner.remove_file(rel)
+        }
+        fn remove_file_if(&self, rel: &Path, expected: &[u8]) -> RemoteResult<RemoveIfVerdict> {
+            if rel == layout::operation_lock() {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let mut guard = self.fault.lock().unwrap();
+                if let Some(outcome) = guard.take() {
+                    match outcome {
+                        GuardFaultOutcome::ErrorBeforeDelete => {
+                            return Err(crate::error::Error::transport(
+                                "injected ErrorBeforeDelete",
+                            ));
+                        }
+                        GuardFaultOutcome::ErrorAfterDelete => {
+                            let _ = self.inner.remove_file_if(rel, expected)?;
+                            return Err(crate::error::Error::transport(
+                                "injected ErrorAfterDelete (response lost)",
+                            ));
+                        }
+                        GuardFaultOutcome::Success | GuardFaultOutcome::SuccessorMismatch => {
+                            return self.inner.remove_file_if(rel, expected);
+                        }
+                    }
+                }
+            }
+            self.inner.remove_file_if(rel, expected)
+        }
+        fn remove_dir_all(&self, rel: &Path) -> RemoteResult<()> {
+            self.inner.remove_dir_all(rel)
+        }
+        fn exists(&self, rel: &Path) -> bool {
+            self.inner.exists(rel)
+        }
+        fn metadata(&self, rel: &Path) -> RemoteResult<RemoteMeta> {
+            self.inner.metadata(rel)
+        }
+        fn metadata_opt(&self, rel: &Path) -> RemoteResult<Option<RemoteMeta>> {
+            self.inner.metadata_opt(rel)
+        }
+        fn exec(&self, argv: &[String], timeout: Duration) -> RemoteResult<ExecOutcome> {
+            self.inner.exec(argv, timeout)
+        }
+        fn filesystem_bytes(&self) -> RemoteResult<FsBytes> {
+            self.inner.filesystem_bytes()
+        }
+    }
+
+    fn run_guard_release_case(
+        outcome: GuardFaultOutcome,
+    ) -> std::result::Result<(), TestCaseError> {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let remote_root = dir.path().join("remote");
+        let fault = Arc::new(Mutex::new(Some(outcome)));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fault_remote = GuardFaultRemote {
+            inner: LocalTransport::new(&crate::testutil::fixture_env(), remote_root.clone())
+                .unwrap(),
+            fault: fault.clone(),
+            calls: calls.clone(),
+        };
+        let helper = RemoteHelper::new(&fault_remote);
+        let guard = helper.acquire_lock_guard("op-predecessor").unwrap();
+        let predecessor_bytes = fault_remote.read(&layout::operation_lock()).unwrap();
+        if outcome == GuardFaultOutcome::SuccessorMismatch {
+            let direct =
+                LocalTransport::new(&crate::testutil::fixture_env(), remote_root.clone()).unwrap();
+            let helper_b = RemoteHelper::new(&direct);
+            let predecessor_rec: LockRecord = serde_json::from_slice(&predecessor_bytes).unwrap();
+            let _successor = helper_b
+                .recover_lock(&predecessor_rec, "op-successor")
+                .unwrap();
+            let successor_bytes = direct.read(&layout::operation_lock()).unwrap();
+            let res = guard.release();
+            prop_assert!(
+                res.is_err(),
+                "successor mismatch release must be Err, got {res:?}"
+            );
+            prop_assert_eq!(
+                calls.load(Ordering::SeqCst),
+                2,
+                "successor mismatch must trigger exactly one drop-time retry (2 calls total)"
+            );
+            let after = fault_remote.read(&layout::operation_lock()).unwrap();
+            prop_assert_eq!(
+                after,
+                successor_bytes,
+                "successor's lock bytes must be unchanged byte-for-byte (never deleted)"
+            );
+        } else if outcome == GuardFaultOutcome::Success {
+            let res = guard.release();
+            prop_assert!(
+                res.is_ok(),
+                "explicit Success release must be Ok, got {res:?}"
+            );
+            prop_assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "successful explicit release must trigger no drop retry (1 call total)"
+            );
+            prop_assert!(
+                fault_remote
+                    .metadata_opt(&layout::operation_lock())
+                    .unwrap()
+                    .is_none(),
+                "lock file must be absent after successful release"
+            );
+        } else {
+            let res = guard.release();
+            prop_assert!(
+                res.is_err(),
+                "{:?} release must return Err, got {:?}",
+                outcome,
+                res
+            );
+            prop_assert_eq!(
+                calls.load(Ordering::SeqCst),
+                2,
+                "{:?} must trigger exactly one drop-time retry (2 calls total)",
+                outcome
+            );
+            prop_assert!(
+                fault_remote
+                    .metadata_opt(&layout::operation_lock())
+                    .unwrap()
+                    .is_none(),
+                "lock must be gone after the drop-retry heals the stranding for {:?}",
+                outcome
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn deterministic_success_no_retry() {
+        run_guard_release_case(GuardFaultOutcome::Success).unwrap();
+    }
+
+    proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: crate::testutil::proptest_cases(64),
+            max_shrink_iters: 10000,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..proptest::test_runner::Config::default()
+        })]
+        #[test]
+        fn guard_release_heals_stranding_and_preserves_successor(
+            outcome in prop_oneof![
+                Just(GuardFaultOutcome::Success),
+                Just(GuardFaultOutcome::ErrorBeforeDelete),
+                Just(GuardFaultOutcome::ErrorAfterDelete),
+                Just(GuardFaultOutcome::SuccessorMismatch),
+            ]
+        ) {
+            run_guard_release_case(outcome)?;
         }
     }
 }
