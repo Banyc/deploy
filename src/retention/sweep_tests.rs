@@ -41,9 +41,9 @@ use crate::identity::{
     TreeDigest, VariantName, test_deployment_id, test_generation_id, test_tree_digest,
 };
 use crate::ledger::{
-    DeploymentIntent, DeploymentStatus, DesiredGeneration, IntentSlot, TargetSnapshot,
-    LedgerTerminal, NonEmptySlotTable, ObservationWire, ObservedGenerationWire, SlotOutcome,
-    SlotOutcomeKind, SlotResult, SlotTable, TerminalDisposition,
+    DeploymentIntent, DeploymentStatus, DesiredGeneration, IntentSlot, LedgerTerminal,
+    NonEmptySlotTable, ObservationWire, ObservedGenerationWire, SlotOutcome, SlotOutcomeKind,
+    SlotResult, SlotTable, TargetSnapshot, TerminalDisposition,
 };
 use crate::remote::helper::{GenerationAssignment, RemoteHelper};
 use crate::remote::layout;
@@ -169,7 +169,7 @@ fn make_gen(
         .create_dir_all(&layout::tree_root(canonical_tree.as_str()))
         .unwrap();
     helper
-        .acquire_lock_guard("op")
+        .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
         .unwrap()
         .create_generation(&GenerationAssignment {
             deployment_id: test_deployment_id(deployment_id),
@@ -467,7 +467,7 @@ fn run_no_leak_case(
         );
     }
     helper
-        .acquire_lock_guard("op")
+        .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
         .unwrap()
         .swap_current(
             &crate::remote::helper::ExpectedCurrent::Absent,

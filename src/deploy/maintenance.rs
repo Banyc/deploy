@@ -121,7 +121,7 @@ pub(crate) fn retain_slot_post_commit(
     // `#[cfg(test)]`) and in unarmed tests.
     #[cfg(test)]
     store.step17_hook_barrier(deployment_id, HookPhase::FreshStep17);
-    if let Ok(_guard) = helper.acquire_lock_guard(op_id.as_str()) {
+    if let Ok(_guard) = helper.acquire_lock_guard(op_id) {
         match rotate_slot_locked(helper, store, config, slot_retention, deployment_id) {
             Ok(()) => {
                 maintenance.extend(clear_retention_deferred(store, target_name, sid));
@@ -470,7 +470,7 @@ pub(crate) fn retry_deferred_retentions(
         // here). A no-op in production builds and unarmed tests.
         #[cfg(test)]
         store.step17_hook_barrier(deployment_id, HookPhase::DeferredRetry);
-        if let Ok(_guard) = helper.acquire_lock_guard(op_id.as_str()) {
+        if let Ok(_guard) = helper.acquire_lock_guard(op_id) {
             // The slot's ONE retention policy, from its OWNING VARIANT
             // (resolved from the current config — retention is never a
             // member-target union).

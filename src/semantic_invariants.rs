@@ -1255,7 +1255,7 @@ impl Fixture {
         let helper = RemoteHelper::new(remote.as_ref());
         let op = format!("si-contend-{}", OperationId::generate().as_str());
         let record = helper
-            .acquire_lock(&op, false)
+            .acquire_lock_record_for_test(&crate::identity::OperationId::new(op.clone()))
             .expect("the contention lock must be free at the start of the step");
         (record, server)
     }
@@ -1519,7 +1519,7 @@ impl Fixture {
                 {
                     if guard.is_none() {
                         let holder = format!("si-step17-{}", OperationId::generate().as_str());
-                        guard = Some(helper.acquire_lock_guard(&holder).expect(
+                        guard = Some(helper.acquire_lock_guard(&crate::identity::OperationId::new(holder.to_string())).expect(
                             "the slot mutation lock must be free while the engine is parked \
                              at the step-17 hook",
                         ));
@@ -1776,7 +1776,7 @@ impl Fixture {
         for server in ["s1", "s2", "s3"] {
             self.with_helper_for(server, |helper| {
                 let op = OperationId::generate();
-                let _guard = helper.acquire_lock_guard(op.as_str())?;
+                let _guard = helper.acquire_lock_guard(&op)?;
                 let retained =
                     compute_retained(&helper, self.config.pins(), &self.store, retention)?;
                 helper.rotate(&retained, &HashSet::new())
@@ -2363,7 +2363,7 @@ fn state_machine_lifecycle_cleanup_failure_after_commit() {
 #[test]
 fn state_machine_lifecycle_retention_lock_contention_defers_not_silent() {
     let id = test_deployment_id("si-lockcont-push");
-    let holder = "op-lockcont-holder";
+    let holder = crate::identity::OperationId::new("op-lockcont-holder".to_string());
     let f = Fixture::new();
     let remote = f.remote();
     let helper = RemoteHelper::new(remote.as_ref());
@@ -2389,7 +2389,7 @@ fn state_machine_lifecycle_retention_lock_contention_defers_not_silent() {
                 if let Ok(_phase) = hook.wait_at_step17_bounded(std::time::Duration::from_millis(5))
                 {
                     if guard.is_none() {
-                        guard = Some(helper.acquire_lock_guard(holder).expect(
+                        guard = Some(helper.acquire_lock_guard(&holder).expect(
                             "the slot lock must be free while the engine is parked at the \
                              step-17 hook",
                         ));
@@ -2437,7 +2437,7 @@ fn state_machine_lifecycle_retention_lock_contention_defers_not_silent() {
                 if let Ok(_phase) = hook.wait_at_step17_bounded(std::time::Duration::from_millis(5))
                 {
                     if guard.is_none() {
-                        guard = Some(helper.acquire_lock_guard(holder).expect(
+                        guard = Some(helper.acquire_lock_guard(&holder).expect(
                             "the slot lock must be free while the engine is parked at the \
                              no-op retry hook",
                         ));
@@ -7441,7 +7441,9 @@ fn run_three_controller_case(
                 let before = read_lock_record(&remote)
                     .expect("a claim's pre-read cannot be faulted (no read fault armed for Claim)");
                 observed[c as usize] = before.clone();
-                let result = helper.acquire_lock(controller_op(c), false);
+                let result = helper.acquire_lock_record_for_test(
+                    &crate::identity::OperationId::new(controller_op(c).to_string()),
+                );
                 if before.is_none() {
                     // Fresh claim on genuinely absent slot — must be unique.
                     match result {
@@ -7631,7 +7633,10 @@ fn run_three_controller_case(
                 }
                 let before = read_lock_record(&remote)
                     .expect("a recover's pre-read cannot be faulted (no read fault armed)");
-                match helper.recover_lock(&obs, controller_op(c)) {
+                match helper.recover_lock(
+                    &obs,
+                    &crate::identity::OperationId::new(controller_op(c).to_string()),
+                ) {
                     Ok(rec) => {
                         // Fresh unique acquisition id, never equal to observed's id.
                         prop_assert!(

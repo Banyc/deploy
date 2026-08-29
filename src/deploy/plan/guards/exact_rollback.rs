@@ -10,8 +10,8 @@ use crate::identity::DeploymentId;
 use crate::identity::ServerId;
 use crate::identity::SlotId;
 use crate::identity::TargetName;
-use crate::ledger::TargetSnapshot;
 use crate::ledger::PhysicalBinding;
+use crate::ledger::TargetSnapshot;
 
 // EXACT ROLLBACK VERIFICATION (A2): a deployment rollback restores the
 // snapshot's exact per-slot artifact AND physical binding, so every

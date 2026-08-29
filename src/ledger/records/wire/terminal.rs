@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::super::observation::{Observation, ObservedGeneration};
-use super::super::{CompleteRollback, DeploymentStatus, TargetSnapshot, SlotTable};
+use super::super::{CompleteRollback, DeploymentStatus, SlotTable, TargetSnapshot};
 use super::outcomes::{SlotOutcome, SlotOutcomeKind, SlotResult, SlotTransition};
 /// The DISPOSITION of a deployment's terminal event — the DOMAIN replaces
 /// the wire's `status: String` + optional rollback TAG-PLUS-OPTIONAL-PAYLOAD
@@ -786,7 +786,7 @@ mod tests_terminal {
     use crate::identity::{
         DeploymentId, SlotId, TargetName, test_generation_id, test_release_id, test_tree_digest,
     };
-    use crate::ledger::records::{TargetSnapshot, PhysicalBinding, SnapshotEntry};
+    use crate::ledger::records::{PhysicalBinding, SnapshotEntry, TargetSnapshot};
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
     use std::collections::{BTreeMap, BTreeSet};

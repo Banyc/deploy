@@ -37,7 +37,7 @@ use crate::error::{Error, Result};
 use crate::identity::{GenerationRef, SlotId};
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::super::{DeploymentIntent, TargetSnapshot, PhysicalBinding, SnapshotEntry};
+use super::super::{DeploymentIntent, PhysicalBinding, SnapshotEntry, TargetSnapshot};
 
 /// THE ONE PRIVATE VALIDATED MAP VALUE — the complete per-slot rollback
 /// fact: a slot's VERIFIED [`GenerationRef`] (generation AND artifact)

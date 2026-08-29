@@ -77,7 +77,7 @@ use std::collections::BTreeSet;
 use crate::identity::SlotId;
 #[cfg(test)]
 use crate::ledger::{
-    DeploymentIntent, DeploymentStatus, TargetSnapshot, LedgerTerminal, SlotResult, SlotTable,
+    DeploymentIntent, DeploymentStatus, LedgerTerminal, SlotResult, SlotTable, TargetSnapshot,
 };
 #[cfg(test)]
 use crate::testutil::test_faults::FaultKind;

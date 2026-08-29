@@ -145,7 +145,9 @@ mod tests_assignment {
             LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
                 .unwrap();
         let helper = RemoteHelper::new(&remote);
-        let _guard = helper.acquire_lock_guard("op").unwrap();
+        let _guard = helper
+            .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
+            .unwrap();
 
         _guard
             .create_generation(&assignment("gen-1", "tree-a"))

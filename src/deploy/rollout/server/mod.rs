@@ -86,7 +86,7 @@ pub(crate) fn process_server(
     // Acquire the slot's mutation lock via an RAII guard so every return path
     // (including errors) releases it. Held in a named binding so in-process
     // compensation can borrow it without re-acquiring.
-    let held = match helper.acquire_lock_guard(op_id.as_str()) {
+    let held = match helper.acquire_lock_guard(op_id) {
         Ok(g) => g,
         Err(e) => {
             return Ok(ServerProc {

@@ -456,10 +456,9 @@ mod tests {
         test_tree_digest,
     };
     use crate::ledger::{
-        DeploymentIntent, DesiredGeneration, IntentSlot, TargetSnapshot, LedgerTerminal,
-        NonEmptySlotTable, ObservationWire, ObservedAssignment, ObservedGenerationWire,
-        ObservedSlot, Pins, SlotOutcome, SlotOutcomeKind, SlotResult, SlotTable,
-        TerminalDisposition,
+        DeploymentIntent, DesiredGeneration, IntentSlot, LedgerTerminal, NonEmptySlotTable,
+        ObservationWire, ObservedAssignment, ObservedGenerationWire, ObservedSlot, Pins,
+        SlotOutcome, SlotOutcomeKind, SlotResult, SlotTable, TargetSnapshot, TerminalDisposition,
     };
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;

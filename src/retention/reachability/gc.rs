@@ -476,9 +476,9 @@ mod tests {
         TreeDigest, VariantName, test_deployment_id, test_generation_id, test_tree_digest,
     };
     use crate::ledger::{
-        DeploymentIntent, DesiredGeneration, IntentSlot, TargetSnapshot, LedgerTerminal,
-        NonEmptySlotTable, Observation, ObservationError, ObservedAssignment, ObservedSlot, Pins,
-        PreviousGeneration, TerminalDisposition,
+        DeploymentIntent, DesiredGeneration, IntentSlot, LedgerTerminal, NonEmptySlotTable,
+        Observation, ObservationError, ObservedAssignment, ObservedSlot, Pins, PreviousGeneration,
+        TargetSnapshot, TerminalDisposition,
     };
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;

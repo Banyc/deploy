@@ -655,8 +655,8 @@ mod tests {
         test_tree_digest,
     };
     use crate::ledger::{
-        DeploymentIntent, DeploymentStatus, DesiredGeneration, IntentSlot, TargetSnapshot,
-        LedgerTerminal, NonEmptySlotTable, ObservedSlot, TerminalDisposition,
+        DeploymentIntent, DeploymentStatus, DesiredGeneration, IntentSlot, LedgerTerminal,
+        NonEmptySlotTable, ObservedSlot, TargetSnapshot, TerminalDisposition,
     };
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
@@ -1874,7 +1874,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let remote =
             LocalTransport::new(&crate::testutil::fixture_env(), slot_deploy_dir.clone()).unwrap();
         let helper = RemoteHelper::new(&remote);
-        let rec = helper.acquire_lock("op-dead", false).unwrap();
+        let rec = helper
+            .acquire_lock_record_for_test(&crate::identity::OperationId::new("op-dead".to_string()))
+            .unwrap();
         // No --yes: refusal naming holder+acquisition+--yes+--acquisition, lock byte-identical.
         let before = remote.read(&layout::operation_lock()).unwrap();
         let err = run_with(
@@ -1966,7 +1968,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let remote2 =
             LocalTransport::new(&crate::testutil::fixture_env(), slot_deploy_dir.clone()).unwrap();
         let helper2 = RemoteHelper::new(&remote2);
-        let rec2 = helper2.acquire_lock("op-dead2", false).unwrap();
+        let rec2 = helper2
+            .acquire_lock_record_for_test(&crate::identity::OperationId::new(
+                "op-dead2".to_string(),
+            ))
+            .unwrap();
         let factory =
             move |s: &crate::config::ServerDef,
                   slot: &crate::config::SlotConfig|

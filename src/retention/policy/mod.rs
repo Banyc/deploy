@@ -367,7 +367,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .create_dir_all(&layout::tree_root(test_tree_digest("t2").as_str()))
             .unwrap();
         helper
-            .acquire_lock_guard("op")
+            .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
             .unwrap()
             .create_generation(&GenerationAssignment {
                 deployment_id: test_deployment_id("d1"),
@@ -384,7 +384,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             })
             .unwrap();
         helper
-            .acquire_lock_guard("op")
+            .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
             .unwrap()
             .create_generation(&GenerationAssignment {
                 deployment_id: test_deployment_id("d2"),
@@ -401,7 +401,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             })
             .unwrap();
         helper
-            .acquire_lock_guard("op")
+            .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
             .unwrap()
             .swap_current(
                 &crate::remote::helper::ExpectedCurrent::Absent,
@@ -522,7 +522,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .create_dir_all(&layout::tree_root(canonical_tree.as_str()))
             .unwrap();
         helper
-            .acquire_lock_guard("op")
+            .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
             .unwrap()
             .create_generation(&crate::remote::helper::GenerationAssignment {
                 deployment_id: test_deployment_id(deployment_id),
@@ -579,7 +579,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             None,
         );
         helper
-            .acquire_lock_guard("op")
+            .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
             .unwrap()
             .swap_current(
                 &crate::remote::helper::ExpectedCurrent::Absent,
@@ -641,7 +641,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         make_gen(&helper, "d1", "g1", "t-old", &old, None, None);
         make_gen(&helper, "d2", "g2", "t-recent", &recent, Some("g1"), None);
         helper
-            .acquire_lock_guard("op")
+            .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
             .unwrap()
             .swap_current(
                 &crate::remote::helper::ExpectedCurrent::Absent,
@@ -731,7 +731,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             None,
         );
         helper
-            .acquire_lock_guard("op")
+            .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
             .unwrap()
             .swap_current(
                 &crate::remote::helper::ExpectedCurrent::Absent,
@@ -807,7 +807,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         );
         // current -> g2, whose assignment records g1 as prior.
         helper
-            .acquire_lock_guard("op")
+            .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
             .unwrap()
             .swap_current(
                 &crate::remote::helper::ExpectedCurrent::Absent,
@@ -874,7 +874,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             None,
         );
         helper
-            .acquire_lock_guard("op")
+            .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
             .unwrap()
             .swap_current(
                 &crate::remote::helper::ExpectedCurrent::Absent,
@@ -983,7 +983,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             Some("production"),
         );
         helper
-            .acquire_lock_guard("op")
+            .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
             .unwrap()
             .swap_current(
                 &crate::remote::helper::ExpectedCurrent::Absent,
@@ -1116,7 +1116,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             None,
         );
         helper
-            .acquire_lock_guard("op")
+            .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
             .unwrap()
             .swap_current(
                 &crate::remote::helper::ExpectedCurrent::Absent,
@@ -1208,7 +1208,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             None,
         );
         helper
-            .acquire_lock_guard("op")
+            .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
             .unwrap()
             .swap_current(
                 &crate::remote::helper::ExpectedCurrent::Absent,
@@ -1822,11 +1822,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     created_at: g.created_at.to_string(),
                     target: None,
                 };
-                helper.acquire_lock_guard("op").unwrap().create_generation( &asn).unwrap();
+                helper.acquire_lock_guard(&crate::identity::OperationId::new("op".to_string())).unwrap().create_generation( &asn).unwrap();
                 assignments.push(asn);
             }
             let current = history.last().unwrap().clone();
-            helper.acquire_lock_guard("op").unwrap().swap_current(
+            helper.acquire_lock_guard(&crate::identity::OperationId::new("op".to_string())).unwrap().swap_current(
                     &crate::remote::helper::ExpectedCurrent::Absent,
                     current.id.as_str(),
                     "op",
@@ -2409,11 +2409,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     created_at: g.created_at.to_string(),
                     target: None,
                 };
-                helper.acquire_lock_guard("op").unwrap().create_generation( &asn).unwrap();
+                helper.acquire_lock_guard(&crate::identity::OperationId::new("op".to_string())).unwrap().create_generation( &asn).unwrap();
                 assignments.push(asn);
             }
             let current = history.last().unwrap().clone();
-            helper.acquire_lock_guard("op").unwrap().swap_current(
+            helper.acquire_lock_guard(&crate::identity::OperationId::new("op".to_string())).unwrap().swap_current(
                     &crate::remote::helper::ExpectedCurrent::Absent,
                     current.id.as_str(),
                     "op",

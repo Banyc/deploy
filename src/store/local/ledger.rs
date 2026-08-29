@@ -655,9 +655,9 @@ mod tests {
     };
     use crate::ledger::{
         DeploymentIntent, DesiredGeneration, IntentSlot, LedgerIntentWire, LedgerLine,
-        TargetSnapshot, LedgerTerminal, LedgerTerminalWire, NonEmptySlotTable, Observation,
-        ObservedGeneration, PhysicalBinding, PreviousGeneration, SlotOutcome, SlotOutcomeKind,
-        SlotTable, SlotTransition, TerminalDisposition,
+        LedgerTerminal, LedgerTerminalWire, NonEmptySlotTable, Observation, ObservedGeneration,
+        PhysicalBinding, PreviousGeneration, SlotOutcome, SlotOutcomeKind, SlotTable,
+        SlotTransition, TargetSnapshot, TerminalDisposition,
     };
     use proptest::prelude::*;
     use proptest::test_runner::{FileFailurePersistence, RngSeed};

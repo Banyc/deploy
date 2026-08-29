@@ -123,7 +123,9 @@ pub use state::GenerationAssignment;
 pub use state::current::{CurrentState, ExpectedCurrent};
 
 use crate::error::{Error, Result};
-use crate::identity::{AcquisitionId, BehaviorContract, GenerationId, ReleaseId, ReleaseRecord};
+use crate::identity::{
+    AcquisitionId, BehaviorContract, GenerationId, OperationId, ReleaseId, ReleaseRecord,
+};
 use crate::remote::layout;
 use crate::remote::transport::{CreateNewVerdict, Remote, RemoveIfVerdict, VerifiedExisting};
 use serde::{Deserialize, Serialize};
@@ -207,117 +209,78 @@ impl<'a> RemoteHelper<'a> {
     /// own record is already installed) both mean the lock now carries my
     /// record. A DIFFERENT holder's record FAILS with "held by X (acquisition Y)"
     /// — NO automatic break, NO time check, no expiry: a held lock never
-    /// becomes breakable on its own.
+    /// becomes breakable on its own. On ANY different existing record the
+    /// call FAILS immediately with contention; the ONLY takeover path is
+    /// [`Self::recover_lock`], which requires the exact previously observed
+    /// record and performs compare-and-delete.
     ///
-    /// `force` breaks a held lock — used ONLY by the recovery path (see
-    /// [`Self::recover_lock`]); the override is a compare-and-delete BREAK,
-    /// never a blind overwrite: the lock is removed only if it still carries
-    /// the EXACT record that was read, so a valid successor's lock that
-    /// changed between the read and the delete is never removed. Returns the
-    /// authoritative record now held — a caller MUST present the SAME record
-    /// to [`Self::release_lock`], so a stale release can never delete a
-    /// successor's lock.
-    pub fn acquire_lock(&self, op_id: &str, force: bool) -> Result<LockRecord> {
+    /// RAW RECORD ACQUISITION IS PRIVATE: production callers can only ever
+    /// acquire the lock through [`Self::acquire_lock_guard`] (the
+    /// `HeldSlotLock` capability); the raw record is the guard's own
+    /// acquisition step. Crate-internal tests that need to seed a lock
+    /// record without a guard use the test-only seam
+    /// [`Self::acquire_lock_record_for_test`].
+    fn acquire_lock_record(&self, op_id: &OperationId) -> Result<LockRecord> {
         let p = &layout::operation_lock();
-        // The acquisition id is minted ONCE per acquire_lock call and reused
-        // across every iteration so the atomic create-if-absent bite-identical
-        // retry convergence holds (AlreadyPresent with IDENTICAL bytes means
-        // our own record). The force-break path advances to a FRESH id on
-        // each successful break, never reusing the broken record's id.
-        let mut acquisition_id = AcquisitionId::generate();
-        for _ in 0..RECOVERY_BREAK_ATTEMPTS {
-            let record = LockRecord {
-                operation_id: op_id.to_string(),
-                acquisition_id: acquisition_id.clone(),
-            };
-            let bytes = serde_json::to_vec(&record)
-                .map_err(|e| Error::remote(format!("serialize lock record: {e}")))?;
-            // Atomic create-if-absent: only one caller wins the race for a
-            // free lock. The TYPED verdict maps to the lock semantics
-            // directly: `Created` (I won the race) and `AlreadyPresent` with
-            // IDENTICAL bytes (the identical retry — my own record is
-            // already installed) both mean the lock now carries my record;
-            // `Conflict` carries the TYPED reason — only a CONTENT conflict
-            // (a DIFFERENT holder's lock bytes, type+mode verified regular)
-            // is the read-the-winner path below, while a METADATA conflict
-            // (a directory or symlink where the lock file should be, a mode
-            // mismatch, an unreadable entry) is a REAL conflict: the lock is
-            // never silently accepted and the entry is never treated as an
-            // ownership record.
-            match self.remote.try_write_new(p, &bytes)? {
-                CreateNewVerdict::Created | CreateNewVerdict::AlreadyPresent => return Ok(record),
-                CreateNewVerdict::Conflict(VerifiedExisting::ContentMismatch) => {}
-                CreateNewVerdict::Conflict(VerifiedExisting::ModeMismatch { actual, required }) => {
-                    return Err(Error::remote(format!(
-                        "remote mutation lock exists with mode {actual:o} (required {required:o}); refusing to treat it as a lock"
-                    )));
-                }
-                CreateNewVerdict::Conflict(VerifiedExisting::NotRegularFile { kind }) => {
-                    return Err(Error::remote(format!(
-                        "remote mutation lock path is a {kind:?} entry, not a regular lock file; refusing to treat it as a lock"
-                    )));
-                }
-                CreateNewVerdict::Conflict(VerifiedExisting::Unreadable(e)) => {
-                    return Err(Error::remote(format!(
-                        "remote mutation lock exists but is unreadable: {e}"
-                    )));
-                }
-                CreateNewVerdict::Conflict(VerifiedExisting::NotFound) => {
-                    return Err(Error::remote(
-                        "remote mutation lock vanished during verification",
-                    ));
-                }
-                CreateNewVerdict::Conflict(VerifiedExisting::Ok { .. }) => {
-                    return Err(Error::remote(
-                        "remote mutation lock verification unexpectedly succeeded as Ok",
-                    ));
-                }
-            }
-            // Already held by a different record: read the winner and decide
-            // — EVERY different-acquisition record is contention, even when its
-            // operation_id matches (an operation id never confers ownership;
-            // only the acquisition id minted by THIS call identifies the lock
-            // owner). Only the explicit recovery path (confirmed-dead,
-            // compare-and-delete) can take over, gated by `force`.
-            let held = self.remote.read(p)?;
-            let held_rec: LockRecord = serde_json::from_slice(&held).map_err(|e| {
-                Error::integrity(format!(
-                    "mutation lock {} is not an ownership record: {e}",
-                    p.display()
-                ))
-            })?;
-            if !force {
-                if held_rec.operation_id == op_id {
-                    return Err(Error::remote(format!(
-                        "mutation lock held by operation '{}' (acquisition {}), not acquired by this call — an operation id never confers ownership; only the acquisition id created by THIS call identifies the lock owner (this is not a reentrant acquisition, because a fresh acquisition id was minted — if you meant to reuse an already-held lock, pass the held &HeldSlotLock capability into nested routines instead of re-acquiring)",
-                        held_rec.operation_id, held_rec.acquisition_id
-                    )));
-                }
+        let acquisition_id = AcquisitionId::generate();
+        let record = LockRecord {
+            operation_id: op_id.to_string(),
+            acquisition_id,
+        };
+        let bytes = serde_json::to_vec(&record)
+            .map_err(|e| Error::remote(format!("serialize lock record: {e}")))?;
+        match self.remote.try_write_new(p, &bytes)? {
+            CreateNewVerdict::Created | CreateNewVerdict::AlreadyPresent => return Ok(record),
+            CreateNewVerdict::Conflict(VerifiedExisting::ContentMismatch) => {}
+            CreateNewVerdict::Conflict(VerifiedExisting::ModeMismatch { actual, required }) => {
                 return Err(Error::remote(format!(
-                    "remote mutation lock held by '{}' (acquisition {}), not '{op_id}' — no automatic takeover; explicit recovery is required after confirming the holder died (recover via `deploy unlock <target> <slot> --yes`) — an operation id never confers ownership; only the acquisition id created by THIS call identifies the lock owner",
-                    held_rec.operation_id, held_rec.acquisition_id
+                    "remote mutation lock exists with mode {actual:o} (required {required:o}); refusing to treat it as a lock"
                 )));
             }
-            // BREAK (recovery only): atomic compare-and-delete of the EXACT
-            // record that was read. A lock that changed between the read and
-            // the delete (a successor) is NEVER removed —
-            // the break fails and the loop re-reads. Only a `Removed` verdict
-            // frees the slot and advances to a FRESH acquisition id.
-            match self.remote.remove_file_if(p, &held)? {
-                RemoveIfVerdict::Removed => {
-                    acquisition_id = AcquisitionId::generate();
-                }
-                RemoveIfVerdict::Mismatch | RemoveIfVerdict::Absent => {}
+            CreateNewVerdict::Conflict(VerifiedExisting::NotRegularFile { kind }) => {
+                return Err(Error::remote(format!(
+                    "remote mutation lock path is a {kind:?} entry, not a regular lock file; refusing to treat it as a lock"
+                )));
+            }
+            CreateNewVerdict::Conflict(VerifiedExisting::Unreadable(e)) => {
+                return Err(Error::remote(format!(
+                    "remote mutation lock exists but is unreadable: {e}"
+                )));
+            }
+            CreateNewVerdict::Conflict(VerifiedExisting::NotFound) => {
+                return Err(Error::remote(
+                    "remote mutation lock vanished during verification",
+                ));
+            }
+            CreateNewVerdict::Conflict(VerifiedExisting::Ok { .. }) => {
+                return Err(Error::remote(
+                    "remote mutation lock verification unexpectedly succeeded as Ok",
+                ));
             }
         }
+        let held = self.remote.read(p)?;
+        let held_rec: LockRecord = serde_json::from_slice(&held).map_err(|e| {
+            Error::integrity(format!(
+                "mutation lock {} is not an ownership record: {e}",
+                p.display()
+            ))
+        })?;
+        if held_rec.operation_id == op_id.as_str() {
+            return Err(Error::remote(format!(
+                "mutation lock held by operation '{}' (acquisition {}), not acquired by this call — an operation id never confers ownership; only the acquisition id created by THIS call identifies the lock owner (this is not a reentrant acquisition, because a fresh acquisition id was minted — if you meant to reuse an already-held lock, pass the held &HeldSlotLock capability into nested routines instead of re-acquiring)",
+                held_rec.operation_id, held_rec.acquisition_id
+            )));
+        }
         Err(Error::remote(format!(
-            "remote mutation lock contended beyond {RECOVERY_BREAK_ATTEMPTS} attempts (slot {})",
-            p.display()
+            "remote mutation lock held by '{}' (acquisition {}), not '{}' — no automatic takeover; explicit recovery is required after confirming the holder died (recover via `deploy unlock <target> <slot> --yes`) — an operation id never confers ownership; only the acquisition id created by THIS call identifies the lock owner",
+            held_rec.operation_id,
+            held_rec.acquisition_id,
+            op_id.as_str()
         )))
     }
 
     /// Release the mutation lock: atomic compare-and-delete with the record
-    /// returned by [`Self::acquire_lock`]. The file is removed ONLY if it
+    /// returned by [`Self::acquire_lock_record`]. The file is removed ONLY if it
     /// still carries EXACTLY this record — a STALE release (the lock now
     /// belongs to a successor, e.g. a recovery re-took the slot)
     /// FAILS explicitly and NEVER deletes the successor's lock. An
@@ -378,7 +341,7 @@ impl<'a> RemoteHelper<'a> {
     pub fn recover_lock(
         &self,
         observed: &LockRecord,
-        new_operation_id: &str,
+        new_operation_id: &OperationId,
     ) -> Result<LockRecord> {
         let p = &layout::operation_lock();
         // First try the transport's atomic recover (SSH: one remote exec under
@@ -456,13 +419,24 @@ impl<'a> RemoteHelper<'a> {
     /// ownership; only the acquisition id created by THIS call identifies the
     /// lock owner. Nested routines must receive the held `&HeldSlotLock`
     /// capability instead of re-acquiring.
-    pub fn acquire_lock_guard(&self, op_id: &str) -> Result<HeldSlotLock<'_>> {
-        let record = self.acquire_lock(op_id, false)?;
+    pub fn acquire_lock_guard(&self, op_id: &OperationId) -> Result<HeldSlotLock<'_>> {
+        let record = self.acquire_lock_record(op_id)?;
         Ok(HeldSlotLock {
             helper: self,
             record,
             active: true,
         })
+    }
+
+    /// TEST-ONLY SEAM: acquire a raw lock record WITHOUT a guard, so test
+    /// modules outside `remote::helper` (which cannot call the private
+    /// [`Self::acquire_lock_record`]) can seed a held lock for contention /
+    /// recovery scenarios. Exists only in test builds — production code has
+    /// no raw-acquisition entry point (every production mutation goes
+    /// through [`Self::acquire_lock_guard`]).
+    #[cfg(test)]
+    pub(crate) fn acquire_lock_record_for_test(&self, op_id: &OperationId) -> Result<LockRecord> {
+        self.acquire_lock_record(op_id)
     }
 
     /// Recompute and write `state/inventory.json`. This is NOT a slot
@@ -608,16 +582,6 @@ pub fn now_rfc3339() -> String {
     jiff::Timestamp::now().to_string()
 }
 
-/// The bounded retry budget of the recovery break loop in
-/// [`RemoteHelper::acquire_lock`] (the `force` path) and the create/install
-/// convergence of the healthy path. Each iteration either installs our
-/// record, converges (identical retry), fails on a DIFFERENT holder, or —
-/// with `force` — breaks EXACTLY ONE record it verified (compare-and-delete
-/// never removes a successor's lock), so progress is guaranteed and the cap
-/// only bounds adversarially-repeated foreign breaks. There is NO automatic
-/// break: a held lock is only ever broken by this explicit recovery path.
-const RECOVERY_BREAK_ATTEMPTS: usize = 8;
-
 /// The on-server mutation-lock record: owner identity plus a UNIQUE
 /// ACQUISITION ID (uuid-v7, freshly minted per acquisition). The record IS
 /// the lock's content — the compare-and-delete primitive
@@ -683,11 +647,15 @@ mod tests {
         let helper = RemoteHelper::new(&remote);
 
         {
-            let _guard = helper.acquire_lock_guard("op-1").expect("lock acquired");
+            let _guard = helper
+                .acquire_lock_guard(&crate::identity::OperationId::new("op-1".to_string()))
+                .expect("lock acquired");
             // While the guard is alive the lock is held: a second operation
             // cannot acquire it.
             assert!(
-                helper.acquire_lock("op-2", false).is_err(),
+                helper
+                    .acquire_lock_record(&crate::identity::OperationId::new("op-2".to_string()))
+                    .is_err(),
                 "a second operation must not acquire a held lock"
             );
             // Simulate an error path: the guard drops here (scope exit)
@@ -704,7 +672,9 @@ mod tests {
             "the lock file must be removed on drop"
         );
         assert!(
-            helper.acquire_lock("op-2", false).is_ok(),
+            helper
+                .acquire_lock_record(&crate::identity::OperationId::new("op-2".to_string()))
+                .is_ok(),
             "the lock must be released when the guard drops"
         );
     }
@@ -724,7 +694,9 @@ mod tests {
                 .unwrap();
         let helper = RemoteHelper::new(&remote);
 
-        let record = helper.acquire_lock("op-1", false).unwrap();
+        let record = helper
+            .acquire_lock_record(&crate::identity::OperationId::new("op-1".to_string()))
+            .unwrap();
         assert_eq!(record.operation_id, "op-1");
         assert!(
             !record.acquisition_id.as_str().is_empty(),
@@ -733,7 +705,9 @@ mod tests {
         // A DIFFERENT holder's record blocks a contender — NO automatic
         // takeover: the lock never becomes breakable on its own.
         assert!(
-            helper.acquire_lock("op-2", false).is_err(),
+            helper
+                .acquire_lock_record(&crate::identity::OperationId::new("op-2".to_string()))
+                .is_err(),
             "a held lock must block a contender (no automatic takeover)"
         );
         // Release with the same record: compare-and-delete removes the lock.
@@ -746,7 +720,9 @@ mod tests {
             "the lock must be removed by the release"
         );
         // The slot is free again; the next acquisition carries a fresh unique id.
-        let r2 = helper.acquire_lock("op-2", false).unwrap();
+        let r2 = helper
+            .acquire_lock_record(&crate::identity::OperationId::new("op-2".to_string()))
+            .unwrap();
         assert_ne!(
             r2.acquisition_id, record.acquisition_id,
             "fresh acquisition after free has unique id"
@@ -770,16 +746,24 @@ mod tests {
         let helper_a = RemoteHelper::new(&remote);
         let helper_b = RemoteHelper::new(&remote);
 
-        let a = helper_a.acquire_lock("A", false).unwrap();
+        let a = helper_a
+            .acquire_lock_record(&crate::identity::OperationId::new("A".to_string()))
+            .unwrap();
         // B cannot take the lock while A holds it — no matter what: no
         // expiry, no automatic break.
-        assert!(helper_b.acquire_lock("B", false).is_err());
+        assert!(
+            helper_b
+                .acquire_lock_record(&crate::identity::OperationId::new("B".to_string()))
+                .is_err()
+        );
         // A "crashes" (its lock stays in place — no release). The lock is
         // held forever until explicit recovery: B's fresh acquire still
         // fails even with `force: false` obviously, and there is no time
         // that would ever make it succeed on its own.
         assert!(
-            helper_b.acquire_lock("B", false).is_err(),
+            helper_b
+                .acquire_lock_record(&crate::identity::OperationId::new("B".to_string()))
+                .is_err(),
             "a crashed owner's lock is held until explicit recovery"
         );
         // EXPLICIT RECOVERY under the authoritative local application-store
@@ -794,7 +778,7 @@ mod tests {
         )
         .expect("the authoritative local lock must be acquirable");
         let b = helper_b
-            .recover_lock(&a, "B")
+            .recover_lock(&a, &crate::identity::OperationId::new("B".to_string()))
             .expect("explicit recovery of the confirmed-dead controller succeeds");
         assert_ne!(
             b.acquisition_id, a.acquisition_id,
@@ -850,15 +834,19 @@ mod tests {
         let helper_c = RemoteHelper::new(&remote);
 
         // A acquires and crashes.
-        let a = helper_a.acquire_lock("A", false).unwrap();
+        let a = helper_a
+            .acquire_lock_record(&crate::identity::OperationId::new("A".to_string()))
+            .unwrap();
         // B recovers the slot: fresh acquisition id.
-        let b = helper_b.recover_lock(&a, "B").unwrap();
+        let b = helper_b
+            .recover_lock(&a, &crate::identity::OperationId::new("B".to_string()))
+            .unwrap();
         assert_ne!(b.acquisition_id, a.acquisition_id);
         // C tries to recover the slot with A's OLD observed record (stale —
         // the slot now carries B's record): REFUSED, and B's lock
         // survives byte-for-byte.
         let err = helper_c
-            .recover_lock(&a, "C")
+            .recover_lock(&a, &crate::identity::OperationId::new("C".to_string()))
             .expect_err("a recovery with a stale observed record must be refused");
         assert!(
             err.to_string().contains("recovery refused"),
@@ -871,7 +859,9 @@ mod tests {
             "the successor's lock must survive a refused recovery byte-for-byte"
         );
         // Recovery with the CURRENT observed record succeeds: fresh unique id.
-        let c = helper_c.recover_lock(&b, "C").unwrap();
+        let c = helper_c
+            .recover_lock(&b, &crate::identity::OperationId::new("C".to_string()))
+            .unwrap();
         assert_ne!(
             c.acquisition_id, b.acquisition_id,
             "recoveries install fresh unique ids"
@@ -891,14 +881,23 @@ mod tests {
                 .unwrap();
         let helper = RemoteHelper::new(&remote);
 
-        let record = helper.acquire_lock("op-1", false).unwrap();
+        let record = helper
+            .acquire_lock_record(&crate::identity::OperationId::new("op-1".to_string()))
+            .unwrap();
         helper.release_lock(&record).unwrap();
         let err = helper
-            .recover_lock(&record, "op-2")
+            .recover_lock(
+                &record,
+                &crate::identity::OperationId::new("op-2".to_string()),
+            )
             .expect_err("recovering a free slot must be refused");
         assert!(err.to_string().contains("already free"));
         // A fresh acquire proceeds directly (create-once on the free slot).
-        assert!(helper.acquire_lock("op-2", false).is_ok());
+        assert!(
+            helper
+                .acquire_lock_record(&crate::identity::OperationId::new("op-2".to_string()))
+                .is_ok()
+        );
     }
 
     /// The compare-and-delete release is record-exact: releasing with a
@@ -912,7 +911,9 @@ mod tests {
                 .unwrap();
         let helper = RemoteHelper::new(&remote);
 
-        let held = helper.acquire_lock("op-1", false).unwrap();
+        let held = helper
+            .acquire_lock_record(&crate::identity::OperationId::new("op-1".to_string()))
+            .unwrap();
         // A fabricated record with the same operation but a WRONG acquisition id: the
         // release must fail as stale and the real lock must survive.
         let forged = LockRecord {
@@ -1151,13 +1152,14 @@ mod nested_guard_proptest {
         let helper = RemoteHelper::new(&remote);
         let op_a = format!("op-reentrant-{op_suffix}");
         let outer = helper
-            .acquire_lock_guard(&op_a)
+            .acquire_lock_guard(&crate::identity::OperationId::new(op_a.to_string()))
             .expect("outer acquire must succeed");
         let initial_bytes = remote.read(&layout::operation_lock()).unwrap();
-        let err = match helper.acquire_lock_guard(&op_a) {
-            Ok(_) => panic!("reentrant acquire must be rejected"),
-            Err(e) => e,
-        };
+        let err =
+            match helper.acquire_lock_guard(&crate::identity::OperationId::new(op_a.to_string())) {
+                Ok(_) => panic!("reentrant acquire must be rejected"),
+                Err(e) => e,
+            };
         let msg = err.to_string();
         prop_assert!(
             msg.contains("never confers ownership") || msg.contains("not acquired by this call"),
@@ -1178,7 +1180,9 @@ mod nested_guard_proptest {
             "reentrant rejection must leave on-disk record byte-identical"
         );
         // Contender with different op still blocked.
-        let contender = helper.acquire_lock("op-contender", false);
+        let contender = helper.acquire_lock_record(&crate::identity::OperationId::new(
+            "op-contender".to_string(),
+        ));
         prop_assert!(
             contender.is_err(),
             "contender must remain blocked while outer lives"
@@ -1209,7 +1213,9 @@ mod nested_guard_proptest {
         let helper_b = RemoteHelper::new(&remote);
         let op_a = format!("op-cap-{variant}");
         let op_b = "op-B-cap";
-        let outer = helper_a.acquire_lock_guard(&op_a).unwrap();
+        let outer = helper_a
+            .acquire_lock_guard(&crate::identity::OperationId::new(op_a.to_string()))
+            .unwrap();
         let initial_bytes = remote.read(&layout::operation_lock()).unwrap();
         // Inner routine takes &HeldSlotLock capability, never re-acquires.
         fn compensation_inner(_cap: &HeldSlotLock<'_>, variant: u8) {
@@ -1224,7 +1230,8 @@ mod nested_guard_proptest {
                 initial_bytes.clone(),
                 "tail window must keep outer record byte-for-byte"
             );
-            let b_attempt = helper_b.acquire_lock(op_b, false);
+            let b_attempt =
+                helper_b.acquire_lock_record(&crate::identity::OperationId::new(op_b.to_string()));
             prop_assert!(
                 b_attempt.is_err(),
                 "B must remain blocked in tail window while outer lives"
@@ -1245,7 +1252,8 @@ mod nested_guard_proptest {
                 .is_none(),
             "lock file must be removed after outer drop"
         );
-        let b_ok = helper_b.acquire_lock(op_b, false);
+        let b_ok =
+            helper_b.acquire_lock_record(&crate::identity::OperationId::new(op_b.to_string()));
         prop_assert!(b_ok.is_ok(), "B may succeed only after outer guard drops");
         if let Ok(rec) = b_ok {
             let _ = helper_b.release_lock(&rec);
@@ -1269,8 +1277,12 @@ mod nested_guard_proptest {
         let helper_b = RemoteHelper::new(&remote_b);
         let op_a = "op-iso-A";
         let op_b = "op-iso-B";
-        let guard_a = helper_a.acquire_lock_guard(op_a).unwrap();
-        let guard_b = helper_b.acquire_lock_guard(op_b).unwrap();
+        let guard_a = helper_a
+            .acquire_lock_guard(&crate::identity::OperationId::new(op_a.to_string()))
+            .unwrap();
+        let guard_b = helper_b
+            .acquire_lock_guard(&crate::identity::OperationId::new(op_b.to_string()))
+            .unwrap();
         // Each lock file lives in its own real directory.
         prop_assert!(
             remote_a
@@ -1602,7 +1614,9 @@ mod cross_remote_guard_mutation {
         // Snapshot B before
         let before_b = snapshot_tree(remote_b.root());
         // Acquire A's guard
-        let guard_a = helper_a.acquire_lock_guard("op-A").unwrap();
+        let guard_a = helper_a
+            .acquire_lock_guard(&crate::identity::OperationId::new("op-A".to_string()))
+            .unwrap();
         // Randomized sequence on A's guard
         for op in &ops {
             let _ = match op {
@@ -1667,7 +1681,9 @@ mod cross_remote_guard_mutation {
         // Reverse: acquire B's guard, assert A unchanged
         drop(guard_a);
         let before_a = snapshot_tree(remote_a.root());
-        let guard_b = helper_b.acquire_lock_guard("op-B").unwrap();
+        let guard_b = helper_b
+            .acquire_lock_guard(&crate::identity::OperationId::new("op-B".to_string()))
+            .unwrap();
         for op in &ops {
             let _ = match op {
                 GuardOp::SwapCurrent {
@@ -1890,7 +1906,8 @@ mod barrier_proptest {
         let tx1 = tx.clone();
         let h1 = std::thread::spawn(move || {
             let helper = RemoteHelper::new(w1.as_ref() as &dyn Remote);
-            let res = helper.acquire_lock_guard("op-race");
+            let res = helper
+                .acquire_lock_guard(&crate::identity::OperationId::new("op-race".to_string()));
             let is_ok = res.is_ok();
             let err_msg = res.as_ref().err().map(|e| e.to_string());
             tx1.send((is_ok, err_msg)).unwrap();
@@ -1904,7 +1921,8 @@ mod barrier_proptest {
         let tx2 = tx.clone();
         let h2 = std::thread::spawn(move || {
             let helper = RemoteHelper::new(w2.as_ref() as &dyn Remote);
-            let res = helper.acquire_lock_guard("op-race");
+            let res = helper
+                .acquire_lock_guard(&crate::identity::OperationId::new("op-race".to_string()));
             let is_ok = res.is_ok();
             let err_msg = res.as_ref().err().map(|e| e.to_string());
             tx2.send((is_ok, err_msg)).unwrap();
@@ -1947,7 +1965,8 @@ mod barrier_proptest {
         // While winner alive, third operation fails and record stays byte-identical
         {
             let helper3 = RemoteHelper::new(wrapper.as_ref() as &dyn Remote);
-            let third = helper3.acquire_lock("op-3", false);
+            let third =
+                helper3.acquire_lock_record(&crate::identity::OperationId::new("op-3".to_string()));
             prop_assert!(
                 third.is_err(),
                 "third operation must be blocked while winner holds lock"
@@ -1974,7 +1993,7 @@ mod barrier_proptest {
         {
             let helper3 = RemoteHelper::new(wrapper.as_ref() as &dyn Remote);
             let rec = helper3
-                .acquire_lock("op-3", false)
+                .acquire_lock_record(&crate::identity::OperationId::new("op-3".to_string()))
                 .expect("third operation must succeed after winner released");
             prop_assert_ne!(
                 rec.acquisition_id.clone(),
@@ -2146,7 +2165,11 @@ mod guard_release_retry {
             calls: calls.clone(),
         };
         let helper = RemoteHelper::new(&fault_remote);
-        let guard = helper.acquire_lock_guard("op-predecessor").unwrap();
+        let guard = helper
+            .acquire_lock_guard(&crate::identity::OperationId::new(
+                "op-predecessor".to_string(),
+            ))
+            .unwrap();
         let predecessor_bytes = fault_remote.read(&layout::operation_lock()).unwrap();
         if outcome == GuardFaultOutcome::SuccessorMismatch {
             let direct =
@@ -2154,7 +2177,10 @@ mod guard_release_retry {
             let helper_b = RemoteHelper::new(&direct);
             let predecessor_rec: LockRecord = serde_json::from_slice(&predecessor_bytes).unwrap();
             let _successor = helper_b
-                .recover_lock(&predecessor_rec, "op-successor")
+                .recover_lock(
+                    &predecessor_rec,
+                    &crate::identity::OperationId::new("op-successor".to_string()),
+                )
                 .unwrap();
             let successor_bytes = direct.read(&layout::operation_lock()).unwrap();
             let res = guard.release();
@@ -2240,6 +2266,147 @@ mod guard_release_retry {
             ]
         ) {
             run_guard_release_case(outcome)?;
+        }
+    }
+}
+
+#[cfg(test)]
+mod ordinary_acquisition_never_takes_over {
+    use super::*;
+    use crate::remote::transport::LocalTransport;
+    use proptest::prelude::*;
+    use proptest::test_runner::RngSeed;
+
+    fn run_case(
+        holder_tag: u8,
+        contenders: Vec<u8>,
+        wrong_tag: u8,
+    ) -> std::result::Result<(), TestCaseError> {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let remote =
+            LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
+                .unwrap();
+        let helper = RemoteHelper::new(&remote);
+        let holder_op = crate::identity::OperationId::new(format!("holder-{holder_tag}"));
+        let guard = helper
+            .acquire_lock_guard(&holder_op)
+            .expect("holder acquire must succeed");
+        let original_bytes = remote.read(&layout::operation_lock()).unwrap();
+        let observed: LockRecord = serde_json::from_slice(&original_bytes).unwrap();
+        // Keep the guard alive so the lock stays held, but we need to allow contender attempts to fail while leaving bytes identical.
+        // The guard's existence keeps the lock file present; contender attempts should fail and not modify bytes.
+        for &c in &contenders {
+            let contender_op = crate::identity::OperationId::new(format!("contender-{c}"));
+            let res_record = helper.acquire_lock_record(&contender_op);
+            prop_assert!(
+                res_record.is_err(),
+                "ordinary acquisition must fail while lock held, contender {c}"
+            );
+            let err_msg = res_record.unwrap_err().to_string();
+            prop_assert!(
+                err_msg.contains("no automatic takeover") || err_msg.contains("explicit recovery"),
+                "contention error must mention no automatic takeover, got: {err_msg}"
+            );
+            let after = remote.read(&layout::operation_lock()).unwrap();
+            prop_assert_eq!(
+                &after,
+                &original_bytes,
+                "lock bytes must be identical after failed ordinary acquisition"
+            );
+            let res_guard = helper.acquire_lock_guard(&contender_op);
+            prop_assert!(
+                res_guard.is_err(),
+                "ordinary guard acquisition must also fail"
+            );
+            let after2 = remote.read(&layout::operation_lock()).unwrap();
+            prop_assert_eq!(
+                &after2,
+                &original_bytes,
+                "lock bytes must be identical after failed guard acquisition"
+            );
+        }
+        // Wrong observed record (different acquisition id) must fail and leave bytes identical
+        let wrong_op = crate::identity::OperationId::new(format!("wrong-{wrong_tag}"));
+        let wrong_record = LockRecord {
+            operation_id: wrong_op.to_string(),
+            acquisition_id: crate::identity::AcquisitionId::generate(),
+        };
+        // Ensure wrong is not equal to observed
+        prop_assert_ne!(&wrong_record, &observed);
+        let wrong_res = helper.recover_lock(
+            &wrong_record,
+            &crate::identity::OperationId::new(format!("successor-wrong-{wrong_tag}")),
+        );
+        prop_assert!(wrong_res.is_err(), "recover with wrong observed must fail");
+        let after_wrong = remote.read(&layout::operation_lock()).unwrap();
+        prop_assert_eq!(
+            &after_wrong,
+            &original_bytes,
+            "lock bytes must be identical after wrong recover"
+        );
+
+        // Exact observed must succeed and install fresh acquisition
+        let successor_op = crate::identity::OperationId::new(format!("successor-{holder_tag}"));
+        let successor = helper
+            .recover_lock(&observed, &successor_op)
+            .expect("recover with exact observed must succeed");
+        prop_assert_ne!(
+            &successor.acquisition_id,
+            &observed.acquisition_id,
+            "successor must have fresh acquisition id"
+        );
+        let after_success = remote.read(&layout::operation_lock()).unwrap();
+        let after_rec: LockRecord = serde_json::from_slice(&after_success).unwrap();
+        prop_assert_eq!(
+            &after_rec,
+            &successor,
+            "on-disk lock must be successor record"
+        );
+        prop_assert_ne!(
+            &after_success,
+            &original_bytes,
+            "lock bytes must change after successful recover"
+        );
+
+        // Release successor and drop holder guard (holder's release will be stale and fail, but successor holds it)
+        // The holder guard's drop will attempt stale release, but successor's lock should survive
+        drop(guard);
+        // After holder guard drops (stale release attempt), successor's lock must still be present byte-for-byte
+        let after_drop = remote.read(&layout::operation_lock()).unwrap();
+        prop_assert_eq!(
+            &after_drop,
+            &after_success,
+            "successor lock must survive holder's stale release on drop"
+        );
+        // Clean up successor
+        helper
+            .release_lock(&successor)
+            .expect("successor release must succeed");
+        prop_assert!(
+            remote
+                .metadata_opt(&layout::operation_lock())
+                .unwrap()
+                .is_none(),
+            "lock must be free after successor release"
+        );
+        Ok(())
+    }
+
+    proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: crate::testutil::proptest_cases(16),
+            max_shrink_iters: 10000,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..proptest::test_runner::Config::default()
+        })]
+        #[test]
+        fn ordinary_acquisition_always_fails_and_leaves_bytes_identical_only_exact_recover_succeeds(
+            holder_tag in 0u8..4,
+            contenders in prop::collection::vec(0u8..4, 1..4),
+            wrong_tag in 10u8..14,
+        ) {
+            run_case(holder_tag, contenders, wrong_tag)?;
         }
     }
 }

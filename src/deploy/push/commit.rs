@@ -1871,7 +1871,7 @@ pub(crate) mod commit_tests {
             .unwrap();
         let helper = RemoteHelper::new(&remote);
         helper
-            .acquire_lock_guard("op-mint")
+            .acquire_lock_guard(&crate::identity::OperationId::new("op-mint".to_string()))
             .unwrap()
             .create_generation(&GenerationAssignment {
                 deployment_id: deployment_id.clone(),
@@ -1884,7 +1884,7 @@ pub(crate) mod commit_tests {
             })
             .unwrap();
         helper
-            .acquire_lock_guard("op-mint")
+            .acquire_lock_guard(&crate::identity::OperationId::new("op-mint".to_string()))
             .unwrap()
             .swap_current(&ExpectedCurrent::Absent, generation.as_str(), "op-mint")
             .unwrap();
@@ -1908,7 +1908,7 @@ pub(crate) mod commit_tests {
             .unwrap();
         let helper = RemoteHelper::new(&remote);
         helper
-            .acquire_lock_guard("op-foreign")
+            .acquire_lock_guard(&crate::identity::OperationId::new("op-foreign".to_string()))
             .unwrap()
             .create_generation(&GenerationAssignment {
                 deployment_id: test_deployment_id("deploy-foreign"),

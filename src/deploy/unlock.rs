@@ -142,7 +142,7 @@ pub(crate) fn run_unlock(
             }
 
             // Explicit recovery: fresh acquisition id, then explicit release leaving slot free.
-            let successor = helper.recover_lock(&observed, op_id.as_str())?;
+            let successor = helper.recover_lock(&observed, &op_id)?;
             helper.release_lock(&successor)?;
 
             // Local guard drops here.
@@ -245,6 +245,20 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         (config, cfg_path)
     }
 
+    fn acquire_via_guard(helper: &RemoteHelper, op_str: &str) -> crate::remote::helper::LockRecord {
+        let op = crate::identity::OperationId::new(op_str.to_string());
+        let guard = helper
+            .acquire_lock_guard(&crate::identity::OperationId::new(op.to_string()))
+            .unwrap();
+        let bytes = helper
+            .remote()
+            .read(&crate::remote::layout::operation_lock())
+            .unwrap();
+        let rec: crate::remote::helper::LockRecord = serde_json::from_slice(&bytes).unwrap();
+        std::mem::forget(guard);
+        rec
+    }
+
     fn slot_factory(
         deploy_dir: PathBuf,
     ) -> impl Fn(
@@ -302,7 +316,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // Plant hostile lock.
         let remote = LocalTransport::new(&fixture_env(), slot_dir.clone()).unwrap();
         let helper = RemoteHelper::new(&remote);
-        let _rec = helper.acquire_lock("op-dead", false).unwrap();
+        let _rec = acquire_via_guard(&helper, "op-dead");
         let before = remote.read(&layout::operation_lock()).unwrap();
 
         let factory = slot_factory(slot_dir.clone());
@@ -354,7 +368,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // Plant hostile lock.
         let remote = LocalTransport::new(&fixture_env(), slot_dir.clone()).unwrap();
         let helper = RemoteHelper::new(&remote);
-        let rec = helper.acquire_lock("op-dead", false).unwrap();
+        let rec = acquire_via_guard(&helper, "op-dead");
 
         let factory = slot_factory(slot_dir.clone());
         let report = run_unlock(
@@ -392,7 +406,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "lock file must be gone after recover+release"
         );
         // Follow-up acquire succeeds with a fresh unique acquisition id.
-        let rec = helper.acquire_lock("op-after", false).unwrap();
+        let rec = acquire_via_guard(&helper, "op-after");
         assert!(
             !rec.acquisition_id.as_str().is_empty(),
             "fresh lock after free carries an acquisition id"
@@ -453,7 +467,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let store = crate::store::local::LocalStore::with_base(dir.path().join("store")).unwrap();
         let remote = LocalTransport::new(&fixture_env(), slot_dir.clone()).unwrap();
         let helper = RemoteHelper::new(&remote);
-        helper.acquire_lock("op-dead", false).unwrap();
+        acquire_via_guard(&helper, "op-dead");
         let before = remote.read(&layout::operation_lock()).unwrap();
         let factory = slot_factory(slot_dir.clone());
         let err = run_unlock(
@@ -483,7 +497,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let store = crate::store::local::LocalStore::with_base(dir.path().join("store")).unwrap();
         let remote = LocalTransport::new(&fixture_env(), slot_dir.clone()).unwrap();
         let helper = RemoteHelper::new(&remote);
-        let rec = helper.acquire_lock("op-dead", false).unwrap();
+        let rec = acquire_via_guard(&helper, "op-dead");
         let before = remote.read(&layout::operation_lock()).unwrap();
         let factory = slot_factory(slot_dir.clone());
         let err = run_unlock(
@@ -511,11 +525,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let remote = LocalTransport::new(&fixture_env(), slot_dir.clone()).unwrap();
         let helper = RemoteHelper::new(&remote);
         // Inspect-A: plant A and record its acquisition.
-        let rec_a = helper.acquire_lock("op-A", false).unwrap();
+        let rec_a = acquire_via_guard(&helper, "op-A");
         let acq_a = rec_a.acquisition_id.clone();
         // Release A -> acquire B (newer record installed after inspection).
         helper.release_lock(&rec_a).unwrap();
-        let rec_b = helper.acquire_lock("op-B", false).unwrap();
+        let rec_b = acquire_via_guard(&helper, "op-B");
         assert_ne!(
             rec_b.acquisition_id, acq_a,
             "B must carry fresh acquisition"
@@ -597,10 +611,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             let store = crate::store::local::LocalStore::with_base(dir.path().join("store")).unwrap();
             let remote = LocalTransport::new(&fixture_env(), slot_dir.clone()).unwrap();
             let helper = RemoteHelper::new(&remote);
-            let rec_a = helper.acquire_lock(&format!("op-{tag_a}"), false).unwrap();
+            let rec_a = acquire_via_guard(&helper, &format!("op-{tag_a}"));
             let acq_a = rec_a.acquisition_id.clone();
             helper.release_lock(&rec_a).unwrap();
-            let rec_b = helper.acquire_lock(&format!("op-{tag_b}"), false).unwrap();
+            let rec_b = acquire_via_guard(&helper, &format!("op-{tag_b}"));
             prop_assert_ne!(rec_b.acquisition_id.clone(), acq_a.clone());
             let before_b = remote.read(&layout::operation_lock()).unwrap();
             let factory = slot_factory(slot_dir.clone());

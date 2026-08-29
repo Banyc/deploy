@@ -113,7 +113,9 @@ mod tests_markers {
         .unwrap();
 
         let helper = RemoteHelper::new(&remote);
-        let _guard = helper.acquire_lock_guard("op-marker").unwrap();
+        let _guard = helper
+            .acquire_lock_guard(&crate::identity::OperationId::new("op-marker".to_string()))
+            .unwrap();
         _guard
             .write_commit_marker("deploy-0", "gen-0", &["p1".to_string()], Some("t1"))
             .expect("commit marker install must succeed past stale temp");
@@ -162,7 +164,9 @@ mod tests_markers {
         std::os::unix::fs::symlink(&target, root.join(&marker)).unwrap();
 
         let helper = RemoteHelper::new(&remote);
-        let _guard = helper.acquire_lock_guard("op-symlink").unwrap();
+        let _guard = helper
+            .acquire_lock_guard(&crate::identity::OperationId::new("op-symlink".to_string()))
+            .unwrap();
         let err = _guard
             .write_commit_marker("deploy-0", "gen-0", &["p1".to_string()], Some("t1"))
             .expect_err("a symlink where the marker should be is a real conflict");
@@ -218,7 +222,9 @@ mod tests_markers {
                 // Acquire a single guard covering the burst of marker writes
                 // (the capability is per-slot, reused across writes in this
                 // test harness).
-                let _guard = h.acquire_lock_guard("op-burst").unwrap();
+                let _guard = h
+                    .acquire_lock_guard(&crate::identity::OperationId::new("op-burst".to_string()))
+                    .unwrap();
                 for i in 0..80 {
                     if let Err(e) = _guard.write_commit_marker(
                         &format!("deploy-{i}"),

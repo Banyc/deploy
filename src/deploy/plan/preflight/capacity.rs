@@ -111,7 +111,7 @@ fn retain_best_effort_for_capacity(
     op_id: &OperationId,
     deployment_id: &DeploymentId,
 ) {
-    if let Ok(_guard) = helper.acquire_lock_guard(op_id.as_str()) {
+    if let Ok(_guard) = helper.acquire_lock_guard(op_id) {
         let retention = config
             .slot_retention(&slot.id)
             .expect("the assignment's slot is declared by its owning variant");

@@ -5,7 +5,7 @@ use deploy::config::ProjectConfig;
 use deploy::deploy::{PushOptions, push};
 use deploy::error::Result;
 use deploy::identity::{ServerId, SlotId, TreeDigest};
-use deploy::ledger::{DeploymentStatus, LedgerEntry, TargetSnapshot, PhysicalBinding};
+use deploy::ledger::{DeploymentStatus, LedgerEntry, PhysicalBinding, TargetSnapshot};
 
 use deploy::remote::transport::{CreateNewVerdict, FsBytes, LocalTransport, Remote};
 use deploy::store::local::LocalStore;
@@ -2593,10 +2593,11 @@ fn capacity_retention_compute_retained_failure_releases_lock() -> Result<()> {
         // failure; the probe lock is then released with the record the
         // acquire returned (the release is a compare-and-delete against that
         // EXACT record).
-        let record = helper.acquire_lock("op-after", false).expect(
+        let probe_op = deploy::identity::OperationId::generate();
+        let probe_guard = helper.acquire_lock_guard(&probe_op).expect(
             "another operation must be able to acquire the lock after the failure ({server})",
         );
-        helper.release_lock(&record)?;
+        probe_guard.release()?;
     }
     Ok(())
 }
@@ -2713,14 +2714,14 @@ fn step17_retention_failure_defers_maintenance_until_noop_retry() -> Result<()> 
         );
         let helper = RemoteHelper::new(&remote);
         // Another operation must be able to acquire the lock after the
-        // failure; the probe lock is then released with the record the
-        // acquire returned (the release is a compare-and-delete against that
-        // EXACT record).
-        let record = helper.acquire_lock("op-after", false).expect(
+        // failure; the probe lock is then released through the guard (the
+        // release is a compare-and-delete against the guard's EXACT record).
+        let probe_op = deploy::identity::OperationId::generate();
+        let probe_guard = helper.acquire_lock_guard(&probe_op).expect(
             "another operation must be able to acquire the lock after the failure ({server})",
         );
         // Release the probe lock so the end-to-end re-push below starts clean.
-        helper.release_lock(&record)?;
+        probe_guard.release()?;
     }
 
     // Push 2: unchanged content, so this is an up-to-date NO-OP — but the
@@ -3231,7 +3232,7 @@ fn pending_commit_diverged_generation_is_degraded_not_successful() -> Result<()>
         .create_dir_all(&deploy::remote::layout::tree_root(foreign_tree.as_str()))?;
     let foreign_gen = deploy::identity::GenerationId::generate();
     foreign_helper
-        .acquire_lock_guard("op-foreign")
+        .acquire_lock_guard(&deploy::identity::OperationId::generate())
         .unwrap()
         .create_generation(&GenerationAssignment {
             deployment_id: deploy::identity::DeploymentId::generate(),
@@ -3250,7 +3251,7 @@ fn pending_commit_diverged_generation_is_degraded_not_successful() -> Result<()>
             target: None,
         })?;
     foreign_helper
-        .acquire_lock_guard("op-foreign")
+        .acquire_lock_guard(&deploy::identity::OperationId::generate())
         .unwrap()
         .swap_current(
             &deploy::remote::helper::ExpectedCurrent::Absent,

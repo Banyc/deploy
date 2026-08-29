@@ -3182,7 +3182,7 @@ exec /bin/mv "$@"
                     std::fs::read_link(&link).unwrap(),
                 );
                 let helper = RemoteHelper::new(&t);
-                let guard = helper.acquire_lock_guard("op");
+                let guard = helper.acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()));
                 let err = match guard {
                     Ok(g) => g.swap_current( &ExpectedCurrent::Absent, "gen-gate", "op")
                         .unwrap_err(),
@@ -3260,12 +3260,12 @@ exec /bin/mv "$@"
             target: None,
         };
         helper
-            .acquire_lock_guard("op")
+            .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
             .unwrap()
             .create_generation(&mk(&g1, "t1"))
             .unwrap();
         helper
-            .acquire_lock_guard("op")
+            .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
             .unwrap()
             .create_generation(&mk(&g2, "t2"))
             .unwrap();
@@ -3277,7 +3277,7 @@ exec /bin/mv "$@"
                 .unwrap();
         }
         helper
-            .acquire_lock_guard("op")
+            .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
             .unwrap()
             .swap_current(&ExpectedCurrent::Absent, g2.as_str(), "op")
             .unwrap();

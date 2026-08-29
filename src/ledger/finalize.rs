@@ -67,8 +67,8 @@ use crate::ledger::records::{
     validate_successful_rollback_against_intent,
 };
 pub use crate::ledger::records::{
-    DeploymentIntent, LedgerEntry, LedgerIntentWire, TargetSnapshot, LedgerTerminal,
-    LedgerTerminalWire, PhysicalBinding, TerminalDisposition,
+    DeploymentIntent, LedgerEntry, LedgerIntentWire, LedgerTerminal, LedgerTerminalWire,
+    PhysicalBinding, TargetSnapshot, TerminalDisposition,
 };
 use crate::remote::helper::{HeldSlotLock, RemoteHelper};
 use crate::store::local::LocalStore;
@@ -211,7 +211,7 @@ pub fn finalize_successful_locked(
                 slot: (*sid).clone(),
             });
         };
-        match helper.acquire_lock_guard(op_id.as_str()) {
+        match helper.acquire_lock_guard(op_id) {
             Ok(guard) => guards.push(guard),
             Err(_) => {
                 // The lock is transiently held elsewhere: leave the attempt
@@ -680,7 +680,7 @@ mod tests {
             ))
             .unwrap();
         helper
-            .acquire_lock_guard("op-seed")
+            .acquire_lock_guard(&crate::identity::OperationId::new("op-seed".to_string()))
             .unwrap()
             .create_generation(&crate::remote::helper::GenerationAssignment {
                 deployment_id: attempt.deployment_id.clone(),
@@ -697,7 +697,7 @@ mod tests {
             })
             .unwrap();
         helper
-            .acquire_lock_guard("op-seed")
+            .acquire_lock_guard(&crate::identity::OperationId::new("op-seed".to_string()))
             .unwrap()
             .swap_current(
                 &ExpectedCurrent::Absent,
@@ -800,7 +800,7 @@ mod tests {
             ))
             .unwrap();
         helper
-            .acquire_lock_guard("op-seed")
+            .acquire_lock_guard(&crate::identity::OperationId::new("op-seed".to_string()))
             .unwrap()
             .create_generation(&crate::remote::helper::GenerationAssignment {
                 deployment_id: attempt.deployment_id.clone(),
@@ -817,7 +817,7 @@ mod tests {
             })
             .unwrap();
         helper
-            .acquire_lock_guard("op-seed")
+            .acquire_lock_guard(&crate::identity::OperationId::new("op-seed".to_string()))
             .unwrap()
             .swap_current(
                 &ExpectedCurrent::Absent,

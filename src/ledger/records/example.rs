@@ -34,8 +34,9 @@ use crate::identity::{
 };
 use crate::ledger::finalize::LedgerLine;
 use crate::ledger::records::{
-    DeploymentStatus, LedgerIntentWire, TargetSnapshot, LedgerTerminalWire, ObservationWire,
-    ObservedGenerationWire, PhysicalBinding, SnapshotEntry, SlotOutcomeKind, SlotResult,
+    DeploymentStatus, LedgerIntentWire, LedgerTerminalWire, ObservationWire,
+    ObservedGenerationWire, PhysicalBinding, SlotOutcomeKind, SlotResult, SnapshotEntry,
+    TargetSnapshot,
 };
 use std::collections::BTreeMap;
 

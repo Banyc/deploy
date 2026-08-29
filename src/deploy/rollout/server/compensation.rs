@@ -126,7 +126,7 @@ pub(crate) fn compensate_server(
     config: &ProjectConfig,
     template_vars: &crate::remote::canonical::TemplateVars,
 ) -> Result<bool> {
-    let guard = match helper.acquire_lock_guard(op_id.as_str()) {
+    let guard = match helper.acquire_lock_guard(op_id) {
         Ok(g) => g,
         Err(_) => return Ok(false),
     };
@@ -357,7 +357,7 @@ mod compensation_tests {
         // `current` moved to g2)...
         let g2 = GenerationId::generate();
         helper
-            .acquire_lock_guard("op2")
+            .acquire_lock_guard(&crate::identity::OperationId::new("op2".to_string()))
             .unwrap()
             .create_generation(&crate::remote::helper::GenerationAssignment {
                 deployment_id: test_deployment_id("d2"),
@@ -374,7 +374,7 @@ mod compensation_tests {
             })
             .unwrap();
         helper
-            .acquire_lock_guard("op2")
+            .acquire_lock_guard(&crate::identity::OperationId::new("op2".to_string()))
             .unwrap()
             .swap_current(
                 &crate::remote::helper::ExpectedCurrent::Generation(first.generation.clone()),
@@ -386,7 +386,7 @@ mod compensation_tests {
         // op's compensation ran: the CAS precondition (current == g2) fails.
         let g3 = GenerationId::generate();
         helper
-            .acquire_lock_guard("op3")
+            .acquire_lock_guard(&crate::identity::OperationId::new("op3".to_string()))
             .unwrap()
             .create_generation(&crate::remote::helper::GenerationAssignment {
                 deployment_id: test_deployment_id("d3"),
@@ -403,7 +403,7 @@ mod compensation_tests {
             })
             .unwrap();
         helper
-            .acquire_lock_guard("op3")
+            .acquire_lock_guard(&crate::identity::OperationId::new("op3".to_string()))
             .unwrap()
             .swap_current(
                 &crate::remote::helper::ExpectedCurrent::Generation(g2.clone()),

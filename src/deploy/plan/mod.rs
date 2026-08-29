@@ -19,10 +19,10 @@ use crate::identity::SlotId;
 use crate::identity::TreeDigest;
 use crate::identity::VariantName;
 use crate::ledger::FrozenSlotTopology;
-use crate::ledger::TargetSnapshot;
 use crate::ledger::PhysicalBinding;
 use crate::ledger::PlanOrigin;
 use crate::ledger::PushRef;
+use crate::ledger::TargetSnapshot;
 use crate::ledger::VerifiedReleaseRebinding;
 use crate::ledger::resolve_deployment;
 use crate::store::local::LocalStore;
@@ -556,8 +556,8 @@ mod plan_tests {
         test_deployment_id, test_generation_id, test_tree_digest,
     };
     use crate::ledger::{
-        DeploymentIntent, DesiredGeneration, IntentSlot, TargetSnapshot, LedgerTerminal,
-        NonEmptySlotTable, PhysicalBinding, TerminalDisposition,
+        DeploymentIntent, DesiredGeneration, IntentSlot, LedgerTerminal, NonEmptySlotTable,
+        PhysicalBinding, TargetSnapshot, TerminalDisposition,
     };
     use crate::verify::release::RELEASE_RECORD_SCHEMA_VERSION;
     use proptest::prelude::*;

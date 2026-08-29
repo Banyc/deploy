@@ -48,9 +48,8 @@ mod tests_entry {
     use crate::ledger::records::SlotOutcomeKind;
     use crate::ledger::records::{DeploymentIntent, LedgerIntentWire};
     use crate::ledger::records::{
-        DeploymentStatus, TargetSnapshot, Observation, ObservationError, ObservationWire,
-        ObservedGeneration, ObservedGenerationWire, PhysicalBinding, SlotAttemptStateWire,
-        SlotResult,
+        DeploymentStatus, Observation, ObservationError, ObservationWire, ObservedGeneration,
+        ObservedGenerationWire, PhysicalBinding, SlotAttemptStateWire, SlotResult, TargetSnapshot,
     };
     use crate::ledger::records::{LedgerTerminal, LedgerTerminalWire, TerminalDisposition};
     use crate::store::local::LocalStore;

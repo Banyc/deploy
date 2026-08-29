@@ -75,7 +75,7 @@ pub(crate) fn decide_commit_status(
             let helper = &helpers[sid];
             // Hold the lock for the whole commit step so a failure cannot leak it
             // (a `?` on a manual lock would otherwise leave the lock held).
-            let _guard = match helper.acquire_lock_guard(op_id.as_str()) {
+            let _guard = match helper.acquire_lock_guard(op_id) {
                 Ok(g) => g,
                 Err(_) => {
                     commit_status = DeploymentStatus::PendingCommit;
