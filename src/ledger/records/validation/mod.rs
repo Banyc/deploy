@@ -26,4 +26,5 @@ pub(crate) use membership::verify_successful_membership_equations;
 pub use rebinding::{FrozenSlotTopology, RebindingPlan, VerifiedReleaseRebinding};
 pub(crate) use rollback::BoundGeneration;
 pub(crate) use rollback::build_rollback;
+pub(crate) use rollback::validate_successful_rollback_against_intent;
 pub(crate) use schema::{LEDGER_SCHEMA_VERSION, PINS_SCHEMA_VERSION};

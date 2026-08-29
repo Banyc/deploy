@@ -1590,7 +1590,44 @@ mod tests_entry {
         legs: &BTreeMap<SlotId, SuccessfulLegs>,
     ) -> (LedgerIntentWire, LedgerTerminalWire) {
         let keys: Vec<SlotId> = slots.iter().cloned().collect();
-        let intent = agreeing_intent(&keys);
+        // For Successful, the intent's desired must EQUAL the rollback's generation/artifact/binding
+        // (the new shared validator checks this). Build the rollback inputs first for that case.
+        let intent = if status == DeploymentStatus::Successful {
+            let rb_slots: BTreeMap<SlotId, GenerationRef> = keys
+                .iter()
+                .map(|k| {
+                    let l = &legs[k];
+                    let gen_id = match &l.observation {
+                        Observation::Known(og) if l.rb_match => og.generation.clone(),
+                        _ => test_generation_id(&format!("rb-{}", k.as_str())),
+                    };
+                    (k.clone(), gen_ref_with_gen(k, gen_id))
+                })
+                .collect();
+            let bindings: BTreeMap<SlotId, PhysicalBinding> =
+                keys.iter().map(|k| (k.clone(), binding(k))).collect();
+            // Build intent whose desired + bindings exactly match the rollback inputs
+            let desired = rb_slots.clone();
+            let pre_push: BTreeMap<SlotId, Option<SlotAttemptStateWire>> =
+                keys.iter().map(|k| (k.clone(), None)).collect();
+            LedgerIntentWire {
+                deployment_schema_version: crate::ledger::LEDGER_SCHEMA_VERSION,
+                deployment_id: test_deployment_id("deploy-w"),
+                target: TargetName::new("t1".to_string()),
+                group: None,
+                slot_ids: keys.clone(),
+                selected_membership: keys.clone(),
+                full_membership: keys.clone(),
+                behavior_sha256: "sha256-w".to_string(),
+                attempted_at: "2026-01-01T00:00:00Z".to_string(),
+                desired,
+                pre_push,
+                bindings: bindings.clone(),
+                slots: BTreeMap::new(),
+            }
+        } else {
+            agreeing_intent(&keys)
+        };
         let outcomes: BTreeMap<SlotId, SlotResult> = keys
             .iter()
             .map(|k| {

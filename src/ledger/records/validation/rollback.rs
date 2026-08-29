@@ -22,12 +22,22 @@
 //! The wire/domain RECORDS themselves ([`crate::ledger::records::LedgerRollback`],
 //! [`crate::ledger::records::PhysicalBinding`]) live in the shared core
 //! ([`crate::ledger::records`]).
+//!
+//! The SHARED VALIDATOR ([`validate_successful_rollback_against_intent`])
+//! enforces that a Successful rollback REPRODUCES the durable intent's
+//! frozen facts for every ACTIVATED slot — generation, artifact, and
+//! physical binding — and is called from BOTH the writer pre-append guard
+//! ([`crate::ledger::finalize::finalize_successful_locked`]) and the ledger
+//! read ([`crate::store::local::LocalStore::read_ledger`] via
+//! `verify_terminal_against_entry`): a rollback that drifts from its own
+//! intent fails closed with `Error::integrity` naming the slot and the
+//! diverging leg.
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::identity::{GenerationRef, SlotId};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use super::super::{LedgerRollback, PhysicalBinding, RollbackEntry};
+use super::super::{DeploymentIntent, LedgerRollback, PhysicalBinding, RollbackEntry};
 
 /// THE ONE PRIVATE VALIDATED MAP VALUE — the complete per-slot rollback
 /// fact: a slot's VERIFIED [`GenerationRef`] (generation AND artifact)
@@ -61,15 +71,64 @@ pub fn build_rollback(
     Ok(LedgerRollback::from_entries(entries))
 }
 
+/// ONE shared validator: a Successful rollback must REPRODUCE the durable
+/// intent's frozen facts for every ACTIVATED slot — the recorded generation
+/// equals the planned desired generation, the recorded artifact equals the
+/// planned desired artifact, and the recorded physical binding equals the
+/// plan-time frozen binding. Called from BOTH the writer (finalize's
+/// pre-append guard) and the ledger read (`verify_terminal_against_entry`
+/// after wire conversion): a rollback that drifts from its own intent fails
+/// closed with `Error::integrity` naming the slot and the diverging leg.
+pub(crate) fn validate_successful_rollback_against_intent(
+    intent: &DeploymentIntent,
+    rollback: &LedgerRollback,
+    activated: &BTreeSet<SlotId>,
+) -> Result<()> {
+    for slot_id in activated {
+        let planned = intent.slots.get(slot_id).ok_or_else(|| {
+            Error::integrity(format!(
+                "rollback-vs-intent: activated slot '{slot_id}' is not in the intent's membership — the rollback must reproduce the plan, and the plan must cover every activated slot"
+            ))
+        })?;
+        let recorded = rollback.get(slot_id).ok_or_else(|| {
+            Error::integrity(format!(
+                "rollback-vs-intent: the rollback has no entry for activated slot '{slot_id}' — every activated slot's rollback entry must reproduce the plan"
+            ))
+        })?;
+        if recorded.generation() != &planned.desired.generation {
+            return Err(Error::integrity(format!(
+                "rollback-vs-intent: activated slot '{slot_id}' diverged on generation — recorded {:?} vs planned {:?} — the rollback must reproduce the plan",
+                recorded.generation(),
+                planned.desired.generation
+            )));
+        }
+        if recorded.artifact() != &planned.desired.artifact {
+            return Err(Error::integrity(format!(
+                "rollback-vs-intent: activated slot '{slot_id}' diverged on artifact — recorded {:?} vs planned {:?} — the rollback must reproduce the plan",
+                recorded.artifact(),
+                planned.desired.artifact
+            )));
+        }
+        if recorded.binding() != &planned.binding {
+            return Err(Error::integrity(format!(
+                "rollback-vs-intent: activated slot '{slot_id}' diverged on physical binding — recorded {:?} vs planned {:?} — the rollback must reproduce the plan",
+                recorded.binding(),
+                planned.binding
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests_rollback {
     use super::*;
     use crate::identity::{
-        ArtifactRef, GenerationRef, PlacementSlotAssignment, ServerId, SlotId, VariantName,
-        test_deployment_id, test_generation_id, test_tree_digest,
+        ArtifactRef, GenerationRef, PlacementSlotAssignment, ServerId, SlotId, TargetName,
+        VariantName, test_deployment_id, test_generation_id, test_tree_digest,
     };
     use proptest::prelude::*;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     fn verified_ref_for(key: &SlotId, gen_id: &str, rel: &str, tree: &str) -> GenerationRef {
         GenerationRef {
@@ -356,5 +415,258 @@ mod tests_rollback {
             err.to_string().contains("selected_membership")
                 || err.to_string().contains("full_membership")
         );
+    }
+
+    // ---- SHARED VALIDATOR: ROLLBACK VS INTENT (the user's contract) ----
+    // Build a VALID intent/terminal pair from fixtures and mutate ONE leg.
+    // The terminal stays INTERNALLY self-consistent (memberships, outcomes
+    // keys, rollback keys untouched except the mutated entry) — the mismatch
+    // is ONLY against the intent, so the record is self-consistent yet
+    // contradicts its intent. Both writer and read paths must fail closed.
+    fn valid_intent_rollback_activated() -> (
+        crate::ledger::records::DeploymentIntent,
+        LedgerRollback,
+        BTreeSet<SlotId>,
+    ) {
+        let slot = SlotId::new("p1".to_string());
+        let gen_id = test_generation_id("gen-1");
+        let artifact = ArtifactRef {
+            release: crate::identity::test_release_id("rel-1"),
+            variant: VariantName::new("standard".to_string()),
+            tree: test_tree_digest("tree-1"),
+        };
+        let binding = PhysicalBinding {
+            server: ServerId::new("s1".to_string()),
+            deploy_dir: "/srv/deploy/p1".to_string(),
+        };
+        let intent = crate::ledger::records::DeploymentIntent {
+            deployment_id: test_deployment_id("deploy-valid"),
+            target: TargetName::new("production".to_string()),
+            group: None,
+            behavior_sha256: "sha256-aa".to_string(),
+            attempted_at: "2026-01-01T00:00:00Z".to_string(),
+            slots: crate::ledger::tables::NonEmptySlotTable::build(BTreeMap::from([(
+                slot.clone(),
+                crate::ledger::records::IntentSlot {
+                    desired: crate::ledger::records::DesiredGeneration {
+                        generation: gen_id.clone(),
+                        artifact: artifact.clone(),
+                    },
+                    pre_push: None,
+                    binding: binding.clone(),
+                },
+            )]))
+            .unwrap(),
+            full_membership: BTreeSet::from([slot.clone()]),
+        };
+        let rollback = LedgerRollback::from_entries(BTreeMap::from([(
+            slot.clone(),
+            RollbackEntry::new(gen_id, artifact, binding),
+        )]));
+        let activated = BTreeSet::from([slot]);
+        (intent, rollback, activated)
+    }
+
+    fn mutate_rollback_for_leg(
+        rollback: LedgerRollback,
+        slot: &SlotId,
+        leg: u32,
+    ) -> LedgerRollback {
+        let entry = rollback.get(slot).unwrap().clone();
+        let mutated = match leg {
+            0 => RollbackEntry::new(
+                test_generation_id("gen-other"),
+                entry.artifact().clone(),
+                entry.binding().clone(),
+            ),
+            1 => RollbackEntry::new(
+                entry.generation().clone(),
+                ArtifactRef {
+                    release: crate::identity::test_release_id("rel-other"),
+                    variant: entry.artifact().variant.clone(),
+                    tree: entry.artifact().tree.clone(),
+                },
+                entry.binding().clone(),
+            ),
+            2 => RollbackEntry::new(
+                entry.generation().clone(),
+                ArtifactRef {
+                    release: entry.artifact().release.clone(),
+                    variant: VariantName::new("other-variant".to_string()),
+                    tree: entry.artifact().tree.clone(),
+                },
+                entry.binding().clone(),
+            ),
+            3 => RollbackEntry::new(
+                entry.generation().clone(),
+                ArtifactRef {
+                    release: entry.artifact().release.clone(),
+                    variant: entry.artifact().variant.clone(),
+                    tree: test_tree_digest("other-tree"),
+                },
+                entry.binding().clone(),
+            ),
+            4 => RollbackEntry::new(
+                entry.generation().clone(),
+                entry.artifact().clone(),
+                PhysicalBinding {
+                    server: ServerId::new("s-other".to_string()),
+                    deploy_dir: entry.binding().deploy_dir.clone(),
+                },
+            ),
+            5 => RollbackEntry::new(
+                entry.generation().clone(),
+                entry.artifact().clone(),
+                PhysicalBinding {
+                    server: entry.binding().server.clone(),
+                    deploy_dir: "/srv/other/deploy".to_string(),
+                },
+            ),
+            _ => unreachable!(),
+        };
+        let mut map = rollback.into_entries();
+        map.insert(slot.clone(), mutated);
+        LedgerRollback::from_entries(map)
+    }
+
+    fn assert_leg_fails_closed(leg: u32) {
+        let (intent, base_rollback, activated) = valid_intent_rollback_activated();
+        let slot = SlotId::new("p1".to_string());
+        let mutated_rollback = mutate_rollback_for_leg(base_rollback, &slot, leg);
+        // (a) writer direct validator
+        let res =
+            validate_successful_rollback_against_intent(&intent, &mutated_rollback, &activated);
+        assert!(res.is_err(), "writer validator must fail for leg {leg}");
+        let err_str = res.unwrap_err().to_string();
+        assert!(
+            err_str.contains("rollback-vs-intent"),
+            "err must contain rollback-vs-intent, got: {err_str}"
+        );
+        let expected = match leg {
+            0 => "generation",
+            1..=3 => "artifact",
+            4..=5 => "physical binding",
+            _ => unreachable!(),
+        };
+        assert!(
+            err_str.contains(expected),
+            "leg {leg} err must name '{expected}', got: {err_str}"
+        );
+        // (a) store append refuses (via verify_terminal_against_entry)
+        let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let store = crate::store::local::LocalStore::with_base(tmp.path().join("store")).unwrap();
+        store
+            .append_intent(intent.target.as_str(), &intent)
+            .unwrap();
+        let mutated_terminal = crate::ledger::records::LedgerTerminal {
+            recorded_at: "2026-01-01T00:00:00Z".to_string(),
+            disposition: crate::ledger::records::TerminalDisposition::Successful {
+                rollback: mutated_rollback.clone(),
+                activated: activated.clone(),
+                full_membership: activated.clone(),
+            },
+            reason: None,
+        };
+        let append_res = store.append_terminal(
+            intent.target.as_str(),
+            &intent.deployment_id,
+            &mutated_terminal,
+        );
+        assert!(append_res.is_err(), "store append must fail for leg {leg}");
+        let append_err = append_res.unwrap_err().to_string();
+        assert!(
+            append_err.contains("rollback-vs-intent") || append_err.contains("integrity"),
+            "append err must be integrity/rollback-vs-intent, got: {append_err}"
+        );
+        // (b) read path fails closed (direct ledger file with mutated wire)
+        let tmp2 = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let read_store =
+            crate::store::local::LocalStore::with_base(tmp2.path().join("store")).unwrap();
+        let intent_wire = crate::ledger::records::LedgerIntentWire::from(&intent);
+        let terminal_wire = crate::ledger::records::LedgerTerminalWire::from_domain(
+            &intent.deployment_id,
+            &intent.target,
+            &mutated_terminal,
+        );
+        let line1 =
+            serde_json::to_string(&crate::ledger::finalize::LedgerLine::Intent(intent_wire))
+                .unwrap();
+        let line2 = serde_json::to_string(&crate::ledger::finalize::LedgerLine::Terminal(
+            terminal_wire,
+        ))
+        .unwrap();
+        let p = read_store.ledger_path(intent.target.as_str());
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, format!("{line1}\n{line2}\n")).unwrap();
+        let read_res = read_store.read_ledger(intent.target.as_str());
+        assert!(read_res.is_err(), "read_ledger must fail for leg {leg}");
+        assert!(
+            read_res
+                .unwrap_err()
+                .to_string()
+                .contains("rollback-vs-intent"),
+            "read err must contain rollback-vs-intent"
+        );
+    }
+
+    #[test]
+    fn rollback_vs_intent_deterministic_legs() {
+        for leg in 0..=5 {
+            assert_leg_fails_closed(leg);
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config { cases: 64, rng_seed: proptest::test_runner::RngSeed::Fixed(0x5EED_5EED), failure_persistence: None, ..proptest::test_runner::Config::default() })]
+        #[test]
+        fn prop_rollback_vs_intent_fails_closed_on_every_leg(leg in 0..=5u32) {
+            let (intent, base_rollback, activated) = valid_intent_rollback_activated();
+            let slot = SlotId::new("p1".to_string());
+            let mutated_rollback = mutate_rollback_for_leg(base_rollback, &slot, leg);
+            // (a) writer direct validator
+            let res = validate_successful_rollback_against_intent(&intent, &mutated_rollback, &activated);
+            prop_assert!(res.is_err(), "writer validator must fail for leg {leg}");
+            let err_str = res.unwrap_err().to_string();
+            prop_assert!(err_str.contains("rollback-vs-intent"), "err must contain rollback-vs-intent, got: {err_str}");
+            let expected = match leg {
+                0 => "generation",
+                1..=3 => "artifact",
+                4..=5 => "physical binding",
+                _ => unreachable!(),
+            };
+            prop_assert!(err_str.contains(expected), "leg {leg} err must name '{expected}', got: {err_str}");
+            // (a) store append refuses
+            let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+            let store = crate::store::local::LocalStore::with_base(tmp.path().join("store")).unwrap();
+            store.append_intent(intent.target.as_str(), &intent).unwrap();
+            let mutated_terminal = crate::ledger::records::LedgerTerminal {
+                recorded_at: "2026-01-01T00:00:00Z".to_string(),
+                disposition: crate::ledger::records::TerminalDisposition::Successful {
+                    rollback: mutated_rollback.clone(),
+                    activated: activated.clone(),
+                    full_membership: activated.clone(),
+                },
+                reason: None,
+            };
+            let append_res = store.append_terminal(intent.target.as_str(), &intent.deployment_id, &mutated_terminal);
+            prop_assert!(append_res.is_err(), "store append must fail for leg {leg}");
+            // (b) read path fails closed
+            let tmp2 = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+            let read_store = crate::store::local::LocalStore::with_base(tmp2.path().join("store")).unwrap();
+            let intent_wire = crate::ledger::records::LedgerIntentWire::from(&intent);
+            let terminal_wire = crate::ledger::records::LedgerTerminalWire::from_domain(
+                &intent.deployment_id,
+                &intent.target,
+                &mutated_terminal,
+            );
+            let line1 = serde_json::to_string(&crate::ledger::finalize::LedgerLine::Intent(intent_wire)).unwrap();
+            let line2 = serde_json::to_string(&crate::ledger::finalize::LedgerLine::Terminal(terminal_wire)).unwrap();
+            let p = read_store.ledger_path(intent.target.as_str());
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, format!("{line1}\n{line2}\n")).unwrap();
+            let read_res = read_store.read_ledger(intent.target.as_str());
+            prop_assert!(read_res.is_err(), "read_ledger must fail for leg {leg}");
+            prop_assert!(read_res.unwrap_err().to_string().contains("rollback-vs-intent"), "read err must contain rollback-vs-intent");
+        }
     }
 }

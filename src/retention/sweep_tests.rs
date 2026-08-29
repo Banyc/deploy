@@ -358,15 +358,45 @@ fn seed_history(store: &LocalStore, target: &str, prefix: &str, history: &[bool]
     for (i, ok) in history.iter().enumerate() {
         let id = format!("{prefix}-{i}");
         let canonical = test_deployment_id(&id);
-        store.append_intent(target, &intent(&id, target)).unwrap();
         if *ok {
             let rel = crate::identity::test_release_id(&id).as_str().to_string();
             let tree = format!("tree-{id}");
+            // Build matching intent whose desired generation/artifact/binding equals the rollback
+            let p1 = SlotId::new("p1".to_string());
+            let slots = BTreeMap::from([(
+                p1.clone(),
+                IntentSlot {
+                    desired: DesiredGeneration {
+                        generation: test_generation_id("gen-1"),
+                        artifact: ArtifactRef {
+                            release: crate::identity::ReleaseId::new(rel.clone()),
+                            variant: VariantName::new("standard".to_string()),
+                            tree: test_tree_digest(&tree),
+                        },
+                    },
+                    pre_push: None,
+                    binding: crate::ledger::PhysicalBinding {
+                        server: ServerId::new("s1".to_string()),
+                        deploy_dir: "/srv/deploy/p1".to_string(),
+                    },
+                },
+            )]);
+            let matching_intent = DeploymentIntent {
+                deployment_id: canonical.clone(),
+                target: TargetName::new(target.to_string()),
+                group: None,
+                behavior_sha256: "sha256-aa".to_string(),
+                attempted_at: "2026-01-01T00:00:00Z".to_string(),
+                slots: NonEmptySlotTable::build(slots).expect("fixture"),
+                full_membership: BTreeSet::from([SlotId::new("p1".to_string())]),
+            };
+            store.append_intent(target, &matching_intent).unwrap();
             store
                 .append_terminal(target, &canonical, &terminal_for(&rel, &tree))
                 .unwrap();
             successful.push(canonical.as_str().to_string());
         } else {
+            store.append_intent(target, &intent(&id, target)).unwrap();
             store
                 .append_terminal(target, &canonical, &failed_terminal())
                 .unwrap();

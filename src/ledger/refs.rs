@@ -291,23 +291,26 @@ mod tests {
     fn intent(dep: &str) -> DeploymentIntent {
         let p1 = SlotId::new("p1".to_string());
         // ONE slot table (the membership + desired/pre-push entries).
+        // The desired generation/artifact/binding are DERIVED from the deployment id
+        // so the intent MATCHES the successful terminal's rollback (generation, artifact, binding)
+        // — the new shared validator requires this, and the old fixtures were wrong under the new contract.
         let slots = BTreeMap::from([(
             p1.clone(),
             IntentSlot {
                 desired: DesiredGeneration {
-                    generation: test_generation_id("gen-1"),
+                    generation: test_generation_id(&format!("gen-{dep}")),
                     artifact: ArtifactRef {
-                        release: crate::identity::test_release_id("rel-1"),
+                        release: crate::identity::test_release_id(dep),
                         variant: VariantName::new("standard".to_string()),
-                        tree: test_tree_digest("tree-1"),
+                        tree: test_tree_digest(&format!("tree-{dep}")),
                     },
                 },
                 pre_push: None,
                 // The FROZEN plan-time physical binding (schema v6): the
-                // fixture's single slot is bound to server s1 at
-                // /srv/deploy/p1.
+                // fixture's single slot is bound to server-01 at
+                // /srv/deploy/p1 — matching the terminal's physical binding.
                 binding: crate::ledger::PhysicalBinding {
-                    server: ServerId::new("s1".to_string()),
+                    server: ServerId::new("server-01".to_string()),
                     deploy_dir: "/srv/deploy/p1".to_string(),
                 },
             },

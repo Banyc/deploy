@@ -59,8 +59,10 @@
 //! write path; see the "append / read line kinds" section below.
 
 use crate::error::{Error, Result};
-use crate::identity::{DeploymentId, GenerationRef, OperationId, PlacementSlotAssignment, SlotId};
-use crate::ledger::records::{BoundGeneration, build_rollback};
+use crate::identity::{GenerationRef, OperationId, PlacementSlotAssignment, SlotId};
+use crate::ledger::records::{
+    BoundGeneration, build_rollback, validate_successful_rollback_against_intent,
+};
 pub use crate::ledger::records::{
     DeploymentIntent, LedgerEntry, LedgerIntentWire, LedgerRollback, LedgerTerminal,
     LedgerTerminalWire, PhysicalBinding, TerminalDisposition,
@@ -123,9 +125,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 /// remote between the engine's observation and this finalization can no
 /// longer leak a STALE rollback snapshot into the payload. The ACTIVATED
 /// slot-id set is DERIVED from the INTENT (its selected slots), and a
-/// PRE-APPEND GUARD ([`verify_rollback_matches_desired`]) enforces
-/// `rollback[selected] == intent.desired` (the complete GenerationRef
-/// equality: generation AND artifact) for every selected slot BEFORE the
+/// PRE-APPEND GUARD ([`crate::ledger::records::validate_successful_rollback_against_intent`]) enforces
+/// `rollback[activated] == intent.desired+binding` (generation, artifact, and physical binding) for every selected slot BEFORE the
 /// terminal is appended — a mismatch aborts (fail closed), never appends.
 ///
 /// PARTIAL-ROLLOUT SNAPSHOT SEMANTICS: every successful deployment —
@@ -358,14 +359,17 @@ pub fn finalize_successful_locked(
             attempt.deployment_id
         )));
     }
-    // THE PRE-APPEND GUARD (fail closed): every selected slot's constructed
-    // rollback entry must EXACTLY equal the frozen desired assignment (the
-    // complete GenerationRef equality: generation AND artifact). The
+    // THE PRE-APPEND GUARD (fail closed): every activated slot's constructed
+    // rollback entry must EXACTLY equal the frozen desired assignment AND
+    // physical binding (generation, artifact, and physical binding). The
     // verification above proved the observed values equal the desired ones,
     // so this guard can only fire on an internal construction bug — a
     // mismatched payload ABORTS (integrity error), the terminal is NEVER
     // appended for a rollback that does not reproduce the verified state.
-    verify_rollback_matches_desired(&attempt.deployment_id, &rollback, attempt)?;
+    // The shared validator [`crate::ledger::records::validate_successful_rollback_against_intent`]
+    // enforces the three legs (generation, artifact, binding) per activated slot.
+    let selected_set: BTreeSet<SlotId> = selected.iter().map(|sid| (*sid).clone()).collect();
+    validate_successful_rollback_against_intent(attempt, &rollback, &selected_set)?;
 
     // 6. APPEND THE TERMINAL while still holding the locks (the ONLY
     //    commit of the finalize); a failure propagates as an `Err` — the
@@ -520,39 +524,6 @@ fn verify_selected_locked(
     Ok(LockedObservation::Verified(observed))
 }
 
-/// THE PRE-APPEND GUARD (fail closed): every selected slot's constructed
-/// rollback entry must EXACTLY EQUAL the frozen desired assignment — the
-/// COMPLETE `GenerationRef` equality (generation AND artifact:
-/// release/variant/tree). The lock-verified re-observation proved the
-/// observed values equal the desired ones, so this guard can only fire on
-/// an internal construction bug; a mismatch ABORTS the finalization with an
-/// integrity error — the terminal is NEVER appended for a rollback payload
-/// that does not reproduce the verified desired state (a stale or diverged
-/// snapshot must never be persisted).
-fn verify_rollback_matches_desired(
-    deployment_id: &DeploymentId,
-    rollback: &LedgerRollback,
-    attempt: &DeploymentIntent,
-) -> Result<()> {
-    for (sid, slot) in attempt.slots.iter() {
-        let rb = rollback.get(sid).ok_or_else(|| {
-            Error::integrity(format!(
-                "finalize {deployment_id}: the rollback snapshot has no entry for selected slot '{sid}' — every selected slot's rollback entry must exactly equal the frozen desired assignment"
-            ))
-        })?;
-        if rb.generation() != &slot.desired.generation || rb.artifact() != &slot.desired.artifact {
-            return Err(Error::integrity(format!(
-                "finalize {deployment_id}: the rollback entry for selected slot '{sid}' ({:?}, {:?}) does not exactly equal the frozen desired assignment ({:?}, {:?}) — the rollback must reproduce exactly the verified desired state (generation AND artifact); refusing to append a stale or diverged snapshot",
-                rb.generation(),
-                rb.artifact(),
-                slot.desired.generation,
-                slot.desired.artifact
-            )));
-        }
-    }
-    Ok(())
-}
-
 // ---- append / read line kinds ----
 // The ledger's append/read SEMANTIC types: the two physical line kinds
 // (the WIRE enum the append-only JSONL stream carries). The MERGED entry
@@ -686,7 +657,7 @@ mod tests {
         let bindings: BTreeMap<SlotId, PhysicalBinding> = BTreeMap::from([(
             SlotId::new("p1"),
             PhysicalBinding {
-                server: ServerId::new("server-01"),
+                server: ServerId::new("s1".to_string()),
                 deploy_dir: "/srv/deploy/p1".to_string(),
             },
         )]);
@@ -778,8 +749,8 @@ mod tests {
     /// snapshot (this test then fails); the fix REMOVED those inputs from
     /// the successful finalizer, so the payload is constructed exclusively
     /// from the verified live `GenerationRef`s, and the pre-append guard
-    /// ([`verify_rollback_matches_desired`]) pins `rollback[selected] ==
-    /// intent.desired` (generation AND artifact) before the append.
+    /// ([`crate::ledger::records::validate_successful_rollback_against_intent`]) pins `rollback[activated] ==
+    /// intent.desired+binding` (generation, artifact, and physical binding) before the append.
     #[test]
     fn finalize_payload_ignores_stale_observed_values() {
         use crate::identity::OperationId;
@@ -857,7 +828,7 @@ mod tests {
         let bindings: BTreeMap<SlotId, PhysicalBinding> = BTreeMap::from([(
             SlotId::new("p1"),
             PhysicalBinding {
-                server: ServerId::new("server-01"),
+                server: ServerId::new("s1".to_string()),
                 deploy_dir: "/srv/deploy/p1".to_string(),
             },
         )]);
@@ -969,7 +940,8 @@ mod tests {
             }
             crate::ledger::records::LedgerRollback::from_entries(__entries)
         };
-        verify_rollback_matches_desired(&attempt.deployment_id, &matching, &attempt)
+        let activated: BTreeSet<SlotId> = attempt.slots.keys().cloned().collect();
+        validate_successful_rollback_against_intent(&attempt, &matching, &activated)
             .expect("the matching rollback passes the pre-append guard");
         // A DIVERGED rollback: the selected entry carries a DIFFERENT
         // generation AND a different artifact — refused before any append.
@@ -1028,10 +1000,10 @@ mod tests {
             }
             crate::ledger::records::LedgerRollback::from_entries(__entries)
         };
-        let err = verify_rollback_matches_desired(&attempt.deployment_id, &diverged, &attempt)
+        let err = validate_successful_rollback_against_intent(&attempt, &diverged, &activated)
             .expect_err("a diverged rollback entry must refuse the finalization before any append");
         assert!(
-            err.to_string().contains("does not exactly equal"),
+            err.to_string().contains("rollback-vs-intent"),
             "the refusal names the divergence from the frozen desired, got: {err}"
         );
     }

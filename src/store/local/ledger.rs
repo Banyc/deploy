@@ -6,6 +6,7 @@
 
 use crate::error::{Error, Result};
 use crate::identity::{DeploymentId, SlotId};
+use crate::ledger::records::validate_successful_rollback_against_intent;
 use crate::ledger::{
     DeploymentIntent, DeploymentStatus, LEDGER_SCHEMA_VERSION, LedgerEntry, LedgerIntentWire,
     LedgerLine, LedgerTerminal, LedgerTerminalWire, TerminalDisposition,
@@ -31,9 +32,13 @@ use crate::testutil::test_faults::FaultKind;
 /// g == rollback.slots[slot].generation, error None, uncompensated) must
 /// accept the wire, and the STATUS-SPECIFIC legs (a Successful terminal
 /// must REPRODUCE the intent's FROZEN selected/full memberships + the
-/// full-push selected == full equality; a FailedPreflight terminal must
+/// full-push selected == full equality AND the rollback-vs-intent facts
+/// (generation/artifact/physical binding per activated slot via
+/// [`crate::ledger::records::validate_successful_rollback_against_intent`] after wire conversion);
+/// a FailedPreflight terminal must
 /// carry NO outcomes; every other terminal's outcomes must EXACTLY cover
-/// the membership) must hold. A disagreement → `Error::integrity`.
+/// the membership) must hold. A disagreement → `Error::integrity`. Corrupted
+/// historical records whose rollback drifts from its intent fail closed during every read.
 ///
 /// THE PRE-WRITE GUARANTEE: [`LocalStore::append_terminal`] runs this on the
 /// CONSTRUCTED pair (the deployment's durable intent + the terminal about
@@ -132,16 +137,19 @@ fn verify_terminal_against_entry(
             // must EQUAL full_membership. A GROUP push allows a proper
             // subset (activated ⊆ full is already enforced by the
             // conversion).
-            let (selected, full) = match &terminal.disposition {
+            let (rollback, activated, selected, full) = match &terminal.disposition {
                 TerminalDisposition::Successful {
+                    rollback,
                     activated,
                     full_membership,
                     ..
-                } => (activated, full_membership),
+                } => (rollback, activated, activated, full_membership),
                 _ => unreachable!(
                     "a Successful terminal carries its rollback + activated set + memberships"
                 ),
             };
+            // THE ROLLBACK-VS-INTENT LEG: a Successful rollback must REPRODUCE the durable intent's frozen facts for every activated slot — generation, artifact, and physical binding.
+            validate_successful_rollback_against_intent(&entry.intent, rollback, activated)?;
             if selected != &entry.intent.selected_membership() {
                 return Err(Error::integrity(format!(
                     "ledger of target '{target}': Successful terminal for deployment '{}' records selected membership {selected:?} but the intent froze selected membership {:?} — the terminal must REPRODUCE the immutable intent's frozen selected membership (never the live configuration)",
@@ -712,7 +720,7 @@ mod tests {
                                 assignment: PlacementSlotAssignment {
                                     placement_slot: SlotId::new("p1".to_string()),
                                     artifact: ArtifactRef {
-                                        release: crate::identity::test_release_id("rel-sha256-a"),
+                                        release: crate::identity::test_release_id("rel-1"),
                                         variant: VariantName::new("standard".to_string()),
                                         tree: test_tree_digest("1"),
                                     },
@@ -820,7 +828,7 @@ mod tests {
             .artifact()
             .release
             .as_str(),
-            crate::identity::test_release_id("rel-sha256-a").as_str()
+            crate::identity::test_release_id("rel-1").as_str()
         );
         // A terminal without its intent is refused (fail closed).
         let err = store

@@ -124,7 +124,9 @@ pub use observation::{
     ObservedGeneration, ObservedGenerationWire, ObservedSlot, ObservedTarget,
 };
 pub(crate) use validation::verify_successful_membership_equations;
-pub(crate) use validation::{BoundGeneration, build_rollback};
+pub(crate) use validation::{
+    BoundGeneration, build_rollback, validate_successful_rollback_against_intent,
+};
 pub use validation::{FrozenSlotTopology, RebindingPlan, VerifiedReleaseRebinding};
 pub(crate) use validation::{LEDGER_SCHEMA_VERSION, PINS_SCHEMA_VERSION};
 pub use wire::{

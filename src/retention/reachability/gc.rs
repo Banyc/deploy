@@ -578,6 +578,7 @@ interval_seconds = 0
     /// A deployment's LEDGER record: intent + SUCCESSFUL terminal whose
     /// rollback references `release` / `tree`. The intent satisfies EXACT
     /// key-set equality (`slot_ids == desired == pre_push`).
+    #[allow(dead_code)]
     fn intent(id: &str) -> DeploymentIntent {
         let p1 = SlotId::new(SLOT.to_string());
         // ONE slot table (the membership + desired/pre-push entries).
@@ -852,7 +853,38 @@ interval_seconds = 0
         for i in 0..retained {
             let id = format!("deploy-ret-{i}");
             let canonical = test_deployment_id(&id);
-            store.append_intent(TARGET, &intent(&id)).unwrap();
+            // Build a matching intent whose desired generation/artifact/binding equals the terminal's rollback
+            let rel = crate::identity::test_release_id(&format!("ret-{i}"));
+            let tree = test_tree_digest(&format!("tree-ret-{i}"));
+            let p1 = SlotId::new(SLOT.to_string());
+            let slots = BTreeMap::from([(
+                p1.clone(),
+                IntentSlot {
+                    desired: DesiredGeneration {
+                        generation: test_generation_id("gen-1"),
+                        artifact: ArtifactRef {
+                            release: rel.clone(),
+                            variant: VariantName::new("standard".to_string()),
+                            tree: tree.clone(),
+                        },
+                    },
+                    pre_push: None,
+                    binding: crate::ledger::PhysicalBinding {
+                        server: ServerId::new("s1".to_string()),
+                        deploy_dir: "/srv/eng".to_string(),
+                    },
+                },
+            )]);
+            let matching_intent = DeploymentIntent {
+                deployment_id: canonical.clone(),
+                target: TargetName::new(TARGET.to_string()),
+                group: None,
+                behavior_sha256: "sha256-aa".to_string(),
+                attempted_at: "2026-01-01T00:00:00Z".to_string(),
+                slots: NonEmptySlotTable::build(slots).expect("fixture"),
+                full_membership: BTreeSet::from([SlotId::new(SLOT.to_string())]),
+            };
+            store.append_intent(TARGET, &matching_intent).unwrap();
             store
                 .append_terminal(
                     TARGET,

@@ -600,18 +600,44 @@ mod tests {
         let mut successful = Vec::new();
         for (i, ok) in history.iter().enumerate() {
             let id = format!("{prefix}-{i}");
-            store.append_intent(target, &intent(&id, target)).unwrap();
             if *ok {
-                // The terminal's rollback canonicalizes its raw tag
-                // (rollback_for → test_release_id), so the ledger references
-                // test_release_id(id) — the same canonical id the seeded
-                // release dirs use.
+                // Successful: intent's desired must MATCH the rollback (generation, artifact, binding)
                 let rel = id.clone();
+                let p1 = SlotId::new("p1".to_string());
+                let slots = BTreeMap::from([(
+                    p1.clone(),
+                    IntentSlot {
+                        desired: DesiredGeneration {
+                            generation: test_generation_id("gen-1"),
+                            artifact: ArtifactRef {
+                                release: crate::identity::test_release_id(&rel),
+                                variant: VariantName::new("standard".to_string()),
+                                tree: test_tree_digest("tree-1"),
+                            },
+                        },
+                        pre_push: None,
+                        binding: crate::ledger::PhysicalBinding {
+                            server: ServerId::new("s1".to_string()),
+                            deploy_dir: "/srv/deploy/p1".to_string(),
+                        },
+                    },
+                )]);
+                let matching_intent = DeploymentIntent {
+                    deployment_id: test_deployment_id(&id),
+                    target: TargetName::new(target.to_string()),
+                    group: None,
+                    behavior_sha256: "sha256-aa".to_string(),
+                    attempted_at: "2026-01-01T00:00:00Z".to_string(),
+                    slots: NonEmptySlotTable::build(slots).expect("fixture"),
+                    full_membership: BTreeSet::from([SlotId::new("p1".to_string())]),
+                };
+                store.append_intent(target, &matching_intent).unwrap();
                 store
                     .append_terminal(target, &test_deployment_id(&id), &terminal_for(&rel))
                     .unwrap();
                 successful.push(test_deployment_id(&id).as_str().to_string());
             } else {
+                store.append_intent(target, &intent(&id, target)).unwrap();
                 store
                     .append_terminal(
                         target,
@@ -803,7 +829,36 @@ interval_seconds = 0
     /// back to the same tree digest, so the pre-suffix-unique-artifact cases
     /// need a custom entry).
     fn seed_success(store: &LocalStore, target: &str, id: &str, release: &str, tree: &str) {
-        store.append_intent(target, &intent(id, target)).unwrap();
+        // Build intent whose desired matches the terminal's rollback (generation, artifact, binding)
+        let p1 = SlotId::new("p1".to_string());
+        let slots = BTreeMap::from([(
+            p1.clone(),
+            IntentSlot {
+                desired: DesiredGeneration {
+                    generation: test_generation_id("gen-1"),
+                    artifact: ArtifactRef {
+                        release: crate::identity::test_release_id(release),
+                        variant: VariantName::new("standard".to_string()),
+                        tree: test_tree_digest(tree),
+                    },
+                },
+                pre_push: None,
+                binding: crate::ledger::PhysicalBinding {
+                    server: ServerId::new("s1".to_string()),
+                    deploy_dir: "/srv/deploy/p1".to_string(),
+                },
+            },
+        )]);
+        let matching_intent = DeploymentIntent {
+            deployment_id: test_deployment_id(id),
+            target: TargetName::new(target.to_string()),
+            group: None,
+            behavior_sha256: "sha256-aa".to_string(),
+            attempted_at: "2026-01-01T00:00:00Z".to_string(),
+            slots: NonEmptySlotTable::build(slots).expect("fixture"),
+            full_membership: BTreeSet::from([SlotId::new("p1".to_string())]),
+        };
+        store.append_intent(target, &matching_intent).unwrap();
         let mut term = terminal_for(release);
         // Rewrite the rollback's per-slot tree to the caller's tree.
         let rollback = match &mut term.disposition {
