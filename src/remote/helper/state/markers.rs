@@ -9,7 +9,10 @@ use super::super::RemoteHelper;
 
 impl<'a> RemoteHelper<'a> {
     /// Write a commit marker for a deployment under this server. Requires the
-    /// slot-mutation capability (`_lock`). The marker records the generation
+    /// slot-mutation capability — only callable via `HeldSlotLock::write_commit_marker`
+    /// (the receiver is the guard; the helper is the guard's own — a guard can only
+    /// mutate the slot it was acquired from; there is no API parameter through which
+    /// a guard from server A can authorize a mutation on server B). The marker records the generation
     /// this slot committed, the full set of placement slot IDs that
     /// participate in the commit (so a partial marker can never masquerade as
     /// a complete commit), and the originating target of the push. `target`
@@ -20,9 +23,8 @@ impl<'a> RemoteHelper<'a> {
     /// and an existing record must match byte-for-byte (deterministic payload
     /// for the same deployment) or the rewrite fails integrity. A concurrent or
     /// retried commit therefore never corrupts a recorded fact.
-    pub fn write_commit_marker(
+    pub(crate) fn write_commit_marker_locked(
         &self,
-        _lock: &super::super::LockGuard<'_>,
         deployment_id: &str,
         generation: &str,
         slot_ids: &[String],
@@ -112,14 +114,8 @@ mod tests_markers {
 
         let helper = RemoteHelper::new(&remote);
         let _guard = helper.acquire_lock_guard("op-marker").unwrap();
-        helper
-            .write_commit_marker(
-                &_guard,
-                "deploy-0",
-                "gen-0",
-                &["p1".to_string()],
-                Some("t1"),
-            )
+        _guard
+            .write_commit_marker("deploy-0", "gen-0", &["p1".to_string()], Some("t1"))
             .expect("commit marker install must succeed past stale temp");
 
         let marker: serde_json::Value = serde_json::from_slice(
@@ -167,14 +163,8 @@ mod tests_markers {
 
         let helper = RemoteHelper::new(&remote);
         let _guard = helper.acquire_lock_guard("op-symlink").unwrap();
-        let err = helper
-            .write_commit_marker(
-                &_guard,
-                "deploy-0",
-                "gen-0",
-                &["p1".to_string()],
-                Some("t1"),
-            )
+        let err = _guard
+            .write_commit_marker("deploy-0", "gen-0", &["p1".to_string()], Some("t1"))
             .expect_err("a symlink where the marker should be is a real conflict");
         let msg = err.to_string();
         assert!(
@@ -230,8 +220,7 @@ mod tests_markers {
                 // test harness).
                 let _guard = h.acquire_lock_guard("op-burst").unwrap();
                 for i in 0..80 {
-                    if let Err(e) = h.write_commit_marker(
-                        &_guard,
+                    if let Err(e) = _guard.write_commit_marker(
                         &format!("deploy-{i}"),
                         &format!("gen-{i}"),
                         &["p1".to_string()],

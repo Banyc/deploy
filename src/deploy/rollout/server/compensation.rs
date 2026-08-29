@@ -69,9 +69,8 @@ pub(crate) fn compensate_server_locked(
             // Compare-and-swap: only roll back if `current` still points at the
             // generation we just activated. Otherwise another controller changed
             // it and we must not clobber their state.
-            if helper
+            if held
                 .swap_current(
-                    held,
                     &crate::remote::helper::ExpectedCurrent::Generation(advanced_gen.clone()),
                     prior.as_str(),
                     op_id.as_str(),
@@ -103,11 +102,10 @@ pub(crate) fn compensate_server_locked(
         None => {
             // First deploy: remove `current` only if it still points at the
             // generation we advanced (compare-and-swap style).
-            Ok(helper
-                .remove_current_if(
-                    held,
-                    &crate::remote::helper::ExpectedCurrent::Generation(advanced_gen.clone()),
-                )
+            Ok(held
+                .remove_current_if(&crate::remote::helper::ExpectedCurrent::Generation(
+                    advanced_gen.clone(),
+                ))
                 .unwrap_or(false))
         }
     }
@@ -359,26 +357,26 @@ mod compensation_tests {
         // `current` moved to g2)...
         let g2 = GenerationId::generate();
         helper
-            .create_generation(
-                &helper.acquire_lock_guard("op2").unwrap(),
-                &crate::remote::helper::GenerationAssignment {
-                    deployment_id: test_deployment_id("d2"),
-                    generation_id: g2.clone(),
-                    artifact: ArtifactRef {
-                        release: h.harness_release_id(),
-                        variant: crate::identity::VariantName::new("standard"),
-                        tree: h.tree.clone(),
-                    },
-                    behavior_sha256: "b".into(),
-                    prior_generation: Some(first.generation.clone()),
-                    created_at: crate::remote::helper::now_rfc3339(),
-                    target: Some(crate::identity::TargetName::new("t1")),
+            .acquire_lock_guard("op2")
+            .unwrap()
+            .create_generation(&crate::remote::helper::GenerationAssignment {
+                deployment_id: test_deployment_id("d2"),
+                generation_id: g2.clone(),
+                artifact: ArtifactRef {
+                    release: h.harness_release_id(),
+                    variant: crate::identity::VariantName::new("standard"),
+                    tree: h.tree.clone(),
                 },
-            )
+                behavior_sha256: "b".into(),
+                prior_generation: Some(first.generation.clone()),
+                created_at: crate::remote::helper::now_rfc3339(),
+                target: Some(crate::identity::TargetName::new("t1")),
+            })
             .unwrap();
         helper
+            .acquire_lock_guard("op2")
+            .unwrap()
             .swap_current(
-                &helper.acquire_lock_guard("op2").unwrap(),
                 &crate::remote::helper::ExpectedCurrent::Generation(first.generation.clone()),
                 g2.as_str(),
                 "op2",
@@ -388,26 +386,26 @@ mod compensation_tests {
         // op's compensation ran: the CAS precondition (current == g2) fails.
         let g3 = GenerationId::generate();
         helper
-            .create_generation(
-                &helper.acquire_lock_guard("op3").unwrap(),
-                &crate::remote::helper::GenerationAssignment {
-                    deployment_id: test_deployment_id("d3"),
-                    generation_id: g3.clone(),
-                    artifact: ArtifactRef {
-                        release: h.harness_release_id(),
-                        variant: crate::identity::VariantName::new("standard"),
-                        tree: h.tree.clone(),
-                    },
-                    behavior_sha256: "b".into(),
-                    prior_generation: Some(g2.clone()),
-                    created_at: crate::remote::helper::now_rfc3339(),
-                    target: Some(crate::identity::TargetName::new("t1")),
+            .acquire_lock_guard("op3")
+            .unwrap()
+            .create_generation(&crate::remote::helper::GenerationAssignment {
+                deployment_id: test_deployment_id("d3"),
+                generation_id: g3.clone(),
+                artifact: ArtifactRef {
+                    release: h.harness_release_id(),
+                    variant: crate::identity::VariantName::new("standard"),
+                    tree: h.tree.clone(),
                 },
-            )
+                behavior_sha256: "b".into(),
+                prior_generation: Some(g2.clone()),
+                created_at: crate::remote::helper::now_rfc3339(),
+                target: Some(crate::identity::TargetName::new("t1")),
+            })
             .unwrap();
         helper
+            .acquire_lock_guard("op3")
+            .unwrap()
             .swap_current(
-                &helper.acquire_lock_guard("op3").unwrap(),
                 &crate::remote::helper::ExpectedCurrent::Generation(g2.clone()),
                 g3.as_str(),
                 "op3",

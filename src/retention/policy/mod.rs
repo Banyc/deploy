@@ -367,44 +367,43 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .create_dir_all(&layout::tree_root(test_tree_digest("t2").as_str()))
             .unwrap();
         helper
-            .create_generation(
-                &helper.acquire_lock_guard("op").unwrap(),
-                &GenerationAssignment {
-                    deployment_id: test_deployment_id("d1"),
-                    generation_id: test_generation_id("g1"),
-                    artifact: crate::identity::ArtifactRef {
-                        release: crate::identity::test_release_id("r"),
-                        variant: VariantName::new("standard"),
-                        tree: test_tree_digest("t1"),
-                    },
-                    behavior_sha256: "b".into(),
-                    prior_generation: None,
-                    created_at: "2020-01-01T00:00:00Z".into(),
-                    target: None,
+            .acquire_lock_guard("op")
+            .unwrap()
+            .create_generation(&GenerationAssignment {
+                deployment_id: test_deployment_id("d1"),
+                generation_id: test_generation_id("g1"),
+                artifact: crate::identity::ArtifactRef {
+                    release: crate::identity::test_release_id("r"),
+                    variant: VariantName::new("standard"),
+                    tree: test_tree_digest("t1"),
                 },
-            )
+                behavior_sha256: "b".into(),
+                prior_generation: None,
+                created_at: "2020-01-01T00:00:00Z".into(),
+                target: None,
+            })
             .unwrap();
         helper
-            .create_generation(
-                &helper.acquire_lock_guard("op").unwrap(),
-                &GenerationAssignment {
-                    deployment_id: test_deployment_id("d2"),
-                    generation_id: test_generation_id("g2"),
-                    artifact: crate::identity::ArtifactRef {
-                        release: crate::identity::test_release_id("r"),
-                        variant: VariantName::new("standard"),
-                        tree: test_tree_digest("t2"),
-                    },
-                    behavior_sha256: "b".into(),
-                    prior_generation: Some(test_generation_id("g1")),
-                    created_at: "2020-01-02T00:00:00Z".into(),
-                    target: None,
+            .acquire_lock_guard("op")
+            .unwrap()
+            .create_generation(&GenerationAssignment {
+                deployment_id: test_deployment_id("d2"),
+                generation_id: test_generation_id("g2"),
+                artifact: crate::identity::ArtifactRef {
+                    release: crate::identity::test_release_id("r"),
+                    variant: VariantName::new("standard"),
+                    tree: test_tree_digest("t2"),
                 },
-            )
+                behavior_sha256: "b".into(),
+                prior_generation: Some(test_generation_id("g1")),
+                created_at: "2020-01-02T00:00:00Z".into(),
+                target: None,
+            })
             .unwrap();
         helper
+            .acquire_lock_guard("op")
+            .unwrap()
             .swap_current(
-                &helper.acquire_lock_guard("op").unwrap(),
                 &crate::remote::helper::ExpectedCurrent::Absent,
                 test_generation_id("g2").as_str(),
                 "op",
@@ -523,22 +522,21 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .create_dir_all(&layout::tree_root(canonical_tree.as_str()))
             .unwrap();
         helper
-            .create_generation(
-                &helper.acquire_lock_guard("op").unwrap(),
-                &crate::remote::helper::GenerationAssignment {
-                    deployment_id: test_deployment_id(deployment_id),
-                    generation_id: test_generation_id(generation_id),
-                    artifact: crate::identity::ArtifactRef {
-                        release: crate::identity::test_release_id("r"),
-                        variant: VariantName::new("standard"),
-                        tree: canonical_tree,
-                    },
-                    behavior_sha256: "b".into(),
-                    prior_generation: prior_generation.map(test_generation_id),
-                    created_at: created.into(),
-                    target: target.map(|t| crate::identity::TargetName::new(t.to_string())),
+            .acquire_lock_guard("op")
+            .unwrap()
+            .create_generation(&crate::remote::helper::GenerationAssignment {
+                deployment_id: test_deployment_id(deployment_id),
+                generation_id: test_generation_id(generation_id),
+                artifact: crate::identity::ArtifactRef {
+                    release: crate::identity::test_release_id("r"),
+                    variant: VariantName::new("standard"),
+                    tree: canonical_tree,
                 },
-            )
+                behavior_sha256: "b".into(),
+                prior_generation: prior_generation.map(test_generation_id),
+                created_at: created.into(),
+                target: target.map(|t| crate::identity::TargetName::new(t.to_string())),
+            })
             .unwrap();
     }
 
@@ -581,8 +579,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             None,
         );
         helper
+            .acquire_lock_guard("op")
+            .unwrap()
             .swap_current(
-                &helper.acquire_lock_guard("op").unwrap(),
                 &crate::remote::helper::ExpectedCurrent::Absent,
                 test_generation_id("g3").as_str(),
                 "op",
@@ -642,8 +641,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         make_gen(&helper, "d1", "g1", "t-old", &old, None, None);
         make_gen(&helper, "d2", "g2", "t-recent", &recent, Some("g1"), None);
         helper
+            .acquire_lock_guard("op")
+            .unwrap()
             .swap_current(
-                &helper.acquire_lock_guard("op").unwrap(),
                 &crate::remote::helper::ExpectedCurrent::Absent,
                 test_generation_id("g2").as_str(),
                 "op",
@@ -731,8 +731,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             None,
         );
         helper
+            .acquire_lock_guard("op")
+            .unwrap()
             .swap_current(
-                &helper.acquire_lock_guard("op").unwrap(),
                 &crate::remote::helper::ExpectedCurrent::Absent,
                 test_generation_id("g3").as_str(),
                 "op",
@@ -806,8 +807,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         );
         // current -> g2, whose assignment records g1 as prior.
         helper
+            .acquire_lock_guard("op")
+            .unwrap()
             .swap_current(
-                &helper.acquire_lock_guard("op").unwrap(),
                 &crate::remote::helper::ExpectedCurrent::Absent,
                 test_generation_id("g2").as_str(),
                 "op",
@@ -872,8 +874,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             None,
         );
         helper
+            .acquire_lock_guard("op")
+            .unwrap()
             .swap_current(
-                &helper.acquire_lock_guard("op").unwrap(),
                 &crate::remote::helper::ExpectedCurrent::Absent,
                 test_generation_id("g1").as_str(),
                 "op",
@@ -980,8 +983,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             Some("production"),
         );
         helper
+            .acquire_lock_guard("op")
+            .unwrap()
             .swap_current(
-                &helper.acquire_lock_guard("op").unwrap(),
                 &crate::remote::helper::ExpectedCurrent::Absent,
                 test_generation_id("g3").as_str(),
                 "op",
@@ -1112,8 +1116,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             None,
         );
         helper
+            .acquire_lock_guard("op")
+            .unwrap()
             .swap_current(
-                &helper.acquire_lock_guard("op").unwrap(),
                 &crate::remote::helper::ExpectedCurrent::Absent,
                 test_generation_id("g3").as_str(),
                 "op",
@@ -1203,8 +1208,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             None,
         );
         helper
+            .acquire_lock_guard("op")
+            .unwrap()
             .swap_current(
-                &helper.acquire_lock_guard("op").unwrap(),
                 &crate::remote::helper::ExpectedCurrent::Absent,
                 test_generation_id("g2").as_str(),
                 "op",
@@ -1816,12 +1822,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     created_at: g.created_at.to_string(),
                     target: None,
                 };
-                helper.create_generation(&helper.acquire_lock_guard("op").unwrap(), &asn).unwrap();
+                helper.acquire_lock_guard("op").unwrap().create_generation( &asn).unwrap();
                 assignments.push(asn);
             }
             let current = history.last().unwrap().clone();
-            helper
-                .swap_current(&helper.acquire_lock_guard("op").unwrap(),
+            helper.acquire_lock_guard("op").unwrap().swap_current(
                     &crate::remote::helper::ExpectedCurrent::Absent,
                     current.id.as_str(),
                     "op",
@@ -2404,12 +2409,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     created_at: g.created_at.to_string(),
                     target: None,
                 };
-                helper.create_generation(&helper.acquire_lock_guard("op").unwrap(), &asn).unwrap();
+                helper.acquire_lock_guard("op").unwrap().create_generation( &asn).unwrap();
                 assignments.push(asn);
             }
             let current = history.last().unwrap().clone();
-            helper
-                .swap_current(&helper.acquire_lock_guard("op").unwrap(),
+            helper.acquire_lock_guard("op").unwrap().swap_current(
                     &crate::remote::helper::ExpectedCurrent::Absent,
                     current.id.as_str(),
                     "op",

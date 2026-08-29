@@ -1871,26 +1871,22 @@ pub(crate) mod commit_tests {
             .unwrap();
         let helper = RemoteHelper::new(&remote);
         helper
-            .create_generation(
-                &helper.acquire_lock_guard("op-mint").unwrap(),
-                &GenerationAssignment {
-                    deployment_id: deployment_id.clone(),
-                    generation_id: generation.clone(),
-                    artifact: artifact.clone(),
-                    behavior_sha256: "sha256-aa".to_string(),
-                    prior_generation: None,
-                    created_at: "2026-01-01T00:00:00Z".to_string(),
-                    target: Some(TargetName::new("t1".to_string())),
-                },
-            )
+            .acquire_lock_guard("op-mint")
+            .unwrap()
+            .create_generation(&GenerationAssignment {
+                deployment_id: deployment_id.clone(),
+                generation_id: generation.clone(),
+                artifact: artifact.clone(),
+                behavior_sha256: "sha256-aa".to_string(),
+                prior_generation: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                target: Some(TargetName::new("t1".to_string())),
+            })
             .unwrap();
         helper
-            .swap_current(
-                &helper.acquire_lock_guard("op-mint").unwrap(),
-                &ExpectedCurrent::Absent,
-                generation.as_str(),
-                "op-mint",
-            )
+            .acquire_lock_guard("op-mint")
+            .unwrap()
+            .swap_current(&ExpectedCurrent::Absent, generation.as_str(), "op-mint")
             .unwrap();
     }
 
@@ -1912,18 +1908,17 @@ pub(crate) mod commit_tests {
             .unwrap();
         let helper = RemoteHelper::new(&remote);
         helper
-            .create_generation(
-                &helper.acquire_lock_guard("op-foreign").unwrap(),
-                &GenerationAssignment {
-                    deployment_id: test_deployment_id("deploy-foreign"),
-                    generation_id: foreign_gen.clone(),
-                    artifact: foreign_artifact,
-                    behavior_sha256: "b".to_string(),
-                    prior_generation: None,
-                    created_at: "2026-01-01T00:00:00Z".to_string(),
-                    target: Some(TargetName::new("t1".to_string())),
-                },
-            )
+            .acquire_lock_guard("op-foreign")
+            .unwrap()
+            .create_generation(&GenerationAssignment {
+                deployment_id: test_deployment_id("deploy-foreign"),
+                generation_id: foreign_gen.clone(),
+                artifact: foreign_artifact,
+                behavior_sha256: "b".to_string(),
+                prior_generation: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                target: Some(TargetName::new("t1".to_string())),
+            })
             .unwrap();
         foreign_gen
     }

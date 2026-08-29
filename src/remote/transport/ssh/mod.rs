@@ -3184,8 +3184,7 @@ exec /bin/mv "$@"
                 let helper = RemoteHelper::new(&t);
                 let guard = helper.acquire_lock_guard("op");
                 let err = match guard {
-                    Ok(g) => helper
-                        .swap_current(&g, &ExpectedCurrent::Absent, "gen-gate", "op")
+                    Ok(g) => g.swap_current( &ExpectedCurrent::Absent, "gen-gate", "op")
                         .unwrap_err(),
                     Err(e) => e,
                 };
@@ -3261,10 +3260,14 @@ exec /bin/mv "$@"
             target: None,
         };
         helper
-            .create_generation(&helper.acquire_lock_guard("op").unwrap(), &mk(&g1, "t1"))
+            .acquire_lock_guard("op")
+            .unwrap()
+            .create_generation(&mk(&g1, "t1"))
             .unwrap();
         helper
-            .create_generation(&helper.acquire_lock_guard("op").unwrap(), &mk(&g2, "t2"))
+            .acquire_lock_guard("op")
+            .unwrap()
+            .create_generation(&mk(&g2, "t2"))
             .unwrap();
         for tree in ["t1", "t2"] {
             let d = test_tree_digest(tree);
@@ -3274,12 +3277,9 @@ exec /bin/mv "$@"
                 .unwrap();
         }
         helper
-            .swap_current(
-                &helper.acquire_lock_guard("op").unwrap(),
-                &ExpectedCurrent::Absent,
-                g2.as_str(),
-                "op",
-            )
+            .acquire_lock_guard("op")
+            .unwrap()
+            .swap_current(&ExpectedCurrent::Absent, g2.as_str(), "op")
             .unwrap();
         let garbage = test_tree_digest("garbage");
         helper

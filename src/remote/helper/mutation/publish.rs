@@ -189,11 +189,13 @@ impl<'a> RemoteHelper<'a> {
     }
 
     /// Publish a previously staged incoming tree into the object store. Requires
-    /// the slot-mutation capability (`_lock`). Reuses an existing, verified
+    /// the slot-mutation capability — only callable via `HeldSlotLock::publish_from_incoming`
+    /// (the receiver is the guard; the helper is the guard's own — a guard can only
+    /// mutate the slot it was acquired from; there is no API parameter through which
+    /// a guard from server A can authorize a mutation on server B). Reuses an existing, verified
     /// object.
-    pub fn publish_from_incoming(
+    pub(crate) fn publish_from_incoming_locked(
         &self,
-        _lock: &super::super::LockGuard<'_>,
         deployment_id: &str,
         digest: &str,
     ) -> Result<()> {

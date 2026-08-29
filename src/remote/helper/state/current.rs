@@ -242,10 +242,13 @@ impl<'a> RemoteHelper<'a> {
     /// ([`Self::acquire_lock_guard`]) for the whole read-decide-swap window.
     /// The same rule governs [`Self::remove_current_if`]. A swap performed
     /// without the flock can race a concurrent activation between its status
-    /// read and the rename. Requires the slot-mutation capability (`_lock`).
-    pub fn swap_current(
+    /// read and the rename. Requires the slot-mutation capability — only
+    /// callable via `HeldSlotLock::swap_current` (the receiver is the guard;
+    /// the helper is the guard's own — a guard can only mutate the slot it was
+    /// acquired from; there is no API parameter through which a guard from
+    /// server A can authorize a mutation on server B).
+    pub(crate) fn swap_current_locked(
         &self,
-        _lock: &super::super::LockGuard<'_>,
         expected: &ExpectedCurrent,
         gen_id: &str,
         op_id: &str,
@@ -287,17 +290,17 @@ impl<'a> RemoteHelper<'a> {
     }
 
     /// Remove the top-level `current` symlink (used for first-deploy
-    /// compensation). Requires the slot-mutation capability (`_lock`).
+    /// compensation). Requires the slot-mutation capability — only callable via
+    /// `HeldSlotLock::remove_current_if` (the receiver is the guard; the helper
+    /// is the guard's own — a guard can only mutate the slot it was acquired from;
+    /// there is no API parameter through which a guard from server A can authorize
+    /// a mutation on server B).
     /// `expected` makes the removal a compare-and-swap: the link is removed
     /// only if it currently points at `expected`, so a concurrent activation
     /// cannot be clobbered.
     /// Remove `current` only if it currently points at `expected`. Returns true
     /// if it was removed, false if `current` pointed elsewhere (or did not exist).
-    pub fn remove_current_if(
-        &self,
-        _lock: &super::super::LockGuard<'_>,
-        expected: &ExpectedCurrent,
-    ) -> Result<bool> {
+    pub(crate) fn remove_current_if_locked(&self, expected: &ExpectedCurrent) -> Result<bool> {
         // Same exact-equality gate as the swap: resolve the actual state once
         // (malformed/transport errors propagate, link byte-identical) and
         // remove ONLY on an exact generation match. `Absent` expectation with
@@ -793,8 +796,7 @@ mod tests_current {
             let helper = RemoteHelper::new(&remote);
             let new_gen = GenerationId::generate();
             let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                helper.swap_current(
-                    &helper.acquire_lock_guard("op").unwrap(),
+                helper.acquire_lock_guard("op").unwrap().swap_current(
                     &ExpectedCurrent::Absent,
                     new_gen.as_str(),
                     "op",
@@ -814,8 +816,7 @@ mod tests_current {
             );
             // The CAS form (with an expected generation) fails the same way.
             let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                helper.swap_current(
-                    &helper.acquire_lock_guard("op").unwrap(),
+                helper.acquire_lock_guard("op").unwrap().swap_current(
                     &ExpectedCurrent::Generation(new_gen.clone()),
                     new_gen.as_str(),
                     "op",
@@ -852,8 +853,7 @@ mod tests_current {
         let helper = RemoteHelper::new(&remote);
         let new_gen = GenerationId::generate();
         let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            helper.swap_current(
-                &helper.acquire_lock_guard("op").unwrap(),
+            helper.acquire_lock_guard("op").unwrap().swap_current(
                 &ExpectedCurrent::Absent,
                 new_gen.as_str(),
                 "op",
@@ -886,8 +886,7 @@ mod tests_current {
         let helper = RemoteHelper::new(&remote);
         let new_gen = GenerationId::generate();
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            helper.swap_current(
-                &helper.acquire_lock_guard("op").unwrap(),
+            helper.acquire_lock_guard("op").unwrap().swap_current(
                 &ExpectedCurrent::Absent,
                 new_gen.as_str(),
                 "op",
@@ -925,8 +924,9 @@ mod tests_current {
 
         // Mismatched expected: refuse (remote CAS error), link untouched.
         let err = helper
+            .acquire_lock_guard("op")
+            .unwrap()
             .swap_current(
-                &helper.acquire_lock_guard("op").unwrap(),
                 &ExpectedCurrent::Generation(next_gen.clone()),
                 next_gen.as_str(),
                 "op",
@@ -944,8 +944,9 @@ mod tests_current {
 
         // Matching expected: proceeds and moves the link.
         helper
+            .acquire_lock_guard("op")
+            .unwrap()
             .swap_current(
-                &helper.acquire_lock_guard("op").unwrap(),
                 &ExpectedCurrent::Generation(cas_gid.clone()),
                 next_gen.as_str(),
                 "op",
@@ -1344,7 +1345,7 @@ mod tests_current {
             // malformed-present current is an integrity error — both leave
             // the entry byte-identical. ----
             let swap = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                helper.swap_current(&helper.acquire_lock_guard("op").unwrap(), &ExpectedCurrent::Absent, new_gen.as_str(), "op")
+                helper.acquire_lock_guard("op").unwrap().swap_current( &ExpectedCurrent::Absent, new_gen.as_str(), "op")
             }))
             .expect("swap must never panic on arbitrary symlink layouts");
             match swap {
@@ -1565,10 +1566,9 @@ mod tests_current {
                 };
                 let helper = RemoteHelper::new(remote.as_ref());
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match name {
-                    "swap" => helper
-                        .swap_current(&helper.acquire_lock_guard("op").unwrap(), &expected, new_gen.as_str(), "op")
+                    "swap" => helper.acquire_lock_guard("op").unwrap().swap_current( &expected, new_gen.as_str(), "op")
                         .map(|_| true),
-                    _ => helper.remove_current_if(&helper.acquire_lock_guard("op").unwrap(), &expected),
+                    _ => helper.acquire_lock_guard("op").unwrap().remove_current_if( &expected),
                 }));
                 match result {
                     Ok(Ok(_)) => {
@@ -1768,8 +1768,8 @@ mod tests_current {
                 let remote = HintedCurrentRemote { inner, exists_hint, meta };
                 let helper = RemoteHelper::new(&remote);
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match name {
-                    "swap" => helper.swap_current(&helper.acquire_lock_guard("op").unwrap(), &expected, new_gen.as_str(), "op").map(|_| true),
-                    _ => helper.remove_current_if(&helper.acquire_lock_guard("op").unwrap(), &expected),
+                    "swap" => helper.acquire_lock_guard("op").unwrap().swap_current( &expected, new_gen.as_str(), "op").map(|_| true),
+                    _ => helper.acquire_lock_guard("op").unwrap().remove_current_if( &expected),
                 }));
                 match result {
                     Ok(Ok(_)) => {

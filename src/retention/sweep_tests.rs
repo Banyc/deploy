@@ -169,22 +169,21 @@ fn make_gen(
         .create_dir_all(&layout::tree_root(canonical_tree.as_str()))
         .unwrap();
     helper
-        .create_generation(
-            &helper.acquire_lock_guard("op").unwrap(),
-            &GenerationAssignment {
-                deployment_id: test_deployment_id(deployment_id),
-                generation_id: test_generation_id(generation_id),
-                artifact: ArtifactRef {
-                    release: crate::identity::test_release_id("r"),
-                    variant: VariantName::new("standard".to_string()),
-                    tree: canonical_tree,
-                },
-                behavior_sha256: "b".into(),
-                prior_generation: prior_generation.map(test_generation_id),
-                created_at: created.into(),
-                target: None,
+        .acquire_lock_guard("op")
+        .unwrap()
+        .create_generation(&GenerationAssignment {
+            deployment_id: test_deployment_id(deployment_id),
+            generation_id: test_generation_id(generation_id),
+            artifact: ArtifactRef {
+                release: crate::identity::test_release_id("r"),
+                variant: VariantName::new("standard".to_string()),
+                tree: canonical_tree,
             },
-        )
+            behavior_sha256: "b".into(),
+            prior_generation: prior_generation.map(test_generation_id),
+            created_at: created.into(),
+            target: None,
+        })
         .unwrap();
 }
 
@@ -468,8 +467,9 @@ fn run_no_leak_case(
         );
     }
     helper
+        .acquire_lock_guard("op")
+        .unwrap()
         .swap_current(
-            &helper.acquire_lock_guard("op").unwrap(),
             &crate::remote::helper::ExpectedCurrent::Absent,
             test_generation_id(&format!("g{}", n - 1)).as_str(),
             "op",

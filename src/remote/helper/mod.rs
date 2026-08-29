@@ -62,7 +62,7 @@
 //! OPERATOR ERROR, out of contract, and the protocol never pretends to
 //! enforce protection against it. There is NO per-mutation fencing — the
 //! fence is CAPABILITY POSSESSION: only a controller that holds the lock
-//! (possesses the RAII [`LockGuard`]/[`HeldSlotLock`] capability) can call
+//! (possesses the RAII [`HeldSlotLock`] capability — a guard can only mutate the slot it was acquired from — the receiver is the guard, the helper is the guard's own; there is no API parameter through which a guard from server A can authorize a mutation on server B) can call
 //! the slot-mutation functions (`create_generation`, `swap_current`,
 //! `transaction_record`, `write_commit_marker`, `remove_current_if`,
 //! `publish_from_incoming`). A mutation never consults the on-disk lock;
@@ -505,7 +505,10 @@ impl<'a> RemoteHelper<'a> {
 /// This is the slot-mutation capability: only a controller that holds this
 /// guard (possesses the capability) may call the slot-mutation functions
 /// (`create_generation`, `swap_current`, `transaction_record`,
-/// `write_commit_marker`, `remove_current_if`, `publish_from_incoming`).
+/// `write_commit_marker`, `remove_current_if`, `publish_from_incoming`)
+/// — a guard can only mutate the slot it was acquired from — the receiver is
+/// the guard, the helper is the guard's own; there is no API parameter through
+/// which a guard from server A can authorize a mutation on server B.
 /// The guard is OPAQUE — the held [`LockRecord`] is private and cannot be
 /// forged.
 pub struct HeldSlotLock<'a> {
@@ -546,9 +549,45 @@ impl<'a> Drop for HeldSlotLock<'a> {
     }
 }
 
-/// Backwards-compat alias: existing call sites using `LockGuard` keep compiling.
-/// New code should use `HeldSlotLock`.
-pub type LockGuard<'a> = HeldSlotLock<'a>;
+impl HeldSlotLock<'_> {
+    /// Atomically move `current` to the given generation (guard-bound).
+    pub fn swap_current(
+        &self,
+        expected: &ExpectedCurrent,
+        gen_id: &str,
+        op_id: &str,
+    ) -> Result<()> {
+        self.helper.swap_current_locked(expected, gen_id, op_id)
+    }
+    /// Remove `current` only if it points at `expected` (guard-bound).
+    pub fn remove_current_if(&self, expected: &ExpectedCurrent) -> Result<bool> {
+        self.helper.remove_current_if_locked(expected)
+    }
+    /// Publish a staged incoming tree into the object store (guard-bound).
+    pub fn publish_from_incoming(&self, deployment_id: &str, digest: &str) -> Result<()> {
+        self.helper
+            .publish_from_incoming_locked(deployment_id, digest)
+    }
+    /// Persist a transaction record (guard-bound).
+    pub fn transaction_record(&self, op_id: &str, state: &str) -> Result<()> {
+        self.helper.transaction_record_locked(op_id, state)
+    }
+    /// Write a commit marker (guard-bound).
+    pub fn write_commit_marker(
+        &self,
+        deployment_id: &str,
+        generation: &str,
+        slot_ids: &[String],
+        target: Option<&str>,
+    ) -> Result<()> {
+        self.helper
+            .write_commit_marker_locked(deployment_id, generation, slot_ids, target)
+    }
+    /// Create a generation record and its `root` symlink (guard-bound).
+    pub fn create_generation(&self, assignment: &GenerationAssignment) -> Result<()> {
+        self.helper.create_generation_locked(assignment)
+    }
+}
 
 pub fn now_rfc3339() -> String {
     jiff::Timestamp::now().to_string()
@@ -1325,6 +1364,365 @@ mod nested_guard_proptest {
             drop_order in 0u8..=1,
         ) {
             run_isolation_case(drop_order)?;
+        }
+    }
+}
+
+/// Cross-remote guard-bound mutation property: a guard can only mutate the slot it was
+/// acquired from — the receiver is the guard, the helper is the guard's own; there is no
+/// API parameter through which a guard from server A can authorize a mutation on server B.
+/// Post-fix the cross-helper call cannot even be expressed (the method receiver is the guard;
+/// `helper_b.acquire_lock`'s guard can only mutate B) — the property pins the "only the
+/// owning server changes" contract and would FAIL against a hypothetical re-introduction of
+/// the helper-parameter API (a caller could route B-mutations through an A guard — B's tree
+/// would change).
+#[cfg(test)]
+mod cross_remote_guard_mutation {
+    use super::*;
+    use crate::identity::{ArtifactRef, TargetName, VariantName};
+    use crate::remote::helper::{ExpectedCurrent, GenerationAssignment};
+    use crate::remote::transport::LocalTransport;
+    use proptest::prelude::*;
+    use proptest::test_runner::RngSeed;
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
+    fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, (Vec<u8>, u32, bool)> {
+        let mut map = BTreeMap::new();
+        if !root.exists() {
+            return map;
+        }
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(p) = stack.pop() {
+            let meta = match std::fs::symlink_metadata(&p) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let rel = p.strip_prefix(root).unwrap().to_path_buf();
+            if meta.file_type().is_symlink() {
+                let target = std::fs::read_link(&p).unwrap_or_default();
+                map.insert(
+                    rel,
+                    (
+                        target.as_os_str().as_encoded_bytes().to_vec(),
+                        meta.permissions().mode() & 0o7777,
+                        true,
+                    ),
+                );
+            } else if meta.is_dir() {
+                map.insert(
+                    rel.clone(),
+                    (Vec::new(), meta.permissions().mode() & 0o7777, false),
+                );
+                if let Ok(entries) = std::fs::read_dir(&p) {
+                    for e in entries.flatten() {
+                        stack.push(e.path());
+                    }
+                }
+            } else {
+                let data = std::fs::read(&p).unwrap_or_default();
+                map.insert(rel, (data, meta.permissions().mode() & 0o7777, false));
+            }
+        }
+        map
+    }
+
+    fn seed_minimal_fixture(remote: &LocalTransport) {
+        // One generation + current link + one staged incoming tree, identical for A and B.
+        let gen_id = crate::identity::test_generation_id("gen-seed");
+        let tree = crate::identity::test_tree_digest("tree-seed");
+        let deployment_id = "deploy-seed";
+        // Tree object
+        let tree_root = remote
+            .root()
+            .join(crate::remote::layout::tree_root(tree.as_str()));
+        std::fs::create_dir_all(&tree_root).unwrap();
+        std::fs::write(tree_root.join("file"), b"seed").unwrap();
+        // Generation assignment
+        let asn = GenerationAssignment {
+            deployment_id: crate::identity::test_deployment_id(deployment_id),
+            generation_id: gen_id.clone(),
+            artifact: ArtifactRef {
+                release: crate::identity::test_release_id("rel-seed"),
+                variant: VariantName::new("standard".to_string()),
+                tree: tree.clone(),
+            },
+            behavior_sha256: "b".to_string(),
+            prior_generation: None,
+            created_at: "2020-01-01T00:00:00Z".to_string(),
+            target: Some(TargetName::new("t1")),
+        };
+        let gen_dir = remote
+            .root()
+            .join(crate::remote::layout::generation(gen_id.as_str()));
+        std::fs::create_dir_all(&gen_dir).unwrap();
+        std::fs::write(
+            gen_dir.join("assignment.json"),
+            serde_json::to_vec(&asn).unwrap(),
+        )
+        .unwrap();
+        let root_link = crate::remote::layout::generation_root_link(tree.as_str());
+        std::os::unix::fs::symlink(&root_link, gen_dir.join("root")).unwrap();
+        // current -> generations/<gen>/root
+        let cur_target = PathBuf::from(format!(
+            "{}/{}/root",
+            crate::remote::layout::GENERATIONS_COMPONENT,
+            gen_id.as_str()
+        ));
+        let cur_path = remote.root().join("current");
+        let _ = std::fs::remove_file(&cur_path);
+        std::os::unix::fs::symlink(&cur_target, &cur_path).unwrap();
+        // Staged incoming tree
+        let staged = remote.root().join(crate::remote::layout::staged_tree(
+            deployment_id,
+            tree.as_str(),
+        ));
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::write(staged.join("staged_file"), b"staged").unwrap();
+    }
+
+    #[derive(Clone, Debug)]
+    enum GuardOp {
+        SwapCurrent {
+            expected: ExpectedCurrent,
+            gen_id: String,
+            op_id: String,
+        },
+        RemoveCurrentIf {
+            expected: ExpectedCurrent,
+        },
+        PublishFromIncoming {
+            deployment_id: String,
+            digest: String,
+        },
+        TransactionRecord {
+            op_id: String,
+            state: String,
+        },
+        WriteCommitMarker {
+            deployment_id: String,
+            generation: String,
+            slot_ids: Vec<String>,
+            target: Option<String>,
+        },
+        CreateGeneration {
+            gen_tag: String,
+            tree_tag: String,
+        },
+    }
+
+    fn arb_expected() -> impl Strategy<Value = ExpectedCurrent> {
+        prop_oneof![
+            Just(ExpectedCurrent::Absent),
+            "[a-z0-9]{1,8}".prop_map(|tag| ExpectedCurrent::Generation(
+                crate::identity::test_generation_id(&tag)
+            )),
+        ]
+    }
+
+    fn arb_guard_op() -> impl Strategy<Value = GuardOp> {
+        prop_oneof![
+            (arb_expected(), "[a-z0-9]{1,8}", "[a-z0-9]{1,8}").prop_map(
+                |(expected, gen_tag, op_tag)| GuardOp::SwapCurrent {
+                    expected,
+                    gen_id: crate::identity::test_generation_id(&gen_tag)
+                        .as_str()
+                        .to_string(),
+                    op_id: format!("op-{op_tag}"),
+                }
+            ),
+            arb_expected().prop_map(|expected| GuardOp::RemoveCurrentIf { expected }),
+            ("[a-z0-9]{1,8}", "[a-z0-9]{1,8}").prop_map(|(dep_tag, tree_tag)| {
+                GuardOp::PublishFromIncoming {
+                    deployment_id: format!("deploy-{dep_tag}"),
+                    digest: crate::identity::test_tree_digest(&tree_tag)
+                        .as_str()
+                        .to_string(),
+                }
+            }),
+            (
+                "[a-z0-9]{1,8}",
+                prop_oneof![
+                    Just("prepared".to_string()),
+                    Just("committed".to_string()),
+                    Just("compensated".to_string())
+                ]
+            )
+                .prop_map(|(op_tag, state)| GuardOp::TransactionRecord {
+                    op_id: format!("op-{op_tag}"),
+                    state,
+                }),
+            ("[a-z0-9]{1,8}", "[a-z0-9]{1,8}").prop_map(|(dep_tag, gen_tag)| {
+                GuardOp::WriteCommitMarker {
+                    deployment_id: format!("deploy-{dep_tag}"),
+                    generation: crate::identity::test_generation_id(&gen_tag)
+                        .as_str()
+                        .to_string(),
+                    slot_ids: vec!["p1".to_string()],
+                    target: Some("t1".to_string()),
+                }
+            }),
+            ("[a-z0-9]{1,8}", "[a-z0-9]{1,8}")
+                .prop_map(|(gen_tag, tree_tag)| GuardOp::CreateGeneration { gen_tag, tree_tag }),
+        ]
+    }
+
+    fn run_cross_remote_guard_case(ops: Vec<GuardOp>) -> std::result::Result<(), TestCaseError> {
+        let tmp_a = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let tmp_b = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let remote_a =
+            LocalTransport::new(&crate::testutil::fixture_env(), tmp_a.path().join("remote"))
+                .unwrap();
+        let remote_b =
+            LocalTransport::new(&crate::testutil::fixture_env(), tmp_b.path().join("remote"))
+                .unwrap();
+        seed_minimal_fixture(&remote_a);
+        seed_minimal_fixture(&remote_b);
+        let helper_a = RemoteHelper::new(&remote_a);
+        let helper_b = RemoteHelper::new(&remote_b);
+        // Snapshot B before
+        let before_b = snapshot_tree(remote_b.root());
+        // Acquire A's guard
+        let guard_a = helper_a.acquire_lock_guard("op-A").unwrap();
+        // Randomized sequence on A's guard
+        for op in &ops {
+            let _ = match op {
+                GuardOp::SwapCurrent {
+                    expected,
+                    gen_id,
+                    op_id,
+                } => guard_a.swap_current(expected, gen_id, op_id),
+                GuardOp::RemoveCurrentIf { expected } => {
+                    guard_a.remove_current_if(expected).map(|_| ())
+                }
+                GuardOp::PublishFromIncoming {
+                    deployment_id,
+                    digest,
+                } => guard_a.publish_from_incoming(deployment_id, digest),
+                GuardOp::TransactionRecord { op_id, state } => {
+                    guard_a.transaction_record(op_id, state)
+                }
+                GuardOp::WriteCommitMarker {
+                    deployment_id,
+                    generation,
+                    slot_ids,
+                    target,
+                } => guard_a.write_commit_marker(
+                    deployment_id,
+                    generation,
+                    slot_ids,
+                    target.as_deref(),
+                ),
+                GuardOp::CreateGeneration { gen_tag, tree_tag } => {
+                    let asn = GenerationAssignment {
+                        deployment_id: crate::identity::test_deployment_id("deploy-op"),
+                        generation_id: crate::identity::test_generation_id(gen_tag),
+                        artifact: ArtifactRef {
+                            release: crate::identity::test_release_id("rel-op"),
+                            variant: VariantName::new("standard".to_string()),
+                            tree: crate::identity::test_tree_digest(tree_tag),
+                        },
+                        behavior_sha256: "b".to_string(),
+                        prior_generation: None,
+                        created_at: "2020-01-01T00:00:00Z".to_string(),
+                        target: Some(TargetName::new("t1")),
+                    };
+                    guard_a.create_generation(&asn)
+                }
+            };
+        }
+        let after_b = snapshot_tree(remote_b.root());
+        prop_assert_eq!(
+            before_b,
+            after_b,
+            "B's tree must be byte-for-byte unchanged after A's guard mutations"
+        );
+        // A's own lock file is present
+        prop_assert!(
+            remote_a
+                .metadata_opt(&crate::remote::layout::operation_lock())
+                .unwrap()
+                .is_some(),
+            "A's lock file must be present while guard lives"
+        );
+        // Reverse: acquire B's guard, assert A unchanged
+        drop(guard_a);
+        let before_a = snapshot_tree(remote_a.root());
+        let guard_b = helper_b.acquire_lock_guard("op-B").unwrap();
+        for op in &ops {
+            let _ = match op {
+                GuardOp::SwapCurrent {
+                    expected,
+                    gen_id,
+                    op_id,
+                } => guard_b.swap_current(expected, gen_id, op_id),
+                GuardOp::RemoveCurrentIf { expected } => {
+                    guard_b.remove_current_if(expected).map(|_| ())
+                }
+                GuardOp::PublishFromIncoming {
+                    deployment_id,
+                    digest,
+                } => guard_b.publish_from_incoming(deployment_id, digest),
+                GuardOp::TransactionRecord { op_id, state } => {
+                    guard_b.transaction_record(op_id, state)
+                }
+                GuardOp::WriteCommitMarker {
+                    deployment_id,
+                    generation,
+                    slot_ids,
+                    target,
+                } => guard_b.write_commit_marker(
+                    deployment_id,
+                    generation,
+                    slot_ids,
+                    target.as_deref(),
+                ),
+                GuardOp::CreateGeneration { gen_tag, tree_tag } => {
+                    let asn = GenerationAssignment {
+                        deployment_id: crate::identity::test_deployment_id("deploy-op"),
+                        generation_id: crate::identity::test_generation_id(gen_tag),
+                        artifact: ArtifactRef {
+                            release: crate::identity::test_release_id("rel-op"),
+                            variant: VariantName::new("standard".to_string()),
+                            tree: crate::identity::test_tree_digest(tree_tag),
+                        },
+                        behavior_sha256: "b".to_string(),
+                        prior_generation: None,
+                        created_at: "2020-01-01T00:00:00Z".to_string(),
+                        target: Some(TargetName::new("t1")),
+                    };
+                    guard_b.create_generation(&asn)
+                }
+            };
+        }
+        let after_a = snapshot_tree(remote_a.root());
+        prop_assert_eq!(
+            before_a,
+            after_a,
+            "A's tree must be unchanged after B's guard mutations"
+        );
+        prop_assert!(
+            remote_b
+                .metadata_opt(&crate::remote::layout::operation_lock())
+                .unwrap()
+                .is_some(),
+            "B's lock file must be present while guard lives"
+        );
+        Ok(())
+    }
+
+    proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: crate::testutil::proptest_cases(64),
+            max_shrink_iters: 10000,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..proptest::test_runner::Config::default()
+        })]
+        #[test]
+        fn cross_remote_guard_only_owning_server_changes(ops in prop::collection::vec(arb_guard_op(), 0..=8)) {
+            run_cross_remote_guard_case(ops)?;
         }
     }
 }

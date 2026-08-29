@@ -70,7 +70,7 @@ pub use crate::ledger::records::{
     DeploymentIntent, LedgerEntry, LedgerIntentWire, LedgerRollback, LedgerTerminal,
     LedgerTerminalWire, PhysicalBinding, TerminalDisposition,
 };
-use crate::remote::helper::{LockGuard, RemoteHelper};
+use crate::remote::helper::{HeldSlotLock, RemoteHelper};
 use crate::store::local::LocalStore;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -201,7 +201,7 @@ pub fn finalize_successful_locked(
     //    including the refusals and the transient-pending path).
     let mut selected: Vec<&SlotId> = attempt.slots.keys().collect();
     selected.sort();
-    let mut guards: Vec<LockGuard<'_>> = Vec::with_capacity(selected.len());
+    let mut guards: Vec<HeldSlotLock<'_>> = Vec::with_capacity(selected.len());
     for sid in &selected {
         let Some(helper) = helpers.get(sid) else {
             // No live helper for a selected slot: the live state cannot be
@@ -249,11 +249,9 @@ pub fn finalize_successful_locked(
         .map(|s| s.as_str().to_string())
         .collect();
     for (idx, sid) in selected.iter().enumerate() {
-        let helper = &helpers[*sid];
         let guard = &guards[idx];
         let slot = &attempt.slots[*sid];
-        match helper.write_commit_marker(
-            guard,
+        match guard.write_commit_marker(
             attempt.deployment_id.as_str(),
             slot.desired.generation.as_str(),
             &slot_ids,
@@ -682,26 +680,26 @@ mod tests {
             ))
             .unwrap();
         helper
-            .create_generation(
-                &helper.acquire_lock_guard("op-seed").unwrap(),
-                &crate::remote::helper::GenerationAssignment {
-                    deployment_id: attempt.deployment_id.clone(),
-                    generation_id: test_generation_id("gen-1"),
-                    artifact: ArtifactRef {
-                        release: crate::identity::test_release_id("rel-1"),
-                        variant: VariantName::new("standard".to_string()),
-                        tree: test_tree_digest("tree-1"),
-                    },
-                    behavior_sha256: "sha256-aa".to_string(),
-                    prior_generation: None,
-                    created_at: "2026-01-01T00:00:00Z".to_string(),
-                    target: Some(target.clone()),
+            .acquire_lock_guard("op-seed")
+            .unwrap()
+            .create_generation(&crate::remote::helper::GenerationAssignment {
+                deployment_id: attempt.deployment_id.clone(),
+                generation_id: test_generation_id("gen-1"),
+                artifact: ArtifactRef {
+                    release: crate::identity::test_release_id("rel-1"),
+                    variant: VariantName::new("standard".to_string()),
+                    tree: test_tree_digest("tree-1"),
                 },
-            )
+                behavior_sha256: "sha256-aa".to_string(),
+                prior_generation: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                target: Some(target.clone()),
+            })
             .unwrap();
         helper
+            .acquire_lock_guard("op-seed")
+            .unwrap()
             .swap_current(
-                &helper.acquire_lock_guard("op-seed").unwrap(),
                 &ExpectedCurrent::Absent,
                 test_generation_id("gen-1").as_str(),
                 "op-seed",
@@ -802,26 +800,26 @@ mod tests {
             ))
             .unwrap();
         helper
-            .create_generation(
-                &helper.acquire_lock_guard("op-seed").unwrap(),
-                &crate::remote::helper::GenerationAssignment {
-                    deployment_id: attempt.deployment_id.clone(),
-                    generation_id: test_generation_id("gen-1"),
-                    artifact: ArtifactRef {
-                        release: crate::identity::test_release_id("rel-1"),
-                        variant: VariantName::new("standard".to_string()),
-                        tree: test_tree_digest("tree-1"),
-                    },
-                    behavior_sha256: "sha256-aa".to_string(),
-                    prior_generation: None,
-                    created_at: "2026-01-01T00:00:00Z".to_string(),
-                    target: Some(target.clone()),
+            .acquire_lock_guard("op-seed")
+            .unwrap()
+            .create_generation(&crate::remote::helper::GenerationAssignment {
+                deployment_id: attempt.deployment_id.clone(),
+                generation_id: test_generation_id("gen-1"),
+                artifact: ArtifactRef {
+                    release: crate::identity::test_release_id("rel-1"),
+                    variant: VariantName::new("standard".to_string()),
+                    tree: test_tree_digest("tree-1"),
                 },
-            )
+                behavior_sha256: "sha256-aa".to_string(),
+                prior_generation: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                target: Some(target.clone()),
+            })
             .unwrap();
         helper
+            .acquire_lock_guard("op-seed")
+            .unwrap()
             .swap_current(
-                &helper.acquire_lock_guard("op-seed").unwrap(),
                 &ExpectedCurrent::Absent,
                 test_generation_id("gen-1").as_str(),
                 "op-seed",

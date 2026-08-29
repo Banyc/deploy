@@ -1496,7 +1496,7 @@ impl Fixture {
             // helper).
             let remote = self.remote_for(&guard_server);
             let helper = RemoteHelper::new(remote.as_ref());
-            let mut guard: Option<crate::remote::helper::LockGuard<'_>> = None;
+            let mut guard: Option<crate::remote::helper::HeldSlotLock<'_>> = None;
             // Service EVERY park, not just the first: with prior debt the
             // engine parks at the deferred-maintenance RETRY first (the
             // [`step17_hook::HookPhase::DeferredRetry`] phase) and AGAIN at
@@ -2381,7 +2381,7 @@ fn state_machine_lifecycle_retention_lock_contention_defers_not_silent() {
         let hook = step17_hook::Step17Hook::arm(f.store.step17_hook(), id.as_str());
         std::thread::scope(|s| {
             let push = s.spawn(|| f.push_with_id("t1", &id));
-            let mut guard: Option<crate::remote::helper::LockGuard<'_>> = None;
+            let mut guard: Option<crate::remote::helper::HeldSlotLock<'_>> = None;
             // Service EVERY park (the 2-slot fixture parks at each shared
             // slot's step-17 retention), holding the s1 guard at the first
             // park; `recv_timeout` sleeps, never spins.
@@ -2432,7 +2432,7 @@ fn state_machine_lifecycle_retention_lock_contention_defers_not_silent() {
         let hook = step17_hook::Step17Hook::arm(f.store.step17_hook(), id.as_str());
         std::thread::scope(|s| {
             let push = s.spawn(|| f.push_with_id("t1", &id));
-            let mut guard: Option<crate::remote::helper::LockGuard<'_>> = None;
+            let mut guard: Option<crate::remote::helper::HeldSlotLock<'_>> = None;
             while !push.is_finished() {
                 if let Ok(_phase) = hook.wait_at_step17_bounded(std::time::Duration::from_millis(5))
                 {

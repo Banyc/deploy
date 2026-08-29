@@ -3230,9 +3230,10 @@ fn pending_commit_diverged_generation_is_degraded_not_successful() -> Result<()>
         .remote()
         .create_dir_all(&deploy::remote::layout::tree_root(foreign_tree.as_str()))?;
     let foreign_gen = deploy::identity::GenerationId::generate();
-    foreign_helper.create_generation(
-        &foreign_helper.acquire_lock_guard("op-foreign").unwrap(),
-        &GenerationAssignment {
+    foreign_helper
+        .acquire_lock_guard("op-foreign")
+        .unwrap()
+        .create_generation(&GenerationAssignment {
             deployment_id: deploy::identity::DeploymentId::generate(),
             generation_id: foreign_gen.clone(),
             artifact: deploy::identity::ArtifactRef {
@@ -3247,14 +3248,15 @@ fn pending_commit_diverged_generation_is_degraded_not_successful() -> Result<()>
             prior_generation: None,
             created_at: "2020-01-01T00:00:00Z".to_string(),
             target: None,
-        },
-    )?;
-    foreign_helper.swap_current(
-        &foreign_helper.acquire_lock_guard("op-foreign").unwrap(),
-        &deploy::remote::helper::ExpectedCurrent::Absent,
-        foreign_gen.as_str(),
-        "op-foreign",
-    )?;
+        })?;
+    foreign_helper
+        .acquire_lock_guard("op-foreign")
+        .unwrap()
+        .swap_current(
+            &deploy::remote::helper::ExpectedCurrent::Absent,
+            foreign_gen.as_str(),
+            "op-foreign",
+        )?;
     write_file(
         &proj
             .join("releases")

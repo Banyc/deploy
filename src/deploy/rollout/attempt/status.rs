@@ -106,8 +106,7 @@ pub(crate) fn decide_commit_status(
                 commit_reason = Some("commit diverged");
                 continue;
             }
-            match helper.write_commit_marker(
-                &_guard,
+            match _guard.write_commit_marker(
                 deployment_id.as_str(),
                 new_gen[sid].as_str(),
                 &slot_ids,
