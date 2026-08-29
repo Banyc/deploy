@@ -602,14 +602,28 @@ interval_seconds = 0
         deploy_dir: &str,
         pre_push: crate::ledger::Observation<PreviousGeneration>,
     ) -> DeploymentIntent {
+        intent_full_over(id, release, tree, deploy_dir, pre_push, None)
+    }
+
+    /// [`intent_full`] planned against a parent (the current successful head)
+    /// — the lineage invariant (at most one `Successful` per parent) requires
+    /// every seeded successful to chain onto the previous one.
+    fn intent_full_over(
+        id: &str,
+        release: &str,
+        tree: &str,
+        deploy_dir: &str,
+        pre_push: crate::ledger::Observation<PreviousGeneration>,
+        head: Option<&DeploymentIntent>,
+    ) -> DeploymentIntent {
         use crate::kernel::intent::{PlanInput, PlannedDeploy};
         use crate::kernel::snapshot::SnapshotSlot;
         let p1 = SlotId::new(SLOT.to_string());
         crate::kernel::intent::plan(PlanInput {
             deployment_id: test_deployment_id(id),
             target: TargetName::new(TARGET.to_string()),
-            parent: None,
-            parent_snapshot: None,
+            parent: head.map(|h| h.deployment_id().clone()),
+            parent_snapshot: head.map(|h| h.resulting_snapshot()),
             group: None,
             selection: vec![p1.clone()],
             planned: vec![PlannedDeploy {
@@ -774,23 +788,28 @@ interval_seconds = 0
         // each rolling back to `rel-sha256-ret-<i>` / `tree-ret-<i>`. The
         // ledger ids and tree digests are the CANONICAL (validated) forms.
         let mut retained_deployments = Vec::new();
+        let mut head: Option<DeploymentIntent> = None;
         for i in 0..retained {
             let id = format!("deploy-ret-{i}");
             let canonical = test_deployment_id(&id);
             // Build a matching intent whose frozen snapshot
-            // generation/artifact/binding equals the terminal's rollback.
-            let matching_intent = intent_full(
+            // generation/artifact/binding equals the terminal's rollback,
+            // chaining onto the CURRENT successful head (the lineage
+            // invariant — at most one `Successful` per parent).
+            let matching_intent = intent_full_over(
                 &id,
                 &format!("ret-{i}"),
                 &format!("tree-ret-{i}"),
                 "/srv/eng",
                 crate::ledger::Observation::KnownAbsent,
+                head.as_ref(),
             );
             store.append_intent(TARGET, &matching_intent).unwrap();
             store
                 .append_terminal(TARGET, &canonical, &terminal_for(&matching_intent))
                 .unwrap();
             retained_deployments.push(canonical.as_str().to_string());
+            head = Some(matching_intent);
         }
         let ledger_text = std::fs::read_to_string(store.ledger_path(TARGET)).unwrap_or_default();
 

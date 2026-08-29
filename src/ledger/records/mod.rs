@@ -1371,7 +1371,11 @@ mod tests {
 
     /// A stale parent can never produce Successful (proptest 8,
     /// deterministic case): finalizing an intent whose parent is no longer
-    /// the head is refused by the kernel's parent-head assertion.
+    /// the head is refused by the kernel's parent-head assertion — AND the
+    /// PURE STATE MACHINE refuses the `Intent-only → Successful` transition
+    /// for such an intent (the RECOVERY path is the same transition, with NO
+    /// bypass: a recovered pending attempt whose parent drifted can never
+    /// append `Successful`).
     #[test]
     fn stale_parent_cannot_be_head() {
         let i = fixtures::full_intent("deploy-stale", "t1", &[slot(0)], &[]);
@@ -1382,6 +1386,134 @@ mod tests {
         assert_eq!(err.class(), crate::kernel::KernelErrorClass::Conflict);
         // The same intent plans against the actual head and passes.
         assert!(kernel::terminal::assert_parent_is_head(&i, None).is_ok());
+
+        // THE STATE MACHINE GATE (the recovery path's gate): a Successful
+        // terminal for the stale intent is REFUSED by `apply_event` with a
+        // Conflict — recovery appends through the same transition, so a
+        // later recovery of the pending intent can NEVER produce Successful
+        // once the head moved on (a newer head's inherited state can never
+        // be overlaid from logical history).
+        let target = TargetName::parse("t1").unwrap();
+        let mut state = kernel::transition::DeploymentState::new(target.clone());
+        let head_intent = fixtures::full_intent("deploy-head", "t1", &[slot(0)], &[]);
+        state = kernel::transition::apply_event(
+            state,
+            kernel::transition::LedgerEvent::Intent(kernel::transition::IntentEvent {
+                intent: head_intent.clone(),
+            }),
+        )
+        .unwrap();
+        state = kernel::transition::apply_event(
+            state,
+            kernel::transition::LedgerEvent::Terminal(kernel::transition::TerminalEvent {
+                deployment_id: head_intent.deployment_id().clone(),
+                terminal: fixtures::successful_terminal(&head_intent),
+            }),
+        )
+        .unwrap();
+        // The pending intent (parent None — stale against head `deploy-head`)
+        // is durably recorded; its Successful terminal is REFUSED.
+        state = kernel::transition::apply_event(
+            state,
+            kernel::transition::LedgerEvent::Intent(kernel::transition::IntentEvent {
+                intent: i.clone(),
+            }),
+        )
+        .unwrap();
+        let err = kernel::transition::apply_event(
+            state,
+            kernel::transition::LedgerEvent::Terminal(kernel::transition::TerminalEvent {
+                deployment_id: i.deployment_id().clone(),
+                terminal: fixtures::successful_terminal(&i),
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.class(),
+            crate::kernel::KernelErrorClass::Conflict,
+            "the stale Successful transition is a refused conflict, never reconciled implicitly"
+        );
+    }
+
+    /// At most ONE plan per parent can ever append `Successful` (the
+    /// lineage invariant, structural): once A (parent H) appended
+    /// `Successful`, a second intent B with the SAME parent H is REFUSED at
+    /// its Successful terminal — the second one to finalize observes the
+    /// drifted head (A) and is refused ([`KernelError::Conflict`]), never
+    /// reconciled implicitly.
+    #[test]
+    fn at_most_one_successful_per_parent() {
+        let target = TargetName::parse("t1").unwrap();
+        // H: the first successful deployment (parent None) — the shared
+        // parent both A and B plan against.
+        let h_intent = fixtures::full_intent("deploy-h", "t1", &[slot(0), slot(1)], &[]);
+        let base = h_intent.resulting_snapshot();
+        let a = fixtures::group_intent(
+            "deploy-a",
+            "t1",
+            "g",
+            h_intent.deployment_id(),
+            &base,
+            &[slot(0), slot(1)],
+            &[slot(0)],
+        );
+        let b = fixtures::group_intent(
+            "deploy-b",
+            "t1",
+            "g",
+            h_intent.deployment_id(),
+            &base,
+            &[slot(0), slot(1)],
+            &[slot(1)],
+        );
+        let mut state = kernel::transition::DeploymentState::new(target.clone());
+        for intent in [&h_intent, &a, &b] {
+            state = kernel::transition::apply_event(
+                state,
+                kernel::transition::LedgerEvent::Intent(kernel::transition::IntentEvent {
+                    intent: intent.clone(),
+                }),
+            )
+            .unwrap();
+        }
+        // H succeeds (parent None == head None).
+        state = kernel::transition::apply_event(
+            state,
+            kernel::transition::LedgerEvent::Terminal(kernel::transition::TerminalEvent {
+                deployment_id: h_intent.deployment_id().clone(),
+                terminal: fixtures::successful_terminal(&h_intent),
+            }),
+        )
+        .unwrap();
+        // A (parent H) succeeds FIRST: parent == head (H) at append time.
+        state = kernel::transition::apply_event(
+            state,
+            kernel::transition::LedgerEvent::Terminal(kernel::transition::TerminalEvent {
+                deployment_id: a.deployment_id().clone(),
+                terminal: fixtures::successful_terminal(&a),
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            state.successful_head(),
+            Some(a.deployment_id()),
+            "A became the head after its Successful append"
+        );
+        // B (parent H) finalizes SECOND: the head is now A, not H — the
+        // second Successful on the SAME parent is REFUSED.
+        let err = kernel::transition::apply_event(
+            state,
+            kernel::transition::LedgerEvent::Terminal(kernel::transition::TerminalEvent {
+                deployment_id: b.deployment_id().clone(),
+                terminal: fixtures::successful_terminal(&b),
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.class(),
+            crate::kernel::KernelErrorClass::Conflict,
+            "at most one Successful per parent — the second plan to finalize on H is a stale plan"
+        );
     }
 
     // =====================================================================

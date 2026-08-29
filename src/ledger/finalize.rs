@@ -1,6 +1,19 @@
 //! REPLAY-SAFE, LOCK-VERIFIED FINALIZATION of a successful deployment,
 //! reduced to EVIDENCE GATHERING (the semantic decision lives in the
 //! kernel's [`crate::kernel::transition::decide_terminal`]).
+//!
+//! THE GATE LIVES IN THE PURE STATE MACHINE, NOT HERE: the finalizer
+//! appends the PAYLOAD-FREE `Successful` terminal through the store, whose
+//! pre-write validation mirrors the kernel's [`crate::kernel::transition::
+//! apply_event`] — and THAT gate requires `intent.parent == current
+//! successful head` at append time, with NO bypass (recovery is a caller
+//! of the same transition, not a second authority). The parent/head check
+//! and the append are ATOMIC under the target lock, so at most ONE plan
+//! per parent can ever append `Successful`; a finalizer that observes a
+//! drifted head is REFUSED ([`FinalizeOutcome::Refused`], the reason
+//! carrying the kernel's Conflict/StalePlan message) and its caller
+//! finalizes the stale plan `Degraded` — never stranded, never
+//! successful.
 
 use crate::error::{Error, Result};
 use crate::identity::{GenerationRef, OperationId, PlacementSlotAssignment, SlotId};
@@ -24,22 +37,20 @@ pub type LedgerLine = LedgerEventWire;
 /// Finalize a successful deployment: acquire every selected slot's
 /// mutation lock, GATHER the verification evidence (each selected slot's
 /// live generation + assignment artifact equal the intent's planned
-/// result), write the commit markers, re-verify, and — only when the
-/// intent's parent is still the target's successful head — append the
-/// PAYLOAD-FREE `Successful` terminal (bound to the intent by its canonical
-/// digest). The kernel decides the disposition; this function only gathers
-/// evidence and orchestrates the guarded mutations.
+/// result), write the commit markers, re-verify, and append the
+/// PAYLOAD-FREE `Successful` terminal (bound to the intent by its
+/// canonical digest) — subject to the STATE MACHINE's one-parent gate
+/// (the intent's parent must still be the target's successful head at
+/// append time; a drifted head is refused and the caller finalizes the
+/// stale plan `Degraded`). The kernel decides the disposition; this
+/// function only gathers evidence and orchestrates the guarded mutations.
 pub fn finalize_successful_locked(
     store: &LocalStore,
     attempt: &DeploymentIntent,
     helpers: &HashMap<SlotId, RemoteHelper>,
     settings: &FinalizeSettings<'_>,
 ) -> Result<FinalizeOutcome> {
-    let FinalizeSettings {
-        reason,
-        op_id,
-        enforce_parent,
-    } = settings;
+    let FinalizeSettings { reason, op_id } = settings;
     let entries = store.read_ledger(attempt.target().as_str())?;
     if let Some(e) = entries
         .iter()
@@ -54,7 +65,7 @@ pub fn finalize_successful_locked(
     for sid in &selected {
         let Some(helper) = helpers.get(sid) else {
             return Ok(FinalizeOutcome::Refused {
-                reason: "state diverged",
+                reason: "state diverged".to_string(),
                 slot: sid.clone(),
             });
         };
@@ -66,7 +77,7 @@ pub fn finalize_successful_locked(
     match verify_selected_locked(helpers, attempt)? {
         LockedObservation::Diverged(slot) => {
             return Ok(FinalizeOutcome::Refused {
-                reason: "state diverged",
+                reason: "state diverged".to_string(),
                 slot,
             });
         }
@@ -85,7 +96,7 @@ pub fn finalize_successful_locked(
         ) {
             Err(Error::Integrity(_)) => {
                 return Ok(FinalizeOutcome::Refused {
-                    reason: "marker integrity conflict",
+                    reason: "marker integrity conflict".to_string(),
                     slot: sid.clone(),
                 });
             }
@@ -97,38 +108,12 @@ pub fn finalize_successful_locked(
         LockedObservation::Verified(o) => o,
         LockedObservation::Diverged(slot) => {
             return Ok(FinalizeOutcome::Refused {
-                reason: "state diverged",
+                reason: "state diverged".to_string(),
                 slot,
             });
         }
     };
     let _ = observed;
-    // THE ONE-PARENT RULE (before successful finalization): the intent's
-    // parent must still be the target's successful head — a drifted head
-    // means the plan was computed against a stale snapshot. Enforced for
-    // NEW plans only: the MAIN success path gates its finalize here (a
-    // concurrent success would make THIS plan a fork — refused, never
-    // reconciled implicitly). RECOVERY
-    // ([`crate::ledger::recovery::reconcile_pending_commits`]) sets
-    // `enforce_parent: false`: a recovered attempt's plan was already
-    // validated at plan time and durably recorded before mutation, and the
-    // recovery contract (requirement.md step 15) completes it `Successful`
-    // once the LIVE state still matches — independent of any head that
-    // later landed.
-    if *enforce_parent {
-        let head = store
-            .read_last_successful(attempt.target().as_str())
-            .and_then(|h| crate::identity::DeploymentId::parse(&h).ok());
-        if let Err(_e) = crate::kernel::terminal::assert_parent_is_head(attempt, head.as_ref()) {
-            return Ok(FinalizeOutcome::Refused {
-                reason: "stale plan",
-                slot: selected
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| SlotId::new("no-slot".to_string())),
-            });
-        }
-    }
     // THE KERNEL DECIDES: with the verification evidence gathered (every
     // selected slot verified at its planned result) the disposition is
     // `Successful` — payload-free; the result resolves from the intent.
@@ -148,29 +133,42 @@ pub fn finalize_successful_locked(
         disposition,
         Some(reason.to_string()),
     );
-    store.append_terminal(
+    // THE STORE APPENDS THROUGH THE STATE MACHINE'S GATE: the pre-write
+    // validation ([`crate::store::local::ledger`]'s mirror of
+    // `apply_event`) refuses a `Successful` terminal whose intent's parent
+    // is no longer the current successful head — a drifted head (a later
+    // deployment already succeeded on this parent) makes THIS plan stale.
+    // The Conflict (StalePlan) refusal is translated into
+    // [`FinalizeOutcome::Refused`] with the kernel's conflict message as
+    // the reason (the structured stale-plan source); the caller finalizes
+    // the stale plan `Degraded`, never `Successful`, and the stale intent
+    // never becomes the head — the newer head's snapshot is untouched.
+    match store.append_terminal(
         attempt.target().as_str(),
         attempt.deployment_id(),
         &terminal,
-    )?;
-    Ok(FinalizeOutcome::Finalized)
+    ) {
+        Ok(()) => Ok(FinalizeOutcome::Finalized),
+        Err(Error::Conflict(message)) => Ok(FinalizeOutcome::Refused {
+            reason: message,
+            slot: selected
+                .first()
+                .cloned()
+                .unwrap_or_else(|| SlotId::new("no-slot".to_string())),
+        }),
+        Err(e) => Err(e),
+    }
 }
 
 pub struct FinalizeSettings<'a> {
     pub reason: &'a str,
     pub op_id: &'a OperationId,
-    /// Whether the one-parent rule gates this finalization: `true` for the
-    /// MAIN success path (a NEW plan must still be the head's child),
-    /// `false` for RECOVERY of an already-recorded intent-only attempt
-    /// (its plan was validated when it was durably recorded; recovery
-    /// completes it on live-state verification).
-    pub enforce_parent: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FinalizeOutcome {
     Finalized,
     Pending,
-    Refused { reason: &'static str, slot: SlotId },
+    Refused { reason: String, slot: SlotId },
 }
 enum LockedObservation {
     Verified(BTreeMap<SlotId, GenerationRef>),

@@ -486,6 +486,19 @@ mod tests {
     /// shared validator requires the match, and the old fixtures were wrong
     /// under the new contract).
     fn intent_for(id: &str, target: &str, release: &str, tree: &str) -> DeploymentIntent {
+        intent_for_over(id, target, release, tree, None)
+    }
+
+    /// [`intent_for`] planned against a parent (the current successful head)
+    /// — the lineage invariant (at most one `Successful` per parent) requires
+    /// a seeded successful to chain onto the previous one.
+    fn intent_for_over(
+        id: &str,
+        target: &str,
+        release: &str,
+        tree: &str,
+        head: Option<&DeploymentIntent>,
+    ) -> DeploymentIntent {
         use crate::kernel::intent::{PlanInput, PlannedDeploy};
         use crate::kernel::snapshot::SnapshotSlot;
         use crate::ledger::Observation;
@@ -493,8 +506,8 @@ mod tests {
         crate::kernel::intent::plan(PlanInput {
             deployment_id: test_deployment_id(id),
             target: TargetName::new(target.to_string()),
-            parent: None,
-            parent_snapshot: None,
+            parent: head.map(|h| h.deployment_id().clone()),
+            parent_snapshot: head.map(|h| h.resulting_snapshot()),
             group: None,
             selection: vec![p1.clone()],
             planned: vec![PlannedDeploy {
@@ -537,10 +550,24 @@ mod tests {
         let mut successful = Vec::new();
         for (i, ok) in history.iter().enumerate() {
             let id = format!("{prefix}-{i}");
+            // The successful chain must be parented (the lineage invariant —
+            // at most one `Successful` per parent): each seed plans against
+            // the CURRENT successful head.
+            let head = store
+                .read_ledger(target)
+                .unwrap()
+                .into_iter()
+                .rev()
+                .find(|e| {
+                    e.terminal.as_ref().is_some_and(|t| {
+                        t.status() == crate::ledger::records::DeploymentStatus::Successful
+                    })
+                })
+                .map(|e| e.intent);
             if *ok {
                 // Successful: intent's desired must MATCH the rollback (generation, artifact, binding)
                 let rel = id.clone();
-                let matching_intent = intent_for(&id, target, &rel, "tree-1");
+                let matching_intent = intent_for_over(&id, target, &rel, "tree-1", head.as_ref());
                 store.append_intent(target, &matching_intent).unwrap();
                 store
                     .append_terminal(
@@ -726,8 +753,21 @@ interval_seconds = 0
     fn seed_success(store: &LocalStore, target: &str, id: &str, release: &str, tree: &str) {
         // THE COMPLETE RESULT IS STORED ONCE: the intent's slot table bakes
         // the caller's release + tree; the successful terminal is
-        // payload-free and bound by the canonical digest.
-        let matching_intent = intent_for(id, target, release, tree);
+        // payload-free and bound by the canonical digest. The seed chains
+        // onto the CURRENT successful head (the lineage invariant — at most
+        // one `Successful` per parent).
+        let head = store
+            .read_ledger(target)
+            .unwrap()
+            .into_iter()
+            .rev()
+            .find(|e| {
+                e.terminal.as_ref().is_some_and(|t| {
+                    t.status() == crate::ledger::records::DeploymentStatus::Successful
+                })
+            })
+            .map(|e| e.intent);
+        let matching_intent = intent_for_over(id, target, release, tree, head.as_ref());
         store.append_intent(target, &matching_intent).unwrap();
         store
             .append_terminal(

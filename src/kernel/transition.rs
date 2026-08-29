@@ -12,6 +12,29 @@
 //! deployment ENGINE gathers evidence; it never constructs terminal
 //! variants itself ([`decide_terminal`] owns the complete truth table).
 //!
+//! # THE ONE-PARENT RULE lives HERE
+//!
+//! The `Intent-only → Successful` transition (a [`LedgerEvent::Terminal`]
+//! carrying a [`TerminalDisposition::Successful`] for an intent whose entry
+//! has no terminal yet) enforces AT MOST ONE `Successful` PER PARENT within
+//! the observable window — enforced in [`apply_event`] itself, with NO
+//! bypass: recovery is a CALLER of the same transition, not a second
+//! authority. Within the observable window that IS the lineage invariant
+//! `intent.parent == current successful head` (a parent that is present is
+//! a successful head, and it may have produced only one child); the
+//! checkpoint-retained boundary entry's parent lies OUTSIDE the window but
+//! was validated at its original append, and it can never be duplicated
+//! in-window. The parent/head check and the append are atomic under the
+//! ledger's single-writer authority (the target lock the append already
+//! holds), so for any given parent at most ONE plan can ever append
+//! `Successful`; the second one to finalize observes a drifted head and is
+//! REFUSED with [`KernelError::Conflict`] (StalePlan) — never reconciled
+//! implicitly, never successful. This makes the lineage invariant
+//! STRUCTURAL: every Successful entry's parent equals its predecessor head
+//! (as validated at append time), so
+//! [`crate::kernel::snapshot::resolve_snapshot`] always derives from a head
+//! whose inherited entries were valid at append time.
+//!
 //! [`Checkpoint`](LedgerEvent::Checkpoint) events are accepted only as the
 //! FIRST event of a ledger state (the atomic suffix replacement writes the
 //! checkpoint event as the new ledger's first line, recording the discarded
@@ -213,6 +236,35 @@ pub fn apply_event(
                 )));
             }
             validate_terminal_vs_intent(entry, &terminal)?;
+            // THE ONE-PARENT RULE (the state machine's `Successful` gate — NO
+            // bypass, recovery included): the Intent-only → Successful
+            // transition enforces AT MOST ONE `Successful` PER PARENT in the
+            // observable window. A second plan to finalize on a parent that
+            // already produced a Successful entry is STALE — the transition
+            // is REFUSED with [`KernelError::Conflict`] (StalePlan), never
+            // reconciled implicitly. (Within the window a present parent is
+            // a successful head, so this IS `parent == current successful
+            // head`; a checkpoint-retained boundary entry's parent lies
+            // outside the window but was validated at its original append.)
+            // Because the check and the append are atomic under the ledger's
+            // single-writer authority, at most ONE plan per parent can ever
+            // append `Successful`; the refused stale plan is finalized
+            // `Degraded` by its caller and never becomes the head.
+            if terminal.disposition().is_successful() {
+                let parent = entry.intent.parent().cloned();
+                let already = state.entries.iter().any(|e| {
+                    e.terminal.as_ref().is_some_and(|t| {
+                        t.status() == DeploymentStatus::Successful
+                            && e.intent.parent() == parent.as_ref()
+                    })
+                });
+                if already {
+                    return Err(KernelError::conflict(format!(
+                        "stale plan: deployment '{}' of target '{}' derives from parent {:?}, which already produced a successful deployment — at most ONE Successful per parent; a stale plan is refused, never reconciled implicitly",
+                        entry.deployment_id, state.target, parent
+                    )));
+                }
+            }
             let mut entry = state.entries[pos].clone();
             entry.terminal = Some(terminal);
             state.entries[pos] = entry;

@@ -33,9 +33,11 @@ use crate::testutil::test_faults::FaultKind;
 /// the terminal merges into its entry, run BEFORE any write (fail closed —
 /// the ledger bytes stay unchanged on rejection). A terminal the strict
 /// state machine would reject is NEVER written, so any successful append is
-/// immediately readable.
+/// immediately readable. `entries` is the ledger WITHOUT the terminal being
+/// validated (its entry is still terminal-less).
 fn validate_terminal_append(
     target: &str,
+    entries: &[LedgerEntry],
     entry: &LedgerEntry,
     terminal: &LedgerTerminal,
 ) -> Result<()> {
@@ -56,7 +58,34 @@ fn validate_terminal_append(
         Error::integrity(format!(
             "ledger of target '{target}' refuses a terminal event: {e}"
         ))
-    })
+    })?;
+    // THE ONE-PARENT RULE, mirroring the kernel's state machine
+    // ([`crate::kernel::transition::apply_event`] gates the Intent-only →
+    // Successful transition on AT MOST ONE Successful PER PARENT): a
+    // Successful terminal requires that no OTHER entry in the ledger already
+    // carries a Successful terminal for the same parent. The check and the
+    // append are ATOMIC under the single-writer target lock, so for any
+    // given parent at most ONE plan can ever append `Successful` — the
+    // second one to finalize observes a drifted head and is refused with
+    // the kernel's [`KernelError::Conflict`] (StalePlan), never reconciled
+    // implicitly, never successful.
+    if terminal.disposition().is_successful() {
+        let already = entries.iter().any(|e| {
+            e.deployment_id != entry.deployment_id
+                && e.terminal.as_ref().is_some_and(|t| {
+                    t.status() == DeploymentStatus::Successful
+                        && e.intent.parent() == entry.intent.parent()
+                })
+        });
+        if already {
+            return Err(Error::conflict(format!(
+                "ledger of target '{target}' refuses the Successful terminal for deployment '{}': stale plan: its parent {:?} already produced a successful deployment — at most ONE Successful per parent; a stale plan is refused, never reconciled implicitly",
+                entry.deployment_id,
+                entry.intent.parent()
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl LocalStore {
@@ -160,11 +189,12 @@ impl LocalStore {
         }
         // THE PRE-WRITE VALIDATION (fail closed): the intent/terminal pair is
         // verified against the SAME checks the read path's state machine
-        // applies BEFORE any write — the intent_digest binding + the
-        // disposition-vs-intent agreement. A terminal the strict reader
-        // would reject is NEVER written (the append is atomic; the ledger
-        // bytes stay unchanged on rejection).
-        validate_terminal_append(target, entry, terminal)?;
+        // applies BEFORE any write — the intent_digest binding, the
+        // disposition-vs-intent agreement, and the one-parent gate on a
+        // `Successful` disposition (the kernel's Conflict/StalePlan source).
+        // A terminal the strict reader would reject is NEVER written (the
+        // append is atomic; the ledger bytes stay unchanged on rejection).
+        validate_terminal_append(target, &entries, entry, terminal)?;
         let wire = LedgerTerminalWire::to_wire(deployment_id, &entry.target, terminal);
         let line = serde_json::to_string(&LedgerEventWire::Terminal(wire))
             .map_err(|e| Error::store(format!("serialize ledger terminal: {e}")))?;
@@ -475,7 +505,50 @@ mod tests {
     }
 
     fn seed_successful(store: &LocalStore, target: &str, id: &str) {
-        let i = intent(id, target);
+        // The successful chain must be parented (the lineage invariant — at
+        // most one `Successful` per parent): each seed plans against the
+        // CURRENT successful head, so a multi-seed history is always a valid
+        // chain the strict reader accepts (still a FULL push, group None).
+        use crate::kernel::intent::{PlanInput, PlannedDeploy};
+        use crate::ledger::Observation;
+        let head = store
+            .read_ledger(target)
+            .unwrap()
+            .into_iter()
+            .rev()
+            .find(|e| {
+                e.terminal
+                    .as_ref()
+                    .is_some_and(|t| t.status() == DeploymentStatus::Successful)
+            })
+            .map(|e| e.intent);
+        let (parent, parent_snapshot) = match &head {
+            Some(h) => (
+                Some(h.deployment_id().clone()),
+                Some(h.resulting_snapshot()),
+            ),
+            None => (None, None),
+        };
+        let p1 = slot_p1();
+        let i = crate::kernel::intent::plan(PlanInput {
+            deployment_id: test_deployment_id(id),
+            target: TargetName::parse(target).expect("a test target"),
+            parent,
+            parent_snapshot,
+            group: None,
+            selection: vec![p1.clone()],
+            planned: vec![PlannedDeploy {
+                slot: p1,
+                result: crate::testutil::fixtures::snapshot_slot(&slot_p1()),
+                pre_push: Observation::KnownAbsent,
+            }],
+            behavior_digest: crate::identity::BehaviorDigest::parse(
+                crate::identity::DIGEST_TEST_HEX_1,
+            )
+            .unwrap(),
+            attempted_at: crate::identity::Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
+        })
+        .expect("a seeded parented intent plans");
         store.append_intent(target, &i).unwrap();
         store
             .append_terminal(target, i.deployment_id(), &successful_terminal(&i))
@@ -704,10 +777,20 @@ mod tests {
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let target = "t1";
-        store
-            .append_intent(target, &intent("deploy-a", target))
-            .unwrap();
-        let b_i = intent("deploy-b", target);
+        let a_first = intent("deploy-a", target);
+        store.append_intent(target, &a_first).unwrap();
+        // deploy-b chains onto deploy-a (the lineage invariant — at most one
+        // `Successful` per parent), so both can succeed once deploy-a's
+        // terminal lands.
+        let b_i = crate::testutil::fixtures::group_intent(
+            "deploy-b",
+            target,
+            "g",
+            a_first.deployment_id(),
+            &a_first.resulting_snapshot(),
+            &[slot_p1()],
+            &[slot_p1()],
+        );
         store.append_intent(target, &b_i).unwrap();
         store
             .fault_registry()

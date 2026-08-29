@@ -162,10 +162,10 @@ pub(crate) fn run_commit(
             &ledger::FinalizeSettings {
                 reason: "push completed",
                 op_id,
-                // A NEW plan must still be the head's child at finalize
-                // time (the one-parent rule gates new plans — a drifted
-                // head is refused, never reconciled implicitly).
-                enforce_parent: true,
+                // Finalization (recovery included) goes through the PURE
+                // STATE MACHINE's one-parent gate inside the append: a plan
+                // whose parent is no longer the successful head is refused
+                // at terminal-append time — never reconciled implicitly.
             },
         )? {
             ledger::FinalizeOutcome::Finalized => {
@@ -332,13 +332,17 @@ pub(crate) mod commit_tests {
     /// built through the kernel's validated constructor (the domain types
     /// cannot be struct-literal-constructed; the constructor is the ONE
     /// validator). `binding` must match the harness slot's deploy_dir for
-    /// the recovery binding check to pass.
+    /// the recovery binding check to pass. `head` (the current successful
+    /// deployment, when present) becomes the intent's parent — the lineage
+    /// invariant (at most one `Successful` per parent) requires a pending
+    /// attempt to carry the head it was planned against.
     fn crafted_intent(
         dep: &crate::identity::DeploymentId,
         generation: &crate::identity::GenerationId,
         artifact: &crate::identity::ArtifactRef,
         binding: crate::ledger::PhysicalBinding,
         behavior: &crate::identity::BehaviorDigest,
+        head: Option<&DeploymentIntent>,
     ) -> DeploymentIntent {
         use crate::kernel::intent::{PlanInput, PlannedDeploy};
         use crate::kernel::snapshot::SnapshotSlot;
@@ -347,8 +351,8 @@ pub(crate) mod commit_tests {
         crate::kernel::intent::plan(PlanInput {
             deployment_id: dep.clone(),
             target: TargetName::parse("t1").unwrap(),
-            parent: None,
-            parent_snapshot: None,
+            parent: head.map(|h| h.deployment_id().clone()),
+            parent_snapshot: head.map(|h| h.resulting_snapshot()),
             group: None,
             selection: vec![p1.clone()],
             planned: vec![PlannedDeploy {
@@ -361,6 +365,22 @@ pub(crate) mod commit_tests {
                 .unwrap(),
         })
         .expect("a crafted test intent plans")
+    }
+
+    /// The ledger DOMAIN INTENT of the given successful deployment (the
+    /// head) — the parent a crafted pending attempt must chain onto (the
+    /// lineage invariant: at most one `Successful` per parent).
+    fn head_intent(
+        h: &RecoveryHarness,
+        head_id: &crate::identity::DeploymentId,
+    ) -> DeploymentIntent {
+        h.store
+            .read_ledger("t1")
+            .unwrap()
+            .into_iter()
+            .find(|e| e.deployment_id == *head_id)
+            .expect("the head entry exists")
+            .intent
     }
 
     /// The TERMINAL EVENT append (the deployment's ONE atomic finalize write)
@@ -897,6 +917,7 @@ pub(crate) mod commit_tests {
                 deploy_dir: "/srv/eng".to_string(),
             },
             &baseline.behavior_sha256,
+            None,
         );
         h.store.append_attempt("t1", &intent).unwrap();
         assert_eq!(
@@ -950,9 +971,13 @@ pub(crate) mod commit_tests {
         );
 
         // Craft an intent with NO transition appended: eligibility treats the
-        // absent status file as eligible (a just-recorded attempt).
+        // absent status file as eligible (a just-recorded attempt). It plans
+        // against the CURRENT successful head (the lineage invariant — at
+        // most one `Successful` per parent), exactly as a real pending
+        // attempt would.
         let id_a = test_deployment_id("deploy-no-status");
         let desired_ref = baseline.desired[&SlotId::new("p1")].clone();
+        let head = head_intent(&h, &id_b);
 
         let intent = crafted_intent(
             &id_a,
@@ -963,6 +988,7 @@ pub(crate) mod commit_tests {
                 deploy_dir: "/srv/eng".to_string(),
             },
             &baseline.behavior_sha256.clone(),
+            Some(&head),
         );
         h.store.append_attempt("t1", &intent).unwrap();
         assert_eq!(
@@ -1002,9 +1028,14 @@ pub(crate) mod commit_tests {
     }
 
     /// Multiple pending attempts are reconciled OLDEST FIRST (attempts.jsonl
-    /// order) so snapshot/op-log indices stay monotonic: two crafted
-    /// `InProgress` intents appended A-then-B finalize in that order with
-    /// indices 1 and 2 after the baseline.
+    /// order) so successful-chain indices stay monotonic, and the at-most-one
+    /// invariant wins the parent: two crafted pending intents appended
+    /// A-then-B, BOTH planned against the same head (the baseline), are
+    /// reconciled oldest first — A finalizes `Successful` (the first one to
+    /// finalize on the parent, index 1 after the baseline), and B — the
+    /// second plan on the SAME parent — is REFUSED by the state machine's
+    /// one-parent gate and finalized `Degraded`, never `Successful` (its
+    /// successful-chain position stays unassigned).
     #[test]
     fn reconcile_multiple_pending_oldest_first_with_monotonic_indices() {
         let h = RecoveryHarness::new();
@@ -1013,6 +1044,7 @@ pub(crate) mod commit_tests {
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
         let baseline = r1.attempt.as_ref().expect("attempt recorded");
         let desired_ref = baseline.desired[&SlotId::new("p1")].clone();
+        let head = head_intent(&h, &id_b);
 
         let mk = |id: &str| {
             crafted_intent(
@@ -1024,21 +1056,28 @@ pub(crate) mod commit_tests {
                     deploy_dir: "/srv/eng".to_string(),
                 },
                 &baseline.behavior_sha256,
+                Some(&head),
             )
         };
         let a = mk("deploy-multi-a");
         let b = mk("deploy-multi-b");
-        // Two intent-only entries: eligible for reconciliation, oldest first.
+        // Two intent-only entries: eligible for reconciliation, oldest first,
+        // both planned against the SAME parent (the baseline head).
         h.store.append_attempt("t1", &a).unwrap();
         h.store.append_attempt("t1", &b).unwrap();
 
-        // One push reconciles BOTH, oldest first.
+        // One push reconciles both, oldest first: the OLDER pending (A)
+        // finalizes Successful on the parent; the younger (B) observes the
+        // drifted head and is refused — Degraded, never Successful.
         let r2 = push_clean(&h).unwrap();
         assert_eq!(r2.message, "Everything up to date");
         let snapshots = h.store.read_snapshots("t1").unwrap();
-        assert_eq!(snapshots.len(), 3);
+        assert_eq!(
+            snapshots.len(),
+            2,
+            "baseline + the older reconciled attempt"
+        );
         assert_eq!(snapshots[1].deployment_id, *a.deployment_id());
-        assert_eq!(snapshots[2].deployment_id, *b.deployment_id());
         assert_eq!(
             ledger::successful_index(&h.store, "t1", a.deployment_id())
                 .unwrap()
@@ -1047,22 +1086,36 @@ pub(crate) mod commit_tests {
             "successful-chain positions stay monotonic"
         );
         assert_eq!(
-            ledger::successful_index(&h.store, "t1", b.deployment_id())
-                .unwrap()
-                .unwrap(),
-            2
-        );
-        assert_eq!(
             latest_status(&h, a.deployment_id().as_str()),
-            Some(DeploymentStatus::Successful)
+            Some(DeploymentStatus::Successful),
+            "the OLDER pending (processed first) wins the parent"
         );
         assert_eq!(
             latest_status(&h, b.deployment_id().as_str()),
-            Some(DeploymentStatus::Successful)
+            Some(DeploymentStatus::Degraded),
+            "the SECOND pending on the same parent is refused — at most ONE Successful per parent"
+        );
+        let b_terminal_reason = h
+            .store
+            .read_ledger("t1")
+            .unwrap()
+            .into_iter()
+            .find(|e| e.deployment_id == *b.deployment_id())
+            .expect("B's entry exists")
+            .terminal
+            .as_ref()
+            .expect("B has a terminal")
+            .reason()
+            .expect("a reason")
+            .to_string();
+        assert!(
+            b_terminal_reason.contains("stale plan"),
+            "B's Degraded terminal reason carries the stale-plan source, got: {b_terminal_reason}"
         );
         assert_eq!(
             h.store.read_last_successful("t1").as_deref(),
-            Some(b.deployment_id().as_str())
+            Some(a.deployment_id().as_str()),
+            "A remains the head after B's refused finalization"
         );
         assert_eq!(h.store.read_attempts("t1").unwrap().len(), 3);
         for id in [a.deployment_id().as_str(), b.deployment_id().as_str()] {
@@ -2335,7 +2388,6 @@ pub(crate) mod commit_tests {
                 &ledger::FinalizeSettings {
                     reason: "push completed",
                     op_id: &op_id,
-                    enforce_parent: true,
                 },
             )
             .unwrap();
@@ -2594,7 +2646,6 @@ pub(crate) mod commit_tests {
                 &ledger::FinalizeSettings {
                     reason: "push completed",
                     op_id: &op_id,
-                    enforce_parent: true,
                 },
             ) {
                 // ANY SUCCESSFUL APPEND IS IMMEDIATELY READABLE: the

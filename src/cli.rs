@@ -670,14 +670,51 @@ mod tests {
 
     /// Seed the ledger with a successful deployment (intent + its
     /// PAYLOAD-FREE `Successful` terminal, bound by the canonical digest —
-    /// the snapshot resolves from the intent).
+    /// the snapshot resolves from the intent). Each seed plans against the
+    /// CURRENT successful head (the lineage invariant: at most one
+    /// `Successful` per parent), so a multi-seed history is always a valid
+    /// chain the strict reader accepts.
     fn seed_successful(store: &LocalStore, id: &str, attempted_at: &str) {
-        let it = crate::testutil::fixtures::full_intent_at(
-            id,
-            "production",
-            &[SlotId::parse("p1").unwrap()],
-            attempted_at,
-        );
+        use crate::kernel::intent::{PlanInput, PlannedDeploy};
+        use crate::ledger::Observation;
+        let p1 = SlotId::parse("p1").unwrap();
+        let head = store
+            .read_ledger("production")
+            .unwrap()
+            .into_iter()
+            .rev()
+            .find(|e| {
+                e.terminal
+                    .as_ref()
+                    .is_some_and(|t| t.status() == DeploymentStatus::Successful)
+            })
+            .map(|e| e.intent);
+        let (parent, parent_snapshot) = match &head {
+            Some(h) => (
+                Some(h.deployment_id().clone()),
+                Some(h.resulting_snapshot()),
+            ),
+            None => (None, None),
+        };
+        let it = crate::kernel::intent::plan(PlanInput {
+            deployment_id: test_deployment_id(id),
+            target: crate::identity::TargetName::parse("production").unwrap(),
+            parent,
+            parent_snapshot,
+            group: None,
+            selection: vec![p1.clone()],
+            planned: vec![PlannedDeploy {
+                slot: p1,
+                result: crate::testutil::fixtures::snapshot_slot(&SlotId::parse("p1").unwrap()),
+                pre_push: Observation::KnownAbsent,
+            }],
+            behavior_digest: crate::identity::BehaviorDigest::parse(
+                crate::identity::DIGEST_TEST_HEX_1,
+            )
+            .unwrap(),
+            attempted_at: crate::identity::Timestamp::parse(attempted_at).unwrap(),
+        })
+        .expect("a seeded parented intent plans");
         store.append_intent("production", &it).unwrap();
         store
             .append_terminal(

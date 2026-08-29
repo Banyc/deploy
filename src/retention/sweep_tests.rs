@@ -209,7 +209,18 @@ fn intent(id: &str, target: &str) -> DeploymentIntent {
 /// A FULL-push intent with the given release + tree baked into its ONE slot
 /// table (the complete result stored once; the successful terminal is
 /// payload-free and bound by digest).
-fn success_intent(id: &str, target: &str, release: &str, tree: &str) -> DeploymentIntent {
+/// A single-slot (`p1`) VALID successful intent: the frozen snapshot entry
+/// (generation gen-1, the given artifact release/tree, plan-time physical
+/// binding). The seed chains onto the current successful head — the lineage
+/// invariant (at most one `Successful` per parent) requires every seeded
+/// successful to chain onto the previous one.
+fn success_intent_over(
+    id: &str,
+    target: &str,
+    release: &str,
+    tree: &str,
+    head: Option<&DeploymentIntent>,
+) -> DeploymentIntent {
     use crate::kernel::intent::{PlanInput, PlannedDeploy};
     use crate::kernel::snapshot::SnapshotSlot;
     use crate::ledger::Observation;
@@ -217,8 +228,8 @@ fn success_intent(id: &str, target: &str, release: &str, tree: &str) -> Deployme
     crate::kernel::intent::plan(PlanInput {
         deployment_id: test_deployment_id(id),
         target: TargetName::new(target.to_string()),
-        parent: None,
-        parent_snapshot: None,
+        parent: head.map(|h| h.deployment_id().clone()),
+        parent_snapshot: head.map(|h| h.resulting_snapshot()),
         group: None,
         selection: vec![p1.clone()],
         planned: vec![PlannedDeploy {
@@ -271,10 +282,24 @@ fn seed_history(store: &LocalStore, target: &str, prefix: &str, history: &[bool]
     for (i, ok) in history.iter().enumerate() {
         let id = format!("{prefix}-{i}");
         let canonical = test_deployment_id(&id);
+        // The successful chain must be parented (the lineage invariant — at
+        // most one `Successful` per parent): each seed plans against the
+        // CURRENT successful head.
+        let head = store
+            .read_ledger(target)
+            .unwrap()
+            .into_iter()
+            .rev()
+            .find(|e| {
+                e.terminal.as_ref().is_some_and(|t| {
+                    t.status() == crate::ledger::records::DeploymentStatus::Successful
+                })
+            })
+            .map(|e| e.intent);
         if *ok {
             let rel = crate::identity::test_release_id(&id).as_str().to_string();
             let tree = format!("tree-{id}");
-            let matching_intent = success_intent(&id, target, &rel, &tree);
+            let matching_intent = success_intent_over(&id, target, &rel, &tree, head.as_ref());
             store.append_intent(target, &matching_intent).unwrap();
             store
                 .append_terminal(

@@ -335,11 +335,16 @@ pub fn terminal_with_digest(
     ))
 }
 
-/// The parent-congruence check the store runs before mutation and before
-/// successful finalization: `intent.parent == current successful head`. A
+/// The one-parent rule enforcement — `intent.parent == current successful
+/// head`. The PURE STATE MACHINE calls this at every Successful terminal
+/// append inside [`crate::kernel::transition::apply_event`] (recovery
+/// included — recovery is a caller of the same transition, not a second
+/// authority), so the lineage invariant is STRUCTURAL: every Successful
+/// entry's parent equals its predecessor head. The plan-time gate
+/// ([`crate::deploy::push::preflight`]) uses it too, before mutation. A
 /// drifted head means the plan was computed against a snapshot that is no
 /// longer the head — refuse with [`KernelError::Conflict`] (StalePlan) —
-/// never reconcile implicitly.
+/// never reconcile implicitly, never let a stale plan append `Successful`.
 pub fn assert_parent_is_head(
     intent: &DeploymentIntent,
     current_head: Option<&crate::identity::DeploymentId>,

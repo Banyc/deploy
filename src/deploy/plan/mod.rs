@@ -724,7 +724,10 @@ interval_seconds = 0
     /// Seed a SUCCESSFUL ledger entry for `t1`: an intent carrying the
     /// slots' plan-minted generations/artifacts/bindings plus its
     /// PAYLOAD-FREE `Successful` terminal (bound by the canonical digest);
-    /// the snapshot resolves from the intent's slot table.
+    /// the snapshot resolves from the intent's slot table. Each seed plans
+    /// against the CURRENT successful head (the lineage invariant — at most
+    /// one `Successful` per parent), so a multi-seed history is always a
+    /// valid chain the strict reader accepts.
     fn append_successful_snapshot(
         store: &LocalStore,
         deployment_id: &str,
@@ -737,6 +740,24 @@ interval_seconds = 0
         use crate::kernel::intent::{PlanInput, PlannedDeploy};
         use crate::kernel::snapshot::SnapshotSlot;
         use crate::ledger::Observation;
+        let head = store
+            .read_ledger("t1")
+            .unwrap()
+            .into_iter()
+            .rev()
+            .find(|e| {
+                e.terminal
+                    .as_ref()
+                    .is_some_and(|t| t.status() == crate::ledger::DeploymentStatus::Successful)
+            })
+            .map(|e| e.intent);
+        let (parent, parent_snapshot) = match &head {
+            Some(h) => (
+                Some(h.deployment_id().clone()),
+                Some(h.resulting_snapshot()),
+            ),
+            None => (None, None),
+        };
         let planned: Vec<PlannedDeploy> = slot_ids
             .iter()
             .map(|k| {
@@ -758,8 +779,8 @@ interval_seconds = 0
         let intent = crate::kernel::intent::plan(PlanInput {
             deployment_id: tdi(deployment_id),
             target: TargetName::parse("t1").unwrap(),
-            parent: None,
-            parent_snapshot: None,
+            parent,
+            parent_snapshot,
             group: None,
             selection: slot_ids.clone(),
             planned,

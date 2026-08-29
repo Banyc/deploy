@@ -337,6 +337,31 @@ pub(crate) fn seed_snapshot(
     slots: BTreeMap<SlotId, GenerationRef>,
     bindings: BTreeMap<SlotId, crate::ledger::PhysicalBinding>,
 ) {
+    seed_snapshot_over(
+        store,
+        target,
+        deployment_id,
+        _behavior_sha256,
+        slots,
+        bindings,
+        None,
+    )
+}
+
+/// [`seed_snapshot`] with an EXPLICIT parent for this seed (used when the
+/// seed must chain onto a PENDING attempt rather than the current
+/// successful head — e.g. a synthetic concurrent history whose first entry
+/// descends from an intent-only deployment). `None` derives the parent from
+/// the current successful head (the usual case).
+pub(crate) fn seed_snapshot_over(
+    store: &LocalStore,
+    target: &str,
+    deployment_id: &str,
+    _behavior_sha256: &str,
+    slots: BTreeMap<SlotId, GenerationRef>,
+    bindings: BTreeMap<SlotId, crate::ledger::PhysicalBinding>,
+    explicit_parent: Option<DeploymentIntent>,
+) {
     let slot_ids: Vec<SlotId> = slots.keys().cloned().collect();
     // Build each slot's plan-minted generation/artifact/binding from the
     // caller's GenerationRefs and bindings; the terminal binds the intent
@@ -349,6 +374,23 @@ pub(crate) fn seed_snapshot(
     use crate::kernel::intent::{PlanInput, PlannedDeploy};
     use crate::kernel::snapshot::SnapshotSlot;
     use crate::ledger::Observation;
+    // The seeded successful chains onto the given parent — or, by default,
+    // the CURRENT successful head (the lineage invariant — at most one
+    // `Successful` per parent), so a multi-seed history is always a valid
+    // chain.
+    let head = explicit_parent.map(Some).unwrap_or_else(|| {
+        store
+            .read_ledger(target)
+            .unwrap()
+            .into_iter()
+            .rev()
+            .find(|e| {
+                e.terminal.as_ref().is_some_and(|t| {
+                    t.status() == crate::ledger::records::DeploymentStatus::Successful
+                })
+            })
+            .map(|e| e.intent)
+    });
     let planned: Vec<PlannedDeploy> = slot_ids
         .iter()
         .map(|k| {
@@ -370,8 +412,8 @@ pub(crate) fn seed_snapshot(
     let plan_input = PlanInput {
         deployment_id: crate::identity::test_deployment_id(deployment_id),
         target: TargetName::parse(target).unwrap(),
-        parent: None,
-        parent_snapshot: None,
+        parent: head.as_ref().map(|h| h.deployment_id().clone()),
+        parent_snapshot: head.as_ref().map(|h| h.resulting_snapshot()),
         group: None,
         selection: slot_ids.clone(),
         planned,

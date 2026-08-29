@@ -2152,22 +2152,33 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             let bindings = crate::ledger::PhysicalBinding {
                 server: crate::identity::ServerId::parse("s1").unwrap(),
                 deploy_dir: "/srv/eng".to_string()};
+            // The synthetic chain descends from the PENDING attempt (entry
+            // position 0): the lineage invariant (at most one `Successful`
+            // per parent) lets the pending A recover `Successful` ONLY as
+            // the first None-parented success, so the concurrent chain's
+            // FIRST entry must chain onto A — later entries derive the
+            // current head from the store.
+            let pending_intent = h.store.read_ledger("t1").unwrap()[0].intent.clone();
             for i in 0..=latest {
-               seed_snapshot(
-                   &h.store,
-                   "t1",
-                   &format!("deploy-relative-chain-{latest}-{i}"),
-                   pending.behavior_sha256.as_str(),
-                   BTreeMap::from([(
-                       slot.clone(),
-                       GenerationRef {
-                           generation: test_generation_id(&format!("gen-relative-{latest}-{i}")),
-                           assignment: crate::identity::PlacementSlotAssignment {
-                               placement_slot: slot.clone(),
-                               artifact: pending_artifact.clone()}},
-                   )]),
-                   BTreeMap::from([(slot.clone(), bindings.clone())]),
-               );
+                let (slots, bindings, parent) = (BTreeMap::from([(
+                    slot.clone(),
+                    GenerationRef {
+                        generation: test_generation_id(&format!("gen-relative-{latest}-{i}")),
+                        assignment: crate::identity::PlacementSlotAssignment {
+                            placement_slot: slot.clone(),
+                            artifact: pending_artifact.clone()}},
+                )]),
+                BTreeMap::from([(slot.clone(), bindings.clone())]),
+                (i == 0).then(|| pending_intent.clone()));
+                crate::deploy::testsupport::seed_snapshot_over(
+                    &h.store,
+                    "t1",
+                    &format!("deploy-relative-chain-{latest}-{i}"),
+                    pending.behavior_sha256.as_str(),
+                    slots,
+                    bindings,
+                    parent,
+                );
             }
             assert_eq!(
                 h.store.read_snapshots("t1").unwrap().len() as u64,

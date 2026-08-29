@@ -273,7 +273,6 @@ mod tests {
         ArtifactRef, DeploymentId, ServerId, SlotId, VariantName, test_deployment_id,
         test_generation_id, test_tree_digest,
     };
-    use crate::ledger::records::LedgerTerminal;
     use crate::ledger::records::PhysicalBinding;
     use crate::ledger::records::{DeploymentIntent, TargetSnapshot};
     #[cfg(test)]
@@ -291,8 +290,11 @@ mod tests {
     /// A minimal but VALID FULL-push intent for the target: one slot `p1`
     /// with per-deployment generation/artifact/binding values DERIVED from
     /// the deployment id (so "exactly its stored state" is a meaningful
-    /// equality), built through the kernel's validated constructor.
-    fn intent(dep: &str) -> DeploymentIntent {
+    /// equality), built through the kernel's validated constructor. Planned
+    /// against a parent (the current successful head) — the lineage
+    /// invariant (at most one `Successful` per parent) requires every seeded
+    /// successful to chain onto the previous one.
+    fn intent_over(dep: &str, head: Option<&DeploymentIntent>) -> DeploymentIntent {
         use crate::kernel::intent::{PlanInput, PlannedDeploy};
         use crate::kernel::snapshot::SnapshotSlot;
         use crate::ledger::Observation;
@@ -300,8 +302,8 @@ mod tests {
         crate::kernel::intent::plan(PlanInput {
             deployment_id: test_deployment_id(dep),
             target: TargetName::parse("production").unwrap(),
-            parent: None,
-            parent_snapshot: None,
+            parent: head.map(|h| h.deployment_id().clone()),
+            parent_snapshot: head.map(|h| h.resulting_snapshot()),
             group: None,
             selection: vec![p1.clone()],
             planned: vec![PlannedDeploy {
@@ -329,29 +331,26 @@ mod tests {
         .expect("the refs-test intent plans")
     }
 
-    /// A SUCCESSFUL terminal BOUND to [`intent`] — the terminal is
-    /// PAYLOAD-FREE; the snapshot resolves from the intent's slot table (the
-    /// `release` argument is retained for call-site compatibility).
-    fn successful_terminal(dep: &str, _release: &str) -> LedgerTerminal {
-        crate::testutil::fixtures::successful_terminal(&intent(dep))
-    }
-
     /// Seed `count` successful deployments (ids `deploy-0`..`deploy-{n-1}`,
-    /// releases derived from the ids) onto the target's ledger.
+    /// releases derived from the ids) onto the target's ledger, each chaining
+    /// onto the CURRENT successful head (the lineage invariant).
     fn seed_chain(store: &LocalStore, count: usize) -> Vec<String> {
         let mut ids = Vec::new();
+        let mut head: Option<DeploymentIntent> = None;
         for n in 0..count {
             let id = format!("deploy-{n}");
             let canonical = test_deployment_id(&id);
-            store.append_intent("production", &intent(&id)).unwrap();
+            let i = intent_over(&id, head.as_ref());
+            store.append_intent("production", &i).unwrap();
             store
                 .append_terminal(
                     "production",
                     &canonical,
-                    &successful_terminal(&id, crate::identity::test_release_id(&id).as_str()),
+                    &crate::testutil::fixtures::successful_terminal(&i),
                 )
                 .unwrap();
             ids.push(canonical.as_str().to_string());
+            head = Some(i);
         }
         ids
     }
@@ -603,7 +602,11 @@ mod tests {
     /// A minimal intent record for the target, enough to seed a ledger entry.
     /// `dep` is a CANONICAL deployment id (the ledger is keyed by the
     /// validated form).
-    fn intent_entry(dep: &str) -> DeploymentIntent {
+    /// The one-slot entry intent planned against the CURRENT successful head
+    /// — the lineage invariant (at most one `Successful` per parent) requires
+    /// a seeded successful to chain onto the previous successful, with failed
+    /// entries between successes leaving the head unchanged.
+    fn intent_entry_over(dep: &str, head: Option<&DeploymentIntent>) -> DeploymentIntent {
         // Rebuild the one-slot intent with a CANONICAL deployment id (the
         // ledger is keyed by the validated form).
         let p1 = SlotId::parse("p1").unwrap();
@@ -613,8 +616,8 @@ mod tests {
         crate::kernel::intent::plan(PlanInput {
             deployment_id: DeploymentId::parse(dep).expect("canonical seeded id"),
             target: TargetName::parse("production").unwrap(),
-            parent: None,
-            parent_snapshot: None,
+            parent: head.map(|h| h.deployment_id().clone()),
+            parent_snapshot: head.map(|h| h.resulting_snapshot()),
             group: None,
             selection: vec![p1.clone()],
             planned: vec![PlannedDeploy {
@@ -713,10 +716,10 @@ mod tests {
     fn ref_grammar_resolve_case(history: Vec<(String, bool)>, token: String) {
         let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
+        let mut head: Option<DeploymentIntent> = None;
         for (id, ok) in &history {
-            store
-                .append_intent("production", &intent_entry(id))
-                .unwrap();
+            let it = intent_entry_over(id, head.as_ref());
+            store.append_intent("production", &it).unwrap();
             if *ok {
                 // Each successful deployment is a rollback payload keyed by
                 // its id, with a deterministic payload derived from the id
@@ -724,7 +727,7 @@ mod tests {
                 // The terminal binds the EXACT appended intent (its digest
                 // is validated by the reader/append — a re-derived intent
                 // would carry a different canonical digest).
-                let it = intent_entry(id);
+                let it = intent_entry_over(id, head.as_ref());
                 store
                     .append_terminal(
                         "production",
@@ -732,8 +735,9 @@ mod tests {
                         &crate::testutil::fixtures::successful_terminal(&it),
                     )
                     .unwrap();
+                head = Some(it);
             } else {
-                let it = intent_entry(id);
+                let it = intent_entry_over(id, head.as_ref());
                 store
                     .append_terminal(
                         "production",

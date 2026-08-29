@@ -25,13 +25,17 @@
 //! * **[`terminal`]** — successful terminals are PAYLOAD-FREE; the
 //!   [`terminal::IntentDigest`] binds a terminal to the exact canonical
 //!   intent; the terminal dispositions are structural (private validated
-//!   payloads); [`terminal::assert_parent_is_head`] enforces the one-parent
-//!   rule.
+//!   payloads); [`terminal::assert_parent_is_head`] is the ONE-parent rule
+//!   helper the state machine calls at every Successful terminal append.
 //! * **[`snapshot`]** — the snapshot resolution rule: a successful
 //!   deployment's snapshot IS `entry.intent.resulting_snapshot()`; there is
 //!   no `SnapshotId`.
 //! * **[`transition`]** — the pure ledger state machine + the terminal
-//!   truth table.
+//!   truth table; [`transition::apply_event`] gates the `Intent-only →
+//!   Successful` transition on the one-parent rule (`intent.parent ==
+//!   current successful head` at terminal-append time) with NO bypass —
+//!   recovery is a caller of the same transition, so a stale plan can never
+//!   append `Successful`.
 //! * **[`error`]** — the five error classes every kernel error belongs to.
 //!
 //! The LEDGER LAYER is reduced to a strict event store (strict parsing,

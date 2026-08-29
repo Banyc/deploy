@@ -93,9 +93,12 @@ pub struct DeploymentIntent {
     target: TargetName,
     /// The successful deployment this intent derives from — the target's
     /// successful head at plan time. `None` for a first deployment. Every
-    /// intent records its parent; mutation and successful finalization both
-    /// require `parent == current successful head` (a drifted head is
-    /// refused as a stale plan).
+    /// intent records its parent; the state machine's `Successful` gate
+    /// ([`crate::kernel::transition::apply_event`]) requires
+    /// `parent == current successful head` at terminal-append time for EVERY
+    /// path (recovery included) — a drifted head is refused as a stale plan
+    /// (never successful, never reconciled implicitly), so at most one plan
+    /// per parent ever appends `Successful`.
     parent: Option<DeploymentId>,
     group: Option<RolloutGroupName>,
     /// THE ONE FULL SLOT TABLE: every slot the resulting snapshot covers
