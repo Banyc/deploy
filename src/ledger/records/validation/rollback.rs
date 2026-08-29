@@ -12,14 +12,14 @@
 //! frozen desired assignment (never from the engine's earlier observation
 //! records, which a concurrent controller can make stale, and never from
 //! the intent record itself). The payload is the COMPLETE target snapshot (a
-//! [`crate::ledger::records::LedgerRollback`]: per-slot generation refs +
+//! [`crate::ledger::records::TargetSnapshot`]: per-slot generation refs +
 //! COMPLETE physical bindings), so EXACT ROLLBACK is possible:
 //! `deploy push <target> <deployment-id>` restores exactly that
 //! deployment's stored state, verified by the binding map (a missing
 //! binding entry is "unverifiable" and makes exact rollback refuse the
 //! slot).
 //!
-//! The wire/domain RECORDS themselves ([`crate::ledger::records::LedgerRollback`],
+//! The wire/domain RECORDS themselves ([`crate::ledger::records::TargetSnapshot`],
 //! [`crate::ledger::records::PhysicalBinding`]) live in the shared core
 //! ([`crate::ledger::records`]).
 //!
@@ -37,7 +37,7 @@ use crate::error::{Error, Result};
 use crate::identity::{GenerationRef, SlotId};
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::super::{DeploymentIntent, LedgerRollback, PhysicalBinding, RollbackEntry};
+use super::super::{DeploymentIntent, TargetSnapshot, PhysicalBinding, SnapshotEntry};
 
 /// THE ONE PRIVATE VALIDATED MAP VALUE — the complete per-slot rollback
 /// fact: a slot's VERIFIED [`GenerationRef`] (generation AND artifact)
@@ -50,15 +50,15 @@ pub(crate) struct BoundGeneration {
 
 pub fn build_rollback(
     verified: &BTreeMap<SlotId, BoundGeneration>,
-    base: Option<&LedgerRollback>,
+    base: Option<&TargetSnapshot>,
     current_slot_ids: &[SlotId],
-) -> Result<LedgerRollback> {
-    let mut entries: BTreeMap<SlotId, RollbackEntry> =
+) -> Result<TargetSnapshot> {
+    let mut entries: BTreeMap<SlotId, SnapshotEntry> =
         base.map(|b| b.clone().into_entries()).unwrap_or_default();
     for (slot, bg) in verified {
         entries.insert(
             slot.clone(),
-            RollbackEntry::new(
+            SnapshotEntry::new(
                 bg.generation.generation.clone(),
                 bg.generation.assignment.artifact.clone(),
                 bg.binding.clone(),
@@ -68,7 +68,7 @@ pub fn build_rollback(
     let current: std::collections::HashSet<&str> =
         current_slot_ids.iter().map(|s| s.as_str()).collect();
     entries.retain(|k, _| current.contains(k.as_str()));
-    Ok(LedgerRollback::from_entries(entries))
+    Ok(TargetSnapshot::from_entries(entries))
 }
 
 /// ONE shared validator: a Successful rollback must REPRODUCE the durable
@@ -81,7 +81,7 @@ pub fn build_rollback(
 /// closed with `Error::integrity` naming the slot and the diverging leg.
 pub(crate) fn validate_successful_rollback_against_intent(
     intent: &DeploymentIntent,
-    rollback: &LedgerRollback,
+    rollback: &TargetSnapshot,
     activated: &BTreeSet<SlotId>,
 ) -> Result<()> {
     for slot_id in activated {
@@ -176,10 +176,10 @@ mod tests_rollback {
         let selected = SlotId::new("p1".to_string());
         let unselected = SlotId::new("p2".to_string());
         let outside = SlotId::new("p3".to_string());
-        let base = LedgerRollback::from_entries(BTreeMap::from([
+        let base = TargetSnapshot::from_entries(BTreeMap::from([
             (selected.clone(), {
                 let r = verified_ref_for(&selected, "gen-old-1", "rel-old", "tree-old-1");
-                RollbackEntry::new(
+                SnapshotEntry::new(
                     r.generation,
                     r.assignment.artifact,
                     PhysicalBinding {
@@ -190,7 +190,7 @@ mod tests_rollback {
             }),
             (unselected.clone(), {
                 let r = verified_ref_for(&unselected, "gen-old-2", "rel-old", "tree-old-2");
-                RollbackEntry::new(
+                SnapshotEntry::new(
                     r.generation,
                     r.assignment.artifact,
                     PhysicalBinding {
@@ -201,7 +201,7 @@ mod tests_rollback {
             }),
             (outside.clone(), {
                 let r = verified_ref_for(&outside, "gen-old-3", "rel-old", "tree-old-3");
-                RollbackEntry::new(
+                SnapshotEntry::new(
                     r.generation,
                     r.assignment.artifact,
                     PhysicalBinding {
@@ -235,10 +235,10 @@ mod tests_rollback {
         let healthy = BTreeMap::from([(p1.clone(), bound(&p1, "gen-new", "rel-new", "tree-new"))]);
         build_rollback(&healthy, None, std::slice::from_ref(&p1))
             .expect("the healthy single map builds");
-        let base = LedgerRollback::from_entries(BTreeMap::from([
+        let base = TargetSnapshot::from_entries(BTreeMap::from([
             (p1.clone(), {
                 let r = verified_ref_for(&p1, "gen-old-1", "rel-old", "tree-old-1");
-                RollbackEntry::new(
+                SnapshotEntry::new(
                     r.generation,
                     r.assignment.artifact,
                     PhysicalBinding {
@@ -249,7 +249,7 @@ mod tests_rollback {
             }),
             (p2.clone(), {
                 let r = verified_ref_for(&p2, "gen-old-2", "rel-old", "tree-old-2");
-                RollbackEntry::new(
+                SnapshotEntry::new(
                     r.generation,
                     r.assignment.artifact,
                     PhysicalBinding {
@@ -266,11 +266,11 @@ mod tests_rollback {
         assert_eq!(e.generation(), &expected.generation);
         assert!(rb.get(&p2).is_some());
     }
-    fn fixture_rollback() -> LedgerRollback {
+    fn fixture_rollback() -> TargetSnapshot {
         let mut m = BTreeMap::new();
         m.insert(
             SlotId::new("slot-1".to_string()),
-            RollbackEntry::new(
+            SnapshotEntry::new(
                 test_generation_id("gen-1"),
                 ArtifactRef {
                     release: crate::identity::test_release_id("rel-1"),
@@ -285,7 +285,7 @@ mod tests_rollback {
         );
         m.insert(
             SlotId::new("slot-2".to_string()),
-            RollbackEntry::new(
+            SnapshotEntry::new(
                 test_generation_id("gen-2"),
                 ArtifactRef {
                     release: crate::identity::test_release_id("rel-2"),
@@ -298,11 +298,11 @@ mod tests_rollback {
                 },
             ),
         );
-        LedgerRollback::from_entries(m)
+        TargetSnapshot::from_entries(m)
     }
 
     fn entry_json(slot: &str, gen_id: &str, rel: &str, tree: &str, server: &str) -> String {
-        let e = RollbackEntry::new(
+        let e = SnapshotEntry::new(
             test_generation_id(gen_id),
             ArtifactRef {
                 release: crate::identity::test_release_id(rel),
@@ -324,8 +324,8 @@ mod tests_rollback {
             // VALID rollback JSON STRING — deterministic fixture via Serialize.
             let rb = fixture_rollback();
             let valid = serde_json::to_string(&rb).unwrap();
-            let parsed: crate::ledger::records::LedgerRollbackWire = serde_json::from_str(&valid).unwrap();
-            let domain: LedgerRollback = parsed.into();
+            let parsed: crate::ledger::records::TargetSnapshotWire = serde_json::from_str(&valid).unwrap();
+            let domain: TargetSnapshot = parsed.into();
             prop_assert_eq!(domain, rb);
 
             // (a) DUPLICATE slot key inside entries — second occurrence of slot-1 with different entry.
@@ -335,38 +335,38 @@ mod tests_rollback {
                 let base = &valid[..valid.len() - 2];
                 format!("{},\"slot-1\":{}}}", base, dup_entry)
             };
-            let err = serde_json::from_str::<crate::ledger::records::LedgerRollbackWire>(&dup_json).unwrap_err();
+            let err = serde_json::from_str::<crate::ledger::records::TargetSnapshotWire>(&dup_json).unwrap_err();
             prop_assert!(err.to_string().contains("duplicate rollback slot"), "expected duplicate error, got: {err} / dup_json={dup_json}");
 
             // (b) MISSING entries member entirely.
             let missing = "{}".to_string();
-            prop_assert!(serde_json::from_str::<crate::ledger::records::LedgerRollbackWire>(&missing).is_err());
+            prop_assert!(serde_json::from_str::<crate::ledger::records::TargetSnapshotWire>(&missing).is_err());
             let missing2 = r#"{"slots":{"p1":"old-format-data"}}"#;
-            prop_assert!(serde_json::from_str::<crate::ledger::records::LedgerRollbackWire>(missing2).is_err());
+            prop_assert!(serde_json::from_str::<crate::ledger::records::TargetSnapshotWire>(missing2).is_err());
 
             // (c) UNKNOWN top-level field added (old "slots" shape).
             let unknown = {
                 let inner = &valid[1..valid.len() - 1];
                 format!("{{{},\"slots\":{{\"p1\":\"old-format-data\"}}}}", inner)
             };
-            prop_assert!(serde_json::from_str::<crate::ledger::records::LedgerRollbackWire>(&unknown).is_err());
+            prop_assert!(serde_json::from_str::<crate::ledger::records::TargetSnapshotWire>(&unknown).is_err());
 
             // (d) DUPLICATE top-level "entries" member — two "entries" keys.
             let entries_value = serde_json::to_string(&serde_json::json!({"entries": {"slot-1": serde_json::from_str::<serde_json::Value>(&entry_json("slot-1", "gen-1", "rel-1", "t1", "s1")).unwrap()}})).unwrap();
             // Build {"entries":{...},"entries":{...}}
             let dup_top = format!("{{\"entries\":{{\"slot-1\":{}}},\"entries\":{{\"slot-2\":{}}}}}", entry_json("slot-1", "gen-1", "rel-1", "t1", "s1"), entry_json("slot-2", "gen-2", "rel-2", "t2", "s2"));
             let _ = entries_value; // keep binding used
-            prop_assert!(serde_json::from_str::<crate::ledger::records::LedgerRollbackWire>(&dup_top).is_err());
+            prop_assert!(serde_json::from_str::<crate::ledger::records::TargetSnapshotWire>(&dup_top).is_err());
 
             // Deterministic type-level refusals.
             let bad_gen_as_number = r#"{"entries":{"slot-1":{"generation":123,"artifact":{"release":"rel-sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","variant":"standard","tree":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"binding":{"server":"s1","deploy_dir":"/srv/deploy/slot-1"}}}}"#;
-            prop_assert!(serde_json::from_str::<crate::ledger::records::LedgerRollbackWire>(bad_gen_as_number).is_err());
+            prop_assert!(serde_json::from_str::<crate::ledger::records::TargetSnapshotWire>(bad_gen_as_number).is_err());
             let bad_artifact_as_string = r#"{"entries":{"slot-1":{"generation":"gen-1","artifact":"not-an-object","binding":{"server":"s1","deploy_dir":"/srv/deploy/slot-1"}}}}"#;
-            prop_assert!(serde_json::from_str::<crate::ledger::records::LedgerRollbackWire>(bad_artifact_as_string).is_err());
+            prop_assert!(serde_json::from_str::<crate::ledger::records::TargetSnapshotWire>(bad_artifact_as_string).is_err());
             let bad_binding_as_array = r#"{"entries":{"slot-1":{"generation":"gen-1","artifact":{"release":"rel-sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","variant":"standard","tree":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"binding":[]}}}"#;
-            prop_assert!(serde_json::from_str::<crate::ledger::records::LedgerRollbackWire>(bad_binding_as_array).is_err());
+            prop_assert!(serde_json::from_str::<crate::ledger::records::TargetSnapshotWire>(bad_binding_as_array).is_err());
             let bad_entries_as_array = r#"{"entries":[]}"#;
-            prop_assert!(serde_json::from_str::<crate::ledger::records::LedgerRollbackWire>(bad_entries_as_array).is_err());
+            prop_assert!(serde_json::from_str::<crate::ledger::records::TargetSnapshotWire>(bad_entries_as_array).is_err());
         }
     }
     #[test]
@@ -376,16 +376,16 @@ mod tests_rollback {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(v.get("entries").is_some());
         assert_eq!(v.get("entries").unwrap().as_object().unwrap().len(), 2);
-        let back: crate::ledger::records::LedgerRollbackWire = serde_json::from_str(&json).unwrap();
-        let back: LedgerRollback = back.into();
+        let back: crate::ledger::records::TargetSnapshotWire = serde_json::from_str(&json).unwrap();
+        let back: TargetSnapshot = back.into();
         assert_eq!(back, rb);
     }
     #[test]
     fn rollback_entries_shape_round_trips_and_old_shape_rejected() {
         let slot = SlotId::new("p1".to_string());
-        let rb = LedgerRollback::from_entries(BTreeMap::from([(
+        let rb = TargetSnapshot::from_entries(BTreeMap::from([(
             slot.clone(),
-            RollbackEntry::new(
+            SnapshotEntry::new(
                 test_generation_id("g1"),
                 ArtifactRef {
                     release: crate::identity::test_release_id("rel-1"),
@@ -402,9 +402,9 @@ mod tests_rollback {
         let json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         assert!(json.get("entries").is_some());
         assert!(json.get("slots").is_none());
-        let wire: crate::ledger::records::LedgerRollbackWire =
+        let wire: crate::ledger::records::TargetSnapshotWire =
             serde_json::from_str(&json_str).unwrap();
-        let back: LedgerRollback = wire.into();
+        let back: TargetSnapshot = wire.into();
         assert_eq!(back, rb);
         let did = test_deployment_id("deploy-old");
         let old_line = format!(
@@ -425,7 +425,7 @@ mod tests_rollback {
     // contradicts its intent. Both writer and read paths must fail closed.
     fn valid_intent_rollback_activated() -> (
         crate::ledger::records::DeploymentIntent,
-        LedgerRollback,
+        TargetSnapshot,
         BTreeSet<SlotId>,
     ) {
         let slot = SlotId::new("p1".to_string());
@@ -459,27 +459,27 @@ mod tests_rollback {
             .unwrap(),
             full_membership: BTreeSet::from([slot.clone()]),
         };
-        let rollback = LedgerRollback::from_entries(BTreeMap::from([(
+        let rollback = TargetSnapshot::from_entries(BTreeMap::from([(
             slot.clone(),
-            RollbackEntry::new(gen_id, artifact, binding),
+            SnapshotEntry::new(gen_id, artifact, binding),
         )]));
         let activated = BTreeSet::from([slot]);
         (intent, rollback, activated)
     }
 
     fn mutate_rollback_for_leg(
-        rollback: LedgerRollback,
+        rollback: TargetSnapshot,
         slot: &SlotId,
         leg: u32,
-    ) -> LedgerRollback {
+    ) -> TargetSnapshot {
         let entry = rollback.get(slot).unwrap().clone();
         let mutated = match leg {
-            0 => RollbackEntry::new(
+            0 => SnapshotEntry::new(
                 test_generation_id("gen-other"),
                 entry.artifact().clone(),
                 entry.binding().clone(),
             ),
-            1 => RollbackEntry::new(
+            1 => SnapshotEntry::new(
                 entry.generation().clone(),
                 ArtifactRef {
                     release: crate::identity::test_release_id("rel-other"),
@@ -488,7 +488,7 @@ mod tests_rollback {
                 },
                 entry.binding().clone(),
             ),
-            2 => RollbackEntry::new(
+            2 => SnapshotEntry::new(
                 entry.generation().clone(),
                 ArtifactRef {
                     release: entry.artifact().release.clone(),
@@ -497,7 +497,7 @@ mod tests_rollback {
                 },
                 entry.binding().clone(),
             ),
-            3 => RollbackEntry::new(
+            3 => SnapshotEntry::new(
                 entry.generation().clone(),
                 ArtifactRef {
                     release: entry.artifact().release.clone(),
@@ -506,7 +506,7 @@ mod tests_rollback {
                 },
                 entry.binding().clone(),
             ),
-            4 => RollbackEntry::new(
+            4 => SnapshotEntry::new(
                 entry.generation().clone(),
                 entry.artifact().clone(),
                 PhysicalBinding {
@@ -514,7 +514,7 @@ mod tests_rollback {
                     deploy_dir: entry.binding().deploy_dir.clone(),
                 },
             ),
-            5 => RollbackEntry::new(
+            5 => SnapshotEntry::new(
                 entry.generation().clone(),
                 entry.artifact().clone(),
                 PhysicalBinding {
@@ -526,7 +526,7 @@ mod tests_rollback {
         };
         let mut map = rollback.into_entries();
         map.insert(slot.clone(), mutated);
-        LedgerRollback::from_entries(map)
+        TargetSnapshot::from_entries(map)
     }
 
     fn assert_leg_fails_closed(leg: u32) {

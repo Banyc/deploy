@@ -67,7 +67,7 @@ use crate::ledger::records::{
     validate_successful_rollback_against_intent,
 };
 pub use crate::ledger::records::{
-    DeploymentIntent, LedgerEntry, LedgerIntentWire, LedgerRollback, LedgerTerminal,
+    DeploymentIntent, LedgerEntry, LedgerIntentWire, TargetSnapshot, LedgerTerminal,
     LedgerTerminalWire, PhysicalBinding, TerminalDisposition,
 };
 use crate::remote::helper::{HeldSlotLock, RemoteHelper};
@@ -904,7 +904,7 @@ mod tests {
             > = BTreeMap::new();
             let mut __entries: BTreeMap<
                 crate::identity::SlotId,
-                crate::ledger::records::RollbackEntry,
+                crate::ledger::records::SnapshotEntry,
             > = BTreeMap::new();
             for (k, v) in __slots.clone() {
                 let b = __bindings.get(&k).cloned().unwrap_or(
@@ -915,7 +915,7 @@ mod tests {
                 );
                 __entries.insert(
                     k.clone(),
-                    crate::ledger::records::RollbackEntry::new(
+                    crate::ledger::records::SnapshotEntry::new(
                         v.generation.clone(),
                         v.assignment.artifact.clone(),
                         b,
@@ -924,7 +924,7 @@ mod tests {
             }
             for (k, b) in __bindings.clone() {
                 __entries.entry(k.clone()).or_insert_with(|| {
-                    crate::ledger::records::RollbackEntry::new(
+                    crate::ledger::records::SnapshotEntry::new(
                         crate::identity::GenerationId::new("gen-missing".to_string()),
                         crate::identity::ArtifactRef {
                             release: crate::identity::test_release_id("rel-missing"),
@@ -935,7 +935,7 @@ mod tests {
                     )
                 });
             }
-            crate::ledger::records::LedgerRollback::from_entries(__entries)
+            crate::ledger::records::TargetSnapshot::from_entries(__entries)
         };
         let activated: BTreeSet<SlotId> = attempt.slots.keys().cloned().collect();
         validate_successful_rollback_against_intent(&attempt, &matching, &activated)
@@ -964,7 +964,7 @@ mod tests {
             > = BTreeMap::new();
             let mut __entries: BTreeMap<
                 crate::identity::SlotId,
-                crate::ledger::records::RollbackEntry,
+                crate::ledger::records::SnapshotEntry,
             > = BTreeMap::new();
             for (k, v) in __slots.clone() {
                 let b = __bindings.get(&k).cloned().unwrap_or(
@@ -975,7 +975,7 @@ mod tests {
                 );
                 __entries.insert(
                     k.clone(),
-                    crate::ledger::records::RollbackEntry::new(
+                    crate::ledger::records::SnapshotEntry::new(
                         v.generation.clone(),
                         v.assignment.artifact.clone(),
                         b,
@@ -984,7 +984,7 @@ mod tests {
             }
             for (k, b) in __bindings.clone() {
                 __entries.entry(k.clone()).or_insert_with(|| {
-                    crate::ledger::records::RollbackEntry::new(
+                    crate::ledger::records::SnapshotEntry::new(
                         crate::identity::GenerationId::new("gen-missing".to_string()),
                         crate::identity::ArtifactRef {
                             release: crate::identity::test_release_id("rel-missing"),
@@ -995,7 +995,7 @@ mod tests {
                     )
                 });
             }
-            crate::ledger::records::LedgerRollback::from_entries(__entries)
+            crate::ledger::records::TargetSnapshot::from_entries(__entries)
         };
         let err = validate_successful_rollback_against_intent(&attempt, &diverged, &activated)
             .expect_err("a diverged rollback entry must refuse the finalization before any append");

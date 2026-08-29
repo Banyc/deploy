@@ -29,7 +29,7 @@ use crate::identity::{DeploymentId, ReleaseId, SlotId, TargetName};
 use crate::ledger::finalize::LedgerEntry;
 use crate::ledger::records::DeploymentIntent;
 use crate::ledger::records::TerminalDisposition;
-use crate::ledger::records::{DeploymentStatus, LedgerRollback};
+use crate::ledger::records::{DeploymentStatus, TargetSnapshot};
 use crate::store::local::LocalStore;
 use std::collections::BTreeMap;
 
@@ -197,7 +197,7 @@ pub fn resolve_deployment(
     store: &LocalStore,
     target: &TargetName,
     deployment_id: &DeploymentId,
-) -> Result<LedgerRollback> {
+) -> Result<TargetSnapshot> {
     let entries = store.read_ledger(target.as_str())?;
     let entry = entries
         .iter()
@@ -251,7 +251,7 @@ pub fn attempt_slot_ids(attempt: &DeploymentIntent) -> Vec<SlotId> {
 pub fn deployment_index(
     store: &LocalStore,
     target: &TargetName,
-) -> Result<BTreeMap<String, LedgerRollback>> {
+) -> Result<BTreeMap<String, TargetSnapshot>> {
     let mut out = BTreeMap::new();
     for e in successful_deployments(store, target)? {
         if let TerminalDisposition::Successful(st) = &e.terminal.as_ref().unwrap().disposition {
@@ -368,7 +368,7 @@ mod tests {
                         )]);
                         let mut __entries: BTreeMap<
                             crate::identity::SlotId,
-                            crate::ledger::records::RollbackEntry,
+                            crate::ledger::records::SnapshotEntry,
                         > = BTreeMap::new();
                         for (k, v) in __slots.clone() {
                             let b = __bindings.get(&k).cloned().unwrap_or(
@@ -379,7 +379,7 @@ mod tests {
                             );
                             __entries.insert(
                                 k.clone(),
-                                crate::ledger::records::RollbackEntry::new(
+                                crate::ledger::records::SnapshotEntry::new(
                                     v.generation.clone(),
                                     v.assignment.artifact.clone(),
                                     b,
@@ -388,7 +388,7 @@ mod tests {
                         }
                         for (k, b) in __bindings.clone() {
                             __entries.entry(k.clone()).or_insert_with(|| {
-                                crate::ledger::records::RollbackEntry::new(
+                                crate::ledger::records::SnapshotEntry::new(
                                     crate::identity::GenerationId::new("gen-missing".to_string()),
                                     crate::identity::ArtifactRef {
                                         release: crate::identity::test_release_id("rel-missing"),
@@ -401,7 +401,7 @@ mod tests {
                                 )
                             });
                         }
-                        crate::ledger::records::LedgerRollback::from_entries(__entries)
+                        crate::ledger::records::TargetSnapshot::from_entries(__entries)
                     },
                     crate::identity::NonEmptySlotSet::try_new(BTreeSet::from([SlotId::new(
                         "p1".to_string(),
@@ -696,7 +696,7 @@ mod tests {
     /// error).
     fn assert_deployment_id_resolution(store: &LocalStore, history: &[(String, bool)]) {
         let target = TargetName::new("production".to_string());
-        let stored: BTreeMap<String, LedgerRollback> = successful_deployments(store, &target)
+        let stored: BTreeMap<String, TargetSnapshot> = successful_deployments(store, &target)
             .unwrap()
             .into_iter()
             .filter_map(|e| {

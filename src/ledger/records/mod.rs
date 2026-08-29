@@ -10,7 +10,7 @@
 //!
 //! The SHARED core comes first — the deployment-record fields
 //! ([`SlotAttemptState`] / [`DeploymentStatus`]), the ROLLBACK records
-//! ([`LedgerRollback`] / [`RollbackEntry`] / [`PhysicalBinding`] /
+//! ([`TargetSnapshot`] / [`SnapshotEntry`] / [`PhysicalBinding`] /
 //! [`CompleteRollback`]), the PLAN/report records ([`BehaviorIndex`],
 //! [`SlotPlan`], [`DeploymentPlanWire`] / [`DeploymentPlan`], [`PlanSource`] /
 //! [`PlanOrigin`]), and the pins/server records ([`Pins`] /
@@ -206,31 +206,31 @@ pub struct PhysicalBinding {
 /// carrying its generation, artifact, and physical binding. The payload IS
 /// the domain struct serialized directly; the schema version gates old shapes.
 #[derive(Clone, Debug, Serialize)]
-pub struct LedgerRollback {
-    entries: BTreeMap<SlotId, RollbackEntry>,
+pub struct TargetSnapshot {
+    entries: BTreeMap<SlotId, SnapshotEntry>,
 }
 
 /// The STRICT wire shape for the rollback payload: entries REQUIRED,
 /// unknown fields REJECTED (`deny_unknown_fields`), and every slot key
 /// unique (a map-visitor deserializer refuses a duplicate — ambiguous
 /// JSON can never read as a valid rollback). Deserialize-only: the writer
-/// emits `LedgerRollback`'s own `Serialize` (the same `{"entries": ...}`).
+/// emits `TargetSnapshot`'s own `Serialize` (the same `{"entries": ...}`).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct LedgerRollbackWire {
+pub(crate) struct TargetSnapshotWire {
     #[serde(deserialize_with = "deserialize_unique_entries")]
-    entries: BTreeMap<SlotId, RollbackEntry>,
+    entries: BTreeMap<SlotId, SnapshotEntry>,
 }
 
 fn deserialize_unique_entries<'de, D>(
     deserializer: D,
-) -> std::result::Result<BTreeMap<SlotId, RollbackEntry>, D::Error>
+) -> std::result::Result<BTreeMap<SlotId, SnapshotEntry>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     struct UniqueEntriesVisitor;
     impl<'de> serde::de::Visitor<'de> for UniqueEntriesVisitor {
-        type Value = BTreeMap<SlotId, RollbackEntry>;
+        type Value = BTreeMap<SlotId, SnapshotEntry>;
         fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
             f.write_str("a map with unique slot keys")
         }
@@ -239,7 +239,7 @@ where
             M: serde::de::MapAccess<'de>,
         {
             let mut entries = BTreeMap::new();
-            while let Some((slot, entry)) = access.next_entry::<SlotId, RollbackEntry>()? {
+            while let Some((slot, entry)) = access.next_entry::<SlotId, SnapshotEntry>()? {
                 if entries.insert(slot.clone(), entry).is_some() {
                     return Err(serde::de::Error::custom(format!(
                         "duplicate rollback slot '{slot}'"
@@ -252,33 +252,33 @@ where
     deserializer.deserialize_map(UniqueEntriesVisitor)
 }
 
-impl From<LedgerRollbackWire> for LedgerRollback {
-    fn from(w: LedgerRollbackWire) -> Self {
-        LedgerRollback::from_entries(w.entries)
+impl From<TargetSnapshotWire> for TargetSnapshot {
+    fn from(w: TargetSnapshotWire) -> Self {
+        TargetSnapshot::from_entries(w.entries)
     }
 }
 
 pub(crate) fn deserialize_opt_strict_rollback<'de, D>(
     deserializer: D,
-) -> std::result::Result<Option<LedgerRollback>, D::Error>
+) -> std::result::Result<Option<TargetSnapshot>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    Option::<LedgerRollbackWire>::deserialize(deserializer).map(|o| o.map(Into::into))
+    Option::<TargetSnapshotWire>::deserialize(deserializer).map(|o| o.map(Into::into))
 }
-impl PartialEq for LedgerRollback {
+impl PartialEq for TargetSnapshot {
     fn eq(&self, other: &Self) -> bool {
         self.entries == other.entries
     }
 }
-impl Eq for LedgerRollback {}
+impl Eq for TargetSnapshot {}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RollbackEntry {
+pub struct SnapshotEntry {
     generation: GenerationId,
     artifact: ArtifactRef,
     binding: PhysicalBinding,
 }
-impl RollbackEntry {
+impl SnapshotEntry {
     pub fn new(generation: GenerationId, artifact: ArtifactRef, binding: PhysicalBinding) -> Self {
         Self {
             generation,
@@ -296,14 +296,14 @@ impl RollbackEntry {
         &self.binding
     }
 }
-impl LedgerRollback {
-    pub fn from_entries(entries: BTreeMap<SlotId, RollbackEntry>) -> Self {
+impl TargetSnapshot {
+    pub fn from_entries(entries: BTreeMap<SlotId, SnapshotEntry>) -> Self {
         Self { entries }
     }
-    pub fn iter(&self) -> impl Iterator<Item = (&SlotId, &RollbackEntry)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&SlotId, &SnapshotEntry)> {
         self.entries.iter()
     }
-    pub fn get(&self, slot: &SlotId) -> Option<&RollbackEntry> {
+    pub fn get(&self, slot: &SlotId) -> Option<&SnapshotEntry> {
         self.entries.get(slot)
     }
     pub fn keys(&self) -> impl Iterator<Item = &SlotId> {
@@ -315,7 +315,7 @@ impl LedgerRollback {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
-    pub fn into_entries(self) -> BTreeMap<SlotId, RollbackEntry> {
+    pub fn into_entries(self) -> BTreeMap<SlotId, SnapshotEntry> {
         self.entries
     }
     pub fn generation_ref(&self, slot: &SlotId) -> Option<GenerationRef> {
@@ -346,10 +346,10 @@ impl LedgerRollback {
 pub type BehaviorIndex = BTreeMap<ReleaseId, BTreeMap<String, BehaviorContract>>;
 
 /// The COMPLETE ROLLBACK payload of a SUCCESSFUL deployment — the existing
-/// [`LedgerRollback`] under the domain terminal's name: the per-slot
+/// [`TargetSnapshot`] under the domain terminal's name: the per-slot
 /// generation refs + physical bindings the terminal event carries exactly
 /// when the deployment was successful.
-pub type CompleteRollback = LedgerRollback;
+pub type CompleteRollback = TargetSnapshot;
 
 /// A durable pin: retained artifact CONTENT, store-global (a release or
 /// binding is shared by every target that references it, so a pin protects
@@ -945,7 +945,7 @@ mod tests {
                     > = keys.iter().map(|k| (k.clone(), binding(k))).collect();
                     let mut __entries: BTreeMap<
                         crate::identity::SlotId,
-                        crate::ledger::records::RollbackEntry,
+                        crate::ledger::records::SnapshotEntry,
                     > = BTreeMap::new();
                     for (k, v) in __slots.clone() {
                         let b = __bindings.get(&k).cloned().unwrap_or(
@@ -956,7 +956,7 @@ mod tests {
                         );
                         __entries.insert(
                             k.clone(),
-                            crate::ledger::records::RollbackEntry::new(
+                            crate::ledger::records::SnapshotEntry::new(
                                 v.generation.clone(),
                                 v.assignment.artifact.clone(),
                                 b,
@@ -965,7 +965,7 @@ mod tests {
                     }
                     for (k, b) in __bindings.clone() {
                         __entries.entry(k.clone()).or_insert_with(|| {
-                            crate::ledger::records::RollbackEntry::new(
+                            crate::ledger::records::SnapshotEntry::new(
                                 crate::identity::GenerationId::new("gen-missing".to_string()),
                                 crate::identity::ArtifactRef {
                                     release: crate::identity::test_release_id("rel-missing"),
@@ -978,7 +978,7 @@ mod tests {
                             )
                         });
                     }
-                    crate::ledger::records::LedgerRollback::from_entries(__entries)
+                    crate::ledger::records::TargetSnapshot::from_entries(__entries)
                 }),
                 selected_membership: keys.to_vec(),
                 full_membership: keys.to_vec(),
@@ -1389,7 +1389,7 @@ mod tests {
             > = BTreeMap::new();
             let mut __entries: BTreeMap<
                 crate::identity::SlotId,
-                crate::ledger::records::RollbackEntry,
+                crate::ledger::records::SnapshotEntry,
             > = BTreeMap::new();
             for (k, v) in __slots.clone() {
                 let b = __bindings.get(&k).cloned().unwrap_or(
@@ -1400,7 +1400,7 @@ mod tests {
                 );
                 __entries.insert(
                     k.clone(),
-                    crate::ledger::records::RollbackEntry::new(
+                    crate::ledger::records::SnapshotEntry::new(
                         v.generation.clone(),
                         v.assignment.artifact.clone(),
                         b,
@@ -1409,7 +1409,7 @@ mod tests {
             }
             for (k, b) in __bindings.clone() {
                 __entries.entry(k.clone()).or_insert_with(|| {
-                    crate::ledger::records::RollbackEntry::new(
+                    crate::ledger::records::SnapshotEntry::new(
                         crate::identity::GenerationId::new("gen-missing".to_string()),
                         crate::identity::ArtifactRef {
                             release: crate::identity::test_release_id("rel-missing"),
@@ -1420,7 +1420,7 @@ mod tests {
                     )
                 });
             }
-            crate::ledger::records::LedgerRollback::from_entries(__entries)
+            crate::ledger::records::TargetSnapshot::from_entries(__entries)
         });
         assert!(
             bad.into_domain().is_err(),
@@ -1548,7 +1548,7 @@ mod tests {
             let rb = bad.rollback.take().unwrap();
             let mut entries = rb.into_entries();
             entries.remove(&slot(1));
-            bad.rollback = Some(LedgerRollback::from_entries(entries));
+            bad.rollback = Some(TargetSnapshot::from_entries(entries));
         }
         assert!(
             bad.into_domain().is_err(),
@@ -1565,9 +1565,9 @@ mod tests {
             let gr = gen_ref_for(&slot(9));
             entries.insert(
                 slot(9),
-                RollbackEntry::new(gr.generation, gr.assignment.artifact, binding(&slot(9))),
+                SnapshotEntry::new(gr.generation, gr.assignment.artifact, binding(&slot(9))),
             );
-            bad.rollback = Some(LedgerRollback::from_entries(entries));
+            bad.rollback = Some(TargetSnapshot::from_entries(entries));
         }
         assert!(
             bad.into_domain().is_err(),
@@ -1677,9 +1677,9 @@ mod tests {
     }
     #[test]
     fn rollback_wire_disagreement_per_duplicate_fails_closed() {
-        let rb = LedgerRollback::from_entries(BTreeMap::from([(
+        let rb = TargetSnapshot::from_entries(BTreeMap::from([(
             slot(1),
-            RollbackEntry::new(
+            SnapshotEntry::new(
                 test_generation_id("slot-1"),
                 ArtifactRef {
                     release: test_release_id("slot-1"),
@@ -1692,8 +1692,8 @@ mod tests {
         assert_eq!(rb.releases(), BTreeSet::from([test_release_id("slot-1")]));
         let json = serde_json::to_string(&rb).unwrap();
         assert!(json.contains("\"entries\""));
-        let wire: LedgerRollbackWire = serde_json::from_str(&json).unwrap();
-        let rb2: LedgerRollback = wire.into();
+        let wire: TargetSnapshotWire = serde_json::from_str(&json).unwrap();
+        let rb2: TargetSnapshot = wire.into();
         assert_eq!(rb2.releases(), rb.releases());
         assert_eq!(rb2.len(), 1);
     }
@@ -1713,7 +1713,7 @@ mod tests {
             > = BTreeMap::from([(slot(1), binding(&slot(1)))]);
             let mut __entries: BTreeMap<
                 crate::identity::SlotId,
-                crate::ledger::records::RollbackEntry,
+                crate::ledger::records::SnapshotEntry,
             > = BTreeMap::new();
             for (k, v) in __slots.clone() {
                 let b = __bindings.get(&k).cloned().unwrap_or(
@@ -1724,7 +1724,7 @@ mod tests {
                 );
                 __entries.insert(
                     k.clone(),
-                    crate::ledger::records::RollbackEntry::new(
+                    crate::ledger::records::SnapshotEntry::new(
                         v.generation.clone(),
                         v.assignment.artifact.clone(),
                         b,
@@ -1733,7 +1733,7 @@ mod tests {
             }
             for (k, b) in __bindings.clone() {
                 __entries.entry(k.clone()).or_insert_with(|| {
-                    crate::ledger::records::RollbackEntry::new(
+                    crate::ledger::records::SnapshotEntry::new(
                         crate::identity::GenerationId::new("gen-missing".to_string()),
                         crate::identity::ArtifactRef {
                             release: crate::identity::test_release_id("rel-missing"),
@@ -1744,7 +1744,7 @@ mod tests {
                     )
                 });
             }
-            crate::ledger::records::LedgerRollback::from_entries(__entries)
+            crate::ledger::records::TargetSnapshot::from_entries(__entries)
         };
         let outcome = || SlotResult {
             slot_id: slot(1),
@@ -2039,7 +2039,7 @@ mod tests {
     /// assignment naming its own key) with EXACT bindings (the wire
     /// conversion refuses a rollback whose bindings omit a slotted
     /// generation).
-    fn arbitrary_rollback() -> impl Strategy<Value = LedgerRollback> {
+    fn arbitrary_rollback() -> impl Strategy<Value = TargetSnapshot> {
         prop::collection::btree_set(slot_strategy(), 1..4).prop_map(|keys| {
             let slots: BTreeMap<SlotId, GenerationRef> =
                 keys.iter().map(|k| (k.clone(), gen_ref_for(k))).collect();
@@ -2054,7 +2054,7 @@ mod tests {
                 > = bindings;
                 let mut __entries: BTreeMap<
                     crate::identity::SlotId,
-                    crate::ledger::records::RollbackEntry,
+                    crate::ledger::records::SnapshotEntry,
                 > = BTreeMap::new();
                 for (k, v) in __slots.clone() {
                     let b = __bindings.get(&k).cloned().unwrap_or(
@@ -2065,7 +2065,7 @@ mod tests {
                     );
                     __entries.insert(
                         k.clone(),
-                        crate::ledger::records::RollbackEntry::new(
+                        crate::ledger::records::SnapshotEntry::new(
                             v.generation.clone(),
                             v.assignment.artifact.clone(),
                             b,
@@ -2074,7 +2074,7 @@ mod tests {
                 }
                 for (k, b) in __bindings.clone() {
                     __entries.entry(k.clone()).or_insert_with(|| {
-                        crate::ledger::records::RollbackEntry::new(
+                        crate::ledger::records::SnapshotEntry::new(
                             crate::identity::GenerationId::new("gen-missing".to_string()),
                             crate::identity::ArtifactRef {
                                 release: crate::identity::test_release_id("rel-missing"),
@@ -2085,7 +2085,7 @@ mod tests {
                         )
                     });
                 }
-                crate::ledger::records::LedgerRollback::from_entries(__entries)
+                crate::ledger::records::TargetSnapshot::from_entries(__entries)
             }
         })
     }

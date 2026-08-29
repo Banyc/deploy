@@ -10,8 +10,8 @@
 //! [`PINS_SCHEMA_VERSION`]).
 //!
 //! The record SHAPES these facets validate live with their owners: the
-//! rollback records ([`crate::ledger::records::LedgerRollback`] /
-//! [`crate::ledger::records::PhysicalBinding`] and [`crate::ledger::records::RollbackEntry`]) in the shared core, the
+//! rollback records ([`crate::ledger::records::TargetSnapshot`] /
+//! [`crate::ledger::records::PhysicalBinding`] and [`crate::ledger::records::SnapshotEntry`]) in the shared core, the
 //! plan records that carry the rebinding proof
 //! ([`crate::ledger::records::DeploymentPlanWire`]) in the shared core, the
 //! terminal conversion that enforces the membership equations in

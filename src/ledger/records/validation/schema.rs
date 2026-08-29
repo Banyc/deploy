@@ -35,7 +35,7 @@
 /// current one is REJECTED on read (no compatibility fallback), so a
 /// record is interpreted only under exactly the schema that wrote it:
 ///
-/// * version 7 (CURRENT): the rollback payload is a single `entries: BTreeMap<SlotId, RollbackEntry>` map (generation + artifact + binding per slot) serialized directly; the schema version gates old shapes.
+/// * version 7 (CURRENT): the rollback payload is a single `entries: BTreeMap<SlotId, SnapshotEntry>` map (generation + artifact + binding per slot) serialized directly; the schema version gates old shapes.
 /// * version 6: the INTENT record FREEZES each selected slot's
 ///   PHYSICAL BINDING — a required `bindings: BTreeMap<SlotId,
 ///   PhysicalBinding>` projection whose key set must EQUAL the selected

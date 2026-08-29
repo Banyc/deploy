@@ -5,7 +5,7 @@ use deploy::config::ProjectConfig;
 use deploy::deploy::{PushOptions, push};
 use deploy::error::Result;
 use deploy::identity::{ServerId, SlotId, TreeDigest};
-use deploy::ledger::{DeploymentStatus, LedgerEntry, LedgerRollback, PhysicalBinding};
+use deploy::ledger::{DeploymentStatus, LedgerEntry, TargetSnapshot, PhysicalBinding};
 
 use deploy::remote::transport::{CreateNewVerdict, FsBytes, LocalTransport, Remote};
 use deploy::store::local::LocalStore;
@@ -28,7 +28,7 @@ fn successful_entries(store: &LocalStore, target: &str) -> Result<Vec<LedgerEntr
 
 /// The rollback payload of a successful entry (the old snapshot fields:
 /// `slots`, `bindings`, `behavior_sha256`, `release`).
-fn rollback_of(e: &LedgerEntry) -> &LedgerRollback {
+fn rollback_of(e: &LedgerEntry) -> &TargetSnapshot {
     match &e
         .terminal
         .as_ref()

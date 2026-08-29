@@ -10,7 +10,7 @@ use crate::identity::DeploymentId;
 use crate::identity::ServerId;
 use crate::identity::SlotId;
 use crate::identity::TargetName;
-use crate::ledger::LedgerRollback;
+use crate::ledger::TargetSnapshot;
 use crate::ledger::PhysicalBinding;
 
 // EXACT ROLLBACK VERIFICATION (A2): a deployment rollback restores the
@@ -33,7 +33,7 @@ use crate::ledger::PhysicalBinding;
 /// planned (they remain at the latest current state).
 pub(crate) fn verify_exact_rollback_bindings(
     members: &[(&SlotConfig, &ServerDef)],
-    entry: &LedgerRollback,
+    entry: &TargetSnapshot,
     deployment_id: &DeploymentId,
     ft: &TargetName,
 ) -> Result<()> {

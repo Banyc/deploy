@@ -34,8 +34,8 @@ use crate::identity::{
 };
 use crate::ledger::finalize::LedgerLine;
 use crate::ledger::records::{
-    DeploymentStatus, LedgerIntentWire, LedgerRollback, LedgerTerminalWire, ObservationWire,
-    ObservedGenerationWire, PhysicalBinding, RollbackEntry, SlotOutcomeKind, SlotResult,
+    DeploymentStatus, LedgerIntentWire, TargetSnapshot, LedgerTerminalWire, ObservationWire,
+    ObservedGenerationWire, PhysicalBinding, SnapshotEntry, SlotOutcomeKind, SlotResult,
 };
 use std::collections::BTreeMap;
 
@@ -186,14 +186,14 @@ pub(crate) fn canonical_doc_pair() -> (LedgerIntentWire, LedgerTerminalWire) {
             )
         })
         .collect();
-    let rollback_entries: BTreeMap<SlotId, RollbackEntry> = slots
+    let rollback_entries: BTreeMap<SlotId, SnapshotEntry> = slots
         .iter()
         .map(|(s, v, _, g)| {
             let sid = SlotId::new(s.to_string());
             let gen_ref = gen_ref_for(&sid, v, g);
             (
                 sid.clone(),
-                RollbackEntry::new(
+                SnapshotEntry::new(
                     gen_ref.generation,
                     gen_ref.assignment.artifact,
                     bindings[&sid].clone(),
@@ -207,7 +207,7 @@ pub(crate) fn canonical_doc_pair() -> (LedgerIntentWire, LedgerTerminalWire) {
         status: DeploymentStatus::Successful,
         recorded_at: "2026-08-21T10:25:00Z".to_string(),
         outcomes,
-        rollback: Some(LedgerRollback::from_entries(rollback_entries)),
+        rollback: Some(TargetSnapshot::from_entries(rollback_entries)),
         selected_membership: slot_ids.clone(),
         full_membership: slot_ids,
         reason: Some("push completed".to_string()),

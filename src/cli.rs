@@ -655,7 +655,7 @@ mod tests {
         test_tree_digest,
     };
     use crate::ledger::{
-        DeploymentIntent, DeploymentStatus, DesiredGeneration, IntentSlot, LedgerRollback,
+        DeploymentIntent, DeploymentStatus, DesiredGeneration, IntentSlot, TargetSnapshot,
         LedgerTerminal, NonEmptySlotTable, ObservedSlot, TerminalDisposition,
     };
     use std::collections::BTreeMap;
@@ -754,7 +754,7 @@ mod tests {
                         )]);
                         let mut __entries: BTreeMap<
                             crate::identity::SlotId,
-                            crate::ledger::records::RollbackEntry,
+                            crate::ledger::records::SnapshotEntry,
                         > = BTreeMap::new();
                         for (k, v) in __slots.clone() {
                             let b = __bindings.get(&k).cloned().unwrap_or(
@@ -765,7 +765,7 @@ mod tests {
                             );
                             __entries.insert(
                                 k.clone(),
-                                crate::ledger::records::RollbackEntry::new(
+                                crate::ledger::records::SnapshotEntry::new(
                                     v.generation.clone(),
                                     v.assignment.artifact.clone(),
                                     b,
@@ -774,7 +774,7 @@ mod tests {
                         }
                         for (k, b) in __bindings.clone() {
                             __entries.entry(k.clone()).or_insert_with(|| {
-                                crate::ledger::records::RollbackEntry::new(
+                                crate::ledger::records::SnapshotEntry::new(
                                     crate::identity::GenerationId::new("gen-missing".to_string()),
                                     crate::identity::ArtifactRef {
                                         release: crate::identity::test_release_id("rel-missing"),
@@ -787,7 +787,7 @@ mod tests {
                                 )
                             });
                         }
-                        LedgerRollback::from_entries(__entries)
+                        TargetSnapshot::from_entries(__entries)
                     },
                     crate::identity::NonEmptySlotSet::try_new(BTreeSet::from([p1.clone()]))
                         .unwrap(),

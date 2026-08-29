@@ -456,7 +456,7 @@ mod tests {
         test_tree_digest,
     };
     use crate::ledger::{
-        DeploymentIntent, DesiredGeneration, IntentSlot, LedgerRollback, LedgerTerminal,
+        DeploymentIntent, DesiredGeneration, IntentSlot, TargetSnapshot, LedgerTerminal,
         NonEmptySlotTable, ObservationWire, ObservedAssignment, ObservedGenerationWire,
         ObservedSlot, Pins, SlotOutcome, SlotOutcomeKind, SlotResult, SlotTable,
         TerminalDisposition,
@@ -503,7 +503,7 @@ mod tests {
         }
     }
 
-    fn rollback_for(release: &str) -> LedgerRollback {
+    fn rollback_for(release: &str) -> TargetSnapshot {
         {
             let __slots: BTreeMap<crate::identity::SlotId, crate::identity::GenerationRef> =
                 BTreeMap::from([(
@@ -532,7 +532,7 @@ mod tests {
             )]);
             let mut __entries: BTreeMap<
                 crate::identity::SlotId,
-                crate::ledger::records::RollbackEntry,
+                crate::ledger::records::SnapshotEntry,
             > = BTreeMap::new();
             for (k, v) in __slots.clone() {
                 let b = __bindings.get(&k).cloned().unwrap_or(
@@ -543,7 +543,7 @@ mod tests {
                 );
                 __entries.insert(
                     k.clone(),
-                    crate::ledger::records::RollbackEntry::new(
+                    crate::ledger::records::SnapshotEntry::new(
                         v.generation.clone(),
                         v.assignment.artifact.clone(),
                         b,
@@ -552,7 +552,7 @@ mod tests {
             }
             for (k, b) in __bindings.clone() {
                 __entries.entry(k.clone()).or_insert_with(|| {
-                    crate::ledger::records::RollbackEntry::new(
+                    crate::ledger::records::SnapshotEntry::new(
                         crate::identity::GenerationId::new("gen-missing".to_string()),
                         crate::identity::ArtifactRef {
                             release: crate::identity::test_release_id("rel-missing"),
@@ -563,7 +563,7 @@ mod tests {
                     )
                 });
             }
-            crate::ledger::records::LedgerRollback::from_entries(__entries)
+            crate::ledger::records::TargetSnapshot::from_entries(__entries)
         }
     }
 
@@ -876,14 +876,14 @@ interval_seconds = 0
                 art.tree = test_tree_digest(tree);
                 new_entries.insert(
                     k.clone(),
-                    crate::ledger::records::RollbackEntry::new(
+                    crate::ledger::records::SnapshotEntry::new(
                         e.generation().clone(),
                         art,
                         e.binding().clone(),
                     ),
                 );
             }
-            crate::ledger::records::LedgerRollback::from_entries(new_entries)
+            crate::ledger::records::TargetSnapshot::from_entries(new_entries)
         };
         if let TerminalDisposition::Successful(st) = &mut term.disposition {
             let new_st = crate::ledger::SuccessfulTerminal::new_unchecked(

@@ -10,7 +10,7 @@
 //! ledger (`targets/<target>/ledger.jsonl`, see [`crate::ledger`]): each
 //! entry starts as the DURABLE INTENT (written BEFORE any remote mutation)
 //! and its TERMINAL EVENT carries the status, the per-slot outcomes, and —
-//! when successful — the rollback state ([`crate::ledger::LedgerRollback`]).
+//! when successful — the rollback state ([`crate::ledger::TargetSnapshot`]).
 //! There is NO history-floor marker, NO snapshot op log, NO per-deployment
 //! results/transition stream, and NO cleanup-pending debt flag: the old
 //! multi-file model (and with it the transactional floor-advance backup
@@ -77,7 +77,7 @@ use std::collections::BTreeSet;
 use crate::identity::SlotId;
 #[cfg(test)]
 use crate::ledger::{
-    DeploymentIntent, DeploymentStatus, LedgerRollback, LedgerTerminal, SlotResult, SlotTable,
+    DeploymentIntent, DeploymentStatus, TargetSnapshot, LedgerTerminal, SlotResult, SlotTable,
 };
 #[cfg(test)]
 use crate::testutil::test_faults::FaultKind;
@@ -821,7 +821,7 @@ impl LocalStore {
                         > = BTreeMap::new();
                         let mut __entries: BTreeMap<
                             crate::identity::SlotId,
-                            crate::ledger::records::RollbackEntry,
+                            crate::ledger::records::SnapshotEntry,
                         > = BTreeMap::new();
                         for (k, v) in __slots.clone() {
                             let b = __bindings.get(&k).cloned().unwrap_or(
@@ -832,7 +832,7 @@ impl LocalStore {
                             );
                             __entries.insert(
                                 k.clone(),
-                                crate::ledger::records::RollbackEntry::new(
+                                crate::ledger::records::SnapshotEntry::new(
                                     v.generation.clone(),
                                     v.assignment.artifact.clone(),
                                     b,
@@ -841,7 +841,7 @@ impl LocalStore {
                         }
                         for (k, b) in __bindings.clone() {
                             __entries.entry(k.clone()).or_insert_with(|| {
-                                crate::ledger::records::RollbackEntry::new(
+                                crate::ledger::records::SnapshotEntry::new(
                                     crate::identity::GenerationId::new("gen-missing".to_string()),
                                     crate::identity::ArtifactRef {
                                         release: crate::identity::test_release_id("rel-missing"),
@@ -854,7 +854,7 @@ impl LocalStore {
                                 )
                             });
                         }
-                        LedgerRollback::from_entries(__entries)
+                        TargetSnapshot::from_entries(__entries)
                     },
                     crate::identity::NonEmptySlotSet::try_new(BTreeSet::new()).unwrap(),
                     BTreeSet::new(),

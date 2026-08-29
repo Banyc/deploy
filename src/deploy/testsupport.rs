@@ -404,7 +404,7 @@ pub(crate) fn seed_snapshot(
                             > = bindings;
                             let mut __entries: BTreeMap<
                                 crate::identity::SlotId,
-                                crate::ledger::records::RollbackEntry,
+                                crate::ledger::records::SnapshotEntry,
                             > = BTreeMap::new();
                             for (k, v) in __slots.clone() {
                                 let b = __bindings.get(&k).cloned().unwrap_or(
@@ -415,7 +415,7 @@ pub(crate) fn seed_snapshot(
                                 );
                                 __entries.insert(
                                     k.clone(),
-                                    crate::ledger::records::RollbackEntry::new(
+                                    crate::ledger::records::SnapshotEntry::new(
                                         v.generation.clone(),
                                         v.assignment.artifact.clone(),
                                         b,
@@ -424,7 +424,7 @@ pub(crate) fn seed_snapshot(
                             }
                             for (k, b) in __bindings.clone() {
                                 __entries.entry(k.clone()).or_insert_with(|| {
-                                    crate::ledger::records::RollbackEntry::new(
+                                    crate::ledger::records::SnapshotEntry::new(
                                         crate::identity::GenerationId::new(
                                             "gen-missing".to_string(),
                                         ),
@@ -441,7 +441,7 @@ pub(crate) fn seed_snapshot(
                                     )
                                 });
                             }
-                            crate::ledger::records::LedgerRollback::from_entries(__entries)
+                            crate::ledger::records::TargetSnapshot::from_entries(__entries)
                         },
                         crate::identity::NonEmptySlotSet::try_new(slots.keys().cloned()).unwrap(),
                         slots.keys().cloned().collect(),
@@ -964,7 +964,7 @@ pub(crate) fn single_attempt(h: &RecoveryHarness) -> LedgerIntentReport {
 
 /// The rollback payload of a successful ledger entry (the test view of
 /// the `DeploymentSnapshot` fields: `slots`, `bindings`).
-pub(crate) fn rollback_of(entry: &LedgerEntry) -> &crate::ledger::LedgerRollback {
+pub(crate) fn rollback_of(entry: &LedgerEntry) -> &crate::ledger::TargetSnapshot {
     match &entry
         .terminal
         .as_ref()

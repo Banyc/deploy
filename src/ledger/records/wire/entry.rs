@@ -48,7 +48,7 @@ mod tests_entry {
     use crate::ledger::records::SlotOutcomeKind;
     use crate::ledger::records::{DeploymentIntent, LedgerIntentWire};
     use crate::ledger::records::{
-        DeploymentStatus, LedgerRollback, Observation, ObservationError, ObservationWire,
+        DeploymentStatus, TargetSnapshot, Observation, ObservationError, ObservationWire,
         ObservedGeneration, ObservedGenerationWire, PhysicalBinding, SlotAttemptStateWire,
         SlotResult,
     };
@@ -174,7 +174,7 @@ mod tests_entry {
                     > = keys.iter().map(|k| (k.clone(), binding(k))).collect();
                     let mut __entries: BTreeMap<
                         crate::identity::SlotId,
-                        crate::ledger::records::RollbackEntry,
+                        crate::ledger::records::SnapshotEntry,
                     > = BTreeMap::new();
                     for (k, v) in __slots.clone() {
                         let b = __bindings.get(&k).cloned().unwrap_or(
@@ -185,7 +185,7 @@ mod tests_entry {
                         );
                         __entries.insert(
                             k.clone(),
-                            crate::ledger::records::RollbackEntry::new(
+                            crate::ledger::records::SnapshotEntry::new(
                                 v.generation.clone(),
                                 v.assignment.artifact.clone(),
                                 b,
@@ -194,7 +194,7 @@ mod tests_entry {
                     }
                     for (k, b) in __bindings.clone() {
                         __entries.entry(k.clone()).or_insert_with(|| {
-                            crate::ledger::records::RollbackEntry::new(
+                            crate::ledger::records::SnapshotEntry::new(
                                 crate::identity::GenerationId::new("gen-missing".to_string()),
                                 crate::identity::ArtifactRef {
                                     release: crate::identity::test_release_id("rel-missing"),
@@ -207,7 +207,7 @@ mod tests_entry {
                             )
                         });
                     }
-                    LedgerRollback::from_entries(__entries)
+                    TargetSnapshot::from_entries(__entries)
                 }),
                 selected_membership: keys.to_vec(),
                 full_membership: keys.to_vec(),
@@ -577,7 +577,7 @@ mod tests_entry {
                 > = BTreeMap::new();
                 let mut __entries: BTreeMap<
                     crate::identity::SlotId,
-                    crate::ledger::records::RollbackEntry,
+                    crate::ledger::records::SnapshotEntry,
                 > = BTreeMap::new();
                 for (k, v) in __slots.clone() {
                     let b = __bindings.get(&k).cloned().unwrap_or(
@@ -588,7 +588,7 @@ mod tests_entry {
                     );
                     __entries.insert(
                         k.clone(),
-                        crate::ledger::records::RollbackEntry::new(
+                        crate::ledger::records::SnapshotEntry::new(
                             v.generation.clone(),
                             v.assignment.artifact.clone(),
                             b,
@@ -597,7 +597,7 @@ mod tests_entry {
                 }
                 for (k, b) in __bindings.clone() {
                     __entries.entry(k.clone()).or_insert_with(|| {
-                        crate::ledger::records::RollbackEntry::new(
+                        crate::ledger::records::SnapshotEntry::new(
                             crate::identity::GenerationId::new("gen-missing".to_string()),
                             crate::identity::ArtifactRef {
                                 release: crate::identity::test_release_id("rel-missing"),
@@ -608,7 +608,7 @@ mod tests_entry {
                         )
                     });
                 }
-                LedgerRollback::from_entries(__entries)
+                TargetSnapshot::from_entries(__entries)
             });
         } else {
             t.rollback = None;
@@ -622,13 +622,13 @@ mod tests_entry {
                 let gr = gen_ref_for(&extra);
                 entries.insert(
                     extra.clone(),
-                    crate::ledger::records::RollbackEntry::new(
+                    crate::ledger::records::SnapshotEntry::new(
                         gr.generation,
                         gr.assignment.artifact,
                         binding(&extra),
                     ),
                 );
-                *rb = crate::ledger::records::LedgerRollback::from_entries(entries);
+                *rb = crate::ledger::records::TargetSnapshot::from_entries(entries);
             }
         } else {
             t.rollback = Some({
@@ -640,7 +640,7 @@ mod tests_entry {
                 > = BTreeMap::new();
                 let mut __entries: BTreeMap<
                     crate::identity::SlotId,
-                    crate::ledger::records::RollbackEntry,
+                    crate::ledger::records::SnapshotEntry,
                 > = BTreeMap::new();
                 for (k, v) in __slots.clone() {
                     let b = __bindings.get(&k).cloned().unwrap_or(
@@ -651,7 +651,7 @@ mod tests_entry {
                     );
                     __entries.insert(
                         k.clone(),
-                        crate::ledger::records::RollbackEntry::new(
+                        crate::ledger::records::SnapshotEntry::new(
                             v.generation.clone(),
                             v.assignment.artifact.clone(),
                             b,
@@ -660,7 +660,7 @@ mod tests_entry {
                 }
                 for (k, b) in __bindings.clone() {
                     __entries.entry(k.clone()).or_insert_with(|| {
-                        crate::ledger::records::RollbackEntry::new(
+                        crate::ledger::records::SnapshotEntry::new(
                             crate::identity::GenerationId::new("gen-missing".to_string()),
                             crate::identity::ArtifactRef {
                                 release: crate::identity::test_release_id("rel-missing"),
@@ -671,7 +671,7 @@ mod tests_entry {
                         )
                     });
                 }
-                LedgerRollback::from_entries(__entries)
+                TargetSnapshot::from_entries(__entries)
             });
         }
     }
@@ -725,7 +725,7 @@ mod tests_entry {
                     > = BTreeMap::new();
                     let mut __entries: BTreeMap<
                         crate::identity::SlotId,
-                        crate::ledger::records::RollbackEntry,
+                        crate::ledger::records::SnapshotEntry,
                     > = BTreeMap::new();
                     for (k, v) in __slots.clone() {
                         let b = __bindings.get(&k).cloned().unwrap_or(
@@ -736,7 +736,7 @@ mod tests_entry {
                         );
                         __entries.insert(
                             k.clone(),
-                            crate::ledger::records::RollbackEntry::new(
+                            crate::ledger::records::SnapshotEntry::new(
                                 v.generation.clone(),
                                 v.assignment.artifact.clone(),
                                 b,
@@ -745,7 +745,7 @@ mod tests_entry {
                     }
                     for (k, b) in __bindings.clone() {
                         __entries.entry(k.clone()).or_insert_with(|| {
-                            crate::ledger::records::RollbackEntry::new(
+                            crate::ledger::records::SnapshotEntry::new(
                                 crate::identity::GenerationId::new("gen-missing".to_string()),
                                 crate::identity::ArtifactRef {
                                     release: crate::identity::test_release_id("rel-missing"),
@@ -758,7 +758,7 @@ mod tests_entry {
                             )
                         });
                     }
-                    LedgerRollback::from_entries(__entries)
+                    TargetSnapshot::from_entries(__entries)
                 });
             }
             other => panic!("unexpected wire status {other:?}"),
@@ -777,7 +777,7 @@ mod tests_entry {
             {
                 let mut entries = rb.clone().into_entries();
                 entries.remove(&key);
-                *rb = crate::ledger::records::LedgerRollback::from_entries(entries);
+                *rb = crate::ledger::records::TargetSnapshot::from_entries(entries);
             }
         } else {
             // Only Successful may carry a rollback; a failed status with one
@@ -791,7 +791,7 @@ mod tests_entry {
                 > = BTreeMap::new();
                 let mut __entries: BTreeMap<
                     crate::identity::SlotId,
-                    crate::ledger::records::RollbackEntry,
+                    crate::ledger::records::SnapshotEntry,
                 > = BTreeMap::new();
                 for (k, v) in __slots.clone() {
                     let b = __bindings.get(&k).cloned().unwrap_or(
@@ -802,7 +802,7 @@ mod tests_entry {
                     );
                     __entries.insert(
                         k.clone(),
-                        crate::ledger::records::RollbackEntry::new(
+                        crate::ledger::records::SnapshotEntry::new(
                             v.generation.clone(),
                             v.assignment.artifact.clone(),
                             b,
@@ -811,7 +811,7 @@ mod tests_entry {
                 }
                 for (k, b) in __bindings.clone() {
                     __entries.entry(k.clone()).or_insert_with(|| {
-                        crate::ledger::records::RollbackEntry::new(
+                        crate::ledger::records::SnapshotEntry::new(
                             crate::identity::GenerationId::new("gen-missing".to_string()),
                             crate::identity::ArtifactRef {
                                 release: crate::identity::test_release_id("rel-missing"),
@@ -822,7 +822,7 @@ mod tests_entry {
                         )
                     });
                 }
-                LedgerRollback::from_entries(__entries)
+                TargetSnapshot::from_entries(__entries)
             });
         }
     }
@@ -1071,14 +1071,14 @@ mod tests_entry {
             .expect("a Successful terminal carries its rollback");
         let slot_keys: BTreeSet<SlotId> = rb.keys().cloned().collect();
         let new_slots = apply_key_op(&slot_keys, ops[3]);
-        *rb = crate::ledger::records::LedgerRollback::from_entries(
+        *rb = crate::ledger::records::TargetSnapshot::from_entries(
             new_slots
                 .iter()
                 .map(|k| {
                     let gr = gen_ref_for(k);
                     (
                         k.clone(),
-                        crate::ledger::records::RollbackEntry::new(
+                        crate::ledger::records::SnapshotEntry::new(
                             gr.generation,
                             gr.assignment.artifact,
                             binding(k),
@@ -1294,14 +1294,14 @@ mod tests_entry {
             .expect("a Successful terminal carries its rollback");
         let slot_keys: BTreeSet<SlotId> = rb.keys().cloned().collect();
         let new_slots = apply_key_op(&slot_keys, ops[3]);
-        *rb = crate::ledger::records::LedgerRollback::from_entries(
+        *rb = crate::ledger::records::TargetSnapshot::from_entries(
             new_slots
                 .iter()
                 .map(|k| {
                     let gr = gen_ref_for(k);
                     (
                         k.clone(),
-                        crate::ledger::records::RollbackEntry::new(
+                        crate::ledger::records::SnapshotEntry::new(
                             gr.generation,
                             gr.assignment.artifact,
                             binding(k),
@@ -1671,7 +1671,7 @@ mod tests_entry {
                         > = bindings;
                         let mut __entries: BTreeMap<
                             crate::identity::SlotId,
-                            crate::ledger::records::RollbackEntry,
+                            crate::ledger::records::SnapshotEntry,
                         > = BTreeMap::new();
                         for (k, v) in __slots.clone() {
                             let b = __bindings.get(&k).cloned().unwrap_or(
@@ -1682,7 +1682,7 @@ mod tests_entry {
                             );
                             __entries.insert(
                                 k.clone(),
-                                crate::ledger::records::RollbackEntry::new(
+                                crate::ledger::records::SnapshotEntry::new(
                                     v.generation.clone(),
                                     v.assignment.artifact.clone(),
                                     b,
@@ -1691,7 +1691,7 @@ mod tests_entry {
                         }
                         for (k, b) in __bindings.clone() {
                             __entries.entry(k.clone()).or_insert_with(|| {
-                                crate::ledger::records::RollbackEntry::new(
+                                crate::ledger::records::SnapshotEntry::new(
                                     crate::identity::GenerationId::new("gen-missing".to_string()),
                                     crate::identity::ArtifactRef {
                                         release: crate::identity::test_release_id("rel-missing"),
@@ -1704,7 +1704,7 @@ mod tests_entry {
                                 )
                             });
                         }
-                        LedgerRollback::from_entries(__entries)
+                        TargetSnapshot::from_entries(__entries)
                     }),
                     selected_membership: keys.clone(),
                     full_membership: keys.clone(),
@@ -1848,12 +1848,12 @@ mod tests_entry {
                 {
                     let mut entries = rb.clone().into_entries();
                     let entry = entries.get_mut(&first).expect("the slot is slotted");
-                    *entry = crate::ledger::records::RollbackEntry::new(
+                    *entry = crate::ledger::records::SnapshotEntry::new(
                         test_generation_id("rb-mismatch"),
                         entry.artifact().clone(),
                         entry.binding().clone(),
                     );
-                    *rb = crate::ledger::records::LedgerRollback::from_entries(entries);
+                    *rb = crate::ledger::records::TargetSnapshot::from_entries(entries);
                 }
             }
             2 => {
@@ -1981,13 +1981,13 @@ mod tests_entry {
             let mut entries = rb.clone().into_entries();
             entries.insert(
                 slot(9),
-                crate::ledger::records::RollbackEntry::new(
+                crate::ledger::records::SnapshotEntry::new(
                     gr.generation,
                     gr.assignment.artifact,
                     binding(&slot(9)),
                 ),
             );
-            *rb = crate::ledger::records::LedgerRollback::from_entries(entries);
+            *rb = crate::ledger::records::TargetSnapshot::from_entries(entries);
         }
         let entries = write_pair_ledger(&(intent, terminal)).expect(
             "adding the same key to all four sets keeps the equations satisfied — the read succeeds",
@@ -2021,13 +2021,13 @@ mod tests_entry {
             let mut entries = rb.clone().into_entries();
             entries.insert(
                 slot(3),
-                crate::ledger::records::RollbackEntry::new(
+                crate::ledger::records::SnapshotEntry::new(
                     gr.generation,
                     gr.assignment.artifact,
                     binding(&slot(3)),
                 ),
             );
-            *rb = crate::ledger::records::LedgerRollback::from_entries(entries);
+            *rb = crate::ledger::records::TargetSnapshot::from_entries(entries);
         }
         let mut intent2 = intent.clone();
         intent2.full_membership.push(slot(3));
@@ -2237,13 +2237,13 @@ mod tests_entry {
             let gr = gen_ref_for(&slot(3));
             entries.insert(
                 slot(3),
-                crate::ledger::records::RollbackEntry::new(
+                crate::ledger::records::SnapshotEntry::new(
                     gr.generation,
                     gr.assignment.artifact,
                     binding(&slot(3)),
                 ),
             );
-            *rb = crate::ledger::records::LedgerRollback::from_entries(entries);
+            *rb = crate::ledger::records::TargetSnapshot::from_entries(entries);
         }
         assert!(
             !membership_equations_hold(&bad),

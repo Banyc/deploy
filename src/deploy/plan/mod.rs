@@ -19,7 +19,7 @@ use crate::identity::SlotId;
 use crate::identity::TreeDigest;
 use crate::identity::VariantName;
 use crate::ledger::FrozenSlotTopology;
-use crate::ledger::LedgerRollback;
+use crate::ledger::TargetSnapshot;
 use crate::ledger::PhysicalBinding;
 use crate::ledger::PlanOrigin;
 use crate::ledger::PushRef;
@@ -127,7 +127,7 @@ impl PlannedResolution {
 pub(crate) fn latest_successful_rollback(
     store: &LocalStore,
     target: &str,
-) -> Result<Option<LedgerRollback>> {
+) -> Result<Option<TargetSnapshot>> {
     for entry in store.read_ledger(target)?.into_iter().rev() {
         if let Some(t) = entry.terminal
             && let crate::ledger::TerminalDisposition::Successful(st) = t.disposition
@@ -556,7 +556,7 @@ mod plan_tests {
         test_deployment_id, test_generation_id, test_tree_digest,
     };
     use crate::ledger::{
-        DeploymentIntent, DesiredGeneration, IntentSlot, LedgerRollback, LedgerTerminal,
+        DeploymentIntent, DesiredGeneration, IntentSlot, TargetSnapshot, LedgerTerminal,
         NonEmptySlotTable, PhysicalBinding, TerminalDisposition,
     };
     use crate::verify::release::RELEASE_RECORD_SCHEMA_VERSION;
@@ -802,7 +802,7 @@ interval_seconds = 0
                                 > = bindings;
                                 let mut __entries: BTreeMap<
                                     crate::identity::SlotId,
-                                    crate::ledger::records::RollbackEntry,
+                                    crate::ledger::records::SnapshotEntry,
                                 > = BTreeMap::new();
                                 for (k, v) in __slots.clone() {
                                     let b = __bindings.get(&k).cloned().unwrap_or(
@@ -813,7 +813,7 @@ interval_seconds = 0
                                     );
                                     __entries.insert(
                                         k.clone(),
-                                        crate::ledger::records::RollbackEntry::new(
+                                        crate::ledger::records::SnapshotEntry::new(
                                             v.generation.clone(),
                                             v.assignment.artifact.clone(),
                                             b,
@@ -822,7 +822,7 @@ interval_seconds = 0
                                 }
                                 for (k, b) in __bindings.clone() {
                                     __entries.entry(k.clone()).or_insert_with(|| {
-                                        crate::ledger::records::RollbackEntry::new(
+                                        crate::ledger::records::SnapshotEntry::new(
                                             crate::identity::GenerationId::new(
                                                 "gen-missing".to_string(),
                                             ),
@@ -839,7 +839,7 @@ interval_seconds = 0
                                         )
                                     });
                                 }
-                                LedgerRollback::from_entries(__entries)
+                                TargetSnapshot::from_entries(__entries)
                             },
                             crate::identity::NonEmptySlotSet::try_new(slots.keys().cloned())
                                 .unwrap(),
@@ -1559,7 +1559,7 @@ interval_seconds = 0
             recorded_at: "2026-01-01T00:00:00Z".to_string(),
             disposition: TerminalDisposition::Successful(
                 crate::ledger::SuccessfulTerminal::new_unchecked(
-                    crate::ledger::records::LedgerRollback::from_entries(BTreeMap::new()),
+                    crate::ledger::records::TargetSnapshot::from_entries(BTreeMap::new()),
                     crate::identity::NonEmptySlotSet::try_new(BTreeSet::from([slot_p1.clone()]))
                         .unwrap(),
                     BTreeSet::from([slot_p1.clone()]),
@@ -1627,7 +1627,7 @@ interval_seconds = 0
                     );
                     m
                 },
-                rollback: Some(crate::ledger::records::LedgerRollback::from_entries(
+                rollback: Some(crate::ledger::records::TargetSnapshot::from_entries(
                     std::collections::BTreeMap::new(),
                 )),
                 selected_membership: vec![slot_p1.clone()],
