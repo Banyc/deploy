@@ -33,7 +33,7 @@ use crate::identity::AbsoluteDeployDir;
 use crate::remote::transport::{LocalTransport, Remote};
 
 /// THE ONE AUTHORITATIVE LOCAL DEPLOYMENT ROOT: the canonical directory a
-/// LOCAL slot operates on. It is the slot's validated [`AbsoluteDeployDir`]
+/// LOCAL slot operates on. It is the slot's validated [`crate::identity::AbsoluteDeployDir`]
 /// (absolute, TRAVERSAL-FREE — no `.`/`..` component at any position —
 /// normalized canonical form, the filesystem root refused). A local
 /// connection is PATHLESS ([`ServerConnection::Local`] carries no endpoint),
@@ -41,7 +41,7 @@ use crate::remote::transport::{LocalTransport, Remote};
 /// endpoint to parse or compare, and every consumer sees the same value:
 ///
 /// * [`create_remote`] validates the slot's deploy_dir through the
-///   [`AbsoluteDeployDir`] scalar and roots [`LocalTransport`] exactly there
+///   [`crate::identity::AbsoluteDeployDir`] scalar and roots [`LocalTransport`] exactly there
 ///   — the canonical form the raw -> domain conversion already stored in the
 ///   validated [`crate::config::ProjectConfig`] graph
 ///   ([`crate::config::SlotConfig::with_canonical_deploy_dir`]).
@@ -79,7 +79,7 @@ pub fn create_remote(
             // parse or compare (the mismatch class is gone by construction:
             // a local server can never reference a root other than the
             // slot's deploy_dir). The deploy_dir is still validated through
-            // the [`AbsoluteDeployDir`] scalar here — a relative path, ANY
+            // the `AbsoluteDeployDir` scalar here — a relative path, ANY
             // traversal component (`.`/`..` at any position), or the
             // filesystem root is rejected, and the accepted root is the
             // validated, normalized canonical form the config graph already
@@ -157,7 +157,7 @@ mod tests {
 
     /// A local connection is PATHLESS: the slot's deploy_dir IS the root —
     /// there is no endpoint to parse or compare. The deploy_dir is validated
-    /// through the [`AbsoluteDeployDir`] gate: a traversal component
+    /// through the `AbsoluteDeployDir` gate: a traversal component
     /// (`.`/`..`) at ANY position is rejected, even when the raw path is
     /// absolute and would otherwise reach a real directory.
     #[test]
@@ -182,7 +182,7 @@ mod tests {
     }
 
     /// A relative slot deploy_dir is rejected (the root is a validated
-    /// [`AbsoluteDeployDir`], never a raw `PathBuf`).
+    /// `AbsoluteDeployDir`, never a raw `PathBuf`).
     #[test]
     fn create_remote_local_rejects_relative_deploy_dir() {
         let err = create_remote(&SysEnv::from_process(), &local_server(), Path::new("rel/x"))
@@ -222,7 +222,7 @@ mod tests {
     }
 
     /// The filesystem root (in any spelling that normalizes to it) is refused
-    /// as a local root — the same rule the [`AbsoluteDeployDir`] parse
+    /// as a local root — the same rule the `AbsoluteDeployDir` parse
     /// enforces.
     #[test]
     fn create_remote_local_rejects_root_deploy_dir() {

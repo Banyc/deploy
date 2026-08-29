@@ -11,7 +11,7 @@
 //!   domain boundary — the CLI accepts a bare 64-hex digest, converted
 //!   first), [`identity::scalars`] (the validated scalar value types
 //!   [`Identifier`], [`ApplicationStoreKey`], [`BatchSize`] (nonzero u64),
-//!   [`CapacityPercent`] (0..=100), [`AbsoluteDeployDir`] (absolute,
+//!   [`CapacityPercent`] (0..=100), [`crate::identity::AbsoluteDeployDir`] (absolute,
 //!   traversal-free), [`BehaviorDigest`], [`Timestamp`],
 //!   [`RolloutGroupName`], [`Host`], [`SshUser`]), and the ID FAMILY
 //!   [`identity::id`] — a deeper group of the format-validated identity

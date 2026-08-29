@@ -82,7 +82,7 @@ impl SlotConfig {
     }
 
     /// The slot with its deploy_dir stored in the validated CANONICAL form:
-    /// the current deploy_dir is parsed through the [`AbsoluteDeployDir`]
+    /// the current deploy_dir is parsed through the [`crate::identity::AbsoluteDeployDir`]
     /// scalar (absolute, TRAVERSAL-FREE, normalized — no `.`/`..` at any
     /// position, the filesystem root refused) and a CLONE carrying the
     /// canonical path is returned. Fails exactly when the deploy_dir is not a

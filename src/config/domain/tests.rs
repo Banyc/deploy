@@ -3100,7 +3100,7 @@ fn loaded_config_always_constructs_its_store() {
 //
 // The deploy_dir IS the root, so "transport creation succeeds for every
 // slot" is exactly "every slot's deploy_dir is a valid
-// [`AbsoluteDeployDir`]" plus the graph-level rules the conversion gates
+// `AbsoluteDeployDir`" plus the graph-level rules the conversion gates
 // independently of any endpoint (injective local effective roots — two
 // local slots never share a directory; no legacy `local://` endpoint; one
 // slot per (server, target) pair). The property therefore asserts on every
@@ -3118,7 +3118,7 @@ fn loaded_config_always_constructs_its_store() {
 
 /// A valid absolute deploy_dir path, possibly in a MESSY spelling: absolute
 /// and traversal-free, but with a trailing slash or doubled separators that
-/// [`AbsoluteDeployDir`] folds into the same canonical form.
+/// `AbsoluteDeployDir` folds into the same canonical form.
 fn valid_deploy_dir() -> impl Strategy<Value = String> {
     prop::collection::vec(
         prop::sample::select(&["srv", "app", "deploy", "x1", "x2"]),
@@ -3313,7 +3313,7 @@ fn raw_project_for(graph: &ArbitraryGraph) -> RawProject {
 }
 
 /// The canonical form of a deploy_dir (`""` when it is not a valid
-/// [`AbsoluteDeployDir`]).
+/// `AbsoluteDeployDir`).
 fn canonical_or_empty(s: &str) -> String {
     AbsoluteDeployDir::parse(s)
         .map(|a| a.as_path().to_string_lossy().into_owned())
@@ -3325,7 +3325,7 @@ proptest! {
     // and SSH servers; arbitrary slot deploy_dirs; several targets with
     // guaranteed memberships), construction succeeds EXACTLY when
     // transport creation succeeds for every slot: every slot's deploy_dir
-    // is a valid [`AbsoluteDeployDir`] (the deploy_dir IS the local root),
+    // is a valid `AbsoluteDeployDir` (the deploy_dir IS the local root),
     // the LOCAL effective roots are injective, no legacy `local://`
     // endpoint is present, and no (server, target) pair is shared. Every
     // ACCEPTED graph therefore creates its transports for EVERY slot —
@@ -3343,7 +3343,7 @@ proptest! {
     #[test]
     fn construction_iff_transport_creation_for_every_slot(graph in arbitrary_graph()) {
         // The transport-creation side, computed from the generated data:
-        // every slot's deploy_dir must be a valid [`AbsoluteDeployDir`]
+        // every slot's deploy_dir must be a valid `AbsoluteDeployDir`
         // (the root IS the deploy_dir), the LOCAL effective roots must be
         // injective (two local slots never share a directory), no (server,
         // deploy_dir) location may be shared by two slots, no legacy

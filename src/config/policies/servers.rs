@@ -64,7 +64,7 @@ pub enum HostIdentity {
 
 /// A server's EXACTLY ONE connection form, consolidating the raw
 /// `address`/`user`/`port`/identity fields: `Local` for the pathless local
-/// connection kind (the slot's typed [`AbsoluteDeployDir`] is the SOLE
+/// connection kind (the slot's typed [`crate::identity::AbsoluteDeployDir`] is the SOLE
 /// physical root — the connection carries no root path of its own, so a
 /// local server can never reference a root that diverges from the slot's
 /// deploy_dir), or `Ssh` carrying the validated host, deployment account,
@@ -76,7 +76,7 @@ pub enum HostIdentity {
 pub enum ServerConnection {
     /// The pathless local connection kind: NO address path is carried — the
     /// transport root is the referencing slot's typed deploy_dir
-    /// ([`AbsoluteDeployDir`]), the one authoritative physical root, so there
+    /// ([`crate::identity::AbsoluteDeployDir`]), the one authoritative physical root, so there
     /// is no endpoint for the transport to parse or compare. The raw
     /// `address` marker is the literal `local` (see [`is_local_address`]); a
     /// legacy `local://<path>` address is rejected by the conversion with
@@ -184,7 +184,7 @@ impl ServerDef {
 
 /// The raw `address` marker of a LOCAL server: a pathless connection kind.
 /// The marker carries NO root path — the referencing slot's typed
-/// [`AbsoluteDeployDir`] is the SOLE physical root, so a `local` server can
+/// [`crate::identity::AbsoluteDeployDir`] is the SOLE physical root, so a `local` server can
 /// never reference a root that diverges from the slot's deploy_dir (the
 /// mismatch class that used to fail at transport creation cannot exist).
 pub(crate) const LOCAL_ADDRESS_MARKER: &str = "local";

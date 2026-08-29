@@ -480,7 +480,7 @@ impl TryFrom<RawProject> for ProjectConfig {
                     // stored in the validated CANONICAL form (the ONE
                     // authoritative effective root each local slot operates
                     // on): the raw spelling is normalized through the
-                    // [`AbsoluteDeployDir`] scalar — a relative, traversal-
+                    // `AbsoluteDeployDir` scalar — a relative, traversal-
                     // carrying, or root deploy_dir is rejected HERE, and the
                     // location-uniqueness rules below compare effective
                     // roots, not mere spellings (`/srv/a` and `/srv//a/` are
@@ -676,7 +676,7 @@ impl TryFrom<RawProject> for ProjectConfig {
                         )));
                     }
                 }
-                // The deploy_dir is validated by the [`AbsoluteDeployDir`]
+                // The deploy_dir is validated by the `AbsoluteDeployDir`
                 // scalar (absolute path on the server). The slots entered the
                 // domain graph already in their CANONICAL form (built above
                 // through [`SlotConfig::with_canonical_deploy_dir`]), so this
