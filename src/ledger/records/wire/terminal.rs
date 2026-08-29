@@ -321,7 +321,11 @@ pub struct LedgerTerminalWire {
     pub status: DeploymentStatus,
     pub recorded_at: String,
     pub outcomes: BTreeMap<SlotId, SlotResult>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "crate::ledger::records::deserialize_opt_strict_rollback",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub rollback: Option<LedgerRollback>,
     /// The SELECTED membership — the slots this deployment actually
     /// selected / deployed (the outcomes' keys; a group push's group

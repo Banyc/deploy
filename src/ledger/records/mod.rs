@@ -203,10 +203,66 @@ pub struct PhysicalBinding {
 /// deployment: the snapshot payload of the attempt — one entry per slot
 /// carrying its generation, artifact, and physical binding. The payload IS
 /// the domain struct serialized directly; the schema version gates old shapes.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct LedgerRollback {
-    #[serde(default)]
     entries: BTreeMap<SlotId, RollbackEntry>,
+}
+
+/// The STRICT wire shape for the rollback payload: entries REQUIRED,
+/// unknown fields REJECTED (`deny_unknown_fields`), and every slot key
+/// unique (a map-visitor deserializer refuses a duplicate — ambiguous
+/// JSON can never read as a valid rollback). Deserialize-only: the writer
+/// emits `LedgerRollback`'s own `Serialize` (the same `{"entries": ...}`).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LedgerRollbackWire {
+    #[serde(deserialize_with = "deserialize_unique_entries")]
+    entries: BTreeMap<SlotId, RollbackEntry>,
+}
+
+fn deserialize_unique_entries<'de, D>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<SlotId, RollbackEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct UniqueEntriesVisitor;
+    impl<'de> serde::de::Visitor<'de> for UniqueEntriesVisitor {
+        type Value = BTreeMap<SlotId, RollbackEntry>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a map with unique slot keys")
+        }
+        fn visit_map<M>(self, mut access: M) -> std::result::Result<Self::Value, M::Error>
+        where
+            M: serde::de::MapAccess<'de>,
+        {
+            let mut entries = BTreeMap::new();
+            while let Some((slot, entry)) = access.next_entry::<SlotId, RollbackEntry>()? {
+                if entries.insert(slot.clone(), entry).is_some() {
+                    return Err(serde::de::Error::custom(format!(
+                        "duplicate rollback slot '{slot}'"
+                    )));
+                }
+            }
+            Ok(entries)
+        }
+    }
+    deserializer.deserialize_map(UniqueEntriesVisitor)
+}
+
+impl From<LedgerRollbackWire> for LedgerRollback {
+    fn from(w: LedgerRollbackWire) -> Self {
+        LedgerRollback::from_entries(w.entries)
+    }
+}
+
+pub(crate) fn deserialize_opt_strict_rollback<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<LedgerRollback>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<LedgerRollbackWire>::deserialize(deserializer).map(|o| o.map(Into::into))
 }
 impl PartialEq for LedgerRollback {
     fn eq(&self, other: &Self) -> bool {
@@ -1641,7 +1697,8 @@ mod tests {
         assert_eq!(rb.releases(), BTreeSet::from([test_release_id("slot-1")]));
         let json = serde_json::to_string(&rb).unwrap();
         assert!(json.contains("\"entries\""));
-        let rb2: LedgerRollback = serde_json::from_str(&json).unwrap();
+        let wire: LedgerRollbackWire = serde_json::from_str(&json).unwrap();
+        let rb2: LedgerRollback = wire.into();
         assert_eq!(rb2.releases(), rb.releases());
         assert_eq!(rb2.len(), 1);
     }

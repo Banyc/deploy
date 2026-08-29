@@ -207,109 +207,7 @@ mod tests_rollback {
         assert_eq!(e.generation(), &expected.generation);
         assert!(rb.get(&p2).is_some());
     }
-    fn arb_json_value() -> impl proptest::strategy::Strategy<Value = serde_json::Value> {
-        use proptest::prelude::*;
-        let leaf = prop_oneof![
-            any::<bool>().prop_map(serde_json::Value::Bool),
-            any::<i64>().prop_map(|i| serde_json::Value::Number(i.into())),
-            any::<String>().prop_map(serde_json::Value::String),
-        ];
-        leaf.prop_recursive(3, 32, 8, |inner| {
-            prop_oneof![
-                proptest::collection::vec(inner.clone(), 0..3).prop_map(serde_json::Value::Array),
-                proptest::collection::btree_map(any::<String>(), inner.clone(), 0..3)
-                    .prop_map(|m| serde_json::Value::Object(m.into_iter().collect())),
-            ]
-        })
-    }
-    fn arb_rollback_json() -> impl proptest::strategy::Strategy<Value = serde_json::Value> {
-        use proptest::prelude::*;
-        let valid_one = {
-            let mut m = BTreeMap::new();
-            m.insert(
-                SlotId::new("slot-1".to_string()),
-                RollbackEntry::new(
-                    test_generation_id("gen-1"),
-                    ArtifactRef {
-                        release: crate::identity::test_release_id("rel-1"),
-                        variant: VariantName::new("standard".to_string()),
-                        tree: test_tree_digest("t1"),
-                    },
-                    PhysicalBinding {
-                        server: ServerId::new("s1"),
-                        deploy_dir: "/srv/deploy/slot-1".to_string(),
-                    },
-                ),
-            );
-            let rb = LedgerRollback::from_entries(m);
-            serde_json::to_value(&rb).unwrap()
-        };
-        let mut m2 = BTreeMap::new();
-        m2.insert(
-            SlotId::new("slot-1".to_string()),
-            RollbackEntry::new(
-                test_generation_id("gen-1"),
-                ArtifactRef {
-                    release: crate::identity::test_release_id("rel-1"),
-                    variant: VariantName::new("standard".to_string()),
-                    tree: test_tree_digest("t1"),
-                },
-                PhysicalBinding {
-                    server: ServerId::new("s1"),
-                    deploy_dir: "/srv/deploy/slot-1".to_string(),
-                },
-            ),
-        );
-        m2.insert(
-            SlotId::new("slot-2".to_string()),
-            RollbackEntry::new(
-                test_generation_id("gen-2"),
-                ArtifactRef {
-                    release: crate::identity::test_release_id("rel-2"),
-                    variant: VariantName::new("standard".to_string()),
-                    tree: test_tree_digest("t2"),
-                },
-                PhysicalBinding {
-                    server: ServerId::new("s2"),
-                    deploy_dir: "/srv/deploy/slot-2".to_string(),
-                },
-            ),
-        );
-        let valid_two = serde_json::to_value(LedgerRollback::from_entries(m2)).unwrap();
-        prop_oneof![arb_json_value(), Just(valid_one), Just(valid_two)]
-    }
-    proptest::proptest! {
-        #![proptest_config(proptest::test_runner::Config { cases: 64, rng_seed: proptest::test_runner::RngSeed::Fixed(0x5EED_5EED), failure_persistence: None, ..proptest::test_runner::Config::default() })]
-        #[test]
-        fn prop_rollback_arbitrary_json_is_structurally_complete(v in arb_rollback_json()) {
-            let parsed = serde_json::from_value::<LedgerRollback>(v.clone());
-            if let Ok(rb) = parsed {
-                let json2 = serde_json::to_value(&rb).unwrap();
-                let rb2: LedgerRollback = serde_json::from_value(json2).unwrap();
-                prop_assert_eq!(rb.clone(), rb2);
-                prop_assert_eq!(rb.keys().count(), rb.len());
-                let keys: std::collections::BTreeSet<_> = rb.keys().cloned().collect();
-                prop_assert_eq!(keys.len(), rb.len());
-            }
-            // deterministic malformed checks
-            let bad_missing_gen = serde_json::json!({"entries": {"slot-1": {"artifact": {"release": "rel-sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "variant": "standard", "tree": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, "binding": {"server": "s1", "deploy_dir": "/srv/deploy/slot-1"}}}});
-            prop_assert!(serde_json::from_value::<LedgerRollback>(bad_missing_gen).is_err());
-            let bad_gen_as_number = serde_json::json!({"entries": {"slot-1": {"generation": 123, "artifact": {"release": "rel-sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "variant": "standard", "tree": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, "binding": {"server": "s1", "deploy_dir": "/srv/deploy/slot-1"}}}});
-            prop_assert!(serde_json::from_value::<LedgerRollback>(bad_gen_as_number).is_err());
-            let bad_artifact_as_string = serde_json::json!({"entries": {"slot-1": {"generation": "gen-1", "artifact": "not-an-object", "binding": {"server": "s1", "deploy_dir": "/srv/deploy/slot-1"}}}});
-            prop_assert!(serde_json::from_value::<LedgerRollback>(bad_artifact_as_string).is_err());
-            let bad_binding_as_array = serde_json::json!({"entries": {"slot-1": {"generation": "gen-1", "artifact": {"release": "rel-sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "variant": "standard", "tree": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, "binding": []}}});
-            prop_assert!(serde_json::from_value::<LedgerRollback>(bad_binding_as_array).is_err());
-            let bad_entries_not_object = serde_json::json!({"entries": []});
-            prop_assert!(serde_json::from_value::<LedgerRollback>(bad_entries_not_object).is_err());
-            let bad_slot_with_slash = serde_json::json!({"entries": {"slot/with/slash": {"generation": "gen-1", "artifact": {"release": "rel-sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "variant": "standard", "tree": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, "binding": {"server": "s1", "deploy_dir": "/srv/deploy/slot-1"}}}});
-            // slot key with slash is still a string, serde will accept it as SlotId (which allows any safe segment? but our SlotId::new allows any string, so it will succeed; we just check it either succeeds or fails, but the plan says it should FAIL)
-            // For now, just ensure that if it succeeds, it round-trips; the negative direction is covered above.
-            let _ = serde_json::from_value::<LedgerRollback>(bad_slot_with_slash);
-        }
-    }
-    #[test]
-    fn rollback_two_entries_round_trip() {
+    fn fixture_rollback() -> LedgerRollback {
         let mut m = BTreeMap::new();
         m.insert(
             SlotId::new("slot-1".to_string()),
@@ -341,11 +239,86 @@ mod tests_rollback {
                 },
             ),
         );
-        let rb = LedgerRollback::from_entries(m);
-        let json = serde_json::to_value(&rb).unwrap();
-        assert!(json.get("entries").is_some());
-        assert_eq!(json.get("entries").unwrap().as_object().unwrap().len(), 2);
-        let back: LedgerRollback = serde_json::from_value(json).unwrap();
+        LedgerRollback::from_entries(m)
+    }
+
+    fn entry_json(slot: &str, gen_id: &str, rel: &str, tree: &str, server: &str) -> String {
+        let e = RollbackEntry::new(
+            test_generation_id(gen_id),
+            ArtifactRef {
+                release: crate::identity::test_release_id(rel),
+                variant: VariantName::new("standard".to_string()),
+                tree: test_tree_digest(tree),
+            },
+            PhysicalBinding {
+                server: ServerId::new(server),
+                deploy_dir: format!("/srv/deploy/{slot}"),
+            },
+        );
+        serde_json::to_string(&e).unwrap()
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config { cases: 64, rng_seed: proptest::test_runner::RngSeed::Fixed(0x5EED_5EED), failure_persistence: None, ..proptest::test_runner::Config::default() })]
+        #[test]
+        fn prop_rollback_strict_raw_string_requires_entries_and_unique_slots(_dummy in proptest::strategy::Just(())) {
+            // VALID rollback JSON STRING — deterministic fixture via Serialize.
+            let rb = fixture_rollback();
+            let valid = serde_json::to_string(&rb).unwrap();
+            let parsed: crate::ledger::records::LedgerRollbackWire = serde_json::from_str(&valid).unwrap();
+            let domain: LedgerRollback = parsed.into();
+            prop_assert_eq!(domain, rb);
+
+            // (a) DUPLICATE slot key inside entries — second occurrence of slot-1 with different entry.
+            let dup_entry = entry_json("slot-1", "gen-9", "rel-9", "t9", "s9");
+            // valid is {"entries":{"slot-1":{...},"slot-2":{...}}} — add ,"slot-1":<dup> inside entries.
+            let dup_json = {
+                let base = &valid[..valid.len() - 2];
+                format!("{},\"slot-1\":{}}}", base, dup_entry)
+            };
+            let err = serde_json::from_str::<crate::ledger::records::LedgerRollbackWire>(&dup_json).unwrap_err();
+            prop_assert!(err.to_string().contains("duplicate rollback slot"), "expected duplicate error, got: {err} / dup_json={dup_json}");
+
+            // (b) MISSING entries member entirely.
+            let missing = "{}".to_string();
+            prop_assert!(serde_json::from_str::<crate::ledger::records::LedgerRollbackWire>(&missing).is_err());
+            let missing2 = r#"{"slots":{"p1":"old-format-data"}}"#;
+            prop_assert!(serde_json::from_str::<crate::ledger::records::LedgerRollbackWire>(missing2).is_err());
+
+            // (c) UNKNOWN top-level field added (old "slots" shape).
+            let unknown = {
+                let inner = &valid[1..valid.len() - 1];
+                format!("{{{},\"slots\":{{\"p1\":\"old-format-data\"}}}}", inner)
+            };
+            prop_assert!(serde_json::from_str::<crate::ledger::records::LedgerRollbackWire>(&unknown).is_err());
+
+            // (d) DUPLICATE top-level "entries" member — two "entries" keys.
+            let entries_value = serde_json::to_string(&serde_json::json!({"entries": {"slot-1": serde_json::from_str::<serde_json::Value>(&entry_json("slot-1", "gen-1", "rel-1", "t1", "s1")).unwrap()}})).unwrap();
+            // Build {"entries":{...},"entries":{...}}
+            let dup_top = format!("{{\"entries\":{{\"slot-1\":{}}},\"entries\":{{\"slot-2\":{}}}}}", entry_json("slot-1", "gen-1", "rel-1", "t1", "s1"), entry_json("slot-2", "gen-2", "rel-2", "t2", "s2"));
+            let _ = entries_value; // keep binding used
+            prop_assert!(serde_json::from_str::<crate::ledger::records::LedgerRollbackWire>(&dup_top).is_err());
+
+            // Deterministic type-level refusals.
+            let bad_gen_as_number = r#"{"entries":{"slot-1":{"generation":123,"artifact":{"release":"rel-sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","variant":"standard","tree":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"binding":{"server":"s1","deploy_dir":"/srv/deploy/slot-1"}}}}"#;
+            prop_assert!(serde_json::from_str::<crate::ledger::records::LedgerRollbackWire>(bad_gen_as_number).is_err());
+            let bad_artifact_as_string = r#"{"entries":{"slot-1":{"generation":"gen-1","artifact":"not-an-object","binding":{"server":"s1","deploy_dir":"/srv/deploy/slot-1"}}}}"#;
+            prop_assert!(serde_json::from_str::<crate::ledger::records::LedgerRollbackWire>(bad_artifact_as_string).is_err());
+            let bad_binding_as_array = r#"{"entries":{"slot-1":{"generation":"gen-1","artifact":{"release":"rel-sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","variant":"standard","tree":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"binding":[]}}}"#;
+            prop_assert!(serde_json::from_str::<crate::ledger::records::LedgerRollbackWire>(bad_binding_as_array).is_err());
+            let bad_entries_as_array = r#"{"entries":[]}"#;
+            prop_assert!(serde_json::from_str::<crate::ledger::records::LedgerRollbackWire>(bad_entries_as_array).is_err());
+        }
+    }
+    #[test]
+    fn rollback_two_entries_round_trip() {
+        let rb = fixture_rollback();
+        let json = serde_json::to_string(&rb).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v.get("entries").is_some());
+        assert_eq!(v.get("entries").unwrap().as_object().unwrap().len(), 2);
+        let back: crate::ledger::records::LedgerRollbackWire = serde_json::from_str(&json).unwrap();
+        let back: LedgerRollback = back.into();
         assert_eq!(back, rb);
     }
     #[test]
@@ -366,10 +339,13 @@ mod tests_rollback {
                 },
             ),
         )]));
-        let json = serde_json::to_value(&rb).unwrap();
+        let json_str = serde_json::to_string(&rb).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         assert!(json.get("entries").is_some());
         assert!(json.get("slots").is_none());
-        let back: LedgerRollback = serde_json::from_value(json).unwrap();
+        let wire: crate::ledger::records::LedgerRollbackWire =
+            serde_json::from_str(&json_str).unwrap();
+        let back: LedgerRollback = wire.into();
         assert_eq!(back, rb);
         let did = test_deployment_id("deploy-old");
         let old_line = format!(
