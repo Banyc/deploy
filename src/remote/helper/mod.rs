@@ -95,6 +95,10 @@
 //! * **Acquisition ids never repeat**: every acquisition (fresh claim or
 //!   recovery successor) mints a fresh uuid-v7 acquisition id; ids are
 //!   unique across every acquisition in time and no value is ever reused.
+//! * **Ownership is the acquisition id minted by THIS call** — an operation id
+//!   matching the holder's never entitles a contender to the same lock; every
+//!   different-acquisition record is contention, and only the explicit recovery
+//!   path (confirmed-dead, compare-and-delete) can take over.
 //!
 //! What the protocol does NOT guarantee: if an operator recovers a LIVE
 //! controller, behavior is explicitly unsafe operator error — the protocol
@@ -270,10 +274,11 @@ impl<'a> RemoteHelper<'a> {
                 }
             }
             // Already held by a different record: read the winner and decide
-            // — a same-operation retry (the file's record is authoritative)
-            // converges on it; any other holder is a FAIL (the current
-            // behavior — no automatic break) UNLESS `force` (recovery only)
-            // requests a compare-and-delete break.
+            // — EVERY different-acquisition record is contention, even when its
+            // operation_id matches (an operation id never confers ownership;
+            // only the acquisition id minted by THIS call identifies the lock
+            // owner). Only the explicit recovery path (confirmed-dead,
+            // compare-and-delete) can take over, gated by `force`.
             let held = self.remote.read(p)?;
             let held_rec: LockRecord = serde_json::from_slice(&held).map_err(|e| {
                 Error::integrity(format!(
@@ -281,12 +286,15 @@ impl<'a> RemoteHelper<'a> {
                     p.display()
                 ))
             })?;
-            if held_rec.operation_id == op_id {
-                return Ok(held_rec);
-            }
             if !force {
+                if held_rec.operation_id == op_id {
+                    return Err(Error::remote(format!(
+                        "mutation lock held by operation '{}' (acquisition {}), not acquired by this call — an operation id never confers ownership; only the acquisition id created by THIS call identifies the lock owner (this is not a reentrant acquisition, because a fresh acquisition id was minted — if you meant to reuse an already-held lock, pass the held &HeldSlotLock capability into nested routines instead of re-acquiring)",
+                        held_rec.operation_id, held_rec.acquisition_id
+                    )));
+                }
                 return Err(Error::remote(format!(
-                    "remote mutation lock held by '{}' (acquisition {}), not '{op_id}' — no automatic                      takeover; explicit recovery is required after confirming the holder died                      (recover via `deploy unlock <target> <slot> --yes`)",
+                    "remote mutation lock held by '{}' (acquisition {}), not '{op_id}' — no automatic takeover; explicit recovery is required after confirming the holder died (recover via `deploy unlock <target> <slot> --yes`) — an operation id never confers ownership; only the acquisition id created by THIS call identifies the lock owner",
                     held_rec.operation_id, held_rec.acquisition_id
                 )));
             }
@@ -437,25 +445,18 @@ impl<'a> RemoteHelper<'a> {
     /// Acquire the server mutation lock and return a guard that releases it
     /// on drop, so every return path (including early errors) releases the
     /// lock. Returns an error only if the lock is held by a different
-    /// operation. An explicit [`HeldSlotLock::release`] surfaces the release
+    /// acquisition. An explicit [`HeldSlotLock::release`] surfaces the release
     /// outcome; the drop path is best-effort — with no lease, a failed
     /// drop-time release leaves the lock HELD until explicit recovery (see
     /// [`HeldSlotLock`]).
     ///
-    /// Reentrancy is rejected explicitly: if the on-disk lock is already
-    /// held by the SAME operation id, this is a reentrant acquisition
-    /// (operation ids are fresh per operation) and the call fails with an
-    /// explicit error directing the caller to pass the held
-    /// `&HeldSlotLock` capability instead of re-acquiring.
+    /// Reentrancy is rejected by the ownership rule: a same-operation
+    /// re-acquire mints a NEW acquisition id, so the on-disk record (a
+    /// different acquisition) is contention — an operation id never confers
+    /// ownership; only the acquisition id created by THIS call identifies the
+    /// lock owner. Nested routines must receive the held `&HeldSlotLock`
+    /// capability instead of re-acquiring.
     pub fn acquire_lock_guard(&self, op_id: &str) -> Result<HeldSlotLock<'_>> {
-        if let Some(existing) = read_lock_record(self.remote, &layout::operation_lock())?
-            && existing.operation_id == op_id
-        {
-            return Err(Error::remote(format!(
-                "reentrant lock acquisition: operation '{}' already holds this slot's mutation lock — pass the held &HeldSlotLock capability into nested routines instead of re-acquiring",
-                op_id
-            )));
-        }
         let record = self.acquire_lock(op_id, false)?;
         Ok(HeldSlotLock {
             helper: self,
@@ -1145,8 +1146,12 @@ mod nested_guard_proptest {
         };
         let msg = err.to_string();
         prop_assert!(
-            msg.contains("reentrant"),
-            "error must name reentrancy, got: {msg}"
+            msg.contains("never confers ownership") || msg.contains("not acquired by this call"),
+            "error must name ownership contention (never confers ownership), got: {msg}"
+        );
+        prop_assert!(
+            msg.contains("reentrant") || msg.contains("fresh acquisition id was minted"),
+            "error must hint that this is not a reentrant acquisition, got: {msg}"
         );
         prop_assert!(
             msg.contains(&op_a),
@@ -1367,7 +1372,6 @@ mod nested_guard_proptest {
         }
     }
 }
-
 /// Cross-remote guard-bound mutation property: a guard can only mutate the slot it was
 /// acquired from — the receiver is the guard, the helper is the guard's own; there is no
 /// API parameter through which a guard from server A can authorize a mutation on server B.
@@ -1723,6 +1727,265 @@ mod cross_remote_guard_mutation {
         #[test]
         fn cross_remote_guard_only_owning_server_changes(ops in prop::collection::vec(arb_guard_op(), 0..=8)) {
             run_cross_remote_guard_case(ops)?;
+        }
+    }
+}
+
+#[cfg(test)]
+mod barrier_proptest {
+    use super::*;
+    use crate::error::Result as RemoteResult;
+    use crate::remote::transport::{
+        CreateNewVerdict, ExecOutcome, FsBytes, LocalTransport, Remote, RemoteEntry, RemoteMeta,
+    };
+    use proptest::prelude::*;
+    use proptest::test_runner::RngSeed;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
+
+    struct BarrierTryCreateRemote {
+        inner: LocalTransport,
+        barrier: Arc<Barrier>,
+        seen: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Remote for BarrierTryCreateRemote {
+        fn root(&self) -> &Path {
+            self.inner.root()
+        }
+        fn read(&self, rel: &Path) -> RemoteResult<Vec<u8>> {
+            self.inner.read(rel)
+        }
+        fn write(&self, rel: &Path, data: &[u8], mode: u32) -> RemoteResult<()> {
+            self.inner.write(rel, data, mode)
+        }
+        fn try_write_new(&self, rel: &Path, data: &[u8]) -> RemoteResult<CreateNewVerdict> {
+            if rel == layout::operation_lock()
+                && self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2
+            {
+                self.barrier.wait();
+            }
+            // The sidecar mutex can transiently contend when both contenders
+            // hit try_write_new at the exact same instant (barrier). The
+            // transport's 32-attempt sidecar retry can exhaust in that
+            // window, surfacing as a transport error instead of the normal
+            // ContentMismatch contention. Retry briefly so the race resolves
+            // to the expected create-if-absent verdict.
+            let mut attempts = 0;
+            loop {
+                match self.inner.try_write_new(rel, data) {
+                    Err(e) if e.to_string().contains("sidecar mutex contended") && attempts < 5 => {
+                        attempts += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
+                    other => return other,
+                }
+            }
+        }
+        fn try_write_new_with(
+            &self,
+            rel: &Path,
+            data: &[u8],
+            equivalence: crate::remote::transport::ContentEquivalence,
+        ) -> RemoteResult<CreateNewVerdict> {
+            if rel == layout::operation_lock()
+                && self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2
+            {
+                self.barrier.wait();
+            }
+            let mut attempts = 0;
+            loop {
+                match self.inner.try_write_new_with(rel, data, equivalence) {
+                    Err(e) if e.to_string().contains("sidecar mutex contended") && attempts < 5 => {
+                        attempts += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
+                    other => return other,
+                }
+            }
+        }
+        fn create_dir(&self, rel: &Path) -> RemoteResult<()> {
+            self.inner.create_dir(rel)
+        }
+        fn create_dir_all(&self, rel: &Path) -> RemoteResult<()> {
+            self.inner.create_dir_all(rel)
+        }
+        fn set_mode(&self, rel: &Path, mode: u32) -> RemoteResult<()> {
+            self.inner.set_mode(rel, mode)
+        }
+        fn list(&self, rel: &Path) -> RemoteResult<Vec<RemoteEntry>> {
+            self.inner.list(rel)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> RemoteResult<()> {
+            self.inner.rename(from, to)
+        }
+        fn symlink(&self, target: &Path, link: &Path) -> RemoteResult<()> {
+            self.inner.symlink(target, link)
+        }
+        fn read_link(&self, rel: &Path) -> RemoteResult<PathBuf> {
+            self.inner.read_link(rel)
+        }
+        fn remove_file(&self, rel: &Path) -> RemoteResult<()> {
+            self.inner.remove_file(rel)
+        }
+        fn remove_dir_all(&self, rel: &Path) -> RemoteResult<()> {
+            self.inner.remove_dir_all(rel)
+        }
+        fn remove_file_if(
+            &self,
+            rel: &Path,
+            expected: &[u8],
+        ) -> RemoteResult<crate::remote::transport::RemoveIfVerdict> {
+            self.inner.remove_file_if(rel, expected)
+        }
+        fn exists(&self, rel: &Path) -> bool {
+            self.inner.exists(rel)
+        }
+        fn metadata(&self, rel: &Path) -> RemoteResult<RemoteMeta> {
+            self.inner.metadata(rel)
+        }
+        fn metadata_opt(&self, rel: &Path) -> RemoteResult<Option<RemoteMeta>> {
+            self.inner.metadata_opt(rel)
+        }
+        fn exec(&self, argv: &[String], timeout: Duration) -> RemoteResult<ExecOutcome> {
+            self.inner.exec(argv, timeout)
+        }
+        fn filesystem_bytes(&self) -> RemoteResult<FsBytes> {
+            self.inner.filesystem_bytes()
+        }
+    }
+
+    fn run_barrier_race_case(_first_arriver: u8) -> std::result::Result<(), TestCaseError> {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let inner = LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
+            .unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wrapper = Arc::new(BarrierTryCreateRemote {
+            inner,
+            barrier: barrier.clone(),
+            seen: seen.clone(),
+        });
+        let barrier_hold = Arc::new(Barrier::new(2));
+        let (tx, rx) = std::sync::mpsc::channel::<(bool, Option<String>)>();
+        let w1 = wrapper.clone();
+        let bh1 = barrier_hold.clone();
+        let tx1 = tx.clone();
+        let h1 = std::thread::spawn(move || {
+            let helper = RemoteHelper::new(w1.as_ref() as &dyn Remote);
+            let res = helper.acquire_lock_guard("op-race");
+            let is_ok = res.is_ok();
+            let err_msg = res.as_ref().err().map(|e| e.to_string());
+            tx1.send((is_ok, err_msg)).unwrap();
+            if is_ok {
+                let _guard = res.unwrap();
+                bh1.wait();
+            }
+        });
+        let w2 = wrapper.clone();
+        let bh2 = barrier_hold.clone();
+        let tx2 = tx.clone();
+        let h2 = std::thread::spawn(move || {
+            let helper = RemoteHelper::new(w2.as_ref() as &dyn Remote);
+            let res = helper.acquire_lock_guard("op-race");
+            let is_ok = res.is_ok();
+            let err_msg = res.as_ref().err().map(|e| e.to_string());
+            tx2.send((is_ok, err_msg)).unwrap();
+            if is_ok {
+                let _guard = res.unwrap();
+                bh2.wait();
+            }
+        });
+        drop(tx);
+        let r1 = rx.recv().expect("thread 1 result");
+        let r2 = rx.recv().expect("thread 2 result");
+        let results = [r1, r2];
+        let ok_count = results.iter().filter(|(ok, _)| *ok).count();
+        let err_count = results.iter().filter(|(ok, _)| !*ok).count();
+        prop_assert_eq!(
+            ok_count,
+            1,
+            "exactly one contender must win the barrier race"
+        );
+        prop_assert_eq!(
+            err_count,
+            1,
+            "exactly one contender must lose with contention"
+        );
+        let err_msg = results
+            .iter()
+            .find(|(ok, _)| !*ok)
+            .unwrap()
+            .1
+            .clone()
+            .unwrap_or_default();
+        prop_assert!(
+            err_msg.contains("never confers ownership")
+                || err_msg.contains("not acquired by this call")
+                || err_msg.contains("mutation lock held"),
+            "loser error must name contention/no-ownership, got: {err_msg}"
+        );
+        let winner_bytes = wrapper.read(&layout::operation_lock()).unwrap();
+        let winner_rec: LockRecord = serde_json::from_slice(&winner_bytes).unwrap();
+        // While winner alive, third operation fails and record stays byte-identical
+        {
+            let helper3 = RemoteHelper::new(wrapper.as_ref() as &dyn Remote);
+            let third = helper3.acquire_lock("op-3", false);
+            prop_assert!(
+                third.is_err(),
+                "third operation must be blocked while winner holds lock"
+            );
+            let after = wrapper.read(&layout::operation_lock()).unwrap();
+            prop_assert_eq!(
+                after,
+                winner_bytes.clone(),
+                "on-disk record must remain byte-identical while winner holds lock"
+            );
+        }
+        // Release winner to drop its guard
+        barrier_hold.wait();
+        h1.join().expect("thread 1 panicked");
+        h2.join().expect("thread 2 panicked");
+        prop_assert!(
+            wrapper
+                .metadata_opt(&layout::operation_lock())
+                .unwrap()
+                .is_none(),
+            "lock must be removed after winner drop"
+        );
+        // After winner dropped, third succeeds with fresh acquisition id
+        {
+            let helper3 = RemoteHelper::new(wrapper.as_ref() as &dyn Remote);
+            let rec = helper3
+                .acquire_lock("op-3", false)
+                .expect("third operation must succeed after winner released");
+            prop_assert_ne!(
+                rec.acquisition_id.clone(),
+                winner_rec.acquisition_id,
+                "fresh acquisition after free must have new id"
+            );
+            let _ = helper3.release_lock(&rec);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn barrier_dummy() {}
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: crate::testutil::proptest_cases(64),
+            max_shrink_iters: 1000,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+        #[test]
+        fn barrier_race_exactly_one_winner(first_arriver in 0u8..=1) {
+            run_barrier_race_case(first_arriver)?;
         }
     }
 }

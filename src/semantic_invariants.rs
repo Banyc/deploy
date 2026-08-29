@@ -7441,34 +7441,40 @@ fn run_three_controller_case(
                 let before = read_lock_record(&remote)
                     .expect("a claim's pre-read cannot be faulted (no read fault armed for Claim)");
                 observed[c as usize] = before.clone();
-                match helper.acquire_lock(controller_op(c), false) {
-                    Ok(rec) => {
-                        let id_str = rec.acquisition_id.as_str().to_string();
-                        if before.is_none() {
-                            // Fresh claim on genuinely absent slot — must be unique.
+                let result = helper.acquire_lock(controller_op(c), false);
+                if before.is_none() {
+                    // Fresh claim on genuinely absent slot — must be unique.
+                    match result {
+                        Ok(rec) => {
+                            let id_str = rec.acquisition_id.as_str().to_string();
                             prop_assert!(
                                 seen_ids.insert(id_str.clone()),
                                 "acquisition id must be unique across whole simulation, duplicate {id_str:?}"
                             );
-                        } else {
-                            // Retry on present slot must converge on our own record (already seen).
-                            prop_assert!(
-                                held.as_ref() == Some(&rec),
-                                "a claim on a present slot must converge only on our own record, \
-                                 got held {held:?}, on-disk {before:?}, returned {rec:?}"
-                            );
-                            prop_assert!(
-                                seen_ids.contains(&id_str),
-                                "retry claim should return already-seen acquisition id, got {id_str:?}"
-                            );
+                            *held = Some(rec.clone());
+                            observed[c as usize] = Some(rec.clone());
+                            trace.push(format!("claim:{c}:ok"));
                         }
-                        *held = Some(rec.clone());
-                        observed[c as usize] = Some(rec.clone());
-                        trace.push(format!("claim:{c}:ok"));
+                        Err(_) => {
+                            trace.push(format!("claim:{c}:fail"));
+                        }
                     }
-                    Err(_) => {
-                        trace.push(format!("claim:{c}:fail"));
-                    }
+                } else {
+                    // A claim on a PRESENT on-disk record always errors (contention):
+                    // a fresh acquisition id never equals the on-disk acquisition;
+                    // operation id equality never confers ownership.
+                    prop_assert!(
+                        result.is_err(),
+                        "a claim on any present record is contention — a fresh acquisition id never equals the on-disk acquisition; operation id equality never confers ownership"
+                    );
+                    let after =
+                        read_lock_record(&remote).expect("post-claim read cannot be faulted");
+                    prop_assert_eq!(
+                        before,
+                        after,
+                        "a failed claim on a present record must leave the on-disk record byte-identical"
+                    );
+                    trace.push(format!("claim:{c}:fail:contention"));
                 }
             }
             CtrlAction::Read(c) => {
