@@ -445,38 +445,6 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Build a shell wrapper that holds an exclusive `flock` on the sidecar
-/// mutex file for the entire `inner` command. The sidecar is created
-/// durably (`mkdir -p`, `touch`, `chmod 644`, `sync`) and never removed;
-/// the perl helper opens it and attempts a non-blocking `LOCK_EX|LOCK_NB`
-/// with a bounded retry budget (32 attempts, ~5ms sleep between them,
-/// mirroring `SIDECAR_RETRY_ATTEMPTS` on the local side). A contended
-/// sidecar after the budget fails explicitly, never hangs. The lock is
-/// held via the open file description across the `exec "sh", "-c", inner`
-/// so the whole critical section (create-if-absent or compare-and-delete)
-/// is operation-atomic; the lock is released by the kernel on process
-/// exit. Perl is used because it ships on every Linux/macOS remote and
-/// provides portable `flock` (the `flock(1)` command is absent on macOS).
-fn with_sidecar_cmd(root: &Path, inner: &str) -> String {
-    let sidecar = root
-        .join(crate::remote::layout::operation_lock_sidecar())
-        .to_string_lossy()
-        .into_owned();
-    let parent = std::path::Path::new(&sidecar)
-        .parent()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| ".".to_string());
-    let sidecar_q = shell_quote(&sidecar);
-    let parent_q = shell_quote(&parent);
-    let inner_q = shell_quote(inner);
-    format!(
-        "mkdir -p {parent} && touch {sidecar} && chmod 644 {sidecar} && perl -e 'use Fcntl qw(:flock); open my $fh, \"+<\", $ARGV[0] or die \"open sidecar $ARGV[0]: $!\"; my $locked=0; for (1..32) {{ if (flock($fh, LOCK_EX|LOCK_NB)) {{ $locked=1; last; }} select(undef,undef,undef,0.005); }} die \"sidecar contended\" unless $locked; exec \"sh\", \"-c\", $ARGV[1];' -- {sidecar} {inner}",
-        parent = parent_q,
-        sidecar = sidecar_q,
-        inner = inner_q,
-    )
-}
-
 /// Build the perl script for atomic compare-and-delete under the sidecar:
 /// open the sidecar, flock exclusively with bounded retry, then read the
 /// lock file, compare to `expected`, unlink if match, otherwise leave it.
@@ -706,6 +674,49 @@ impl SshTransport {
             conflict = SSH_TWRITE_CONFLICT_EXIT,
             preinst = SSH_TWRITE_PREINSTALL_EXIT,
             parent = shell_quote(&parent),
+        )
+    }
+
+    /// Build the perl-native command for the operation-lock `try_write_new`:
+    /// the ENTIRE seven-step durable create is performed inside the SAME Perl
+    /// process that owns the sidecar `flock`. The sidecar is created durably
+    /// (`mkdir -p`, `touch`, `chmod 644`) and never removed; the perl helper
+    /// acquires an exclusive `LOCK_EX|LOCK_NB` with the bounded retry budget
+    /// (32 attempts, ~5ms sleep) mirroring `SIDECAR_RETRY_ATTEMPTS`. The lock
+    /// is held via the open file description until the perl process exits — no
+    /// `exec` is ever performed, so the descriptor is never closed with
+    /// `FD_CLOEXEC` before the mutation. Perl is used because it ships on
+    /// every Linux/macOS remote and provides portable `flock`.
+    ///
+    /// The parent-directory fsync (step 7) is performed INSIDE the Perl process
+    /// before exit by opening the directory and calling `IO::Handle->sync` on
+    /// the descriptor, so the flock is still held (the `sync` is durability,
+    /// not mutual exclusion, but keeping it inside avoids releasing the lock
+    /// before the directory entry is durable).
+    fn try_write_new_sidecar_cmd(&self, rel: &Path, mode: u32) -> String {
+        let sidecar = self
+            .root
+            .join(crate::remote::layout::operation_lock_sidecar())
+            .to_string_lossy()
+            .into_owned();
+        let lock = self.root.join(rel).to_string_lossy().into_owned();
+        let parent = std::path::Path::new(&lock)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ".".to_string());
+        let sidecar_q = shell_quote(&sidecar);
+        let parent_q = shell_quote(&parent);
+        let lock_q = shell_quote(&lock);
+        let mode_str = format!("{:o}", mode & 0o7777);
+        let mode_q = shell_quote(&mode_str);
+        format!(
+            "mkdir -p {parent} && touch {sidecar} && chmod 644 {sidecar} && perl -e 'use Fcntl qw(:flock O_WRONLY O_CREAT O_EXCL); use IO::Handle; open my $fh, \"+<\", $ARGV[0] or die \"open sidecar $ARGV[0]: $!\"; my $locked=0; for (1..32) {{ if (flock($fh, LOCK_EX|LOCK_NB)) {{ $locked=1; last; }} select(undef,undef,undef,0.005); }} die \"sidecar contended\" unless $locked; binmode STDIN; my $data = do {{ local $/; <STDIN> }}; my $lock=$ARGV[1]; my $mode=$ARGV[2]; my $dir=$lock; $dir=~s{{/[^/]+$}}{{}}; $dir=\".\" if $dir eq \"\"; my $base=$lock; $base=~s{{.*/}}{{}}; my $tmp; my $tfh; for (1..32) {{ my $uniq=\"$$.\".time.\".\".int(rand(1000000)); $tmp=\"$dir/.$base.tmp.$uniq\"; if (sysopen($tfh, $tmp, O_WRONLY|O_CREAT|O_EXCL)) {{ last; }} $tmp=undef; if (($!+0)!=17) {{ exit {preinst}; }} }} if (!defined $tmp || !defined $tfh) {{ exit {preinst}; }} binmode $tfh; print $tfh $data or do {{ close $tfh; unlink $tmp; exit {preinst}; }}; close $tfh or do {{ unlink $tmp; exit {preinst}; }}; chmod oct($mode), $tmp or do {{ unlink $tmp; exit {preinst}; }}; open my $sfh, \"+<\", $tmp or do {{ unlink $tmp; exit {preinst}; }}; $sfh->sync or do {{ unlink $tmp; exit {preinst}; }}; close $sfh; if (link($tmp, $lock)) {{ unlink $tmp; open my $dfh, \"<\", $dir or exit {preinst}; $dfh->sync or exit {preinst}; close $dfh; exit 0; }} else {{ my $e=$!+0; unlink $tmp; if ($e==17) {{ exit {conflict}; }} else {{ exit {preinst}; }} }}' -- {sidecar} {lock} {mode}",
+            parent = parent_q,
+            sidecar = sidecar_q,
+            lock = lock_q,
+            mode = mode_q,
+            conflict = SSH_TWRITE_CONFLICT_EXIT,
+            preinst = SSH_TWRITE_PREINSTALL_EXIT,
         )
     }
 
@@ -1391,11 +1402,10 @@ impl Remote for SshTransport {
         data: &[u8],
         equivalence: ContentEquivalence,
     ) -> Result<CreateNewVerdict> {
-        let inner = Self::write_new_cmd(&self.root, rel, IMMUTABLE_RECORD_MODE);
         let cmd = if rel == crate::remote::layout::operation_lock() {
-            with_sidecar_cmd(&self.root, &inner)
+            self.try_write_new_sidecar_cmd(rel, IMMUTABLE_RECORD_MODE)
         } else {
-            inner
+            Self::write_new_cmd(&self.root, rel, IMMUTABLE_RECORD_MODE)
         };
         let mut argv = vec!["ssh".to_string()];
         argv.extend(self.ssh_args()?);
@@ -1821,6 +1831,63 @@ mod tests_ssh {
         assert!(
             !cmd.contains("/srv.files.tmp."),
             "temp must not escape the managed root, got: {cmd}"
+        );
+    }
+
+    #[test]
+    fn try_write_new_sidecar_is_perl_native_and_holds_flock() {
+        let tr = transport();
+        let cmd = tr.try_write_new_sidecar_cmd(
+            &crate::remote::layout::operation_lock(),
+            IMMUTABLE_RECORD_MODE,
+        );
+        assert!(
+            !cmd.contains("exec"),
+            "the sidecar flock must survive to process exit: the perl must not exec"
+        );
+        assert!(
+            cmd.contains("<STDIN"),
+            "the perl-native acquire must read the payload from STDIN, got: {cmd}"
+        );
+        assert!(
+            cmd.contains("link("),
+            "the perl-native acquire must install via link(2), got: {cmd}"
+        );
+        assert!(
+            cmd.contains("flock($fh"),
+            "the perl-native acquire must hold the flock loop, got: {cmd}"
+        );
+        // Verify the command is the sidecar-wrapped perl, not the ordinary shell write_new.
+        assert!(
+            cmd.contains("operation.lock.mutex"),
+            "the sidecar command must reference the mutex file, got: {cmd}"
+        );
+        assert!(
+            cmd.contains("operation.lock"),
+            "the sidecar command must reference the lock file, got: {cmd}"
+        );
+        // Ensure the exit-code protocol parity is preserved (conflict and preinstall).
+        assert!(
+            cmd.contains(&SSH_TWRITE_CONFLICT_EXIT.to_string()),
+            "the sidecar command must encode the conflict exit code, got: {cmd}"
+        );
+        assert!(
+            cmd.contains(&SSH_TWRITE_PREINSTALL_EXIT.to_string()),
+            "the sidecar command must encode the preinstall exit code, got: {cmd}"
+        );
+        // Ordinary (non-lock) writes keep the shell implementation — they must not go through the sidecar perl.
+        let ordinary = SshTransport::write_new_cmd(
+            tr.root(),
+            Path::new("state/other.json"),
+            IMMUTABLE_RECORD_MODE,
+        );
+        assert!(
+            !ordinary.contains("operation.lock.mutex"),
+            "ordinary writes must not be sidecar-wrapped"
+        );
+        assert!(
+            ordinary.contains("mktemp"),
+            "ordinary writes retain mktemp-based shell implementation, got: {ordinary}"
         );
     }
 
