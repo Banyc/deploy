@@ -920,7 +920,9 @@ mod tests {
         use super::*;
         use crate::remote::layout;
         use crate::remote::transport::{CreateNewVerdict, LocalTransport, Remote, RemoveIfVerdict};
+        #[cfg(test)]
         use proptest::prelude::*;
+        #[cfg(test)]
         use proptest::test_runner::RngSeed;
 
         fn lock_bytes(operation_id: &str, seq: u64) -> Vec<u8> {
@@ -1016,7 +1018,9 @@ mod nested_guard_proptest {
     use crate::remote::transport::{
         CreateNewVerdict, FsBytes, LocalTransport, Remote, RemoteEntry, RemoteMeta,
     };
+    #[cfg(test)]
     use proptest::prelude::*;
+    #[cfg(test)]
     use proptest::test_runner::RngSeed;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
@@ -1380,7 +1384,9 @@ mod cross_remote_guard_mutation {
     use crate::identity::{ArtifactRef, TargetName, VariantName};
     use crate::remote::helper::{ExpectedCurrent, GenerationAssignment};
     use crate::remote::transport::LocalTransport;
+    #[cfg(test)]
     use proptest::prelude::*;
+    #[cfg(test)]
     use proptest::test_runner::RngSeed;
     use std::collections::BTreeMap;
     use std::os::unix::fs::PermissionsExt;
@@ -1443,7 +1449,7 @@ mod cross_remote_guard_mutation {
             generation_id: gen_id.clone(),
             artifact: ArtifactRef {
                 release: crate::identity::test_release_id("rel-seed"),
-                variant: VariantName::new("standard".to_string()),
+                variant: VariantName::parse("standard").unwrap(),
                 tree: tree.clone(),
             },
             behavior_sha256: "b".to_string(),
@@ -1527,7 +1533,7 @@ mod cross_remote_guard_mutation {
                     gen_id: crate::identity::test_generation_id(&gen_tag)
                         .as_str()
                         .to_string(),
-                    op_id: format!("op-{op_tag}"),
+                    op_id: format!("op-{op_tag}")
                 }
             ),
             arb_expected().prop_map(|expected| GuardOp::RemoveCurrentIf { expected }),
@@ -1549,7 +1555,7 @@ mod cross_remote_guard_mutation {
             )
                 .prop_map(|(op_tag, state)| GuardOp::TransactionRecord {
                     op_id: format!("op-{op_tag}"),
-                    state,
+                    state
                 }),
             ("[a-z0-9]{1,8}", "[a-z0-9]{1,8}").prop_map(|(dep_tag, gen_tag)| {
                 GuardOp::WriteCommitMarker {
@@ -1620,7 +1626,7 @@ mod cross_remote_guard_mutation {
                         generation_id: crate::identity::test_generation_id(gen_tag),
                         artifact: ArtifactRef {
                             release: crate::identity::test_release_id("rel-op"),
-                            variant: VariantName::new("standard".to_string()),
+                            variant: VariantName::parse("standard").unwrap(),
                             tree: crate::identity::test_tree_digest(tree_tag),
                         },
                         behavior_sha256: "b".to_string(),
@@ -1686,7 +1692,7 @@ mod cross_remote_guard_mutation {
                         generation_id: crate::identity::test_generation_id(gen_tag),
                         artifact: ArtifactRef {
                             release: crate::identity::test_release_id("rel-op"),
-                            variant: VariantName::new("standard".to_string()),
+                            variant: VariantName::parse("standard").unwrap(),
                             tree: crate::identity::test_tree_digest(tree_tag),
                         },
                         behavior_sha256: "b".to_string(),
@@ -1736,7 +1742,9 @@ mod barrier_proptest {
     use crate::remote::transport::{
         CreateNewVerdict, ExecOutcome, FsBytes, LocalTransport, Remote, RemoteEntry, RemoteMeta,
     };
+    #[cfg(test)]
     use proptest::prelude::*;
+    #[cfg(test)]
     use proptest::test_runner::RngSeed;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Barrier};
@@ -2006,7 +2014,9 @@ mod guard_release_retry {
         CreateNewVerdict, ExecOutcome, FsBytes, LocalTransport, Remote, RemoteEntry, RemoteMeta,
         RemoveIfVerdict,
     };
+    #[cfg(test)]
     use proptest::prelude::*;
+    #[cfg(test)]
     use proptest::test_runner::RngSeed;
     use std::path::{Path, PathBuf};
     use std::sync::{

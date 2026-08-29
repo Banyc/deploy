@@ -39,7 +39,6 @@ impl SlotSet {
         self.0.is_empty()
     }
 
-    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.0.len()
     }
@@ -74,7 +73,6 @@ impl NonEmptySlotSet {
     }
 
     /// The number of distinct slot ids.
-    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.0.len()
     }

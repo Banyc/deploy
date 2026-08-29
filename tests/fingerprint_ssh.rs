@@ -380,7 +380,7 @@ fn fingerprint_only_dry_run_leaves_remote_untouched() -> Result<()> {
             s.port(),
             slot.deploy_dir(),
             None,
-            Some(&fp),
+            Some(fp.as_str()),
             &cache,
             &env,
         )?))
@@ -441,7 +441,7 @@ fn fingerprint_only_first_push_succeeds() -> Result<()> {
             s.port(),
             slot.deploy_dir(),
             None,
-            Some(&fp),
+            Some(fp.as_str()),
             &cache,
             &env,
         )?))
@@ -523,7 +523,7 @@ fn fingerprint_only_repeat_push_is_idempotent() -> Result<()> {
             s.port(),
             slot.deploy_dir(),
             None,
-            Some(&fp),
+            Some(fp.as_str()),
             &cache,
             &env,
         )?))

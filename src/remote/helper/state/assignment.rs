@@ -124,7 +124,7 @@ mod tests_assignment {
             generation_id: test_generation_id(gen_id),
             artifact: ArtifactRef {
                 release: crate::identity::test_release_id("rel-sha256-x"),
-                variant: crate::identity::VariantName::new("standard".to_string()),
+                variant: crate::identity::VariantName::parse("standard").unwrap(),
                 tree: crate::identity::test_tree_digest(tree),
             },
             behavior_sha256: "b".to_string(),

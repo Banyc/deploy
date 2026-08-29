@@ -108,7 +108,6 @@ impl AcquisitionId {
 /// `op-<uuid-v7>` / 64-hex-digest from a fixture tag. Deterministic per tag:
 /// the same tag yields the same id everywhere, so a fixture can write and
 /// assert the same value.
-#[cfg(test)]
 pub(crate) fn test_uuid_v7(tag: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -127,22 +126,18 @@ pub(crate) fn test_uuid_v7(tag: &str) -> String {
     Uuid::from_bytes(bytes).to_string()
 }
 
-#[cfg(test)]
 pub(crate) fn test_deployment_id(tag: &str) -> DeploymentId {
     DeploymentId::parse(&format!("deploy-{}", test_uuid_v7(tag))).expect("canonical test id")
 }
 
-#[cfg(test)]
 pub(crate) fn test_generation_id(tag: &str) -> GenerationId {
     GenerationId::parse(&format!("gen-{}", test_uuid_v7(tag))).expect("canonical test id")
 }
 
-#[cfg(test)]
 pub(crate) fn test_operation_id(tag: &str) -> OperationId {
     OperationId::parse(&format!("op-{}", test_uuid_v7(tag))).expect("canonical test id")
 }
 
-#[cfg(test)]
 #[allow(dead_code)]
 pub(crate) fn test_acquisition_id(tag: &str) -> AcquisitionId {
     AcquisitionId::parse(&format!("acq-{}", test_uuid_v7(tag))).expect("canonical test id")

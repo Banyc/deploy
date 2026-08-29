@@ -352,8 +352,7 @@ pub(crate) fn process_server(
             error: Some(
                 "committed transaction record write failed; server active but bookkeeping incomplete"
                     .to_string(),
-            ),
-        });
+            )});
     }
     Ok(ServerProc {
         kind: SlotOutcomeKind::Activated,

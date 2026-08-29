@@ -1573,7 +1573,9 @@ impl Remote for SshTransport {
 #[cfg(test)]
 mod tests_ssh {
     use super::*;
+    #[cfg(test)]
     use proptest::prelude::*;
+    #[cfg(test)]
     use proptest::test_runner::RngSeed;
     use std::os::unix::fs::MetadataExt;
     use std::path::Path;
@@ -2521,8 +2523,7 @@ mod tests_ssh {
                 SshStageFailure::ParentFsync => (
                     "sync",
                     "#!/bin/sh\nif [ -d \"$1\" ]; then echo 'sync: dir sync failed' >&2; exit 9; fi\nexit 0\n",
-                ),
-            };
+                )};
             let p = fakebin.join(name);
             std::fs::write(&p, body).unwrap();
             use std::os::unix::fs::PermissionsExt;
@@ -2581,7 +2582,9 @@ mod fingerprint_ssh_tests {
     use crate::remote::transport::{
         NotRegularFileKind, VerifiedExisting, VerifySwapBoundary, VerifySwapKind,
     };
+    #[cfg(test)]
     use proptest::prelude::*;
+    #[cfg(test)]
     use proptest::test_runner::RngSeed;
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
@@ -3398,8 +3401,7 @@ exec /bin/mv "$@"
                         LstatOutcome::TransportSpawnFailure => {
                             assert!(msg.contains("ssh"), "{outcome:?}: {msg}")
                         }
-                        _ => unreachable!(),
-                    }
+                        _ => unreachable!()}
                 }
             }
 
@@ -3422,8 +3424,7 @@ exec /bin/mv "$@"
                 let err = match guard {
                     Ok(g) => g.swap_current( &ExpectedCurrent::Absent, "gen-gate", "op")
                         .unwrap_err(),
-                    Err(e) => e,
-                };
+                    Err(e) => e};
                 assert!(
                     err.to_string().contains("ssh"),
                     "{outcome:?}: a failed lstat must propagate, got: {err}"
@@ -4243,12 +4244,10 @@ exec /bin/mv "$@"
             let existing_bytes: &[u8] = match content {
                 XContent::Exact => intent,
                 XContent::Semantic => br#"{"b":2,"a":1}"#,
-                XContent::Different => br#"{"a":9,"b":9}"#,
-            };
+                XContent::Different => br#"{"a":9,"b":9}"#};
             let entry_mode = match mode {
                 XMode::Exact => required_mode,
-                XMode::Wrong => wrong_mode,
-            };
+                XMode::Wrong => wrong_mode};
             match entry {
                 XEntry::Absent => {}
                 XEntry::Regular => {
@@ -4435,32 +4434,27 @@ exec /bin/mv "$@"
                     VerifySwapKind::Symlink => prop_assert_eq!(
                         verdict,
                         CreateNewVerdict::Conflict(VerifiedExisting::NotRegularFile {
-                            kind: NotRegularFileKind::Symlink,
-                        }),
+                            kind: NotRegularFileKind::Symlink}),
                         "a pre-open symlink swap must be rejected — the remote O_NOFOLLOW open never follows"
                     ),
                     VerifySwapKind::Directory => prop_assert_eq!(
                         verdict,
                         CreateNewVerdict::Conflict(VerifiedExisting::NotRegularFile {
-                            kind: NotRegularFileKind::Directory,
-                        }),
+                            kind: NotRegularFileKind::Directory}),
                         "a pre-open directory swap must be rejected"
                     ),
                     VerifySwapKind::DifferentInode => prop_assert_eq!(
                         verdict,
                         CreateNewVerdict::Conflict(VerifiedExisting::ModeMismatch {
                             actual: wrong_mode & 0o7777,
-                            required,
-                        }),
+                            required}),
                         "a pre-open different-inode swap must be rejected with the SWAPPED inode's mode"
-                    ),
-                },
+                    )},
                 VerifySwapBoundary::AfterOpen | VerifySwapBoundary::AfterFstat => prop_assert_eq!(
                     verdict,
                     CreateNewVerdict::AlreadyPresent,
                     "a post-open swap is harmless: the helper's fd pins the ORIGINAL inode, so the verdict must reflect ITS metadata AND content — never a mix"
-                ),
-            }
+                )}
 
             // Structural TOCTOU closure: the verification is ONE remote
             // helper exec — the recorded ssh invocation log holds EXACTLY ONE
@@ -4482,8 +4476,7 @@ exec /bin/mv "$@"
                 // write + verify-open: a rejection runs no parent sync.
                 VerifySwapBoundary::BeforeOpen => 2,
                 // write + verify-open + the AlreadyPresent parent sync.
-                VerifySwapBoundary::AfterOpen | VerifySwapBoundary::AfterFstat => 3,
-            };
+                VerifySwapBoundary::AfterOpen | VerifySwapBoundary::AfterFstat => 3};
             prop_assert_eq!(
                 invocations.len(),
                 expected_total,

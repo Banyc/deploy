@@ -321,7 +321,10 @@ mod tests {
     };
     use crate::ledger::records::LedgerIntentWire;
     use crate::ledger::records::{PhysicalBinding, SlotAttemptStateWire};
+    use crate::ledger::{TargetSnapshot, TargetSnapshotWire};
+    #[cfg(test)]
     use proptest::prelude::*;
+    #[cfg(test)]
     use proptest::test_runner::RngSeed;
 
     // ---- fixtures ----------------------------------------------------------
@@ -334,7 +337,7 @@ mod tests {
     /// server `s1` at the canonical deploy dir for the slot.
     fn binding(sid: &SlotId) -> PhysicalBinding {
         PhysicalBinding {
-            server: ServerId::new("s1".to_string()),
+            server: ServerId::parse("s1").unwrap(),
             deploy_dir: format!("/srv/deploy/{}", sid.as_str()),
         }
     }
@@ -352,7 +355,7 @@ mod tests {
                 placement_slot: key.clone(),
                 artifact: ArtifactRef {
                     release: test_release_id(key.as_str()),
-                    variant: VariantName::new("standard".to_string()),
+                    variant: VariantName::parse("standard").unwrap(),
                     tree: test_tree_digest(key.as_str()),
                 },
             },
@@ -363,28 +366,33 @@ mod tests {
     /// property needs an AGREEING wire whose `slot_ids` is the authoritative
     /// deployment order).
     fn agreeing_intent(keys: &[SlotId]) -> LedgerIntentWire {
-        let desired: BTreeMap<SlotId, GenerationRef> =
-            keys.iter().map(|k| (k.clone(), gen_ref_for(k))).collect();
+        let snapshot = TargetSnapshot::from_entries(
+            keys.iter()
+                .map(|k| {
+                    let g = gen_ref_for(k);
+                    (
+                        k.clone(),
+                        crate::ledger::SnapshotEntry::new(
+                            g.generation.clone(),
+                            g.assignment.artifact.clone(),
+                            binding(k),
+                        ),
+                    )
+                })
+                .collect(),
+        );
         let pre_push: BTreeMap<SlotId, Option<SlotAttemptStateWire>> =
             keys.iter().map(|k| (k.clone(), None)).collect();
-        // The agreeing intent FREEZES each member's physical binding (schema
-        // v6): the binding keys follow the membership so the intent stays
-        // internally agreeing.
-        let bindings: BTreeMap<SlotId, PhysicalBinding> =
-            keys.iter().map(|k| (k.clone(), binding(k))).collect();
         LedgerIntentWire {
             deployment_schema_version: crate::ledger::LEDGER_SCHEMA_VERSION,
             deployment_id: test_deployment_id("deploy-w"),
-            target: TargetName::new("t1".to_string()),
+            target: TargetName::parse("t1").unwrap(),
             group: None,
             slot_ids: keys.to_vec(),
-            selected_membership: keys.to_vec(),
-            full_membership: keys.to_vec(),
-            behavior_sha256: "sha256-w".to_string(),
+            behavior_sha256: crate::identity::DIGEST_TEST_HEX_1.to_string(),
             attempted_at: "2026-01-01T00:00:00Z".to_string(),
-            desired,
+            resulting_snapshot: TargetSnapshotWire::from(&snapshot),
             pre_push,
-            bindings,
             slots: BTreeMap::new(),
         }
     }

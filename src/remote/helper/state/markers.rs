@@ -35,8 +35,7 @@ impl<'a> HeldSlotLock<'a> {
             "deployment_id": deployment_id,
             "committed": true,
             "generation": generation,
-            "slots": slot_ids,
-        });
+            "slots": slot_ids});
         if let Some(t) = target {
             payload["target"] = serde_json::json!(t);
         }
@@ -150,8 +149,7 @@ mod tests_markers {
             "committed": true,
             "generation": "gen-0",
             "slots": ["p1"],
-            "target": "t1",
-        });
+            "target": "t1"});
         let bytes = serde_json::to_vec_pretty(&payload).unwrap();
         use std::os::unix::fs::PermissionsExt;
         let target = root.join("target.json");

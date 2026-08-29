@@ -20,10 +20,10 @@ pub(crate) use crate::identity::{
     TreeDigest, VariantName, test_deployment_id, test_generation_id, test_tree_digest,
 };
 pub(crate) use crate::ledger::{
-    self, DeploymentIntent, DeploymentPlan, DeploymentStatus, DesiredGeneration, IntentSlot,
-    LedgerEntry, LedgerIntentReport, LedgerTerminal, NonEmptySlotTable, Observation,
-    ObservationWire, ObservedAssignment, ObservedGenerationWire, RefExpr, SlotAttemptState,
-    TerminalDisposition,
+    self, DeploymentIntent, DeploymentPlan, DeploymentStatus, LedgerEntry, LedgerIntentReport,
+    LedgerTerminal, NonEmptySlotTable, Observation, ObservationWire, ObservedAssignment,
+    ObservedGenerationWire, RefExpr, SelectedSlotIntent, SlotAttemptState, SnapshotEntry,
+    TargetSnapshot, TerminalDisposition,
 };
 pub(crate) use crate::remote::transport::{
     CreateNewVerdict, FsBytes, LocalTransport, Remote, scripted::ScriptedExec,
@@ -334,35 +334,34 @@ pub(crate) fn seed_snapshot(
     store: &LocalStore,
     target: &str,
     deployment_id: &str,
-    behavior_sha256: &str,
+    _behavior_sha256: &str,
     slots: BTreeMap<SlotId, GenerationRef>,
     bindings: BTreeMap<SlotId, crate::ledger::PhysicalBinding>,
 ) {
-    // ONE slot table: the membership + the desired entries.
-    let slot_table: BTreeMap<SlotId, IntentSlot> = slots
-        .iter()
-        .map(|(k, g)| {
-            (
-                k.clone(),
-                IntentSlot {
-                    desired: DesiredGeneration {
-                        generation: g.generation.clone(),
-                        artifact: g.assignment.artifact.clone(),
-                    },
-                    pre_push: None,
-                    // The intent FREEZES each slot's plan-time physical
-                    // binding (schema v6) — seed it from the same bindings
-                    // the terminal's rollback records (the seeded
-                    // Successful terminal requires bindings to cover the
-                    // slotted generations exactly).
-                    binding: bindings
-                        .get(k)
-                        .cloned()
-                        .expect("a seeded snapshot binds every slotted slot"),
-                },
-            )
-        })
-        .collect();
+    // THE FROZEN RESULTING SNAPSHOT: one entry per slotted slot carrying
+    // its plan-minted generation/artifact and plan-time physical binding
+    // (schema v6) — seed the binding from the same bindings the terminal's
+    // rollback records (the seeded Successful terminal requires bindings to
+    // cover the slotted generations exactly). The snapshot's key set IS the
+    // frozen membership.
+    let snapshot = TargetSnapshot::from_entries(
+        slots
+            .iter()
+            .map(|(k, g)| {
+                (
+                    k.clone(),
+                    crate::ledger::SnapshotEntry::new(
+                        g.generation.clone(),
+                        g.assignment.artifact.clone(),
+                        bindings
+                            .get(k)
+                            .cloned()
+                            .expect("a seeded snapshot binds every slotted slot"),
+                    ),
+                )
+            })
+            .collect(),
+    );
     store
         .append_intent(
             target,
@@ -370,11 +369,19 @@ pub(crate) fn seed_snapshot(
                 deployment_id: test_deployment_id(deployment_id),
                 target: TargetName::new(target.to_string()),
                 group: None,
-                behavior_sha256: behavior_sha256.to_string(),
-                attempted_at: "2026-01-01T00:00:00Z".to_string(),
-                slots: NonEmptySlotTable::build(slot_table)
-                    .expect("a seeded snapshot always has at least one slot"),
-                full_membership: slots.keys().cloned().collect(),
+                resulting_snapshot: snapshot,
+                selected: NonEmptySlotTable::build(slots.keys().map(|k| {
+                    (
+                        k.clone(),
+                        crate::ledger::SelectedSlotIntent { pre_push: None },
+                    )
+                }))
+                .expect("a seeded snapshot always has at least one slot"),
+                behavior_sha256: crate::identity::BehaviorDigest::parse(
+                    crate::identity::DIGEST_TEST_HEX_1,
+                )
+                .unwrap(),
+                attempted_at: crate::identity::Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
             },
         )
         .unwrap();
@@ -392,7 +399,7 @@ pub(crate) fn seed_snapshot(
                 // Successful terminal must carry one activated slot per
                 // slotted generation).
                 disposition: TerminalDisposition::Successful(
-                    crate::ledger::SuccessfulTerminal::try_new(
+                    crate::ledger::SuccessfulTerminal::try_new_with_full(
                         {
                             let __slots: BTreeMap<
                                 crate::identity::SlotId,
@@ -1697,7 +1704,7 @@ pub(crate) fn group_membership_fixture(
     // unselected slots forward.
     let artifact = ArtifactRef {
         release: rid.clone(),
-        variant: VariantName::new("standard".to_string()),
+        variant: VariantName::parse("standard").unwrap(),
         tree: test_tree_digest("tree-group"),
     };
     let slots: BTreeMap<SlotId, GenerationRef> = config

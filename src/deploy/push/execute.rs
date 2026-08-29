@@ -426,7 +426,7 @@ pub(crate) mod execute_tests {
         assert_eq!(
             res.observation,
             ObservationWire::Known(ObservedGenerationWire {
-                generation: prior_gen.clone(),
+                generation: prior_gen.clone()
             }),
             "the wire outcome records the compensated slot's PRIOR generation"
         );
@@ -718,7 +718,7 @@ interval_seconds = 0
         assert_eq!(attempt.slot_ids.len(), 4);
         for sid in ["p1", "p2", "p3", "p4"] {
             assert!(
-                attempt.slots.contains_key(&SlotId::new(sid)),
+                attempt.slot_ids.iter().any(|s| s.as_str() == sid),
                 "slot {sid} missing from attempt"
             );
         }
@@ -994,9 +994,9 @@ interval_seconds = 0
         assert_eq!(
             attempt.slot_ids,
             vec![
-                SlotId::new("p3".to_string()),
-                SlotId::new("p1".to_string()),
-                SlotId::new("p2".to_string()),
+                SlotId::parse("p3").unwrap(),
+                SlotId::parse("p1").unwrap(),
+                SlotId::parse("p2").unwrap(),
             ],
             "the wire's slot_ids must record the deployment order (the batching order), never sorted by id"
         );
@@ -1113,7 +1113,7 @@ interval_seconds = 0
         assert_eq!(
             res.observation,
             ObservationWire::Known(ObservedGenerationWire {
-                generation: prior_gen.clone(),
+                generation: prior_gen.clone()
             }),
             "the wire outcome records the compensated slot's PRIOR generation"
         );

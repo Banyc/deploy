@@ -576,7 +576,9 @@ pub(crate) mod preflight_tests {
         FailOnceMarkerRemote, FailOnceStagingRemote, recording_factory,
     };
     use crate::verify::release::RELEASE_RECORD_SCHEMA_VERSION;
+    #[cfg(test)]
     use proptest::prelude::*;
+    #[cfg(test)]
     use proptest::test_runner::RngSeed;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
@@ -1698,14 +1700,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "deploy-hist-behavior-fixture",
             "sha256-aa",
             BTreeMap::from([(
-                SlotId::new("p1".to_string()),
+                SlotId::parse("p1").unwrap(),
                 GenerationRef {
                     generation: test_generation_id("gen-hist"),
                     assignment: crate::identity::PlacementSlotAssignment {
-                        placement_slot: SlotId::new("p1".to_string()),
+                        placement_slot: SlotId::parse("p1").unwrap(),
                         artifact: ArtifactRef {
                             release: release.clone(),
-                            variant: VariantName::new("standard".to_string()),
+                            variant: VariantName::parse("standard").unwrap(),
                             tree: test_tree_digest("tree-x"),
                         },
                     },
@@ -1717,9 +1719,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             // MISSING BEHAVIOR SNAPSHOT, so the payload must be otherwise
             // valid for the ledger to load at all.
             BTreeMap::from([(
-                SlotId::new("p1".to_string()),
+                SlotId::parse("p1").unwrap(),
                 crate::ledger::PhysicalBinding {
-                    server: crate::identity::ServerId::new("s1".to_string()),
+                    server: crate::identity::ServerId::parse("s1").unwrap(),
                     deploy_dir: "/srv/eng".to_string(),
                 },
             )]),
@@ -1997,8 +1999,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                         &PushOptions {
                             dry_run: dry,
                             ref_token: Some(token.clone()),
-                        group: None,
-                        },
+                        group: None},
                     )
                     .expect_err(&format!(
                         "a membership mismatch must reject the push (dry_run={dry})"
@@ -2036,8 +2037,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     &PushOptions {
                         dry_run: true,
                         ref_token: Some(token.clone()),
-                    group: None,
-                    },
+                    group: None},
                 )
                 .unwrap_or_else(|e| panic!("a matching membership must dry-run-plan: {e}"));
                 assert!(r.dry_run);
@@ -2063,8 +2063,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     &PushOptions {
                         dry_run: false,
                         ref_token: Some(token.clone()),
-                    group: None,
-                    },
+                    group: None},
                 )
                 .unwrap_or_else(|e| panic!("a matching membership must deploy for real: {e}"));
                 assert_eq!(
@@ -2108,7 +2107,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             }),
         ) {
             let h = RecoveryHarness::new();
-            let slot = SlotId::new("p1".to_string());
+            let slot = SlotId::parse("p1").unwrap();
 
             // (c) A concurrent/reconciled append: a pending-commit attempt
             // whose reconciliation will append EXACTLY ONE snapshot during
@@ -2134,8 +2133,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &PushOptions {
                     dry_run: false,
                     ref_token: None,
-                group: None,
-                },
+                group: None},
             )
             .unwrap();
             assert_eq!(rp.status, Some(DeploymentStatus::PendingCommit));
@@ -2152,9 +2150,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             // are durable in the store), each with the harness's exact
             // physical binding so `plan_assignments` accepts the rollback.
             let bindings = crate::ledger::PhysicalBinding {
-                server: crate::identity::ServerId::new("s1".to_string()),
-                deploy_dir: "/srv/eng".to_string(),
-            };
+                server: crate::identity::ServerId::parse("s1").unwrap(),
+                deploy_dir: "/srv/eng".to_string()};
             for i in 0..=latest {
                seed_snapshot(
                    &h.store,
@@ -2167,9 +2164,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                            generation: test_generation_id(&format!("gen-relative-{latest}-{i}")),
                            assignment: crate::identity::PlacementSlotAssignment {
                                placement_slot: slot.clone(),
-                               artifact: pending_artifact.clone(),
-                           },
-                        },
+                               artifact: pending_artifact.clone()}},
                    )]),
                    BTreeMap::from([(slot.clone(), bindings.clone())]),
                );
@@ -2278,8 +2273,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &PushOptions {
                     dry_run: false,
                     ref_token: Some(token.clone()),
-                group: None,
-                },
+                group: None},
                 &ref_id,
             )
            .expect_err("the plan is durable before the first intent write, so the faulted push must Err");
@@ -2378,16 +2372,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             // fail in resolution, before any planning reads the snapshots'
             // artifacts.
             let h = RecoveryHarness::new();
-            let slot = SlotId::new("p1".to_string());
+            let slot = SlotId::parse("p1").unwrap();
             let artifact = ArtifactRef {
                 release: crate::identity::test_release_id("rel-sha256-1111"),
-                variant: VariantName::new("p1".to_string()),
-                tree: test_tree_digest("aa"),
-            };
+                variant: VariantName::parse("p1").unwrap(),
+                tree: test_tree_digest("aa")};
             let bindings = crate::ledger::PhysicalBinding {
-                server: crate::identity::ServerId::new("s1".to_string()),
-                deploy_dir: "/srv/eng".to_string(),
-            };
+                server: crate::identity::ServerId::parse("s1").unwrap(),
+                deploy_dir: "/srv/eng".to_string()};
             for i in 0..=2u64 {
                 seed_snapshot(
                     &h.store,
@@ -2400,9 +2392,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                             generation: test_generation_id(&format!("gen-fixture-{i}")),
                             assignment: crate::identity::PlacementSlotAssignment {
                                 placement_slot: slot.clone(),
-                                artifact: artifact.clone(),
-                            },
-                        },
+                                artifact: artifact.clone()}},
                     )]),
                     BTreeMap::from([(slot.clone(), bindings.clone())]),
                 );
@@ -2419,8 +2409,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 // An ancestor walk past the start of the 3-deployment chain.
                 1 => format!("parent(@, {})", 2 + offset),
                 // A deployment-id ancestor stepping past the FIRST deployment.
-                _ => format!("{}-", test_deployment_id("deploy-fixture-0")),
-            };
+                _ => format!("{}-", test_deployment_id("deploy-fixture-0"))};
             // Self-check: the token parses and genuinely fails to resolve.
             let expr = ledger::parse_ref_expr(&token).unwrap();
             assert!(
@@ -2442,8 +2431,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &PushOptions {
                     dry_run: true,
                     ref_token: Some(token.clone()),
-                group: None,
-                },
+                group: None},
             )
             .expect_err("a dry run with an invalid ref must fail with a ref error");
             assert!(
@@ -2540,8 +2528,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &PushOptions {
                     dry_run: true,
                     ref_token: Some(token.clone()),
-                    group: Some(group.clone()),
-                },
+                    group: Some(group.clone())},
             )
             .unwrap_or_else(|e| {
                 panic!("a matching membership with group {group} must dry-run-plan: {e}")
@@ -2590,8 +2577,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     &PushOptions {
                         dry_run: dry,
                         ref_token: Some(token.clone()),
-                        group: Some(group.clone()),
-                    },
+                        group: Some(group.clone())},
                 )
                 .expect_err(&format!(
                     "a full-target membership mutation must refuse the group push (dry_run={dry})"

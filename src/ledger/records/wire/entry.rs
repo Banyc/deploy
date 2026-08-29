@@ -50,11 +50,13 @@ mod tests_entry {
     use crate::ledger::records::{
         DeploymentStatus, Observation, ObservationError, ObservationWire, ObservedGeneration,
         ObservedGenerationWire, PhysicalBinding, SlotAttemptStateWire, SlotResult, SlotTable,
-        TargetSnapshot,
+        SnapshotEntry, TargetSnapshot, TargetSnapshotWire,
     };
     use crate::ledger::records::{LedgerTerminal, LedgerTerminalWire, TerminalDisposition};
     use crate::store::local::LocalStore;
+    #[cfg(test)]
     use proptest::prelude::*;
+    #[cfg(test)]
     use proptest::test_runner::RngSeed;
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -70,7 +72,7 @@ mod tests_entry {
 
     fn binding(sid: &SlotId) -> PhysicalBinding {
         PhysicalBinding {
-            server: ServerId::new("s1".to_string()),
+            server: ServerId::parse("s1").unwrap(),
             deploy_dir: format!("/srv/deploy/{}", sid.as_str()),
         }
     }
@@ -84,7 +86,7 @@ mod tests_entry {
                 placement_slot: key.clone(),
                 artifact: ArtifactRef {
                     release: test_release_id(key.as_str()),
-                    variant: VariantName::new("standard".to_string()),
+                    variant: VariantName::parse("standard").unwrap(),
                     tree: test_tree_digest(key.as_str()),
                 },
             },
@@ -104,25 +106,37 @@ mod tests_entry {
         full: &[SlotId],
         group: Option<&str>,
     ) -> LedgerIntentWire {
-        let desired: BTreeMap<SlotId, GenerationRef> =
-            keys.iter().map(|k| (k.clone(), gen_ref_for(k))).collect();
+        // THE FROZEN RESULTING SNAPSHOT: one entry per FULL member (the
+        // selected keys, plus the unselected `full` slots a group push
+        // carries forward). The selected slot's desired state IS its
+        // snapshot entry — no separate desired/bindings projections.
+        let snapshot = TargetSnapshot::from_entries(
+            full.iter()
+                .map(|k| {
+                    let g = gen_ref_for(k);
+                    (
+                        k.clone(),
+                        crate::ledger::SnapshotEntry::new(
+                            g.generation.clone(),
+                            g.assignment.artifact.clone(),
+                            binding(k),
+                        ),
+                    )
+                })
+                .collect(),
+        );
         let pre_push: BTreeMap<SlotId, Option<SlotAttemptStateWire>> =
             keys.iter().map(|k| (k.clone(), None)).collect();
-        let bindings: BTreeMap<SlotId, PhysicalBinding> =
-            keys.iter().map(|k| (k.clone(), binding(k))).collect();
         LedgerIntentWire {
             deployment_schema_version: crate::ledger::LEDGER_SCHEMA_VERSION,
             deployment_id: test_deployment_id("deploy-w"),
-            target: TargetName::new("t1".to_string()),
+            target: TargetName::parse("t1").unwrap(),
             group: group.map(str::to_string),
             slot_ids: keys.to_vec(),
-            selected_membership: keys.to_vec(),
-            full_membership: full.to_vec(),
-            behavior_sha256: "sha256-w".to_string(),
+            behavior_sha256: crate::identity::DIGEST_TEST_HEX_1.to_string(),
             attempted_at: "2026-01-01T00:00:00Z".to_string(),
-            desired,
+            resulting_snapshot: TargetSnapshotWire::from(&snapshot),
             pre_push,
-            bindings,
             slots: BTreeMap::new(),
         }
     }
@@ -150,7 +164,7 @@ mod tests_entry {
     /// full == the membership — the full-push proven shape; the mode is the
     fn agreeing_terminal(keys: &[SlotId], status_idx: u32) -> LedgerTerminalWire {
         let deployment_id = test_deployment_id("deploy-w");
-        let target = TargetName::new("t1".to_string());
+        let target = TargetName::parse("t1").unwrap();
         match status_idx {
             // Successful: EVERY member slot recorded Activated, the
             // COMPLETE rollback payload covers the same membership with
@@ -309,7 +323,7 @@ mod tests_entry {
             )));
         }
         for key in pair.1.outcomes.keys() {
-            if !intent.slots.contains_key(key) {
+            if !intent.selected.contains_key(key) {
                 return Err(Error::integrity(format!(
                     "terminal {}: outcome for slot '{key}' is outside the intent's membership",
                     pair.1.deployment_id
@@ -329,7 +343,7 @@ mod tests_entry {
         // membership (it is the historical selected set written before the
         // push; the terminal's memberships are proven at terminal time).
         let outcome_keys: BTreeSet<SlotId> = terminal.outcomes().keys().cloned().collect();
-        let membership: BTreeSet<SlotId> = intent.slots.keys().cloned().collect();
+        let membership: BTreeSet<SlotId> = intent.selected.keys().cloned().collect();
         match terminal.status() {
             DeploymentStatus::Successful => {
                 // THE INTENT-BINDING LEGS (the user's requirement): the
@@ -365,7 +379,7 @@ mod tests_entry {
                         intent.full_membership()
                     )));
                 }
-                if intent.group.is_none() && selected != full {
+                if intent.group.is_none() && *selected != full {
                     return Err(Error::integrity(format!(
                         "terminal {}: Successful records selected membership {selected:?} and full membership {full:?} — a FULL push (no group) selects every target slot, so its selected membership must EXACTLY equal its full membership",
                         pair.1.deployment_id
@@ -419,9 +433,9 @@ mod tests_entry {
         keys: &[SlotId],
         status_idx: u32,
     ) {
-        assert!(!intent.slots.is_empty(), "the membership is non-empty");
+        assert!(!intent.selected.is_empty(), "the membership is non-empty");
         assert_eq!(
-            intent.slots.len(),
+            intent.selected.len(),
             keys.len(),
             "the table's key count equals the membership count (no duplicates, no missing)"
         );
@@ -431,18 +445,21 @@ mod tests_entry {
             "the membership is exactly the wire's slot_ids (deployment order)"
         );
         for key in keys {
-            let entry = &intent.slots[key];
+            // The member's DESIRED state is its frozen snapshot entry (the
+            // selected slot's desired generation/artifact/binding is derived
+            // from its snapshot entry — never duplicated in the selected
+            // table).
+            let desired = intent
+                .resulting_snapshot
+                .get(key)
+                .expect("selected in snapshot")
+                .artifact();
             assert!(
-                entry
-                    .desired
-                    .artifact
-                    .release
-                    .as_str()
-                    .starts_with("rel-sha256-"),
+                desired.release.as_str().starts_with("rel-sha256-"),
                 "each member carries its desired assignment"
             );
-            // The pre_push ENTRY is structural: every member slot has an
-            // IntentSlot (with `pre_push: Option<PreviousGeneration>`,
+            // The pre_push ENTRY is structural: every selected slot has a
+            // [`SelectedSlotIntent`] (with `pre_push: Option<GenerationRef>`,
             // `None` for a first deployment) — there is no member without
             // its per-slot data.
         }
@@ -483,7 +500,7 @@ mod tests_entry {
                     assert_eq!(
                         outcomes[key].observation,
                         Observation::Known(ObservedGeneration {
-                            generation: st.rollback().get(key).unwrap().generation().clone(),
+                            generation: st.rollback().get(key).unwrap().generation().clone()
                         }),
                         "the derived view's generation EQUALS the rollback's authoritative generation"
                     );
@@ -493,12 +510,12 @@ mod tests_entry {
                 // record PROVES activated == full == the rollback's key set.
                 assert_eq!(
                     terminal.selected_membership(),
-                    Some(&BTreeSet::from_iter(keys.iter().cloned())),
+                    Some(BTreeSet::from_iter(keys.iter().cloned())),
                     "the Successful disposition exposes its selected membership (== the activated set)"
                 );
                 assert_eq!(
                     terminal.full_membership(),
-                    Some(&BTreeSet::from_iter(keys.iter().cloned())),
+                    Some(BTreeSet::from_iter(keys.iter().cloned())),
                     "the Successful disposition exposes its full membership (== the rollback's slots)"
                 );
             }
@@ -602,7 +619,7 @@ mod tests_entry {
                             crate::identity::GenerationId::new("gen-missing".to_string()),
                             crate::identity::ArtifactRef {
                                 release: crate::identity::test_release_id("rel-missing"),
-                                variant: crate::identity::VariantName::new("standard".to_string()),
+                                variant: crate::identity::VariantName::parse("standard").unwrap(),
                                 tree: crate::identity::test_tree_digest("missing"),
                             },
                             b.clone(),
@@ -665,7 +682,7 @@ mod tests_entry {
                             crate::identity::GenerationId::new("gen-missing".to_string()),
                             crate::identity::ArtifactRef {
                                 release: crate::identity::test_release_id("rel-missing"),
-                                variant: crate::identity::VariantName::new("standard".to_string()),
+                                variant: crate::identity::VariantName::parse("standard").unwrap(),
                                 tree: crate::identity::test_tree_digest("missing"),
                             },
                             b.clone(),
@@ -816,7 +833,7 @@ mod tests_entry {
                             crate::identity::GenerationId::new("gen-missing".to_string()),
                             crate::identity::ArtifactRef {
                                 release: crate::identity::test_release_id("rel-missing"),
-                                variant: crate::identity::VariantName::new("standard".to_string()),
+                                variant: crate::identity::VariantName::parse("standard").unwrap(),
                                 tree: crate::identity::test_tree_digest("missing"),
                             },
                             b.clone(),
@@ -833,7 +850,7 @@ mod tests_entry {
         t.reason = Some("tampered note".to_string());
     }
     fn target_mismatch(t: &mut LedgerTerminalWire) {
-        t.target = TargetName::new("other-target".to_string());
+        t.target = TargetName::parse("other-target").unwrap();
     }
     fn deployment_id_mismatch(t: &mut LedgerTerminalWire) {
         t.deployment_id = test_deployment_id("deploy-other");
@@ -874,8 +891,7 @@ mod tests_entry {
                 DeploymentStatus::FailedPreflight => 1,
                 DeploymentStatus::FailedRolledBack => 2,
                 DeploymentStatus::Degraded => 3,
-                other => panic!("unexpected wire status {other:?}"),
-            };
+                other => panic!("unexpected wire status {other:?}")};
             let (d_intent, d_terminal) = pair_to_domain(&(intent.clone(), terminal.clone()))
                 .expect("the agreeing pair converts");
             assert_domain_shape(&d_intent, &d_terminal, &keys, status_idx);
@@ -1004,28 +1020,36 @@ mod tests_entry {
         full: &BTreeSet<SlotId>,
     ) -> LedgerIntentWire {
         let keys: Vec<SlotId> = membership.iter().cloned().collect();
-        let desired: BTreeMap<SlotId, GenerationRef> =
-            keys.iter().map(|k| (k.clone(), gen_ref_for(k))).collect();
         let pre_push: BTreeMap<SlotId, Option<SlotAttemptStateWire>> =
             keys.iter().map(|k| (k.clone(), None)).collect();
-        // The rebuilt intent FREEZES each member's physical binding (schema
-        // v6): the binding keys follow the membership so the intent stays
-        // internally agreeing (the tamper focus is the TERMINAL).
-        let bindings: BTreeMap<SlotId, PhysicalBinding> =
-            keys.iter().map(|k| (k.clone(), binding(k))).collect();
+        // THE FROZEN RESULTING SNAPSHOT over the FULL membership (each
+        // member's plan-minted generation/artifact and plan-time physical
+        // binding — schema v6): its keys ARE the frozen full membership.
+        let snapshot = TargetSnapshot::from_entries(
+            full.iter()
+                .map(|k| {
+                    let g = gen_ref_for(k);
+                    (
+                        k.clone(),
+                        SnapshotEntry::new(
+                            g.generation.clone(),
+                            g.assignment.artifact.clone(),
+                            binding(k),
+                        ),
+                    )
+                })
+                .collect(),
+        );
         LedgerIntentWire {
             deployment_schema_version: intent.deployment_schema_version,
             deployment_id: intent.deployment_id.clone(),
             target: intent.target.clone(),
             group: intent.group.clone(),
             slot_ids: keys.clone(),
-            selected_membership: keys.clone(),
-            full_membership: full.iter().cloned().collect(),
             behavior_sha256: intent.behavior_sha256.clone(),
             attempted_at: intent.attempted_at.clone(),
-            desired,
+            resulting_snapshot: TargetSnapshotWire::from(&snapshot),
             pre_push,
-            bindings,
             slots: BTreeMap::new(),
         }
     }
@@ -1262,13 +1286,17 @@ mod tests_entry {
 
     /// Apply SIX INDEPENDENT key ops to a valid Successful pair and return
     /// the tampered pair: (0) the outcomes keys, (1) the TERMINAL's
-    /// selected_membership, (2) the TERMINAL's full_membership, (3) the
-    /// rollback's slots keys (bindings coupled), (4) the INTENT's frozen
-    /// selected_membership, (5) the INTENT's frozen full_membership. The
-    /// intent is REBUILT over its OWN frozen values (its table keys ARE its
-    /// frozen selected — the conversion re-checks the two AGREE), with the
-    /// given MODE applied to its `group` (`Some("g1")` = group push,
-    /// `None` = full push).
+    /// selected_membership, (2) the rollback's slots keys (bindings
+    /// coupled), (3) the INTENT's frozen selected (its authoritative
+    /// `slot_ids`), (4) the INTENT's frozen full (the resulting snapshot's
+    /// key set), (5) the INTENT's frozen snapshot ENTRY VALUES (a mutation
+    /// of one entry's generation). The terminal's wire `full_membership` is
+    /// a VESTIGIAL field the read never consults (the rollback IS the full
+    /// membership) — it is NOT one of the surviving sets. The intent is
+    /// REBUILT over its OWN frozen values (its table keys ARE its frozen
+    /// selected — the conversion re-checks the two AGREE), with the given
+    /// MODE applied to its `group` (`Some("g1")` = group push, `None` =
+    /// full push).
     fn apply_six_set_tamper(
         pair: &(LedgerIntentWire, LedgerTerminalWire),
         ops: [KeyOp; 6],
@@ -1283,18 +1311,19 @@ mod tests_entry {
             .iter()
             .map(|k| (k.clone(), outcome_for(k, SlotOutcomeKind::Activated)))
             .collect();
-        // (1) TERMINAL selected, (2) TERMINAL full.
+        // (1) TERMINAL selected (the surviving terminal-local set — the
+        //     conversion enforces outcomes == selected_membership), (2)
+        //     ROLLBACK slots keys (bindings coupled to the slots) — the
+        //     object the read's full-equality leg compares against the
+        //     intent's frozen snapshot.
         let selected: BTreeSet<SlotId> = terminal.selected_membership.iter().cloned().collect();
         terminal.selected_membership = apply_key_op(&selected, ops[1]).into_iter().collect();
-        let full: BTreeSet<SlotId> = terminal.full_membership.iter().cloned().collect();
-        terminal.full_membership = apply_key_op(&full, ops[2]).into_iter().collect();
-        // (3) ROLLBACK slots keys (bindings coupled to the slots).
         let rb = terminal
             .rollback
             .as_mut()
             .expect("a Successful terminal carries its rollback");
         let slot_keys: BTreeSet<SlotId> = rb.keys().cloned().collect();
-        let new_slots = apply_key_op(&slot_keys, ops[3]);
+        let new_slots = apply_key_op(&slot_keys, ops[2]);
         *rb = crate::ledger::records::TargetSnapshot::from_entries(
             new_slots
                 .iter()
@@ -1311,57 +1340,107 @@ mod tests_entry {
                 })
                 .collect(),
         );
-        // (4) INTENT selected, (5) INTENT full — the intent's OWN frozen
-        // values, generated INDEPENDENTLY of the terminal's.
-        let intent_selected: BTreeSet<SlotId> =
-            intent.selected_membership.iter().cloned().collect();
-        let new_intent_selected = apply_key_op(&intent_selected, ops[4]);
-        let intent_full: BTreeSet<SlotId> = intent.full_membership.iter().cloned().collect();
-        let new_intent_full = apply_key_op(&intent_full, ops[5]);
+        // (3) INTENT selected, (4) INTENT full — the intent's OWN frozen
+        //     values, generated INDEPENDENTLY of the terminal's. The intent's
+        //     selected is its authoritative `slot_ids`; its frozen full is the
+        //     resulting snapshot's key set.
+        let intent_selected: BTreeSet<SlotId> = intent.slot_ids.iter().cloned().collect();
+        let new_intent_selected = apply_key_op(&intent_selected, ops[3]);
+        let snapshot: TargetSnapshot = intent.resulting_snapshot.clone().into();
+        let intent_full: BTreeSet<SlotId> = snapshot.keys().cloned().collect();
+        let new_intent_full = apply_key_op(&intent_full, ops[4]);
         // Rebuild the intent over its OWN frozen selected (its table keys
         // ARE the selected — the conversion re-checks the two AGREE, no
         // divergence) + frozen full; the mode is applied to its `group`.
         let mut intent = intent_with_membership(intent, &new_intent_selected, &new_intent_full);
         intent.group = if group { Some("g1".to_string()) } else { None };
+        // (5) SNAPSHOT ENTRY VALUE TAMPER: a non-Unchanged op mutates the
+        //     FIRST snapshot entry's generation — the read's full-equality
+        //     leg (rollback == intent.resulting_snapshot) covers the
+        //     per-slot VALUES, not just the keys, so a mutated entry (even
+        //     an UNSELECTED one the snapshot carries forward) diverges the
+        //     rollback-vs-snapshot comparison and the read rejects.
+        if ops[5] != KeyOp::Unchanged {
+            let snapshot: TargetSnapshot = intent.resulting_snapshot.clone().into();
+            // An EMPTY snapshot can only arise when op (4) deleted the last
+            // snapshot key — the read already rejects that wire (the
+            // conversion refuses an empty snapshot), so there is nothing to
+            // mutate here.
+            if let Some(first) = snapshot.clone().keys().next().cloned() {
+                let entry = snapshot.get(&first).expect("the key is slotted").clone();
+                let mut entries = snapshot.into_entries();
+                entries.insert(
+                    first.clone(),
+                    crate::ledger::records::SnapshotEntry::new(
+                        test_generation_id(&format!("snap-other-{}", first.as_str())),
+                        entry.artifact().clone(),
+                        entry.binding().clone(),
+                    ),
+                );
+                intent.resulting_snapshot =
+                    TargetSnapshotWire::from(&TargetSnapshot::from_entries(entries));
+            }
+        }
         (intent, terminal)
     }
 
     /// Evaluate THE SIX-SET EQUATIONS for a written pair — the acceptance
     /// criterion the properties assert `read_ledger` is EXACTLY EQUIVALENT
     /// to: terminal-selected == intent-selected (the intent-binding leg),
-    /// terminal-full == intent-full (the intent-binding leg), outcomes ==
-    /// selected, rollback slots == bindings == full (bindings coupled by
-    /// construction), selected ⊆ full (the intent's OWN frozen consistency
-    /// AND the terminal's), (FULL mode) selected == full, plus the
-    /// Successful non-emptiness (non-empty outcomes and both memberships on
-    /// BOTH records).
+    /// outcomes == selected (the terminal-local equation), rollback slots
+    /// == the intent's frozen snapshot keys (the full membership — the read
+    /// demands rollback == the intent's resulting_snapshot), selected ⊆ the
+    /// snapshot (the intent's OWN frozen consistency AND the terminal's),
+    /// (FULL mode) selected == snapshot keys, the intent's frozen snapshot
+    /// ENTRIES UNMUTATED (the read's full-equality leg covers the per-slot
+    /// values, not just the keys), plus the Successful non-emptiness. The
+    /// terminal's wire `full_membership` is a VESTIGIAL field the read
+    /// never consults (the rollback IS the full membership) — it
+    /// participates in NO equation.
     fn six_set_equations_hold(pair: &(LedgerIntentWire, LedgerTerminalWire)) -> bool {
         let intent = &pair.0;
         let terminal = &pair.1;
         let outcomes: BTreeSet<SlotId> = terminal.outcomes.keys().cloned().collect();
         let t_selected: BTreeSet<SlotId> = terminal.selected_membership.iter().cloned().collect();
-        let t_full: BTreeSet<SlotId> = terminal.full_membership.iter().cloned().collect();
         let rollback_slots: BTreeSet<SlotId> = terminal
             .rollback
             .as_ref()
             .map(|rb| rb.keys().cloned().collect())
             .unwrap_or_default();
-        let i_selected: BTreeSet<SlotId> = intent.selected_membership.iter().cloned().collect();
-        let i_full: BTreeSet<SlotId> = intent.full_membership.iter().cloned().collect();
+        let i_selected: BTreeSet<SlotId> = intent.slot_ids.iter().cloned().collect();
+        let snapshot: TargetSnapshot = intent.resulting_snapshot.clone().into();
+        let i_full: BTreeSet<SlotId> = snapshot.keys().cloned().collect();
         let full_mode = intent.group.is_none();
         t_selected == i_selected
-            && t_full == i_full
             && outcomes == t_selected
-            && rollback_slots == t_full
+            && rollback_slots == i_full
             && i_selected.is_subset(&i_full)
-            && t_selected.is_subset(&t_full)
-            && (!full_mode || t_selected == t_full)
+            && t_selected.is_subset(&i_full)
+            && (!full_mode || i_selected == i_full)
+            && snapshot_entries_canonical(intent)
             && !outcomes.is_empty()
             && !t_selected.is_empty()
-            && !t_full.is_empty()
             && !rollback_slots.is_empty()
             && !i_selected.is_empty()
             && !i_full.is_empty()
+    }
+
+    /// THE INTENT'S FROZEN SNAPSHOT ENTRIES ARE CANONICAL: every
+    /// resulting_snapshot entry is the canonical plan-minted entry for its
+    /// key (the generation the fixture derives from the slot id, the
+    /// agreeing artifact, and the canonical plan-time binding). A tamper of
+    /// set (5) mutates one entry's generation; the read's full-equality leg
+    /// (rollback == intent.resulting_snapshot) then diverges and rejects —
+    /// the snapshots built by the fixture generators are canonical by
+    /// construction, so this predicate is exactly "set (5) untouched".
+    fn snapshot_entries_canonical(intent: &LedgerIntentWire) -> bool {
+        let snapshot: TargetSnapshot = intent.resulting_snapshot.clone().into();
+        snapshot.iter().all(|(k, e)| {
+            let gr = gen_ref_for(k);
+            e.generation() == &gr.generation
+                && e.artifact() == &gr.assignment.artifact
+                && e.binding() == &binding(k)
+        })
     }
 
     /// A key-op strategy BIASED toward `Unchanged` (3:1:1:1) so the
@@ -1379,16 +1458,23 @@ mod tests_entry {
 
     proptest! {
         // THE USER'S SIX-SET PROPERTY: generate the SIX INDEPENDENT SETS —
-        // intent-selected, intent-full, terminal-selected, terminal-full,
-        // outcomes, rollback slots (bindings generated EQUAL to the
-        // rollback slots — the coupled structural invariant) — by
-        // INDEPENDENT Delete/Add/Replace/Unchanged ops from a valid base
-        // pair, plus a group/full MODE (applied to the intent's `group`).
-        // READING (the real `read_ledger` of the written pair) SUCCEEDS IFF
-        // THE SIX EQUATIONS HOLD: terminal-selected == intent-selected,
-        // terminal-full == intent-full, outcomes == selected, rollback ==
-        // full, selected ⊆ full (both records' own consistency), (full
-        // mode) selected == full, plus the Successful non-emptiness. The
+        // (0) outcomes keys, (1) the terminal-selected membership, (2) the
+        // rollback slot keys (bindings generated EQUAL to the rollback
+        // slots — the coupled structural invariant), (3) intent-selected
+        // (slot_ids), (4) intent-full (the resulting snapshot's keys),
+        // (5) the intent's frozen snapshot ENTRY VALUES (a mutation of one
+        // entry's generation) — by INDEPENDENT
+        // Delete/Add/Replace/Unchanged ops from a valid base pair, plus a
+        // group/full MODE (applied to the intent's `group`). The terminal's
+        // wire `full_membership` is NOT one of the sets: it is a VESTIGIAL
+        // field the read never consults (the rollback IS the full
+        // membership). READING (the real `read_ledger` of the written pair)
+        // SUCCEEDS IFF THE SIX EQUATIONS HOLD: terminal-selected ==
+        // intent-selected, outcomes == selected, rollback keys == the
+        // intent's frozen snapshot keys, selected ⊆ snapshot (both records'
+        // own consistency), (full mode) selected == snapshot keys, the
+        // snapshot entries UNMUTATED, plus the Successful non-emptiness.
+        // The
         // intent is rebuilt over its OWN frozen values (its table keys ARE
         // its frozen selected) so it never adds a verdict of its own; the
         // mode is applied to its `group`.
@@ -1421,12 +1507,16 @@ mod tests_entry {
             let pair = (t_intent, t_terminal);
             let expect_ok = six_set_equations_hold(&pair);
             let read = write_pair_ledger(&pair);
+            let intent_full_debug: BTreeSet<SlotId> = {
+                let snapshot: TargetSnapshot = pair.0.resulting_snapshot.clone().into();
+                snapshot.keys().cloned().collect()
+            };
             assert_eq!(
                 read.is_ok(),
                 expect_ok,
                 "read_ledger must succeed iff the six equations hold (intent-selected {:?}, intent-full {:?}, terminal-selected {:?}, terminal-full {:?}, outcomes {:?}, rollback slots {:?}, full mode: {}); read: {:?}",
-                pair.0.selected_membership,
-                pair.0.full_membership,
+                pair.0.slot_ids,
+                intent_full_debug,
                 pair.1.selected_membership,
                 pair.1.full_membership,
                 pair.1.outcomes.keys().collect::<BTreeSet<_>>(),
@@ -1439,7 +1529,8 @@ mod tests_entry {
             // is a PURE function of the persisted sets + mode; the frozen
             // intent values are the only source, never the live config.
             if expect_ok {
-                let frozen_full = pair.0.full_membership.clone();
+                let snapshot: TargetSnapshot = pair.0.resulting_snapshot.clone().into();
+                let frozen_full = snapshot.keys().cloned().collect::<Vec<SlotId>>();
                 write_pair_ledger_under_config(&pair, &frozen_full)
                     .expect("an accepted pair reads under a config matching its frozen full membership");
                 // A config whose target slots DIFFER from the intent's
@@ -1492,7 +1583,8 @@ mod tests_entry {
     // its rollback. The wire keeps the per-slot `outcomes` shape, so the
     // wire → domain conversion enforces THE COMPLETE EQUALITY PREDICATE
     // per selected slot: the observation is `Known(g)`, `g ==
-    // rollback.slots[slot].generation`, `error == None`, and
+    // the rollback's generation for that slot` (the rollback IS the intent's
+    // frozen snapshot), `error == None`, and
     // `compensated == false` — and then DISCARDS the wire's per-slot
     // claims (the domain stores only the ACTIVATED SLOT-ID SET; the per-slot
     // facts are DERIVED from the rollback).
@@ -1527,7 +1619,7 @@ mod tests_entry {
             ],
             prop_oneof![
                 (0u32..6).prop_map(|i| Observation::Known(ObservedGeneration {
-                    generation: test_generation_id(&format!("obs-{i}")),
+                    generation: test_generation_id(&format!("obs-{i}"))
                 })),
                 Just(Observation::KnownAbsent),
                 prop::sample::select(vec![
@@ -1563,7 +1655,7 @@ mod tests_entry {
                 placement_slot: key.clone(),
                 artifact: ArtifactRef {
                     release: test_release_id(key.as_str()),
-                    variant: VariantName::new("standard".to_string()),
+                    variant: VariantName::parse("standard").unwrap(),
                     tree: test_tree_digest(key.as_str()),
                 },
             },
@@ -1602,23 +1694,37 @@ mod tests_entry {
                 .collect();
             let bindings: BTreeMap<SlotId, PhysicalBinding> =
                 keys.iter().map(|k| (k.clone(), binding(k))).collect();
-            // Build intent whose desired + bindings exactly match the rollback inputs
-            let desired = rb_slots.clone();
+            // THE FROZEN RESULTING SNAPSHOT: one entry per member built from
+            // the rollback inputs (generation + artifact) and the exact
+            // bindings map — the intent's desired facts EQUAL the rollback's
+            // generation/artifact/binding (the shared validator checks this).
+            let snapshot = TargetSnapshot::from_entries(
+                keys.iter()
+                    .map(|k| {
+                        let gr = rb_slots.get(k).expect("rollback covers every member");
+                        (
+                            k.clone(),
+                            SnapshotEntry::new(
+                                gr.generation.clone(),
+                                gr.assignment.artifact.clone(),
+                                bindings.get(k).cloned().expect("every member is bound"),
+                            ),
+                        )
+                    })
+                    .collect(),
+            );
             let pre_push: BTreeMap<SlotId, Option<SlotAttemptStateWire>> =
                 keys.iter().map(|k| (k.clone(), None)).collect();
             LedgerIntentWire {
                 deployment_schema_version: crate::ledger::LEDGER_SCHEMA_VERSION,
                 deployment_id: test_deployment_id("deploy-w"),
-                target: TargetName::new("t1".to_string()),
+                target: TargetName::parse("t1").unwrap(),
                 group: None,
                 slot_ids: keys.clone(),
-                selected_membership: keys.clone(),
-                full_membership: keys.clone(),
-                behavior_sha256: "sha256-w".to_string(),
+                behavior_sha256: crate::identity::DIGEST_TEST_HEX_1.to_string(),
                 attempted_at: "2026-01-01T00:00:00Z".to_string(),
-                desired,
+                resulting_snapshot: TargetSnapshotWire::from(&snapshot),
                 pre_push,
-                bindings: bindings.clone(),
                 slots: BTreeMap::new(),
             }
         } else {
@@ -1755,10 +1861,12 @@ mod tests_entry {
         // (Successful vs FailedRolledBack). `read_ledger` (the real durable
         // write → re-read path) SUCCEEDS for a Successful pair EXACTLY WHEN
         // EVERY selected slot satisfies THE COMPLETE EQUALITY PREDICATE:
-        // Known(g) AND g == rollback.slots[slot].generation AND error ==
+        // Known(g) AND g == the rollback's generation for the slot AND error ==
         // None AND compensated == false (plus the existing Successful rules
-        // — non-empty, all Activated, outcomes == selected, rollback ==
-        // full, selected ⊆ full, full-push selected == full — all held by
+        // — non-empty, all Activated, outcomes == selected, selected ⊆ the
+        // rollback, and — through the intent-binding legs — the rollback
+        // EXACTLY equals the intent's frozen resulting_snapshot and the
+        // activated set the intent's selected keys — all held by
         // construction). A non-Successful status is judged by ITS OWN rules
         // (the compensation report), never the predicate. Bounded 64 cases
         // (the product space is large), fixed seed 0x5EED_5EED (house
@@ -1925,12 +2033,10 @@ mod tests_entry {
                         SuccessfulLegs {
                             kind: SlotOutcomeKind::Activated,
                             observation: Observation::Known(ObservedGeneration {
-                                generation: test_generation_id(&format!("obs-{}", k.as_str())),
-                            }),
+                                generation: test_generation_id(&format!("obs-{}", k.as_str()))}),
                             error: None,
                             compensated: false,
-                            rb_match: true,
-                        },
+                            rb_match: true},
                     )
                 })
                 .collect();
@@ -1962,14 +2068,23 @@ mod tests_entry {
         // its frozen full must equal the terminal's).
         let mut intent = intent;
         intent.slot_ids.push(slot(9));
-        intent.selected_membership.push(slot(9));
-        intent.full_membership.push(slot(9));
-        intent.desired.insert(slot(9), gen_ref_for(&slot(9)));
         intent.pre_push.insert(slot(9), None);
-        // The FROZEN PHYSICAL BINDINGS follow the membership (schema v6):
-        // the intent's new member also freezes its plan-time binding, so
-        // the binding keys keep agreeing with the slot table keys.
-        intent.bindings.insert(slot(9), binding(&slot(9)));
+        // The frozen snapshot grows with the new member (schema v6: its
+        // keys ARE the frozen full membership, and the new member freezes
+        // its plan-time generation/artifact/binding).
+        let gr = gen_ref_for(&slot(9));
+        let snapshot: TargetSnapshot = intent.resulting_snapshot.clone().into();
+        let mut entries = snapshot.into_entries();
+        entries.insert(
+            slot(9),
+            SnapshotEntry::new(
+                gr.generation.clone(),
+                gr.assignment.artifact.clone(),
+                binding(&slot(9)),
+            ),
+        );
+        intent.resulting_snapshot =
+            TargetSnapshotWire::from(&TargetSnapshot::from_entries(entries));
         let mut terminal = terminal;
         terminal
             .outcomes
@@ -1995,7 +2110,7 @@ mod tests_entry {
         );
         assert_eq!(entries.len(), 1);
         assert_eq!(
-            entries[0].intent.slots.len(),
+            entries[0].intent.selected.len(),
             3,
             "the intent's membership grew with the added key"
         );
@@ -2031,7 +2146,19 @@ mod tests_entry {
             *rb = crate::ledger::records::TargetSnapshot::from_entries(entries);
         }
         let mut intent2 = intent.clone();
-        intent2.full_membership.push(slot(3));
+        let gr3 = gen_ref_for(&slot(3));
+        let snapshot: TargetSnapshot = intent2.resulting_snapshot.clone().into();
+        let mut entries = snapshot.into_entries();
+        entries.insert(
+            slot(3),
+            SnapshotEntry::new(
+                gr3.generation.clone(),
+                gr3.assignment.artifact.clone(),
+                binding(&slot(3)),
+            ),
+        );
+        intent2.resulting_snapshot =
+            TargetSnapshotWire::from(&TargetSnapshot::from_entries(entries));
         write_pair_ledger(&(intent2, terminal2))
             .expect("growing only the full membership keeps selected ⊆ full — the read succeeds");
         // GROW THE SELECTED SIDE ONLY, WITHIN the full membership
@@ -2079,7 +2206,9 @@ mod tests_entry {
         write_pair_ledger(&pair).expect("the group six-set pair reads");
         // Config-change independence: accepted under a config whose target
         // membership EQUALS the intent's frozen full …
-        write_pair_ledger_under_config(&pair, &intent.full_membership.clone())
+        let snapshot: TargetSnapshot = pair.0.resulting_snapshot.clone().into();
+        let frozen_full = snapshot.keys().cloned().collect::<Vec<SlotId>>();
+        write_pair_ledger_under_config(&pair, &frozen_full)
             .expect("accepted under a config matching the intent's frozen full membership");
         // … and accepted under a DIFFERENT membership (slot-9 is outside
         // every set): acceptance is UNCHANGED — the read never consults the
@@ -2267,7 +2396,7 @@ mod tests_entry {
         let intent = agreeing_intent(&keys);
         // A terminal claiming a DIFFERENT target than its entry.
         let mut terminal = agreeing_terminal(&keys, 0);
-        terminal.target = TargetName::new("other".to_string());
+        terminal.target = TargetName::parse("other").unwrap();
         let err = pair_to_domain(&(intent.clone(), terminal))
             .expect_err("a target disagreement is refused");
         assert!(err.to_string().contains("target"), "err: {err}");

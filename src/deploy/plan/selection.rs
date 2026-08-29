@@ -247,7 +247,9 @@ mod selection_tests {
     use crate::ledger::{PlanOrigin, PushRef, VerifiedReleaseRebinding};
     use crate::store::local::LocalStore;
     use crate::verify::release::RELEASE_RECORD_SCHEMA_VERSION;
+    #[cfg(test)]
     use proptest::prelude::*;
+    #[cfg(test)]
     use proptest::test_runner::RngSeed;
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -861,16 +863,16 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // check records the FULL slot-ID sets (logical only).
         assert_eq!(rp.frozen_topology.len(), 3);
         assert_eq!(
-            rp.frozen_topology[&SlotId::new("p1".to_string())].groups,
+            rp.frozen_topology[&SlotId::parse("p1").unwrap()].groups,
             vec!["G".to_string()]
         );
         assert!(
-            rp.frozen_topology[&SlotId::new("p2".to_string())]
+            rp.frozen_topology[&SlotId::parse("p2").unwrap()]
                 .groups
                 .is_empty()
         );
         assert_eq!(
-            rp.frozen_topology[&SlotId::new("p3".to_string())].groups,
+            rp.frozen_topology[&SlotId::parse("p3").unwrap()].groups,
             vec!["G".to_string()]
         );
         // The rebinding's membership is the PROOF the gate produced: the
@@ -1326,7 +1328,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             // accessors carry the target, the declared temporal source, and
             // the resolved non-empty slot set.
             let empty_err = ResolvedSelection::new(
-                TargetName::new("t1".to_string()),
+                TargetName::parse("t1").unwrap(),
                 ResolvedSelectionSource::Head,
                 std::iter::empty(),
             )

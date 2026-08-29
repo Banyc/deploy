@@ -744,7 +744,9 @@ fn sanitize_name(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(test)]
     use proptest::prelude::*;
+    #[cfg(test)]
     use proptest::test_runner::RngSeed;
 
     fn opts() -> InitOptions {
@@ -1299,14 +1301,12 @@ mod tests {
                     host.clone(),
                     PathBuf::from(format!("/srv/deploy/{expected_name}")),
                 ),
-                None => ("local".to_string(), report.target.join(".deploy-remote")),
-            };
+                None => ("local".to_string(), report.target.join(".deploy-remote"))};
             let server = config.server("server-01").expect("scaffold writes server-01");
             assert_eq!(server.address(), expected_address);
             let is_local = match &opts.address {
                 None => true,
-                Some(a) => a == "local",
-            };
+                Some(a) => a == "local"};
             if is_local {
                 // The pathless local kind drops the SSH user/port in the
                 // domain; its identity is ALWAYS Local (no host
@@ -1331,8 +1331,7 @@ mod tests {
                                 crate::config::HostIdentity::Fingerprint(f) if f.as_str() == fp),
                             "fingerprint identity must round-trip"
                         ),
-                        _ => unreachable!("the generator always sets exactly one SSH identity"),
-                    }
+                        _ => unreachable!("the generator always sets exactly one SSH identity")}
             }
 
             // SLOT OWNERSHIP: the reloaded domain's one slot is exactly what

@@ -475,12 +475,14 @@ mod tests {
         ArtifactRef, GenerationRef, PlacementSlotAssignment, ServerId, SlotId, TargetName,
         TreeDigest, VariantName, test_deployment_id, test_generation_id, test_tree_digest,
     };
+    use crate::ledger::records::{SelectedSlotIntent, SnapshotEntry};
     use crate::ledger::{
-        DeploymentIntent, DesiredGeneration, IntentSlot, LedgerTerminal, NonEmptySlotTable,
-        Observation, ObservationError, ObservedAssignment, ObservedSlot, Pins, PreviousGeneration,
-        TargetSnapshot, TerminalDisposition,
+        DeploymentIntent, LedgerTerminal, NonEmptySlotTable, Observation, ObservationError,
+        ObservedAssignment, ObservedSlot, Pins, TargetSnapshot, TerminalDisposition,
     };
+    #[cfg(test)]
     use proptest::prelude::*;
+    #[cfg(test)]
     use proptest::test_runner::RngSeed;
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
@@ -553,7 +555,7 @@ interval_seconds = 0
             "gc",
             "sha256-aa",
             &BTreeMap::from([(
-                VariantName::new("standard".to_string()),
+                VariantName::parse("standard").unwrap(),
                 test_tree_digest(&format!("tree-pinned-{tag}")),
             )]),
             &BTreeMap::from([(
@@ -580,38 +582,57 @@ interval_seconds = 0
     /// key-set equality (`slot_ids == desired == pre_push`).
     #[allow(dead_code)]
     fn intent(id: &str) -> DeploymentIntent {
+        intent_full(id, "rel-1", "tree-1", "/srv/deploy/p1", None)
+    }
+
+    /// A single-slot (`p1`) VALID intent: the frozen snapshot entry
+    /// (generation gen-1, the given artifact release/tree, plan-time
+    /// physical binding at the given deploy dir) + the optional KNOWN
+    /// pre-push state. The snapshot's desired facts MATCH the rollback
+    /// `terminal_for` builds (the new shared validator requires the match).
+    fn intent_full(
+        id: &str,
+        release: &str,
+        tree: &str,
+        deploy_dir: &str,
+        pre_push: Option<GenerationRef>,
+    ) -> DeploymentIntent {
         let p1 = SlotId::new(SLOT.to_string());
-        // ONE slot table (the membership + desired/pre-push entries).
-        let slots = BTreeMap::from([(
+        // THE FROZEN RESULTING SNAPSHOT: the single slot's plan-minted
+        // generation/artifact and plan-time physical binding.
+        let snapshot = TargetSnapshot::from_entries(BTreeMap::from([(
             p1.clone(),
-            IntentSlot {
-                desired: DesiredGeneration {
-                    generation: test_generation_id("gen-1"),
-                    artifact: ArtifactRef {
-                        release: crate::identity::test_release_id("rel-1"),
-                        variant: VariantName::new("standard".to_string()),
-                        tree: test_tree_digest("tree-1"),
-                    },
+            SnapshotEntry::new(
+                test_generation_id("gen-1"),
+                ArtifactRef {
+                    release: crate::identity::test_release_id(release),
+                    variant: VariantName::parse("standard").unwrap(),
+                    tree: test_tree_digest(tree),
                 },
-                pre_push: None,
                 // The FROZEN plan-time physical binding (schema v6): the
-                // fixture's single slot is bound to server s1 at
-                // /srv/deploy/p1.
-                binding: crate::ledger::PhysicalBinding {
-                    server: ServerId::new("s1".to_string()),
-                    deploy_dir: "/srv/deploy/p1".to_string(),
+                // fixture's single slot is bound to server s1 at the given
+                // deploy dir.
+                crate::ledger::PhysicalBinding {
+                    server: ServerId::parse("s1").unwrap(),
+                    deploy_dir: deploy_dir.to_string(),
                 },
-            },
-        )]);
+            ),
+        )]));
         DeploymentIntent {
             deployment_id: test_deployment_id(id),
             target: TargetName::new(TARGET.to_string()),
             group: None,
-            behavior_sha256: "sha256-aa".to_string(),
-            attempted_at: "2026-01-01T00:00:00Z".to_string(),
-            slots: NonEmptySlotTable::build(slots)
-                .expect("a fixture intent always has at least one slot"),
-            full_membership: BTreeSet::from([SlotId::new(SLOT.to_string())]),
+            resulting_snapshot: snapshot,
+            selected: NonEmptySlotTable::build(BTreeMap::from([(
+                p1,
+                SelectedSlotIntent { pre_push },
+            )]))
+            .expect("fixture always has a slot"),
+            behavior_sha256: crate::identity::BehaviorDigest::parse(
+                crate::identity::DIGEST_TEST_HEX_1,
+            )
+            .unwrap(),
+            attempted_at: crate::identity::Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
         }
     }
 
@@ -623,7 +644,7 @@ interval_seconds = 0
         ("[a-f0-9]{64}", "[a-f0-9]{64}").prop_map(|(rel, tree)| ArtifactRef {
             release: ReleaseId::parse(&format!("rel-sha256-{rel}"))
                 .expect("generated hex is a canonical release id"),
-            variant: VariantName::new("standard".to_string()),
+            variant: VariantName::parse("standard").unwrap(),
             tree: TreeDigest::parse(&tree).expect("generated hex is a valid tree digest"),
         })
     }
@@ -643,46 +664,31 @@ interval_seconds = 0
         ]
     }
 
-    /// An EXACT intent whose pre-push assignment carries the GENERATED
-    /// artifact observation: one slot, a FIXED known desired artifact, and
-    /// the generated pre-push `Some(SlotAttemptState)`. The desired artifact
-    /// is the reachability baseline every case shares.
-    fn intent_with_pre_push(artifact: Observation<ArtifactRef>) -> DeploymentIntent {
-        let p1 = SlotId::new(SLOT.to_string());
-        let slots = BTreeMap::from([(
-            p1.clone(),
-            IntentSlot {
-                desired: DesiredGeneration {
-                    generation: test_generation_id("gen-1"),
-                    artifact: ArtifactRef {
-                        release: crate::identity::test_release_id("desired-rel"),
-                        variant: VariantName::new("standard".to_string()),
-                        tree: test_tree_digest("tree-desired"),
-                    },
+    #[allow(dead_code)]
+    fn arbitrary_pre_push() -> impl Strategy<Value = Option<GenerationRef>> {
+        arbitrary_assignment_observation().prop_map(|obs| match obs {
+            Observation::Known(a) => Some(GenerationRef {
+                generation: test_generation_id("gen-pre"),
+                assignment: PlacementSlotAssignment {
+                    placement_slot: SlotId::new(SLOT.to_string()),
+                    artifact: a,
                 },
-                pre_push: Some(PreviousGeneration {
-                    artifact,
-                    generation: Some(test_generation_id("gen-pre")),
-                }),
-                // The FROZEN plan-time physical binding (schema v6): the
-                // fixture's single slot is bound to server s1 at
-                // /srv/deploy/p1.
-                binding: crate::ledger::PhysicalBinding {
-                    server: ServerId::new("s1".to_string()),
-                    deploy_dir: "/srv/deploy/p1".to_string(),
-                },
-            },
-        )]);
-        DeploymentIntent {
-            deployment_id: test_deployment_id("deploy-prop-unknown"),
-            target: TargetName::new(TARGET.to_string()),
-            group: None,
-            behavior_sha256: "sha256-aa".to_string(),
-            attempted_at: "2026-01-01T00:00:00Z".to_string(),
-            slots: NonEmptySlotTable::build(slots)
-                .expect("a fixture intent always has at least one slot"),
-            full_membership: BTreeSet::from([SlotId::new(SLOT.to_string())]),
-        }
+            }),
+            // The domain pre-push carries ONLY a known prior state or None:
+            // an unreadable assignment is refused at the wire boundary, so
+            // the reachability strategy maps it to the no-prior-state case
+            // (which contributes nothing beyond the desired artifact).
+            Observation::Unknown(_) | Observation::KnownAbsent => None,
+        })
+    }
+    fn intent_with_pre_push(pre_push: Option<GenerationRef>) -> DeploymentIntent {
+        intent_full(
+            "deploy-prop-unknown",
+            "desired-rel",
+            "tree-desired",
+            "/srv/deploy/p1",
+            pre_push,
+        )
     }
 
     fn terminal_for(release: &str, tree: &str) -> LedgerTerminal {
@@ -705,7 +711,7 @@ interval_seconds = 0
                                     placement_slot: SlotId::new(SLOT.to_string()),
                                     artifact: ArtifactRef {
                                         release: ReleaseId::new(release.to_string()),
-                                        variant: VariantName::new("standard".to_string()),
+                                        variant: VariantName::parse("standard").unwrap(),
                                         tree: test_tree_digest(tree),
                                     },
                                 },
@@ -717,7 +723,7 @@ interval_seconds = 0
                         > = BTreeMap::from([(
                             SlotId::new(SLOT.to_string()),
                             crate::ledger::PhysicalBinding {
-                                server: crate::identity::ServerId::new("s1".to_string()),
+                                server: crate::identity::ServerId::parse("s1").unwrap(),
                                 deploy_dir: "/srv/eng".to_string(),
                             },
                         )]);
@@ -762,7 +768,6 @@ interval_seconds = 0
                         SLOT.to_string(),
                     )]))
                     .unwrap(),
-                    BTreeSet::from([SlotId::new(SLOT.to_string())]),
                 )
                 .unwrap(),
             ),
@@ -855,37 +860,15 @@ interval_seconds = 0
         for i in 0..retained {
             let id = format!("deploy-ret-{i}");
             let canonical = test_deployment_id(&id);
-            // Build a matching intent whose desired generation/artifact/binding equals the terminal's rollback
-            let rel = crate::identity::test_release_id(&format!("ret-{i}"));
-            let tree = test_tree_digest(&format!("tree-ret-{i}"));
-            let p1 = SlotId::new(SLOT.to_string());
-            let slots = BTreeMap::from([(
-                p1.clone(),
-                IntentSlot {
-                    desired: DesiredGeneration {
-                        generation: test_generation_id("gen-1"),
-                        artifact: ArtifactRef {
-                            release: rel.clone(),
-                            variant: VariantName::new("standard".to_string()),
-                            tree: tree.clone(),
-                        },
-                    },
-                    pre_push: None,
-                    binding: crate::ledger::PhysicalBinding {
-                        server: ServerId::new("s1".to_string()),
-                        deploy_dir: "/srv/eng".to_string(),
-                    },
-                },
-            )]);
-            let matching_intent = DeploymentIntent {
-                deployment_id: canonical.clone(),
-                target: TargetName::new(TARGET.to_string()),
-                group: None,
-                behavior_sha256: "sha256-aa".to_string(),
-                attempted_at: "2026-01-01T00:00:00Z".to_string(),
-                slots: NonEmptySlotTable::build(slots).expect("fixture"),
-                full_membership: BTreeSet::from([SlotId::new(SLOT.to_string())]),
-            };
+            // Build a matching intent whose frozen snapshot
+            // generation/artifact/binding equals the terminal's rollback.
+            let matching_intent = intent_full(
+                &id,
+                &format!("ret-{i}"),
+                &format!("tree-ret-{i}"),
+                "/srv/eng",
+                None,
+            );
             store.append_intent(TARGET, &matching_intent).unwrap();
             store
                 .append_terminal(
@@ -907,7 +890,7 @@ interval_seconds = 0
                 generation: test_generation_id("gen-obs"),
                 artifact: ArtifactRef {
                     release: crate::identity::test_release_id("rel-sha256-obs"),
-                    variant: VariantName::new("standard".to_string()),
+                    variant: VariantName::parse("standard").unwrap(),
                     tree: test_tree_digest("tree-obs"),
                 },
                 last_deployment: test_deployment_id("deploy-obs"),
@@ -926,7 +909,7 @@ interval_seconds = 0
             releases: vec![store_pin.clone()],
             bindings: vec![ArtifactRef {
                 release: store_pin.clone(),
-                variant: VariantName::new("standard".to_string()),
+                variant: VariantName::parse("standard").unwrap(),
                 tree: test_tree_digest("tree-pinned-store"),
             }],
         };
@@ -1242,55 +1225,42 @@ interval_seconds = 0
     /// (append_intent → read_ledger → into_domain) and collects the
     /// reachability entries. This is the production code path the sweep and
     /// the checkpoint preview share — not a copy of its logic.
-    fn run_assignment_observation_case(artifact: Observation<ArtifactRef>) {
+    fn run_assignment_observation_case(pre_push: Option<GenerationRef>) {
         let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let config = config_with_pin(tmp.path(), None);
         let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
-        let intent = intent_with_pre_push(artifact.clone());
+        let intent = intent_with_pre_push(pre_push.clone());
         store.append_intent(TARGET, &intent).unwrap();
 
-        // ---- 1. NEVER an ArtifactRef from a failure, and the wire round
-        // trip preserves the observation EXACTLY (an `Unknown` pre-push
-        // assignment can never be re-read as a fabricated/known ArtifactRef).
+        // ---- 1. The pre-push state round-trips EXACTLY through the wire
+        // (None stays None; an unreadable assignment can NEVER be re-read as
+        // a fabricated/known `GenerationRef` — the wire → domain conversion
+        // refuses Unknown/KnownAbsent values outright, see
+        // `unreadable_pre_push_wire_fails_closed`).
         let entries = store.read_ledger(TARGET).unwrap();
-        let read_back = &entries[0].intent.slots[&SlotId::new(SLOT.to_string())]
-            .pre_push
-            .as_ref()
-            .expect("the pre_push entry round-trips")
-            .artifact;
+        let read_back = &entries[0].intent.selected[&SlotId::new(SLOT.to_string())].pre_push;
         assert_eq!(
-            read_back, &artifact,
-            "the pre-push assignment observation must round-trip the wire EXACTLY — \
-             an Unknown assignment never becomes a fabricated/known ArtifactRef"
+            read_back, &pre_push,
+            "the pre-push state must round-trip the wire EXACTLY — \
+             no prior state contributes nothing, a known state never changes"
         );
 
         // ---- 2. The reachability effect, through the REAL collection logic:
-        // `Unknown` FAILS the sweep CLOSED (reachability is incomplete — the
-        // GC cannot verify what the slot ran before the attempt, so the scan
-        // aborts BEFORE any deletion and no release/tree entry can ever be
-        // derived from it); `KnownAbsent` contributes NOTHING beyond the
-        // desired artifact; a `Known` artifact DOES contribute its release +
-        // tree (the positive control).
-        match &artifact {
-            Observation::Unknown(_) => {
-                let err = store.reachable_set(&config, None).unwrap_err();
-                assert!(
-                    err.to_string().contains("UNKNOWN pre-push assignment"),
-                    "an Unknown pre-push assignment must fail the sweep closed \
-                     with the UNKNOWN-pre-push integrity error, got: {err}"
-                );
-            }
-            Observation::KnownAbsent => {
+        // `None` (no prior state) contributes NOTHING beyond the desired
+        // artifact; a `Some(gr)` KNOWN pre-push DOES contribute its release
+        // + tree (the positive control).
+        match &pre_push {
+            None => {
                 let retained = store.reachable_set(&config, None).unwrap();
                 assert_eq!(
                     retained.releases.len(),
                     1,
-                    "KnownAbsent contributes nothing: only the desired release is retained, got {retained:?}"
+                    "no prior state contributes nothing: only the desired release is retained, got {retained:?}"
                 );
                 assert_eq!(
                     retained.trees.len(),
                     1,
-                    "KnownAbsent contributes nothing: only the desired tree is retained, got {retained:?}"
+                    "no prior state contributes nothing: only the desired tree is retained, got {retained:?}"
                 );
                 assert!(
                     retained
@@ -1303,14 +1273,18 @@ interval_seconds = 0
                         .contains(test_tree_digest("tree-desired").as_str())
                 );
             }
-            Observation::Known(a) => {
+            Some(gr) => {
                 let retained = store.reachable_set(&config, None).unwrap();
                 assert!(
-                    retained.releases.contains(a.release.as_str()),
+                    retained
+                        .releases
+                        .contains(gr.assignment.artifact.release.as_str()),
                     "a Known pre-push artifact retains its release, got {retained:?}"
                 );
                 assert!(
-                    retained.trees.contains(a.tree.as_str()),
+                    retained
+                        .trees
+                        .contains(gr.assignment.artifact.tree.as_str()),
                     "a Known pre-push artifact retains its tree, got {retained:?}"
                 );
             }
@@ -1323,23 +1297,28 @@ interval_seconds = 0
         // `KnownAbsent` holds nothing, so neither can ever be mistaken for a
         // known artifact. The `unknown_artifact()` SENTINEL API is REMOVED
         // from [`crate::identity`] (any residual reference would not compile):
-        // an `ArtifactRef` in the system always means a known artifact.
-        match &artifact {
-            Observation::Known(a) => {
-                assert!(a.release.as_str().starts_with("rel-sha256-"));
-                assert!(a.tree.as_str().len() == 64);
-            }
-            Observation::Unknown(_) | Observation::KnownAbsent => {}
+        // an `ArtifactRef` in the system always means a known artifact. An
+        // `ArtifactRef` born from the domain pre-push is real and known.
+        if let Some(gr) = &pre_push {
+            assert!(
+                gr.assignment
+                    .artifact
+                    .release
+                    .as_str()
+                    .starts_with("rel-sha256-")
+            );
+            assert!(gr.assignment.artifact.tree.as_str().len() == 64);
         }
     }
 
     proptest! {
-        // THE USER'S PROPERTY: GENERATED assignment-read outcomes (Unknown
-        // with arbitrary messages, KnownAbsent, Known arbitrary artifacts)
-        // must NEVER produce an ArtifactRef or a release/tree reachability
-        // entry from a FAILURE, and no domain value can simultaneously mean
-        // "unknown" and "known artifact". Runs through the REAL store + the
-        // REAL reachable_set scan (the production collection logic). Bounded
+        // THE USER'S PROPERTY: GENERATED pre-push states (no prior state /
+        // arbitrary KNOWN artifacts, generated from the full
+        // Unknown/KnownAbsent/Known observation space but clamped to the
+        // domain's known-or-None carrier) must round-trip EXACTLY through
+        // the real wire and never leak an invented artifact into
+        // reachability. Runs through the REAL store + the REAL reachable_set
+        // scan (the production collection logic). Bounded
         // `proptest_cases(16)` (full 16 with `DEPLOY_FULL_TESTS=1`, fast
         // default), fixed seed 0x5EED_5EED (house style), no persistence.
         #![proptest_config(ProptestConfig {
@@ -1350,22 +1329,47 @@ interval_seconds = 0
         })]
 
         #[test]
-        fn assignment_read_failures_never_produce_an_artifact_or_reachability_entry(
-            artifact in arbitrary_assignment_observation(),
+        fn pre_push_round_trips_exactly_and_reaches_what_it_names(
+            pre_push in arbitrary_pre_push(),
         ) {
-            run_assignment_observation_case(artifact);
+            run_assignment_observation_case(pre_push);
         }
     }
 
-    /// The DETERMINISTIC companion: an `Unknown` pre-push assignment with a
-    /// realistic message fails the sweep closed (the generated property's
-    /// `Unknown` arm, pinned with a fixed message so the failure text is
-    /// asserted exactly).
+    /// The DETERMINISTIC companion: an UNREADABLE pre-push wire value
+    /// (Unknown / KnownAbsent / missing generation) can never be read as a
+    /// domain intent — the wire → domain conversion refuses it fail-closed
+    /// ("an unreadable pre-push cannot be frozen"), so the sweep can never
+    /// derive a release/tree reachability entry from a FAILED assignment
+    /// read: the record cannot even be read.
     #[test]
-    fn unknown_pre_push_assignment_fails_the_sweep_closed() {
-        run_assignment_observation_case(Observation::Unknown(ObservationError {
-            message: "assignment read failed: fixture corruption".to_string(),
+    fn unreadable_pre_push_wire_fails_closed() {
+        let intent = intent_with_pre_push(Some(GenerationRef {
+            generation: test_generation_id("gen-pre"),
+            assignment: PlacementSlotAssignment {
+                placement_slot: SlotId::new(SLOT.to_string()),
+                artifact: ArtifactRef {
+                    release: crate::identity::test_release_id("pre-rel"),
+                    variant: VariantName::parse("standard").unwrap(),
+                    tree: test_tree_digest("tree-pre"),
+                },
+            },
         }));
+        let mut wire = crate::ledger::LedgerIntentWire::from(&intent);
+        wire.pre_push.insert(
+            SlotId::new(SLOT.to_string()),
+            Some(crate::ledger::records::SlotAttemptStateWire {
+                artifact: crate::ledger::ObservationWire::Unknown(ObservationError {
+                    message: "assignment read failed: fixture corruption".to_string(),
+                }),
+                generation: Some(test_generation_id("gen-pre")),
+            }),
+        );
+        let err = crate::ledger::LedgerIntentWire::into_domain(wire).unwrap_err();
+        assert!(
+            err.to_string().contains("pre_push"),
+            "the conversion must refuse the unreadable pre-push wire value, got: {err}"
+        );
     }
 
     // ---- the deterministic unit tests, one per anchor class ----------------
@@ -1503,7 +1507,7 @@ interval_seconds = 0
                 releases: Vec::new(),
                 bindings: vec![ArtifactRef {
                     release: missing.clone(),
-                    variant: VariantName::new("standard".to_string()),
+                    variant: VariantName::parse("standard").unwrap(),
                     tree: test_tree_digest("tree-x"),
                 }],
             })

@@ -71,51 +71,24 @@ pub fn build_rollback(
     Ok(TargetSnapshot::from_entries(entries))
 }
 
-/// ONE shared validator: a Successful rollback must REPRODUCE the durable
-/// intent's frozen facts for every ACTIVATED slot — the recorded generation
-/// equals the planned desired generation, the recorded artifact equals the
-/// planned desired artifact, and the recorded physical binding equals the
-/// plan-time frozen binding. Called from BOTH the writer (finalize's
-/// pre-append guard) and the ledger read (`verify_terminal_against_entry`
-/// after wire conversion): a rollback that drifts from its own intent fails
-/// closed with `Error::integrity` naming the slot and the diverging leg.
+/// ONE shared validator: a Successful rollback must EXACTLY EQUAL the
+/// intent's frozen `resulting_snapshot` (complete snapshot equality) AND
+/// `activated` must EXACTLY equal the intent's `selected` keys.
 pub(crate) fn validate_successful_rollback_against_intent(
     intent: &DeploymentIntent,
     rollback: &TargetSnapshot,
     activated: &BTreeSet<SlotId>,
 ) -> Result<()> {
-    for slot_id in activated {
-        let planned = intent.slots.get(slot_id).ok_or_else(|| {
-            Error::integrity(format!(
-                "rollback-vs-intent: activated slot '{slot_id}' is not in the intent's membership — the rollback must reproduce the plan, and the plan must cover every activated slot"
-            ))
-        })?;
-        let recorded = rollback.get(slot_id).ok_or_else(|| {
-            Error::integrity(format!(
-                "rollback-vs-intent: the rollback has no entry for activated slot '{slot_id}' — every activated slot's rollback entry must reproduce the plan"
-            ))
-        })?;
-        if recorded.generation() != &planned.desired.generation {
-            return Err(Error::integrity(format!(
-                "rollback-vs-intent: activated slot '{slot_id}' diverged on generation — recorded {:?} vs planned {:?} — the rollback must reproduce the plan",
-                recorded.generation(),
-                planned.desired.generation
-            )));
-        }
-        if recorded.artifact() != &planned.desired.artifact {
-            return Err(Error::integrity(format!(
-                "rollback-vs-intent: activated slot '{slot_id}' diverged on artifact — recorded {:?} vs planned {:?} — the rollback must reproduce the plan",
-                recorded.artifact(),
-                planned.desired.artifact
-            )));
-        }
-        if recorded.binding() != &planned.binding {
-            return Err(Error::integrity(format!(
-                "rollback-vs-intent: activated slot '{slot_id}' diverged on physical binding — recorded {:?} vs planned {:?} — the rollback must reproduce the plan",
-                recorded.binding(),
-                planned.binding
-            )));
-        }
+    if rollback != &intent.resulting_snapshot {
+        return Err(Error::integrity(format!(
+            "rollback-vs-intent: the rollback snapshot diverges from the intent's frozen resulting_snapshot — the terminal's rollback must EXACTLY equal the intent's frozen snapshot (full equality over ALL slots)"
+        )));
+    }
+    let selected = intent.selected_membership();
+    if activated != &selected {
+        return Err(Error::integrity(format!(
+            "rollback-vs-intent: activated {activated:?} != intent selected {selected:?} — the terminal's activated set must EXACTLY equal the intent's selected slots"
+        )));
     }
     Ok(())
 }
@@ -127,6 +100,7 @@ mod tests_rollback {
         ArtifactRef, GenerationRef, PlacementSlotAssignment, ServerId, SlotId, TargetName,
         VariantName, test_deployment_id, test_generation_id, test_tree_digest,
     };
+    #[cfg(test)]
     use proptest::prelude::*;
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -137,7 +111,7 @@ mod tests_rollback {
                 placement_slot: key.clone(),
                 artifact: ArtifactRef {
                     release: crate::identity::test_release_id(rel),
-                    variant: VariantName::new("standard".to_string()),
+                    variant: VariantName::parse("standard").unwrap(),
                     tree: test_tree_digest(tree),
                 },
             },
@@ -147,14 +121,14 @@ mod tests_rollback {
         BoundGeneration {
             generation: verified_ref_for(key, gen_id, rel, tree),
             binding: PhysicalBinding {
-                server: ServerId::new("s1".to_string()),
+                server: ServerId::parse("s1").unwrap(),
                 deploy_dir: format!("/srv/deploy/{}", key.as_str()),
             },
         }
     }
     #[test]
     fn build_rollback_records_each_slots_physical_binding() {
-        let slot = SlotId::new("p1".to_string());
+        let slot = SlotId::parse("p1").unwrap();
         let verified = BTreeMap::from([(slot.clone(), bound(&slot, "gen-x", "rel-1", "tree-1"))]);
         let rollback = build_rollback(&verified, None, std::slice::from_ref(&slot))
             .expect("the single map is consistent");
@@ -173,9 +147,9 @@ mod tests_rollback {
     }
     #[test]
     fn build_rollback_overlays_verified_refs_over_the_base() {
-        let selected = SlotId::new("p1".to_string());
-        let unselected = SlotId::new("p2".to_string());
-        let outside = SlotId::new("p3".to_string());
+        let selected = SlotId::parse("p1").unwrap();
+        let unselected = SlotId::parse("p2").unwrap();
+        let outside = SlotId::parse("p3").unwrap();
         let base = TargetSnapshot::from_entries(BTreeMap::from([
             (selected.clone(), {
                 let r = verified_ref_for(&selected, "gen-old-1", "rel-old", "tree-old-1");
@@ -230,8 +204,8 @@ mod tests_rollback {
     }
     #[test]
     fn build_rollback_overlays_replaces_per_slot_entries() {
-        let p1 = SlotId::new("p1".to_string());
-        let p2 = SlotId::new("p2".to_string());
+        let p1 = SlotId::parse("p1").unwrap();
+        let p2 = SlotId::parse("p2").unwrap();
         let healthy = BTreeMap::from([(p1.clone(), bound(&p1, "gen-new", "rel-new", "tree-new"))]);
         build_rollback(&healthy, None, std::slice::from_ref(&p1))
             .expect("the healthy single map builds");
@@ -269,12 +243,12 @@ mod tests_rollback {
     fn fixture_rollback() -> TargetSnapshot {
         let mut m = BTreeMap::new();
         m.insert(
-            SlotId::new("slot-1".to_string()),
+            SlotId::parse("slot-1").unwrap(),
             SnapshotEntry::new(
                 test_generation_id("gen-1"),
                 ArtifactRef {
                     release: crate::identity::test_release_id("rel-1"),
-                    variant: VariantName::new("standard".to_string()),
+                    variant: VariantName::parse("standard").unwrap(),
                     tree: test_tree_digest("t1"),
                 },
                 PhysicalBinding {
@@ -284,12 +258,12 @@ mod tests_rollback {
             ),
         );
         m.insert(
-            SlotId::new("slot-2".to_string()),
+            SlotId::parse("slot-2").unwrap(),
             SnapshotEntry::new(
                 test_generation_id("gen-2"),
                 ArtifactRef {
                     release: crate::identity::test_release_id("rel-2"),
-                    variant: VariantName::new("standard".to_string()),
+                    variant: VariantName::parse("standard").unwrap(),
                     tree: test_tree_digest("t2"),
                 },
                 PhysicalBinding {
@@ -306,7 +280,7 @@ mod tests_rollback {
             test_generation_id(gen_id),
             ArtifactRef {
                 release: crate::identity::test_release_id(rel),
-                variant: VariantName::new("standard".to_string()),
+                variant: VariantName::parse("standard").unwrap(),
                 tree: test_tree_digest(tree),
             },
             PhysicalBinding {
@@ -382,14 +356,14 @@ mod tests_rollback {
     }
     #[test]
     fn rollback_entries_shape_round_trips_and_old_shape_rejected() {
-        let slot = SlotId::new("p1".to_string());
+        let slot = SlotId::parse("p1").unwrap();
         let rb = TargetSnapshot::from_entries(BTreeMap::from([(
             slot.clone(),
             SnapshotEntry::new(
                 test_generation_id("g1"),
                 ArtifactRef {
                     release: crate::identity::test_release_id("rel-1"),
-                    variant: VariantName::new("standard".to_string()),
+                    variant: VariantName::parse("standard").unwrap(),
                     tree: test_tree_digest("t1"),
                 },
                 PhysicalBinding {
@@ -423,47 +397,76 @@ mod tests_rollback {
     // keys, rollback keys untouched except the mutated entry) — the mismatch
     // is ONLY against the intent, so the record is self-consistent yet
     // contradicts its intent. Both writer and read paths must fail closed.
+    //
+    // THE FIXTURE IS A GROUP PUSH (`group: Some("g1")`): the resulting
+    // snapshot FREEZES the FULL membership (the SELECTED `p1` at its minted
+    // generation + the UNSELECTED `p2` carried forward), and the intent
+    // SELECTS only `p1` (`activated == selected == {p1}`). The rollback-vs-
+    // intent validator demands FULL equality (rollback == the intent's
+    // resulting_snapshot over ALL slots) — so mutating either the SELECTED
+    // slot's snapshot entry (legs 0-5) or the UNSELECTED slot's entry (leg
+    // 6) diverges the full snapshot and must fail closed.
     fn valid_intent_rollback_activated() -> (
         crate::ledger::records::DeploymentIntent,
         TargetSnapshot,
         BTreeSet<SlotId>,
     ) {
-        let slot = SlotId::new("p1".to_string());
+        let selected = SlotId::parse("p1").unwrap();
+        let unselected = SlotId::parse("p2").unwrap();
         let gen_id = test_generation_id("gen-1");
         let artifact = ArtifactRef {
             release: crate::identity::test_release_id("rel-1"),
-            variant: VariantName::new("standard".to_string()),
+            variant: VariantName::parse("standard").unwrap(),
             tree: test_tree_digest("tree-1"),
         };
         let binding = PhysicalBinding {
-            server: ServerId::new("s1".to_string()),
+            server: ServerId::parse("s1").unwrap(),
             deploy_dir: "/srv/deploy/p1".to_string(),
         };
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            selected.clone(),
+            SnapshotEntry::new(gen_id.clone(), artifact.clone(), binding.clone()),
+        );
+        // The UNSELECTED slot the group push carries forward in the frozen
+        // snapshot (its own generation/artifact/binding).
+        entries.insert(
+            unselected.clone(),
+            SnapshotEntry::new(
+                test_generation_id("gen-unsel"),
+                ArtifactRef {
+                    release: crate::identity::test_release_id("rel-unsel"),
+                    variant: VariantName::parse("standard").unwrap(),
+                    tree: test_tree_digest("tree-unsel"),
+                },
+                PhysicalBinding {
+                    server: ServerId::parse("s1").unwrap(),
+                    deploy_dir: "/srv/deploy/p2".to_string(),
+                },
+            ),
+        );
+        let snapshot = TargetSnapshot::from_entries(entries);
         let intent = crate::ledger::records::DeploymentIntent {
             deployment_id: test_deployment_id("deploy-valid"),
-            target: TargetName::new("production".to_string()),
-            group: None,
-            behavior_sha256: "sha256-aa".to_string(),
-            attempted_at: "2026-01-01T00:00:00Z".to_string(),
-            slots: crate::ledger::tables::NonEmptySlotTable::build(BTreeMap::from([(
-                slot.clone(),
-                crate::ledger::records::IntentSlot {
-                    desired: crate::ledger::records::DesiredGeneration {
-                        generation: gen_id.clone(),
-                        artifact: artifact.clone(),
-                    },
+            target: TargetName::parse("production").unwrap(),
+            group: Some(crate::identity::RolloutGroupName::parse("g1").unwrap()),
+            resulting_snapshot: snapshot.clone(),
+            selected: crate::ledger::tables::NonEmptySlotTable::build(BTreeMap::from([(
+                selected.clone(),
+                crate::ledger::records::SelectedSlotIntent {
                     pre_push: None,
-                    binding: binding.clone(),
+                    ..Default::default()
                 },
             )]))
             .unwrap(),
-            full_membership: BTreeSet::from([slot.clone()]),
+            behavior_sha256: crate::identity::BehaviorDigest::parse(
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            )
+            .unwrap(),
+            attempted_at: crate::identity::Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
         };
-        let rollback = TargetSnapshot::from_entries(BTreeMap::from([(
-            slot.clone(),
-            SnapshotEntry::new(gen_id, artifact, binding),
-        )]));
-        let activated = BTreeSet::from([slot]);
+        let rollback = snapshot;
+        let activated = BTreeSet::from([selected]);
         (intent, rollback, activated)
     }
 
@@ -492,7 +495,7 @@ mod tests_rollback {
                 entry.generation().clone(),
                 ArtifactRef {
                     release: entry.artifact().release.clone(),
-                    variant: VariantName::new("other-variant".to_string()),
+                    variant: VariantName::parse("other-variant").unwrap(),
                     tree: entry.artifact().tree.clone(),
                 },
                 entry.binding().clone(),
@@ -510,7 +513,7 @@ mod tests_rollback {
                 entry.generation().clone(),
                 entry.artifact().clone(),
                 PhysicalBinding {
-                    server: ServerId::new("s-other".to_string()),
+                    server: ServerId::parse("s-other").unwrap(),
                     deploy_dir: entry.binding().deploy_dir.clone(),
                 },
             ),
@@ -522,6 +525,11 @@ mod tests_rollback {
                     deploy_dir: "/srv/other/deploy".to_string(),
                 },
             ),
+            6 => SnapshotEntry::new(
+                test_generation_id("gen-unsel-other"),
+                entry.artifact().clone(),
+                entry.binding().clone(),
+            ),
             _ => unreachable!(),
         };
         let mut map = rollback.into_entries();
@@ -531,26 +539,26 @@ mod tests_rollback {
 
     fn assert_leg_fails_closed(leg: u32) {
         let (intent, base_rollback, activated) = valid_intent_rollback_activated();
-        let slot = SlotId::new("p1".to_string());
+        // Legs 0-5 mutate the SELECTED slot's snapshot entry (its generation
+        // / release / variant / tree / server / deploy_dir); leg 6 mutates
+        // the UNSELECTED slot's snapshot entry — the validator demands FULL
+        // equality (rollback == intent.resulting_snapshot over ALL slots), so
+        // both a selected-entry mutation and an unselected-entry mutation
+        // diverge the full snapshot and fail.
+        let selected = SlotId::parse("p1").unwrap();
+        let unselected = SlotId::parse("p2").unwrap();
+        let slot = if leg == 6 { unselected } else { selected };
         let mutated_rollback = mutate_rollback_for_leg(base_rollback, &slot, leg);
         // (a) writer direct validator
         let res =
             validate_successful_rollback_against_intent(&intent, &mutated_rollback, &activated);
         assert!(res.is_err(), "writer validator must fail for leg {leg}");
-        let err_str = res.unwrap_err().to_string();
         assert!(
-            err_str.contains("rollback-vs-intent"),
-            "err must contain rollback-vs-intent, got: {err_str}"
-        );
-        let expected = match leg {
-            0 => "generation",
-            1..=3 => "artifact",
-            4..=5 => "physical binding",
-            _ => unreachable!(),
-        };
-        assert!(
-            err_str.contains(expected),
-            "leg {leg} err must name '{expected}', got: {err_str}"
+            res.err()
+                .unwrap()
+                .to_string()
+                .contains("rollback-vs-intent"),
+            "err must contain rollback-vs-intent"
         );
         // (a) store append refuses (via verify_terminal_against_entry)
         let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
@@ -564,7 +572,6 @@ mod tests_rollback {
                 crate::ledger::SuccessfulTerminal::try_new(
                     mutated_rollback.clone(),
                     crate::identity::NonEmptySlotSet::try_new(activated.clone()).unwrap(),
-                    activated.clone(),
                 )
                 .unwrap(),
             ),
@@ -615,7 +622,7 @@ mod tests_rollback {
 
     #[test]
     fn rollback_vs_intent_deterministic_legs() {
-        for leg in 0..=5 {
+        for leg in 0..=6 {
             assert_leg_fails_closed(leg);
         }
     }
@@ -623,50 +630,8 @@ mod tests_rollback {
     proptest::proptest! {
         #![proptest_config(proptest::test_runner::Config { cases: 64, rng_seed: proptest::test_runner::RngSeed::Fixed(0x5EED_5EED), failure_persistence: None, ..proptest::test_runner::Config::default() })]
         #[test]
-        fn prop_rollback_vs_intent_fails_closed_on_every_leg(leg in 0..=5u32) {
-            let (intent, base_rollback, activated) = valid_intent_rollback_activated();
-            let slot = SlotId::new("p1".to_string());
-            let mutated_rollback = mutate_rollback_for_leg(base_rollback, &slot, leg);
-            // (a) writer direct validator
-            let res = validate_successful_rollback_against_intent(&intent, &mutated_rollback, &activated);
-            prop_assert!(res.is_err(), "writer validator must fail for leg {leg}");
-            let err_str = res.unwrap_err().to_string();
-            prop_assert!(err_str.contains("rollback-vs-intent"), "err must contain rollback-vs-intent, got: {err_str}");
-            let expected = match leg {
-                0 => "generation",
-                1..=3 => "artifact",
-                4..=5 => "physical binding",
-                _ => unreachable!(),
-            };
-            prop_assert!(err_str.contains(expected), "leg {leg} err must name '{expected}', got: {err_str}");
-            // (a) store append refuses
-            let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
-            let store = crate::store::local::LocalStore::with_base(tmp.path().join("store")).unwrap();
-            store.append_intent(intent.target.as_str(), &intent).unwrap();
-            let mutated_terminal = crate::ledger::records::LedgerTerminal {
-                recorded_at: "2026-01-01T00:00:00Z".to_string(),
-                disposition: crate::ledger::records::TerminalDisposition::Successful(crate::ledger::SuccessfulTerminal::try_new(mutated_rollback.clone(), crate::identity::NonEmptySlotSet::try_new(activated.clone()).unwrap(), activated.clone()).unwrap()),
-                reason: None,
-            };
-            let append_res = store.append_terminal(intent.target.as_str(), &intent.deployment_id, &mutated_terminal);
-            prop_assert!(append_res.is_err(), "store append must fail for leg {leg}");
-            // (b) read path fails closed
-            let tmp2 = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
-            let read_store = crate::store::local::LocalStore::with_base(tmp2.path().join("store")).unwrap();
-            let intent_wire = crate::ledger::records::LedgerIntentWire::from(&intent);
-            let terminal_wire = crate::ledger::records::LedgerTerminalWire::try_from_domain(
-                &intent.deployment_id,
-                &intent.target,
-                &mutated_terminal,
-            ).unwrap();
-            let line1 = serde_json::to_string(&crate::ledger::finalize::LedgerLine::Intent(intent_wire)).unwrap();
-            let line2 = serde_json::to_string(&crate::ledger::finalize::LedgerLine::Terminal(terminal_wire)).unwrap();
-            let p = read_store.ledger_path(intent.target.as_str());
-            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-            std::fs::write(&p, format!("{line1}\n{line2}\n")).unwrap();
-            let read_res = read_store.read_ledger(intent.target.as_str());
-            prop_assert!(read_res.is_err(), "read_ledger must fail for leg {leg}");
-            prop_assert!(read_res.unwrap_err().to_string().contains("rollback-vs-intent"), "read err must contain rollback-vs-intent");
+        fn prop_rollback_vs_intent_fails_closed_on_every_leg(leg in 0..=6u32) {
+            assert_leg_fails_closed(leg);
         }
     }
 }

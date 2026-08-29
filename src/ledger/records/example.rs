@@ -83,7 +83,7 @@ pub(crate) fn render_wire_pair(
 pub(crate) fn canonical_doc_pair() -> (LedgerIntentWire, LedgerTerminalWire) {
     let deployment_id = DeploymentId::parse("deploy-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b")
         .expect("the canonical example deployment id is a UUIDv7");
-    let target = TargetName::new("production".to_string());
+    let target = TargetName::parse("production").unwrap();
     let release = ReleaseId::parse(
         "rel-sha256-41da2f63a950c8494c3c0f1663cf15aacf35b209293b36d3d5c59f8f022805f1",
     )
@@ -131,13 +131,6 @@ pub(crate) fn canonical_doc_pair() -> (LedgerIntentWire, LedgerTerminalWire) {
         .iter()
         .map(|(s, _, _, _)| SlotId::new(s.to_string()))
         .collect();
-    let desired: BTreeMap<SlotId, GenerationRef> = slots
-        .iter()
-        .map(|(s, v, _, g)| {
-            let sid = SlotId::new(s.to_string());
-            (sid.clone(), gen_ref_for(&sid, v, g))
-        })
-        .collect();
     let pre_push: BTreeMap<SlotId, Option<crate::ledger::records::SlotAttemptStateWire>> =
         slot_ids.iter().map(|sid| (sid.clone(), None)).collect();
     let bindings: BTreeMap<SlotId, PhysicalBinding> = slots
@@ -147,6 +140,27 @@ pub(crate) fn canonical_doc_pair() -> (LedgerIntentWire, LedgerTerminalWire) {
             (sid.clone(), binding_for(&sid, server))
         })
         .collect();
+    // THE FROZEN RESULTING SNAPSHOT: one entry per target slot (its
+    // plan-minted generation/artifact and plan-time physical binding) — its
+    // keys ARE the frozen full membership, and the selected slot's desired
+    // facts are its snapshot entry (no separate desired projection).
+    let snapshot = crate::ledger::records::TargetSnapshot::from_entries(
+        slots
+            .iter()
+            .map(|(s, v, server, g)| {
+                let sid = SlotId::new(s.to_string());
+                let gr = gen_ref_for(&sid, v, g);
+                (
+                    sid.clone(),
+                    crate::ledger::records::SnapshotEntry::new(
+                        gr.generation,
+                        gr.assignment.artifact,
+                        binding_for(&sid, server),
+                    ),
+                )
+            })
+            .collect(),
+    );
 
     let intent = LedgerIntentWire {
         // THE CURRENT SCHEMA VERSION — the constant, never a hardcoded
@@ -157,12 +171,9 @@ pub(crate) fn canonical_doc_pair() -> (LedgerIntentWire, LedgerTerminalWire) {
         target: target.clone(),
         group: None,
         slot_ids: slot_ids.clone(),
-        selected_membership: slot_ids.clone(),
-        full_membership: slot_ids.clone(),
-        bindings: bindings.clone(),
         behavior_sha256: crate::identity::test_sha256_hex("behavior-production"),
         attempted_at: "2026-08-21T10:20:00Z".to_string(),
-        desired,
+        resulting_snapshot: crate::ledger::records::TargetSnapshotWire::from(&snapshot),
         pre_push,
         // The persisted intent carries NO outcomes (outcomes live in the
         // terminal event; the wire keeps this map empty).
@@ -247,7 +258,7 @@ mod tests {
         // frozen memberships == the membership.
         assert_eq!(
             d_terminal.selected_membership(),
-            Some(&d_intent.selected_membership()),
+            Some(d_intent.selected_membership()),
             "a full push's Successful terminal reproduces the intent's frozen selected membership"
         );
         assert_eq!(
@@ -256,8 +267,8 @@ mod tests {
             "a full push's Successful terminal reproduces the intent's frozen full membership"
         );
         let membership: std::collections::BTreeSet<SlotId> =
-            d_intent.slots.keys().cloned().collect();
+            d_intent.selected.keys().cloned().collect();
         assert_eq!(membership, d_intent.selected_membership());
-        assert_eq!(membership, *d_intent.full_membership());
+        assert_eq!(membership, d_intent.full_membership());
     }
 }

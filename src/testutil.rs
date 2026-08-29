@@ -1392,7 +1392,9 @@ mod registry_property_tests {
     // keys, interleaved arm/consume operations, and the exact-once oracle.
 
     use super::test_faults::{FaultKind, FaultRegistry};
+    #[cfg(test)]
     use proptest::prelude::*;
+    #[cfg(test)]
     use proptest::test_runner::RngSeed;
     use std::collections::BTreeSet;
 
@@ -1574,7 +1576,9 @@ mod step17_hook_property_tests {
 
     use super::step17_hook::{HookHandle, HookPhase, Step17Hook};
     use crate::identity::DeploymentId;
+    #[cfg(test)]
     use proptest::prelude::*;
+    #[cfg(test)]
     use proptest::test_runner::RngSeed;
     use std::sync::Arc;
     use std::sync::mpsc::channel;

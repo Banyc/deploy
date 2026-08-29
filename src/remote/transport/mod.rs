@@ -1922,7 +1922,9 @@ mod tests {
         ]
     }
 
+    #[cfg(test)]
     use proptest::prelude::*;
+    #[cfg(test)]
     use proptest::test_runner::RngSeed;
 
     proptest! {
@@ -2199,8 +2201,7 @@ mod tests {
                         CreateNewOptions {
                             mode,
                             content: ContentEquivalence::Exact,
-                            fault: Some(&fault),
-                        },
+                            fault: Some(&fault)},
                     )
                     .expect_err(
                         "the AlreadyPresent retry must run — and propagate the failure of — the parent fsync",
@@ -2494,8 +2495,7 @@ mod tests {
                     // being consumed, the identical retry converges.
                     let w = FaultyLocalRemote {
                         inner: t,
-                        fault: CreateNewFault::new(step),
-                    };
+                        fault: CreateNewFault::new(step)};
                     let err = w
                         .try_write_new(rel, &content)
                         .expect_err("a failure at every stage must propagate as Err");
@@ -2628,26 +2628,22 @@ mod tests {
                     VerifySwapKind::Symlink => prop_assert_eq!(
                         verdict,
                         CreateNewVerdict::Conflict(VerifiedExisting::NotRegularFile {
-                            kind: NotRegularFileKind::Symlink,
-                        }),
+                            kind: NotRegularFileKind::Symlink}),
                         "a pre-open symlink swap must be rejected — the O_NOFOLLOW open never follows"
                     ),
                     VerifySwapKind::Directory => prop_assert_eq!(
                         verdict,
                         CreateNewVerdict::Conflict(VerifiedExisting::NotRegularFile {
-                            kind: NotRegularFileKind::Directory,
-                        }),
+                            kind: NotRegularFileKind::Directory}),
                         "a pre-open directory swap must be rejected"
                     ),
                     VerifySwapKind::DifferentInode => prop_assert_eq!(
                         verdict,
                         CreateNewVerdict::Conflict(VerifiedExisting::ModeMismatch {
                             actual: wrong_mode & 0o7777,
-                            required,
-                        }),
+                            required}),
                         "a pre-open different-inode swap must be rejected with the SWAPPED inode's mode"
-                    ),
-                },
+                    )},
                 VerifySwapBoundary::AfterOpen | VerifySwapBoundary::AfterFstat => {
                     prop_assert_eq!(
                         verdict,

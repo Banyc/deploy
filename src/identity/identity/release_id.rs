@@ -29,7 +29,6 @@ impl ReleaseId {
     /// [`id_newtype!`] contract). Production code must construct through
     /// [`ReleaseId::parse`] (or `FromStr`/`TryFrom`/`from_digest`), so an
     /// invalid release id can never be built outside tests.
-    #[cfg(test)]
     pub fn new(s: impl Into<String>) -> Self {
         ReleaseId(s.into())
     }
@@ -91,7 +90,6 @@ impl<'de> Deserialize<'de> for ReleaseId {
 /// A deterministic canonical `rel-sha256-<64-hex>` release id derived from a
 /// tag (the canonical form [`ReleaseId::from_digest`] produces — the only
 /// form the strict [`ReleaseId::parse`] accepts).
-#[cfg(test)]
 pub(crate) fn test_release_id(tag: &str) -> ReleaseId {
     ReleaseId::from_digest(
         &ReleaseDigest::parse(&super::id::digests::test_sha256_hex(tag))
@@ -99,7 +97,6 @@ pub(crate) fn test_release_id(tag: &str) -> ReleaseId {
     )
 }
 
-#[cfg(test)]
 mod tests {
     use super::*;
 

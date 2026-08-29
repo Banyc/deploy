@@ -17,8 +17,7 @@ impl<'a> HeldSlotLock<'a> {
         let payload = serde_json::json!({
             "operation_id": op_id,
             "state": state,
-            "updated_at": now_rfc3339(),
-        });
+            "updated_at": now_rfc3339()});
         let bytes = serde_json::to_vec_pretty(&payload)
             .map_err(|e| Error::remote(format!("serialize transaction: {e}")))?;
         self.helper.remote.write(&p, &bytes, 0o644)?;

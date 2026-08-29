@@ -86,7 +86,9 @@ mod groups_tests {
     use crate::ledger::{PlanOrigin, PushRef, VerifiedReleaseRebinding};
     use crate::store::local::LocalStore;
     use crate::verify::release::RELEASE_RECORD_SCHEMA_VERSION;
+    #[cfg(test)]
     use proptest::prelude::*;
+    #[cfg(test)]
     use proptest::test_runner::RngSeed;
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -317,8 +319,7 @@ mod groups_tests {
             let (_dir, config, store, release, rec) =
                 membership_drift_fixture(release_inc, current_inc, physical_drift);
             let release_ref = PushRef::Release {
-                release: release.clone(),
-            };
+                release: release.clone()};
             let expected: BTreeSet<String> = SLOT_UNIVERSE
                 .iter()
                 .enumerate()

@@ -589,7 +589,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     // Proptest: inspect-A → release A → acquire B → confirm A (--acquisition <A> --yes)
     // must refuse and leave B byte-identical. Fixed seed, proptest_cases(64),
     // failure_persistence: None per house style.
+    #[cfg(test)]
     use proptest::prelude::*;
+    #[cfg(test)]
     use proptest::test_runner::RngSeed;
 
     proptest! {

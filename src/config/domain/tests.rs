@@ -13,14 +13,15 @@ use crate::identity::{
     test_generation_id, test_tree_digest,
 };
 use crate::ledger::{
-    DeploymentIntent, DesiredGeneration, IntentSlot, LEDGER_SCHEMA_VERSION, LedgerIntentWire,
-    LedgerLine, NonEmptySlotTable,
+    DeploymentIntent, LEDGER_SCHEMA_VERSION, LedgerIntentWire, LedgerLine, NonEmptySlotTable,
 };
 use crate::remote::create_remote;
 use crate::store::local::LocalStore;
+#[cfg(test)]
 use proptest::prelude::*;
+#[cfg(test)]
 use proptest::test_runner::RngSeed;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -1365,37 +1366,39 @@ fn schema_version_candidate() -> impl Strategy<Value = u32> {
 /// A minimal but VALID ledger intent for target `t1` (EXACT key-set
 /// equality: `slot_ids == desired.keys() == pre_push.keys()`).
 fn intended_intent(dep: &str) -> DeploymentIntent {
-    let p1 = SlotId::new("p1".to_string());
-    // ONE slot table (the membership + desired/pre-push entries).
-    let slots = std::collections::BTreeMap::from([(
+    let p1 = SlotId::parse("p1").unwrap();
+    let artifact = ArtifactRef {
+        release: crate::identity::test_release_id("rel-1"),
+        variant: VariantName::parse("standard").unwrap(),
+        tree: test_tree_digest("tree-1"),
+    };
+    let binding = crate::ledger::PhysicalBinding {
+        server: ServerId::parse("s1").unwrap(),
+        deploy_dir: "/srv/deploy/p1".to_string(),
+    };
+    let entries = std::collections::BTreeMap::from([(
         p1.clone(),
-        IntentSlot {
-            desired: DesiredGeneration {
-                generation: test_generation_id("gen-1"),
-                artifact: ArtifactRef {
-                    release: crate::identity::test_release_id("rel-1"),
-                    variant: VariantName::new("standard".to_string()),
-                    tree: test_tree_digest("tree-1"),
-                },
-            },
-            pre_push: None,
-            // The FROZEN plan-time physical binding (schema v6): the
-            // fixture's single slot is bound to server s1 at /srv/deploy/p1.
-            binding: crate::ledger::PhysicalBinding {
-                server: ServerId::new("s1".to_string()),
-                deploy_dir: "/srv/deploy/p1".to_string(),
-            },
-        },
+        crate::ledger::SnapshotEntry::new(test_generation_id("gen-1"), artifact.clone(), binding),
     )]);
+    let snapshot = crate::ledger::TargetSnapshot::from_entries(entries);
     DeploymentIntent {
         deployment_id: test_deployment_id(dep),
-        target: TargetName::new("t1".to_string()),
+        target: TargetName::parse("t1").unwrap(),
         group: None,
-        behavior_sha256: "sha256-aa".to_string(),
-        attempted_at: "2026-01-01T00:00:00Z".to_string(),
-        slots: NonEmptySlotTable::build(slots)
-            .expect("a fixture intent always has at least one slot"),
-        full_membership: BTreeSet::from([SlotId::new("p1".to_string())]),
+        resulting_snapshot: snapshot,
+        selected: NonEmptySlotTable::build(std::collections::BTreeMap::from([(
+            p1.clone(),
+            crate::ledger::SelectedSlotIntent {
+                pre_push: None,
+                ..Default::default()
+            },
+        )]))
+        .expect("fixture"),
+        behavior_sha256: crate::identity::BehaviorDigest::parse(
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        )
+        .unwrap(),
+        attempted_at: crate::identity::Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
     }
 }
 

@@ -68,7 +68,7 @@ use crate::error::{Error, Result};
 // carries parsed entries) are both live imports — keep both.
 use super::gc::SweepStageStats;
 use crate::identity::DeploymentId;
-use crate::ledger::{LedgerEntry, Observation, ObservedAssignment, TerminalDisposition};
+use crate::ledger::{LedgerEntry, ObservedAssignment, TerminalDisposition};
 use crate::store::atomic::{path_state, write_atomic_replace};
 use crate::store::local::LocalStore;
 use std::collections::BTreeSet;
@@ -371,35 +371,21 @@ impl LocalStore {
                 // nothing, and an `Unknown` assignment FAILS CLOSED below
                 // (the sweep cannot verify what the slot ran before the
                 // attempt, so reachability would be incomplete).
-                for s in entry.intent.slots.values() {
+                for sid in entry.intent.selected.keys() {
+                    let snap_entry = entry
+                        .intent
+                        .resulting_snapshot
+                        .get(sid)
+                        .expect("selected in snapshot");
                     out.releases
-                        .insert(s.desired.artifact.release.as_str().to_string());
+                        .insert(snap_entry.artifact().release.as_str().to_string());
                     out.trees
-                        .insert(s.desired.artifact.tree.as_str().to_string());
-                    if let Some(p) = &s.pre_push {
-                        match &p.artifact {
-                            Observation::Known(artifact) => {
-                                out.releases.insert(artifact.release.as_str().to_string());
-                                out.trees.insert(artifact.tree.as_str().to_string());
-                            }
-                            // FAIL CLOSED: an UNKNOWN pre-push assignment means
-                            // the slot's live assignment before the attempt
-                            // could not be read — the GC cannot verify what
-                            // the slot was running, so it must NOT delete
-                            // anything it cannot verify. The sweep aborts (an
-                            // integrity error) BEFORE any deletion; the
-                            // Unknown contributes nothing to the retained set
-                            // (mirrors the observed-slot Unknown rule below).
-                            Observation::Unknown(_) => {
-                                return Err(Error::integrity(
-                                    "an intent records an UNKNOWN pre-push assignment (the \
-                                     slot's live assignment could not be read): the GC cannot \
-                                     verify what the slot was running before the attempt, so \
-                                     the sweep aborts before any deletion",
-                                ));
-                            }
-                            Observation::KnownAbsent => {}
-                        }
+                        .insert(snap_entry.artifact().tree.as_str().to_string());
+                    if let Some(gr) = &entry.intent.selected.get(sid).unwrap().pre_push {
+                        out.releases
+                            .insert(gr.assignment.artifact.release.as_str().to_string());
+                        out.trees
+                            .insert(gr.assignment.artifact.tree.as_str().to_string());
                     }
                 }
                 // The terminal's rollback payload: every slot's OWN artifact
@@ -857,7 +843,6 @@ impl LocalStore {
                         TargetSnapshot::from_entries(__entries)
                     },
                     crate::identity::NonEmptySlotSet::try_new(BTreeSet::new()).unwrap(),
-                    BTreeSet::new(),
                 )
                 .unwrap(),
             ),

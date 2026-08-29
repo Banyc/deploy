@@ -86,13 +86,13 @@ pub use finalize::{
 pub use log::render_log;
 pub use records::{
     ArtifactRefWire, BehaviorIndex, CompensationReport, CompleteRollback, DegradedTerminal,
-    DeploymentIntent, DeploymentPlan, DeploymentPlanWire, DeploymentStatus, DesiredGeneration,
-    FrozenSlotTopology, IntentSlot, LedgerIntentReport, LedgerIntentWire, LedgerTerminal,
-    LedgerTerminalWire, NonEmptySlotTable, Observation, ObservationError, ObservationWire,
-    ObservedAssignment, ObservedGeneration, ObservedGenerationWire, ObservedSlot, ObservedTarget,
-    PhysicalBinding, Pins, PlanOrigin, PlanSource, PreviousGeneration, RebindingPlan, ServerState,
-    SlotAttemptState, SlotAttemptStateWire, SlotOutcome, SlotOutcomeKind, SlotPlan, SlotResult,
-    SlotTable, SlotTransition, SnapshotEntry, SuccessfulTerminal, TargetSnapshot,
+    DeploymentIntent, DeploymentPlan, DeploymentPlanWire, DeploymentStatus, FrozenSlotTopology,
+    LedgerIntentReport, LedgerIntentWire, LedgerTerminal, LedgerTerminalWire, NonEmptySlotTable,
+    Observation, ObservationError, ObservationWire, ObservedAssignment, ObservedGeneration,
+    ObservedGenerationWire, ObservedSlot, ObservedTarget, PhysicalBinding, Pins, PlanOrigin,
+    PlanSource, RebindingPlan, SelectedSlotIntent, ServerState, SlotAttemptState,
+    SlotAttemptStateWire, SlotOutcome, SlotOutcomeKind, SlotPlan, SlotResult, SlotTable,
+    SlotTransition, SnapshotEntry, SuccessfulTerminal, TargetSnapshot, TargetSnapshotWire,
     TerminalDisposition, VerifiedReleaseRebinding,
 };
 pub use refs::{

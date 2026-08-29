@@ -12,7 +12,9 @@ use crate::config::{
 };
 use crate::error::Result;
 use crate::identity::{BatchSize, CapacityPercent, Host, Identifier, ReleaseId, SshUser};
+#[cfg(test)]
 use proptest::prelude::*;
+#[cfg(test)]
 use proptest::test_runner::RngSeed;
 use std::collections::BTreeMap;
 use std::num::NonZeroU16;
@@ -190,7 +192,7 @@ fn arbitrary_connection() -> impl Strategy<Value = ServerConnection> {
         // the slot's deploy_dir is the sole physical root — so the form is
         // always well-formed.
         Just(ServerConnection::Local {
-            identity: HostIdentity::Local,
+            identity: HostIdentity::Local
         }),
         (
             prop::sample::select(vec!["host", "db.example.com", "x y", ""]),
@@ -202,7 +204,7 @@ fn arbitrary_connection() -> impl Strategy<Value = ServerConnection> {
                 address: Host::parse(address).unwrap_or_else(|_| Host::parse("host").unwrap()),
                 user: SshUser::parse(user).unwrap_or_else(|_| SshUser::parse("user").unwrap()),
                 port: NonZeroU16::new(port).unwrap_or(NonZeroU16::new(1).unwrap()),
-                identity,
+                identity
             }),
     ]
 }
@@ -619,7 +621,7 @@ fn with_server_connection_validates_the_enum() {
         cfg.with_server_connection(
             "ghost",
             ServerConnection::Local {
-                identity: HostIdentity::Local,
+                identity: HostIdentity::Local
             },
         )
         .is_err()

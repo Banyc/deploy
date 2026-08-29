@@ -90,11 +90,7 @@ pub(crate) fn run_commit(
         // finalize and recovery paths must stamp the SAME values into the
         // rollback (recovery degrades an attempt whose live binding drifted
         // instead of recording the live value as history).
-        let slot_bindings: BTreeMap<SlotId, crate::ledger::PhysicalBinding> = attempt_intent
-            .slots
-            .iter()
-            .map(|(sid, slot)| (sid.clone(), slot.binding.clone()))
-            .collect();
+
         // The terminal's FULL MEMBERSHIP is the INTENT'S FROZEN value — the
         // finalizer reads `attempt.full_membership()` (the complete target
         // membership resolved AT PLAN TIME, when the immutable intent was
@@ -115,11 +111,12 @@ pub(crate) fn run_commit(
         // selected-slot mutation locks (deterministic sorted-slot-id order),
         // re-observe EVERY selected slot's LIVE `GenerationRef` (generation
         // AND artifact) under the locks and require it to EXACTLY equal the
-        // frozen desired assignment (`attempt_intent.slots[sid].desired`),
+        // selected slot's entry in the intent's FROZEN
+        // `resulting_snapshot` (the single frozen source),
         // write the commit markers, append the `Successful` terminal (ONE
-        // atomic line append) with the rollback built EXCLUSIVELY from the
-        // VERIFIED LIVE `GenerationRef`s the re-observation returned (never
-        // from `execution.actual_servers` / `outcomes_map` — the engine's
+        // atomic line append) with the rollback being EXACTLY that frozen
+        // `resulting_snapshot` (never from `execution.actual_servers` /
+        // `outcomes_map` — the engine's
         // observation records, which a concurrent controller can make stale
         // between this push's observation and the finalize), and release the
         // locks. A slot whose live state diverged (a concurrent controller
@@ -129,7 +126,6 @@ pub(crate) fn run_commit(
             store,
             attempt_intent,
             helpers,
-            &slot_bindings,
             &ledger::FinalizeSettings {
                 reason: "push completed",
                 op_id,
@@ -297,7 +293,9 @@ pub(crate) mod commit_tests {
     use crate::remote::layout;
     use crate::remote::transport::{LocalTransport, Remote};
     use crate::testutil::test_remotes::FailOnceMarkerRemote;
+    #[cfg(test)]
     use proptest::prelude::*;
+    #[cfg(test)]
     use proptest::test_runner::RngSeed;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -692,8 +690,8 @@ pub(crate) mod commit_tests {
         // report, never in the persisted intent). The ONE slot table carries
         // the planned (desired) + observed (pre_push) entries per member.
         assert!(
-            intent.intent.slots.contains_key(&SlotId::new("p1")),
-            "the intent's one slot table carries the planned (desired) + observed (pre_push) entries"
+            intent.intent.selected.contains_key(&SlotId::new("p1")),
+            "the intent's one selected table carries the planned slots"
         );
         assert!(
             h.store.read_results(id.as_str()).is_err(),
@@ -823,31 +821,27 @@ pub(crate) mod commit_tests {
 
         let intent = DeploymentIntent {
             deployment_id: id_a.clone(),
-            target: TargetName::new("t1".to_string()),
+            target: TargetName::parse("t1").unwrap(),
             group: None,
-            behavior_sha256: baseline.behavior_sha256.as_str().to_string(),
-            attempted_at: crate::remote::helper::now_rfc3339(),
-            slots: NonEmptySlotTable::build(BTreeMap::from([(
-                SlotId::new("p1".to_string()),
-                IntentSlot {
-                    desired: DesiredGeneration {
-                        generation: target_a,
-                        artifact: desired_ref.assignment.artifact.clone(),
-                    },
-                    pre_push: None,
-                    // The plan-time binding the harness config froze (server
-                    // s1, deploy_dir /srv/eng): the crafted intent must
-                    // agree with the LIVE binding so the degrade is the
-                    // generation divergence this test arms, not binding
-                    // drift.
-                    binding: crate::ledger::PhysicalBinding {
-                        server: ServerId::new("s1".to_string()),
+            resulting_snapshot: TargetSnapshot::from_entries(BTreeMap::from([(
+                SlotId::parse("p1").unwrap(),
+                SnapshotEntry::new(
+                    target_a,
+                    desired_ref.assignment.artifact.clone(),
+                    crate::ledger::PhysicalBinding {
+                        server: ServerId::parse("s1").unwrap(),
                         deploy_dir: "/srv/eng".to_string(),
                     },
-                },
+                ),
+            )])),
+            selected: NonEmptySlotTable::build(BTreeMap::from([(
+                SlotId::parse("p1").unwrap(),
+                SelectedSlotIntent { pre_push: None },
             )]))
             .expect("one member slot"),
-            full_membership: BTreeSet::from([SlotId::new("p1".to_string())]),
+            behavior_sha256: baseline.behavior_sha256.clone(),
+            attempted_at: crate::identity::Timestamp::parse(&crate::remote::helper::now_rfc3339())
+                .unwrap(),
         };
         h.store.append_attempt("t1", &intent).unwrap();
         assert_eq!(
@@ -906,31 +900,28 @@ pub(crate) mod commit_tests {
         let desired_ref = baseline.desired[&SlotId::new("p1")].clone();
 
         let intent = DeploymentIntent {
-            slots: NonEmptySlotTable::build(BTreeMap::from([(
-                SlotId::new("p1".to_string()),
-                IntentSlot {
-                    desired: DesiredGeneration {
-                        generation: desired_ref.generation.clone(),
-                        artifact: desired_ref.assignment.artifact.clone(),
-                    },
-                    pre_push: None,
-                    // The plan-time binding the harness config froze
-                    // ({s1, /srv/eng}): equal to the LIVE binding, so this
-                    // crafted intent reconciles on the generation match (as
-                    // it did before the frozen-binding check).
-                    binding: crate::ledger::PhysicalBinding {
-                        server: ServerId::new("s1".to_string()),
+            deployment_id: id_a.clone(),
+            target: TargetName::parse("t1").unwrap(),
+            group: None,
+            resulting_snapshot: TargetSnapshot::from_entries(BTreeMap::from([(
+                SlotId::parse("p1").unwrap(),
+                SnapshotEntry::new(
+                    desired_ref.generation.clone(),
+                    desired_ref.assignment.artifact.clone(),
+                    crate::ledger::PhysicalBinding {
+                        server: ServerId::parse("s1").unwrap(),
                         deploy_dir: "/srv/eng".to_string(),
                     },
-                },
+                ),
+            )])),
+            selected: NonEmptySlotTable::build(BTreeMap::from([(
+                SlotId::parse("p1").unwrap(),
+                SelectedSlotIntent { pre_push: None },
             )]))
             .expect("one member slot"),
-            deployment_id: id_a.clone(),
-            target: TargetName::new("t1".to_string()),
-            group: None,
-            behavior_sha256: baseline.behavior_sha256.as_str().to_string(),
-            attempted_at: crate::remote::helper::now_rfc3339(),
-            full_membership: BTreeSet::from([SlotId::new("p1".to_string())]),
+            behavior_sha256: baseline.behavior_sha256.clone(),
+            attempted_at: crate::identity::Timestamp::parse(&crate::remote::helper::now_rfc3339())
+                .unwrap(),
         };
         h.store.append_attempt("t1", &intent).unwrap();
         assert_eq!(
@@ -984,30 +975,27 @@ pub(crate) mod commit_tests {
 
         let mk = |id: &str| DeploymentIntent {
             deployment_id: test_deployment_id(id),
-            target: TargetName::new("t1".to_string()),
+            target: TargetName::parse("t1").unwrap(),
             group: None,
-            behavior_sha256: baseline.behavior_sha256.as_str().to_string(),
-            attempted_at: crate::remote::helper::now_rfc3339(),
-            slots: NonEmptySlotTable::build(BTreeMap::from([(
-                SlotId::new("p1".to_string()),
-                IntentSlot {
-                    desired: DesiredGeneration {
-                        generation: desired_ref.generation.clone(),
-                        artifact: desired_ref.assignment.artifact.clone(),
-                    },
-                    pre_push: None,
-                    // The plan-time binding the harness config froze
-                    // ({s1, /srv/eng}): equal to the LIVE binding, so both
-                    // crafted pending attempts reconcile on the generation
-                    // match.
-                    binding: crate::ledger::PhysicalBinding {
-                        server: ServerId::new("s1".to_string()),
+            resulting_snapshot: TargetSnapshot::from_entries(BTreeMap::from([(
+                SlotId::parse("p1").unwrap(),
+                SnapshotEntry::new(
+                    desired_ref.generation.clone(),
+                    desired_ref.assignment.artifact.clone(),
+                    crate::ledger::PhysicalBinding {
+                        server: ServerId::parse("s1").unwrap(),
                         deploy_dir: "/srv/eng".to_string(),
                     },
-                },
+                ),
+            )])),
+            selected: NonEmptySlotTable::build(BTreeMap::from([(
+                SlotId::parse("p1").unwrap(),
+                SelectedSlotIntent { pre_push: None },
             )]))
             .expect("one member slot"),
-            full_membership: BTreeSet::from([SlotId::new("p1".to_string())]),
+            behavior_sha256: baseline.behavior_sha256.clone(),
+            attempted_at: crate::identity::Timestamp::parse(&crate::remote::helper::now_rfc3339())
+                .unwrap(),
         };
         let a = mk("deploy-multi-a");
         let b = mk("deploy-multi-b");
@@ -1090,8 +1078,8 @@ pub(crate) mod commit_tests {
     #[test]
     fn group_push_rollback_covers_the_complete_membership_and_publishes_per_slot_behavior() {
         let h = TwoSlotHarness::new();
-        let slot_a = SlotId::new("p1".to_string());
-        let slot_b = SlotId::new("p2".to_string());
+        let slot_a = SlotId::parse("p1").unwrap();
+        let slot_b = SlotId::parse("p2").unwrap();
 
         // Push 1: FULL Head push under contract A (argv ["true", "a"]) —
         // release R1 for BOTH slots; snapshot S0: p1=R1, p2=R1.
@@ -1344,8 +1332,8 @@ pub(crate) mod commit_tests {
             ),
         ) {
             let h = TwoSlotHarness::new();
-            let slot_a = SlotId::new("p1".to_string());
-            let slot_b = SlotId::new("p2".to_string());
+            let slot_a = SlotId::parse("p1").unwrap();
+            let slot_b = SlotId::parse("p2").unwrap();
             let full_membership: BTreeSet<SlotId> =
                 BTreeSet::from([slot_a.clone(), slot_b.clone()]);
 
@@ -1411,8 +1399,8 @@ pub(crate) mod commit_tests {
     #[test]
     fn group_push_snapshot_has_full_membership_and_selected_outcomes() {
         let h = TwoSlotHarness::new();
-        let slot_a = SlotId::new("p1".to_string());
-        let slot_b = SlotId::new("p2".to_string());
+        let slot_a = SlotId::parse("p1").unwrap();
+        let slot_b = SlotId::parse("p2").unwrap();
         let full_membership: BTreeSet<SlotId> = BTreeSet::from([slot_a.clone(), slot_b.clone()]);
 
         // Push 1: FULL baseline (both slots under R1).
@@ -1486,12 +1474,12 @@ pub(crate) mod commit_tests {
         );
         assert_eq!(
             terminal.selected_membership(),
-            Some(&BTreeSet::from([slot_a.clone()])),
+            Some(BTreeSet::from([slot_a.clone()])),
             "the terminal PERSISTS the selected membership (== the outcomes' keys == the group's slot)"
         );
         assert_eq!(
             terminal.full_membership(),
-            Some(&full_membership),
+            Some(full_membership.clone()),
             "the terminal PERSISTS the full membership (== the complete target membership == the rollback's slots)"
         );
         assert_eq!(
@@ -1507,8 +1495,8 @@ pub(crate) mod commit_tests {
     #[test]
     fn repeating_the_same_group_succeeds() {
         let h = TwoSlotHarness::new();
-        let slot_a = SlotId::new("p1".to_string());
-        let slot_b = SlotId::new("p2".to_string());
+        let slot_a = SlotId::parse("p1").unwrap();
+        let slot_b = SlotId::parse("p2").unwrap();
         let full_membership: BTreeSet<SlotId> = BTreeSet::from([slot_a.clone(), slot_b.clone()]);
 
         // Push 1: FULL baseline.
@@ -1561,8 +1549,8 @@ pub(crate) mod commit_tests {
     #[test]
     fn full_push_still_enforces_the_strict_four_set_equality() {
         let h = TwoSlotHarness::new();
-        let slot_a = SlotId::new("p1".to_string());
-        let slot_b = SlotId::new("p2".to_string());
+        let slot_a = SlotId::parse("p1").unwrap();
+        let slot_b = SlotId::parse("p2").unwrap();
         let full_membership: BTreeSet<SlotId> = BTreeSet::from([slot_a.clone(), slot_b.clone()]);
 
         let id1 = test_deployment_id("deploy-strict-base");
@@ -1571,7 +1559,12 @@ pub(crate) mod commit_tests {
         let entries = h.store.read_ledger("t1").unwrap();
         let entry = &entries[0];
         assert_eq!(
-            entry.intent.slots.keys().cloned().collect::<BTreeSet<_>>(),
+            entry
+                .intent
+                .selected
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
             full_membership,
             "the full push's intent membership is the full target"
         );
@@ -1583,12 +1576,12 @@ pub(crate) mod commit_tests {
         );
         assert_eq!(
             terminal.selected_membership(),
-            Some(&full_membership),
+            Some(full_membership.clone()),
             "the terminal PERSISTS the selected membership == the full membership (a full push selects every target slot)"
         );
         assert_eq!(
             terminal.full_membership(),
-            Some(&full_membership),
+            Some(full_membership.clone()),
             "the terminal PERSISTS the full membership == the complete target membership"
         );
         let TerminalDisposition::Successful(st) = &terminal.disposition else {
@@ -1609,7 +1602,8 @@ pub(crate) mod commit_tests {
     // ---- Pending-recovery vs the FROZEN bindings (schema v6) -------------
     //
     // The intent FREEZES each selected slot's plan-time `{server,
-    // deploy_dir}` ([`crate::ledger::IntentSlot::binding`]); recovery
+    // deploy_dir}` inside its resulting_snapshot entry (the snapshot is the
+    // single frozen source); recovery
     // compares each selected slot's LIVE binding against that frozen value
     // and finalizes from the FROZEN bindings on equality or marks the
     // attempt Degraded on drift — a server rebound or a moved `deploy_dir`
@@ -1763,18 +1757,26 @@ pub(crate) mod commit_tests {
             // matches the frozen intent (selected bindings equal, selected
             // membership covered, live generations equal the desired ones).
             let membership_ok = intent
-                .slots
+                .selected
                 .keys()
                 .all(|sid| live_bindings.contains_key(sid));
-            let bindings_equal = intent.slots.iter().all(|(sid, slot)| {
-                live_bindings.get(sid) == Some(&slot.binding)
+            let bindings_equal = intent.selected.keys().all(|sid| {
+                live_bindings.get(sid)
+                    == intent
+                        .resulting_snapshot
+                        .get(sid)
+                        .map(|e| e.binding())
             });
-            let gens_match = intent.slots.iter().all(|(sid, slot)| {
+            let gens_match = intent.selected.keys().all(|sid| {
+                let desired_gen = intent
+                    .resulting_snapshot
+                    .get(sid)
+                    .map(|e| e.generation());
                 helpers
                     .get(sid)
                     .and_then(|helper| helper.status().ok())
                     .is_some_and(|st| {
-                        st.current_generation.as_ref() == Some(&slot.desired.generation)
+                        st.current_generation.as_ref() == desired_gen
                     })
             });
             let success_permitted = membership_ok && bindings_equal && gens_match;
@@ -1803,15 +1805,16 @@ pub(crate) mod commit_tests {
                     assert_eq!(snapshots.len(), 1, "exactly one successful snapshot");
                     assert_eq!(snapshots[0].deployment_id, intent.deployment_id);
                     let rb = rollback_of(&snapshots[0]);
-                    for (sid, slot) in intent.slots.iter() {
+                    for sid in intent.selected.keys() {
+                        let entry = intent.resulting_snapshot.get(sid).expect("selected in snapshot");
                         assert_eq!(
                             rb.get(sid).map(|e| e.binding()),
-                            Some(&slot.binding),
+                            Some(entry.binding()),
                             "the rollback binding for {sid} must come from the FROZEN intent, not the live config"
                         );
                         assert_eq!(
                             rb.get(sid).map(|e| e.generation()),
-                            Some(&slot.desired.generation),
+                            Some(entry.generation()),
                             "the rollback generation for {sid} must equal the frozen desired generation"
                         );
                     }
@@ -1877,10 +1880,10 @@ pub(crate) mod commit_tests {
                 deployment_id: deployment_id.clone(),
                 generation_id: generation.clone(),
                 artifact: artifact.clone(),
-                behavior_sha256: "sha256-aa".to_string(),
+                behavior_sha256: crate::identity::DIGEST_TEST_HEX_1.to_string(),
                 prior_generation: None,
                 created_at: "2026-01-01T00:00:00Z".to_string(),
-                target: Some(TargetName::new("t1".to_string())),
+                target: Some(TargetName::parse("t1").unwrap()),
             })
             .unwrap();
         helper
@@ -1900,7 +1903,7 @@ pub(crate) mod commit_tests {
         let foreign_gen = GenerationId::generate();
         let foreign_artifact = ArtifactRef {
             release: crate::identity::test_release_id("rel-foreign"),
-            variant: VariantName::new("standard".to_string()),
+            variant: VariantName::parse("standard").unwrap(),
             tree: test_tree_digest("tree-foreign"),
         };
         remote
@@ -1917,7 +1920,7 @@ pub(crate) mod commit_tests {
                 behavior_sha256: "b".to_string(),
                 prior_generation: None,
                 created_at: "2026-01-01T00:00:00Z".to_string(),
-                target: Some(TargetName::new("t1".to_string())),
+                target: Some(TargetName::parse("t1").unwrap()),
             })
             .unwrap();
         foreign_gen
@@ -1963,18 +1966,18 @@ pub(crate) mod commit_tests {
             let h = TwoSlotHarness::new();
             // The FROZEN DESIRED assignments (a distinct artifact per slot)
             // and the LIVE state minted to match them exactly.
-            let p1 = SlotId::new("p1".to_string());
-            let p2 = SlotId::new("p2".to_string());
+            let p1 = SlotId::parse("p1").unwrap();
+            let p2 = SlotId::parse("p2").unwrap();
             let gen_p1 = GenerationId::generate();
             let gen_p2 = GenerationId::generate();
             let art_p1 = ArtifactRef {
                 release: crate::identity::test_release_id("rel-1"),
-                variant: VariantName::new("standard".to_string()),
+                variant: VariantName::parse("standard").unwrap(),
                 tree: test_tree_digest("tree-1"),
             };
             let art_p2 = ArtifactRef {
                 release: crate::identity::test_release_id("rel-2"),
-                variant: VariantName::new("standard".to_string()),
+                variant: VariantName::parse("standard").unwrap(),
                 tree: test_tree_digest("tree-2"),
             };
             let deployment_id = test_deployment_id("deploy-swap-prop");
@@ -1992,43 +1995,20 @@ pub(crate) mod commit_tests {
             let bindings = h.config.target_slot_bindings("t1").unwrap();
             let intent = DeploymentIntent {
                 deployment_id: deployment_id.clone(),
-                target: TargetName::new("t1".to_string()),
+                target: TargetName::parse("t1").unwrap(),
                 group: None,
-                behavior_sha256: "sha256-aa".to_string(),
-                attempted_at: "2026-01-01T00:00:00Z".to_string(),
-                slots: NonEmptySlotTable::build(vec![
-                    (
-                        p1.clone(),
-                        IntentSlot {
-                            desired: DesiredGeneration {
-                                generation: gen_p1.clone(),
-                                artifact: art_p1.clone(),
-                            },
-                            pre_push: None,
-                            binding: bindings
-                                .get(&p1)
-                                .cloned()
-                                .expect("p1 is a target slot"),
-                        },
-                    ),
-                    (
-                        p2.clone(),
-                        IntentSlot {
-                            desired: DesiredGeneration {
-                                generation: gen_p2.clone(),
-                                artifact: art_p2.clone(),
-                            },
-                            pre_push: None,
-                            binding: bindings
-                                .get(&p2)
-                                .cloned()
-                                .expect("p2 is a target slot"),
-                        },
-                    ),
-                ])
+                behavior_sha256: crate::identity::BehaviorDigest::parse("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855").unwrap(),
+                attempted_at: crate::identity::Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
+                resulting_snapshot: TargetSnapshot::from_entries(BTreeMap::from([
+                    (p1.clone(), SnapshotEntry::new(gen_p1.clone(), art_p1.clone(), bindings.get(&p1).cloned().expect("p1 is a target slot"))),
+                    (p2.clone(), SnapshotEntry::new(gen_p2.clone(), art_p2.clone(), bindings.get(&p2).cloned().expect("p2 is a target slot"))),
+                ])),
+                selected: NonEmptySlotTable::build(BTreeMap::from([
+                    (p1.clone(), SelectedSlotIntent { pre_push: None }),
+                    (p2.clone(), SelectedSlotIntent { pre_push: None }),
+                ]))
                 .expect("two selected slots"),
-                full_membership: BTreeSet::from([p1.clone(), p2.clone()]),
-            };
+        };
             h.store.append_attempt("t1", &intent).unwrap();
 
             // The per-slot helpers: the injected swap rides the FIRST slot's
@@ -2089,16 +2069,17 @@ pub(crate) mod commit_tests {
                     assert_eq!(snapshots.len(), 1, "exactly one successful snapshot");
                     assert_eq!(snapshots[0].deployment_id, deployment_id);
                     let rb = rollback_of(&snapshots[0]);
-                    for (sid, slot) in intent.slots.iter() {
+                    for sid in intent.selected.keys() {
+                        let entry = intent.resulting_snapshot.get(sid).expect("selected in snapshot");
                         let rbs = rb
                             .get(sid)
                             .expect("the rollback covers every selected slot");
                         assert_eq!(
-                            rbs.generation().clone(), slot.desired.generation.clone(),
+                            rbs.generation().clone(), entry.generation().clone(),
                             "rollback generation for {sid} must equal the frozen desired generation"
                         );
                         assert_eq!(
-                            rbs.artifact().clone(), slot.desired.artifact.clone(),
+                            rbs.artifact().clone(), entry.artifact().clone(),
                             "rollback artifact for {sid} must equal the frozen desired artifact (release/variant/tree)"
                         );
                     }
@@ -2192,18 +2173,18 @@ pub(crate) mod commit_tests {
             let h = TwoSlotHarness::new();
             // The FROZEN DESIRED assignments (a distinct artifact per slot)
             // and the LIVE state minted to match them exactly.
-            let p1 = SlotId::new("p1".to_string());
-            let p2 = SlotId::new("p2".to_string());
+            let p1 = SlotId::parse("p1").unwrap();
+            let p2 = SlotId::parse("p2").unwrap();
             let gen_p1 = GenerationId::generate();
             let gen_p2 = GenerationId::generate();
             let art_p1 = ArtifactRef {
                 release: crate::identity::test_release_id("rel-1"),
-                variant: VariantName::new("standard".to_string()),
+                variant: VariantName::parse("standard").unwrap(),
                 tree: test_tree_digest("tree-1"),
             };
             let art_p2 = ArtifactRef {
                 release: crate::identity::test_release_id("rel-2"),
-                variant: VariantName::new("standard".to_string()),
+                variant: VariantName::parse("standard").unwrap(),
                 tree: test_tree_digest("tree-2"),
             };
             let deployment_id = test_deployment_id("deploy-stale-prop");
@@ -2215,43 +2196,20 @@ pub(crate) mod commit_tests {
             let bindings = h.config.target_slot_bindings("t1").unwrap();
             let intent = DeploymentIntent {
                 deployment_id: deployment_id.clone(),
-                target: TargetName::new("t1".to_string()),
+                target: TargetName::parse("t1").unwrap(),
                 group: None,
-                behavior_sha256: "sha256-aa".to_string(),
-                attempted_at: "2026-01-01T00:00:00Z".to_string(),
-                slots: NonEmptySlotTable::build(vec![
-                    (
-                        p1.clone(),
-                        IntentSlot {
-                            desired: DesiredGeneration {
-                                generation: gen_p1.clone(),
-                                artifact: art_p1.clone(),
-                            },
-                            pre_push: None,
-                            binding: bindings
-                                .get(&p1)
-                                .cloned()
-                                .expect("p1 is a target slot"),
-                        },
-                    ),
-                    (
-                        p2.clone(),
-                        IntentSlot {
-                            desired: DesiredGeneration {
-                                generation: gen_p2.clone(),
-                                artifact: art_p2.clone(),
-                            },
-                            pre_push: None,
-                            binding: bindings
-                                .get(&p2)
-                                .cloned()
-                                .expect("p2 is a target slot"),
-                        },
-                    ),
-                ])
+                behavior_sha256: crate::identity::BehaviorDigest::parse("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855").unwrap(),
+                attempted_at: crate::identity::Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
+                resulting_snapshot: TargetSnapshot::from_entries(BTreeMap::from([
+                    (p1.clone(), SnapshotEntry::new(gen_p1.clone(), art_p1.clone(), bindings.get(&p1).cloned().expect("p1 is a target slot"))),
+                    (p2.clone(), SnapshotEntry::new(gen_p2.clone(), art_p2.clone(), bindings.get(&p2).cloned().expect("p2 is a target slot"))),
+                ])),
+                selected: NonEmptySlotTable::build(BTreeMap::from([
+                    (p1.clone(), SelectedSlotIntent { pre_push: None }),
+                    (p2.clone(), SelectedSlotIntent { pre_push: None }),
+                ]))
                 .expect("two selected slots"),
-                full_membership: BTreeSet::from([p1.clone(), p2.clone()]),
-            };
+        };
             h.store.append_attempt("t1", &intent).unwrap();
 
             // THE STALE OBSERVED VALUES the engine could have recorded for
@@ -2265,16 +2223,16 @@ pub(crate) mod commit_tests {
                         &format!("gen-stale-{}", sid.as_str()),
                     ),
                     StaleDivergence::Artifact => {
-                        intent.slots.get(sid).expect("a selected slot").desired.generation.clone()
+                        intent.resulting_snapshot.get(sid).expect("a selected slot").generation().clone()
                     }
                 };
                 let artifact = match stale {
                     StaleDivergence::Generation => {
-                        intent.slots.get(sid).expect("a selected slot").desired.artifact.clone()
+                        intent.resulting_snapshot.get(sid).expect("a selected slot").artifact().clone()
                     }
                     StaleDivergence::Artifact | StaleDivergence::Both => ArtifactRef {
                         release: crate::identity::test_release_id("rel-stale"),
-                        variant: VariantName::new("standard".to_string()),
+                        variant: VariantName::parse("standard").unwrap(),
                         tree: test_tree_digest("tree-stale"),
                     },
                 };
@@ -2282,11 +2240,11 @@ pub(crate) mod commit_tests {
             };
             // The stale fixture genuinely diverges (the bug scenario): at
             // least one leg differs from the frozen desired per slot.
-            for sid in intent.slots.keys() {
+            for sid in intent.selected.keys() {
                 let (g, a) = stale_of(sid);
-                let desired = &intent.slots.get(sid).expect("a selected slot").desired;
+                let desired = &intent.resulting_snapshot.get(sid).expect("a selected slot");
                 assert!(
-                    g != desired.generation || a != desired.artifact,
+                    g != *desired.generation() || a != *desired.artifact(),
                     "the stale fixture must diverge from the frozen desired"
                 );
             }
@@ -2310,7 +2268,6 @@ pub(crate) mod commit_tests {
                 &h.store,
                 &intent,
                 &helpers,
-                &bindings,
                 &ledger::FinalizeSettings {
                     reason: "push completed",
                     op_id: &op_id,
@@ -2331,16 +2288,17 @@ pub(crate) mod commit_tests {
             assert_eq!(snapshots.len(), 1, "exactly one successful snapshot");
             assert_eq!(snapshots[0].deployment_id, deployment_id);
             let rb = rollback_of(&snapshots[0]);
-            for (sid, slot) in intent.slots.iter() {
+            for sid in intent.selected.keys() {
+                let entry = intent.resulting_snapshot.get(sid).expect("selected in snapshot");
                 let rbs = rb
                     .get(sid)
                     .expect("the rollback covers every selected slot");
                 assert_eq!(
-                    rbs.generation().clone(), slot.desired.generation.clone(),
+                    rbs.generation().clone(), entry.generation().clone(),
                     "the rollback generation for {sid} equals the frozen desired (the verified live value), never the stale observation (stale {stale:?})"
                 );
                 assert_eq!(
-                    rbs.artifact().clone(), slot.desired.artifact.clone(),
+                    rbs.artifact().clone(), entry.artifact().clone(),
                     "the rollback artifact for {sid} equals the frozen desired (the verified live value), never the stale observation (stale {stale:?})"
                 );
                 let (stale_gen, stale_art) = stale_of(sid);
@@ -2380,38 +2338,50 @@ pub(crate) mod commit_tests {
     // is FALLIBLE, and `append_terminal` validates the intent/terminal
     // pair against the strict reader's own legs BEFORE writing.
 
-    /// The DIVERGENCE MUTATIONS applied to the frozen-binding map the
-    /// finalizer merges with the lock-verified observed `GenerationRef`s
-    /// (the property below generates all four):
+    /// The DIVERGENCE MUTATIONS applied to the LIVE STATE the lock-verified
+    /// finalizer re-observes against the intent's FROZEN RESULTING SNAPSHOT
+    /// (the property below generates all four). There is NO separate frozen
+    /// binding map anymore: the intent's `resulting_snapshot` IS the single
+    /// frozen source (each entry couples generation + artifact + binding),
+    /// and the finalizer refuses whenever the lock-verified live observation
+    /// diverges from it.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum BindingDivergence {
-        /// The healthy control: the bindings key EXACTLY the selected slots
-        /// (the finalization succeeds and the terminal is readable).
+        /// The healthy control: every selected slot's LIVE state exactly
+        /// equals its frozen snapshot entry (the finalization succeeds and
+        /// the terminal is readable).
         Healthy,
-        /// A SELECTED slot carries NO binding (the map omits it).
+        /// A SELECTED slot's LIVE state is MISSING (its frozen snapshot
+        /// entry has no live counterpart).
         Missing,
-        /// A binding for a NON-selected slot (a slot this attempt never
-        /// deployed).
+        /// A SELECTED slot's LIVE generation is an EXTRA generation the
+        /// frozen snapshot never froze (the live state advanced past it).
         Extra,
-        /// The same slot under a DIFFERENT key (its binding moved to a
-        /// renamed id — the missing + extra pair).
+        /// A SELECTED slot's LIVE assignment's ARTIFACT was RENAMED (the
+        /// live generation matches the frozen one but the artifact does
+        /// not).
         Renamed,
     }
 
     proptest! {
-        // THE USER'S PROPERTY (the unreadable-terminal fix): the frozen
-        // binding map is mutated with a MISSING / EXTRA / RENAMED binding
-        // divergence (or the healthy control), and the ONE lock-verified
-        // finalization runs against the exact live state. ANY SUCCESSFUL
-        // APPEND IS IMMEDIATELY READABLE — when the finalizer returns
-        // `Finalized`, the strict reader (`read_ledger`) accepts the
-        // terminal it wrote and the rollback's bindings key EXACTLY its
-        // slots (the pre-write validation guarantees it); REJECTED INPUTS
-        // LEAVE THE LEDGER BYTES UNCHANGED — the divergent pair is refused
-        // with an integrity error BEFORE any write, and the ledger file is
-        // byte-identical before/after the rejected finalization (the
-        // terminal append is the finalize's ONLY write). Only the healthy
-        // control can succeed; every divergence is refused.
+        // THE USER'S PROPERTY (the unreadable-terminal fix): the LIVE STATE
+        // is mutated with a MISSING / EXTRA / RENAMED divergence vs the
+        // intent's FROZEN RESULTING SNAPSHOT (or the healthy control), and
+        // the ONE lock-verified finalization runs against that live state.
+        // ANY SUCCESSFUL APPEND IS IMMEDIATELY READABLE — when the finalizer
+        // returns `Finalized`, the strict reader (`read_ledger`) accepts the
+        // terminal it wrote, the rollback EXACTLY equals the intent's frozen
+        // resulting_snapshot and the activated set the intent's selected
+        // keys (the pre-write validation + the single-source snapshot
+        // guarantee it); REJECTED INPUTS LEAVE THE LEDGER BYTES UNCHANGED —
+        // a divergent live observation makes the finalizer REFUSE before
+        // any write (the re-observation happens under the locks BEFORE the
+        // marker writes), and the ledger file is byte-identical before/
+        // after the refused finalization (the terminal append is the
+        // finalize's ONLY ledger write). The intent's `resulting_snapshot`
+        // is the SINGLE frozen source — there is no parallel frozen map for
+        // the merge to drift on. Only the healthy control can finalize;
+        // every divergence is refused.
         //
         // Bounded `proptest_cases(16)` (full 16 with `DEPLOY_FULL_TESTS=1`,
         // fast default), fixed seed 0x5EED_5EED (house style), no failure
@@ -2433,89 +2403,81 @@ pub(crate) mod commit_tests {
             ],
         ) {
             let h = TwoSlotHarness::new();
-            // The FROZEN DESIRED assignments (a distinct artifact per slot)
-            // and the LIVE state minted to match them exactly.
-            let p1 = SlotId::new("p1".to_string());
-            let p2 = SlotId::new("p2".to_string());
+            // The FROZEN assignments (a distinct artifact per slot) — the
+            // resulting_snapshot entries the LIVE state must match exactly.
+            let p1 = SlotId::parse("p1").unwrap();
+            let p2 = SlotId::parse("p2").unwrap();
             let gen_p1 = GenerationId::generate();
             let gen_p2 = GenerationId::generate();
             let art_p1 = ArtifactRef {
                 release: crate::identity::test_release_id("rel-1"),
-                variant: VariantName::new("standard".to_string()),
+                variant: VariantName::parse("standard").unwrap(),
                 tree: test_tree_digest("tree-1"),
             };
             let art_p2 = ArtifactRef {
                 release: crate::identity::test_release_id("rel-2"),
-                variant: VariantName::new("standard".to_string()),
+                variant: VariantName::parse("standard").unwrap(),
                 tree: test_tree_digest("tree-2"),
             };
             let deployment_id = test_deployment_id("deploy-readable-prop");
-            mint_live_slot(&h, "s1", &gen_p1, &art_p1, &deployment_id);
-            mint_live_slot(&h, "s2", &gen_p2, &art_p2, &deployment_id);
+            // THE LIVE-STATE DIVERGENCE (the surviving fail-closed input of
+            // the lock-verified finalizer — there is no separate frozen
+            // binding map for the merge to refuse on: the intent's
+            // resulting_snapshot IS the single frozen source, and a
+            // MISSING / EXTRA / RENAMED live fact diverges from it).
+            match divergence {
+                BindingDivergence::Healthy => {
+                    mint_live_slot(&h, "s1", &gen_p1, &art_p1, &deployment_id);
+                    mint_live_slot(&h, "s2", &gen_p2, &art_p2, &deployment_id);
+                }
+                // Missing: p1's LIVE state is absent — the frozen snapshot
+                // entry has no live counterpart.
+                BindingDivergence::Missing => {
+                    mint_live_slot(&h, "s2", &gen_p2, &art_p2, &deployment_id);
+                }
+                // Extra: p1's live generation is an EXTRA generation the
+                // frozen snapshot never froze (the live state advanced past
+                // the frozen entry).
+                BindingDivergence::Extra => {
+                    let gen_extra = GenerationId::generate();
+                    mint_live_slot(&h, "s1", &gen_extra, &art_p1, &deployment_id);
+                    mint_live_slot(&h, "s2", &gen_p2, &art_p2, &deployment_id);
+                }
+                // Renamed: p1's live assignment's ARTIFACT was renamed — the
+                // live generation matches the frozen generation but the
+                // assignment's artifact does not.
+                BindingDivergence::Renamed => {
+                    let art_renamed = ArtifactRef {
+                        release: crate::identity::test_release_id("rel-3"),
+                        variant: VariantName::parse("standard").unwrap(),
+                        tree: test_tree_digest("tree-3"),
+                    };
+                    mint_live_slot(&h, "s1", &gen_p1, &art_renamed, &deployment_id);
+                    mint_live_slot(&h, "s2", &gen_p2, &art_p2, &deployment_id);
+                }
+            }
 
-            // The PENDING intent: durable, no terminal, the frozen desired
-            // assignments + the plan-time physical bindings.
+            // The PENDING intent: durable, no terminal, the frozen
+            // resulting snapshot (each SELECTED slot's minted generation +
+            // artifact + the plan-time physical binding).
             let bindings = h.config.target_slot_bindings("t1").unwrap();
             let intent = DeploymentIntent {
                 deployment_id: deployment_id.clone(),
-                target: TargetName::new("t1".to_string()),
+                target: TargetName::parse("t1").unwrap(),
                 group: None,
-                behavior_sha256: "sha256-aa".to_string(),
-                attempted_at: "2026-01-01T00:00:00Z".to_string(),
-                slots: NonEmptySlotTable::build(vec![
-                    (
-                        p1.clone(),
-                        IntentSlot {
-                            desired: DesiredGeneration {
-                                generation: gen_p1.clone(),
-                                artifact: art_p1.clone(),
-                            },
-                            pre_push: None,
-                            binding: bindings.get(&p1).cloned().expect("p1 is a target slot"),
-                        },
-                    ),
-                    (
-                        p2.clone(),
-                        IntentSlot {
-                            desired: DesiredGeneration {
-                                generation: gen_p2.clone(),
-                                artifact: art_p2.clone(),
-                            },
-                            pre_push: None,
-                            binding: bindings.get(&p2).cloned().expect("p2 is a target slot"),
-                        },
-                    ),
-                ])
+                behavior_sha256: crate::identity::BehaviorDigest::parse("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855").unwrap(),
+                attempted_at: crate::identity::Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
+                resulting_snapshot: TargetSnapshot::from_entries(BTreeMap::from([
+                    (p1.clone(), SnapshotEntry::new(gen_p1.clone(), art_p1.clone(), bindings.get(&p1).cloned().expect("p1 is a target slot"))),
+                    (p2.clone(), SnapshotEntry::new(gen_p2.clone(), art_p2.clone(), bindings.get(&p2).cloned().expect("p2 is a target slot"))),
+                ])),
+                selected: NonEmptySlotTable::build(BTreeMap::from([
+                    (p1.clone(), SelectedSlotIntent { pre_push: None }),
+                    (p2.clone(), SelectedSlotIntent { pre_push: None }),
+                ]))
                 .expect("two selected slots"),
-                full_membership: BTreeSet::from([p1.clone(), p2.clone()]),
-            };
+        };
             h.store.append_attempt("t1", &intent).unwrap();
-
-            // THE DIVERGENCE MUTATION of the frozen-binding map (the
-            // finalizer's merge input).
-            let mutated_bindings: BTreeMap<SlotId, crate::ledger::PhysicalBinding> =
-                match divergence {
-                    BindingDivergence::Healthy => bindings.clone(),
-                    BindingDivergence::Missing => {
-                        let mut m = bindings.clone();
-                        m.remove(&p1);
-                        m
-                    }
-                    BindingDivergence::Extra => {
-                        let mut m = bindings.clone();
-                        m.insert(
-                            SlotId::new("p3".to_string()),
-                            bindings.get(&p1).cloned().expect("p1 is bound"),
-                        );
-                        m
-                    }
-                    BindingDivergence::Renamed => {
-                        let mut m = bindings.clone();
-                        let b = m.remove(&p1).expect("p1 is bound");
-                        m.insert(SlotId::new("p1-renamed".to_string()), b);
-                        m
-                    }
-                };
 
             // The per-slot live helpers (the lock-verified finalizer
             // re-observes the matching live state under these).
@@ -2539,7 +2501,6 @@ pub(crate) mod commit_tests {
                 &h.store,
                 &intent,
                 &helpers,
-                &mutated_bindings,
                 &ledger::FinalizeSettings {
                     reason: "push completed",
                     op_id: &op_id,
@@ -2548,13 +2509,15 @@ pub(crate) mod commit_tests {
                 // ANY SUCCESSFUL APPEND IS IMMEDIATELY READABLE: the
                 // pre-write validation guarantees the terminal the
                 // finalizer wrote is accepted by the strict reader — the
-                // ledger read succeeds and the rollback's bindings key
-                // EXACTLY its slots (the single-map construction).
+                // ledger read succeeds, and the appended terminal EXACTLY
+                // reproduces the intent's frozen values (the rollback ==
+                // resulting_snapshot, the activated set == the selected
+                // keys).
                 Ok(ledger::FinalizeOutcome::Finalized) => {
                     assert_eq!(
                         divergence,
                         BindingDivergence::Healthy,
-                        "only the exact-key bindings (the healthy control) can finalize — a divergence must be refused (divergence {divergence:?})"
+                        "only the exact live state (the healthy control) can finalize — a divergence must be refused (divergence {divergence:?})"
                     );
                     let entries = h.store.read_ledger("t1").unwrap();
                     assert_eq!(entries.len(), 1, "one merged entry");
@@ -2566,21 +2529,22 @@ pub(crate) mod commit_tests {
                         panic!("a successful finalization appends a Successful terminal");
                     };
                     assert_eq!(
-                        st.rollback().keys().collect::<BTreeSet<_>>(),
-                        st.rollback().keys().collect::<BTreeSet<_>>(),
-                        "the appended rollback's bindings key EXACTLY its slots (one validated map — no parallel maps to drift)"
+                        st.rollback(),
+                        &intent.resulting_snapshot,
+                        "the appended rollback EXACTLY equals the intent's frozen resulting_snapshot (one validated snapshot — no parallel maps to drift)"
+                    );
+                    assert_eq!(
+                        st.activated().as_set().iter().cloned().collect::<BTreeSet<_>>(),
+                        intent.selected_membership(),
+                        "the appended terminal's ACTIVATED set EXACTLY equals the intent's frozen SELECTED keys — the record the strict reader accepts"
                     );
                 }
                 // REJECTED INPUTS LEAVE THE LEDGER BYTES UNCHANGED: the
-                // divergent pair was refused (an integrity error — the
-                // construction is fallible and the pre-write validation
-                // aborts before any write) and the ledger file is
-                // byte-identical.
-                Err(e) => {
-                    assert!(
-                        matches!(e, crate::error::Error::Integrity(_)),
-                        "a divergent binding map must be refused with an integrity error, got: {e}"
-                    );
+                // live-state divergence was refused BEFORE any write (the
+                // finalizer re-observes every selected slot under the locks
+                // BEFORE writing the markers) and the ledger file is
+                // byte-identical — no terminal was ever appended.
+                Ok(ledger::FinalizeOutcome::Refused { .. }) => {
                     assert_ne!(
                         divergence,
                         BindingDivergence::Healthy,
@@ -2589,11 +2553,17 @@ pub(crate) mod commit_tests {
                     let after = std::fs::read(&ledger_path).unwrap();
                     assert_eq!(
                         before, after,
-                        "a rejected finalization NEVER writes — the ledger bytes are byte-identical before/after (divergence {divergence:?})"
+                        "a refused finalization NEVER writes — the ledger bytes are byte-identical before/after (divergence {divergence:?})"
                     );
+                    h.store
+                        .read_ledger("t1")
+                        .expect("the intent-only pending entry stays fully readable after the refusal");
                 }
-                Ok(other) => panic!(
-                    "unexpected finalize outcome {other:?} — the live state equals the frozen desired, so only Finalized or a construction refusal is reachable (divergence {divergence:?})"
+                Ok(ledger::FinalizeOutcome::Pending) => panic!(
+                    "the fixture state is deterministic — the finalization must never be Pending (divergence {divergence:?})"
+                ),
+                Err(e) => panic!(
+                    "the lock-verified finalizer REFUSES a divergent live state, it never errors on this fixture input: {e:?} (divergence {divergence:?})"
                 ),
             }
         }

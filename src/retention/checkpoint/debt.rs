@@ -44,7 +44,7 @@ pub(crate) fn reconcile_sweep_debt(
             Some(failed) => failed.clone(),
             None => "checkpoint sweep did not complete; the next push retries it".to_string(),
         };
-        match store.write_sweep_debt(Some(&reason)) {
+        match store.write_sweep_debt(Some(reason.as_str())) {
             Ok(()) => None,
             Err(e) => Some(format!(
                 "sweep debt maintenance deferred: failed to write sweep debt: {e}"

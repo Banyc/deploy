@@ -20,7 +20,7 @@
 //!
 //! The single CONCERN of this module is the observed assignment itself;
 //! every other facet consumes it (the shared core's pre-push assignments,
-//! the intent's [`crate::ledger::records::PreviousGeneration`], the per-slot
+//! the intent's [`crate::ledger::records::SelectedSlotIntent`], the per-slot
 //! outcomes, the rollback payload builder).
 
 use crate::error::{Error, Result};
@@ -333,7 +333,9 @@ mod tests {
         VariantName, test_deployment_id, test_generation_id, test_release_id, test_tree_digest,
     };
     use crate::store::local::LocalStore;
+    #[cfg(test)]
     use proptest::prelude::*;
+    #[cfg(test)]
     use proptest::test_runner::RngSeed;
     use serde_json::json;
 
@@ -342,7 +344,7 @@ mod tests {
     fn artifact_ref(tag: &str) -> ArtifactRef {
         ArtifactRef {
             release: test_release_id(tag),
-            variant: VariantName::new("standard".to_string()),
+            variant: VariantName::parse("standard").unwrap(),
             tree: test_tree_digest(tag),
         }
     }
@@ -356,10 +358,8 @@ mod tests {
             "artifact": {
                 "release": test_release_id(art).as_str(),
                 "variant": "standard",
-                "tree": test_tree_digest(art).as_str(),
-            },
-            "last_deployment": test_deployment_id(dep).as_str(),
-        })
+                "tree": test_tree_digest(art).as_str()},
+            "last_deployment": test_deployment_id(dep).as_str()})
     }
 
     /// A RAW observed record as an arbitrary JSON-ish map: a `state` tag
@@ -429,8 +429,7 @@ mod tests {
                     json!({
                         "release": test_release_id("a").as_str(),
                         "variant": "standard",
-                        "tree": test_tree_digest("a").as_str(),
-                    }),
+                        "tree": test_tree_digest("a").as_str()}),
                 );
             }
             if err {
@@ -509,8 +508,7 @@ mod tests {
     fn wire_rejects_unknown_fields_at_every_level() {
         let valid_known = json!({
             "state": "known",
-            "value": known_value("g", "a", "d"),
-        });
+            "value": known_value("g", "a", "d")});
         // Positive control: the exact serialized shape round-trips.
         let parsed: ObservedAssignment = serde_json::from_value(valid_known.clone()).unwrap();
         assert_eq!(
@@ -518,7 +516,7 @@ mod tests {
             ObservedAssignment::Known {
                 generation: test_generation_id("g"),
                 artifact: artifact_ref("a"),
-                last_deployment: test_deployment_id("d"),
+                last_deployment: test_deployment_id("d")
             }
         );
         // An extra field NEXT TO the tag/content pair is rejected.
@@ -544,8 +542,7 @@ mod tests {
         // A slot record with an extra key is rejected.
         let slot_extra = json!({
             "assignment": valid_known,
-            "bogus": 1,
-        });
+            "bogus": 1});
         assert!(
             serde_json::from_value::<ObservedSlot>(slot_extra).is_err(),
             "a key next to assignment must be REJECTED"
@@ -554,8 +551,7 @@ mod tests {
         let target_extra = json!({
             "target": "production",
             "slots": {},
-            "bogus": 1,
-        });
+            "bogus": 1});
         assert!(
             serde_json::from_value::<ObservedTarget>(target_extra).is_err(),
             "a key next to target/slots must be REJECTED"
@@ -576,29 +572,29 @@ mod tests {
     fn arbitrary_live_observation() -> impl Strategy<Value = ObservedSlot> {
         prop_oneof![
             Just(ObservedSlot {
-                assignment: ObservedAssignment::Absent,
+                assignment: ObservedAssignment::Absent
             }),
             (0..3usize, 0..3usize).prop_map(|(i, j)| ObservedSlot {
                 assignment: ObservedAssignment::Known {
                     generation: test_generation_id(&format!("gen-seq-{i}")),
                     artifact: artifact_ref(&format!("art-seq-{i}-{j}")),
-                    last_deployment: test_deployment_id(&format!("dep-seq-{i}-{j}")),
-                },
+                    last_deployment: test_deployment_id(&format!("dep-seq-{i}-{j}"))
+                }
             }),
             (0..3usize, 0..3usize).prop_map(|(i, j)| ObservedSlot {
                 assignment: ObservedAssignment::AssignmentUnknown {
                     generation: test_generation_id(&format!("gen-seq-{i}")),
                     error: ObservationError {
-                        message: format!("assignment read failed: case {j}"),
-                    },
-                },
+                        message: format!("assignment read failed: case {j}")
+                    }
+                }
             }),
             (0..3usize).prop_map(|j| ObservedSlot {
                 assignment: ObservedAssignment::Unknown {
                     error: ObservationError {
-                        message: format!("status read failed: case {j}"),
-                    },
-                },
+                        message: format!("status read failed: case {j}")
+                    }
+                }
             }),
         ]
     }
@@ -645,7 +641,7 @@ mod tests {
     fn run_sequence_case(sequence: Vec<ObservedSlot>) {
         let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
-        let slot = SlotId::new("p1".to_string());
+        let slot = SlotId::parse("p1").unwrap();
         for obs in &sequence {
             store.write_slot_observed(&slot, obs).unwrap();
             let read_back = store
@@ -910,7 +906,7 @@ mod tests {
                 "known_absent" => ObservationWire::KnownAbsent,
                 "known" => ObservationWire::Known(ArtifactRefWire {
                     release: test_release_id("r"),
-                    variant: VariantName::new("standard".to_string()),
+                    variant: VariantName::parse("standard").unwrap(),
                     tree: test_tree_digest("t"),
                 }),
                 _ => ObservationWire::Unknown(ObservationError {
@@ -941,8 +937,7 @@ mod tests {
         assert!(
             serde_json::from_value::<ObservationWire<ObservedGenerationWire>>(json!({
                 "state": "bogus",
-                "value": { "generation": test_generation_id("g").as_str() },
-            }))
+                "value": { "generation": test_generation_id("g").as_str() }}))
             .is_err(),
             "an unknown tag must be REJECTED"
         );
@@ -950,8 +945,7 @@ mod tests {
         assert!(
             serde_json::from_value::<ObservationWire<ObservedGenerationWire>>(json!({
                 "state": "known",
-                "value": 42,
-            }))
+                "value": 42}))
             .is_err(),
             "a wrong-typed value must be REJECTED"
         );
@@ -959,8 +953,7 @@ mod tests {
         assert!(
             serde_json::from_value::<ObservationWire<ObservedGenerationWire>>(json!({
                 "state": "known",
-                "value": { "generation": 42 },
-            }))
+                "value": { "generation": 42 }}))
             .is_err(),
             "a wrong-typed payload field must be REJECTED"
         );
@@ -968,16 +961,14 @@ mod tests {
         assert!(
             serde_json::from_value::<ObservationWire<ObservedGenerationWire>>(json!({
                 "state": "known_absent",
-                "value": { "generation": test_generation_id("g").as_str() },
-            }))
+                "value": { "generation": test_generation_id("g").as_str() }}))
             .is_err(),
             "a unit variant carrying a value must be REJECTED"
         );
         // A `known` variant missing its value is rejected.
         assert!(
             serde_json::from_value::<ObservationWire<ObservedGenerationWire>>(json!({
-                "state": "known",
-            }))
+                "state": "known"}))
             .is_err(),
             "a known variant missing its value must be REJECTED"
         );
@@ -990,9 +981,7 @@ mod tests {
                     "release": test_release_id("r").as_str(),
                     "variant": "standard",
                     "tree": test_tree_digest("t").as_str(),
-                    "bogus": 1,
-                },
-            }))
+                    "bogus": 1}}))
             .is_err(),
             "a strict artifact payload with an extra field must be REJECTED"
         );
@@ -1004,9 +993,7 @@ mod tests {
                     "release": test_release_id("r").as_str(),
                     "variant": "standard",
                     "tree": test_tree_digest("t").as_str(),
-                    "error": { "message": "boom" },
-                },
-            }))
+                    "error": { "message": "boom" }}}))
             .is_err(),
             "a cross-variant field must be REJECTED"
         );
@@ -1020,11 +1007,11 @@ mod tests {
             Just(Observation::KnownAbsent),
             (0..3usize, 0..3usize).prop_map(|(i, j)| Observation::Known(ArtifactRef {
                 release: test_release_id(&format!("rel-seq-{i}")),
-                variant: VariantName::new("standard".to_string()),
-                tree: test_tree_digest(&format!("tree-seq-{i}-{j}")),
+                variant: VariantName::parse("standard").unwrap(),
+                tree: test_tree_digest(&format!("tree-seq-{i}-{j}"))
             })),
             (0..3usize).prop_map(|j| Observation::Unknown(ObservationError {
-                message: format!("status read failed: case {j}"),
+                message: format!("status read failed: case {j}")
             })),
         ]
     }
@@ -1037,10 +1024,10 @@ mod tests {
         prop_oneof![
             Just(Observation::KnownAbsent),
             (0..3usize).prop_map(|i| Observation::Known(ObservedGeneration {
-                generation: test_generation_id(&format!("gen-seq-{i}")),
+                generation: test_generation_id(&format!("gen-seq-{i}"))
             })),
             (0..3usize).prop_map(|j| Observation::Unknown(ObservationError {
-                message: format!("status read failed: case {j}"),
+                message: format!("status read failed: case {j}")
             })),
         ]
     }

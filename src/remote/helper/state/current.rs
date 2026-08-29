@@ -336,7 +336,9 @@ mod tests_current {
     use crate::identity::{test_deployment_id, test_generation_id, test_tree_digest};
     use crate::remote::helper::GenerationAssignment;
     use crate::remote::transport::LocalTransport;
+    #[cfg(test)]
     use proptest::prelude::*;
+    #[cfg(test)]
     use proptest::test_runner::RngSeed;
 
     fn assignment(gen_id: &str, tree: &str) -> GenerationAssignment {
@@ -345,7 +347,7 @@ mod tests_current {
             generation_id: test_generation_id(gen_id),
             artifact: ArtifactRef {
                 release: crate::identity::test_release_id("rel-sha256-x"),
-                variant: crate::identity::VariantName::new("standard".to_string()),
+                variant: crate::identity::VariantName::parse("standard").unwrap(),
                 tree: crate::identity::test_tree_digest(tree),
             },
             behavior_sha256: "b".to_string(),
@@ -1014,11 +1016,9 @@ mod tests_current {
                     "artifact": {
                         "release": format!("rel-sha256-{}", "0".repeat(64)),
                         "variant": "standard",
-                        "tree": tree,
-                    },
+                        "tree": tree},
                     "behavior_sha256": "0".repeat(64),
-                    "created_at": "2020-01-01T00:00:00Z",
-                }))
+                    "created_at": "2020-01-01T00:00:00Z"}))
                 .expect("the generated record serializes")
             }),
             // Corrupt JSON.
@@ -1245,8 +1245,7 @@ mod tests_current {
                 Some(CurrentKind::Symlink(t)) => {
                     parse_canonical_current_target(Path::new(t)).map(|g| g.as_str().to_string())
                 }
-                _ => None,
-            };
+                _ => None};
             let assignment_parsed: Option<(String, String)> = layout.assignment.as_deref().and_then(
                 |b| {
                     serde_json::from_slice::<GenerationAssignment>(b)
@@ -1271,8 +1270,7 @@ mod tests_current {
                             if t.as_str() == layout::generation_root_link(tree).to_string_lossy().as_ref())
                         && layout.tree_dir
                 }
-                _ => false,
-            };
+                _ => false};
 
             // ---- status() ----
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| helper.status()))
@@ -1500,13 +1498,11 @@ mod tests_current {
             };
             let actual_canonical: Option<crate::identity::GenerationId> = match a {
                 1 => Some(actual_g.clone()),
-                _ => None,
-            };
+                _ => None};
             let agrees = match (a, &expected, actual_canonical.as_ref()) {
                 (0, ExpectedCurrent::Absent, _) => true,
                 (1, ExpectedCurrent::Generation(e), Some(act)) => e == act,
-                _ => false,
-            };
+                _ => false};
             let transport_err = a == 3;
             let malformed = a == 2;
 
@@ -1530,8 +1526,7 @@ mod tests_current {
                         std::os::unix::fs::symlink("objects/not-canonical", base.join("current")).unwrap();
                     }
                     3 => {}
-                    _ => unreachable!(),
-                }
+                    _ => unreachable!()}
                 let link_bytes_before = std::fs::symlink_metadata(base.join("current"))
                     .map(|_| std::fs::read_link(base.join("current")).unwrap())
                     .unwrap_or_default();
@@ -1567,8 +1562,7 @@ mod tests_current {
                             "{name}: a failed mutation must leave the current link byte-identical"
                         );
                     }
-                    Err(_) => panic!("{name}: the gate must never panic"),
-                }
+                    Err(_) => panic!("{name}: the gate must never panic")}
             }
         }
     }
@@ -1731,8 +1725,7 @@ mod tests_current {
                 let meta = match meta_outcome {
                     0 => MetaOutcome::Present,
                     1 => MetaOutcome::Absent,
-                    _ => MetaOutcome::Err,
-                };
+                    _ => MetaOutcome::Err};
                 let link_bytes_before = std::fs::symlink_metadata(base.join("current"))
                     .map(|_| std::fs::read_link(base.join("current")).unwrap())
                     .unwrap_or_default();
@@ -1789,8 +1782,7 @@ mod tests_current {
                             "{name}: a failed mutation must leave the current link byte-identical"
                         );
                     }
-                    Err(_) => panic!("{name}: the gate must never panic"),
-                }
+                    Err(_) => panic!("{name}: the gate must never panic")}
             }
         }
     }

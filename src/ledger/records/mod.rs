@@ -18,8 +18,7 @@
 //!
 //! * **intent** — the durable intent wire/domain pair ([`LedgerIntentWire`]
 //!   / [`DeploymentIntent`]) with the VERIFYING CONVERSION, the per-slot
-//!   payload types ([`IntentSlot`], [`DesiredGeneration`],
-//!   [`PreviousGeneration`]), and the in-memory push report
+//!   payload type ([`SelectedSlotIntent`]) and the in-memory push report
 //!   ([`LedgerIntentReport`]) (the "two line kinds — intent" half);
 //! * **terminal** — the terminal wire/domain pair ([`LedgerTerminalWire`] /
 //!   [`LedgerTerminal`]) with the VERIFYING CONVERSION, the
@@ -130,10 +129,10 @@ pub(crate) use validation::{
 pub use validation::{FrozenSlotTopology, RebindingPlan, VerifiedReleaseRebinding};
 pub(crate) use validation::{LEDGER_SCHEMA_VERSION, PINS_SCHEMA_VERSION};
 pub use wire::{
-    CompensationReport, DegradedTerminal, DeploymentIntent, DesiredGeneration, IntentSlot,
-    LedgerEntry, LedgerIntentReport, LedgerIntentWire, LedgerTerminal, LedgerTerminalWire,
-    PreviousGeneration, SlotAttemptStateWire, SlotOutcome, SlotOutcomeKind, SlotResult,
-    SlotTransition, SuccessfulTerminal, TerminalDisposition,
+    CompensationReport, DegradedTerminal, DeploymentIntent, LedgerEntry, LedgerIntentReport,
+    LedgerIntentWire, LedgerTerminal, LedgerTerminalWire, SelectedSlotIntent, SlotAttemptStateWire,
+    SlotOutcome, SlotOutcomeKind, SlotResult, SlotTransition, SuccessfulTerminal,
+    TerminalDisposition,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,6 +199,14 @@ pub struct PhysicalBinding {
     /// in, exactly as declared in the slot's `deploy_dir` at deployment time.
     pub deploy_dir: String,
 }
+impl Default for PhysicalBinding {
+    fn default() -> Self {
+        Self {
+            server: ServerId::parse("s1").unwrap(),
+            deploy_dir: "/srv/deploy/p1".to_string(),
+        }
+    }
+}
 
 /// The ROLLBACK STATE carried by the terminal event of a SUCCESSFUL
 /// deployment: the snapshot payload of the attempt — one entry per slot
@@ -215,9 +222,9 @@ pub struct TargetSnapshot {
 /// unique (a map-visitor deserializer refuses a duplicate — ambiguous
 /// JSON can never read as a valid rollback). Deserialize-only: the writer
 /// emits `TargetSnapshot`'s own `Serialize` (the same `{"entries": ...}`).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct TargetSnapshotWire {
+pub struct TargetSnapshotWire {
     #[serde(deserialize_with = "deserialize_unique_entries")]
     entries: BTreeMap<SlotId, SnapshotEntry>,
 }
@@ -252,9 +259,27 @@ where
     deserializer.deserialize_map(UniqueEntriesVisitor)
 }
 
+impl Serialize for TargetSnapshotWire {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("TargetSnapshotWire", 1)?;
+        state.serialize_field("entries", &self.entries)?;
+        state.end()
+    }
+}
 impl From<TargetSnapshotWire> for TargetSnapshot {
     fn from(w: TargetSnapshotWire) -> Self {
         TargetSnapshot::from_entries(w.entries)
+    }
+}
+impl From<&TargetSnapshot> for TargetSnapshotWire {
+    fn from(s: &TargetSnapshot) -> Self {
+        TargetSnapshotWire {
+            entries: s.clone().into_entries(),
+        }
     }
 }
 
@@ -817,7 +842,9 @@ mod tests {
     use crate::ledger::records::{ObservationError, ObservedGeneration};
     use crate::ledger::records::{SlotOutcome, SlotOutcomeKind, SlotTransition};
     use crate::store::local::LocalStore;
+    #[cfg(test)]
     use proptest::prelude::*;
+    #[cfg(test)]
     use proptest::test_runner::RngSeed;
     use std::path::Path;
 
@@ -833,7 +860,7 @@ mod tests {
 
     fn binding(sid: &SlotId) -> PhysicalBinding {
         PhysicalBinding {
-            server: ServerId::new("s1".to_string()),
+            server: ServerId::parse("s1").unwrap(),
             deploy_dir: format!("/srv/deploy/{}", sid.as_str()),
         }
     }
@@ -847,7 +874,7 @@ mod tests {
                 placement_slot: key.clone(),
                 artifact: ArtifactRef {
                     release: test_release_id(key.as_str()),
-                    variant: VariantName::new("standard".to_string()),
+                    variant: VariantName::parse("standard").unwrap(),
                     tree: test_tree_digest(key.as_str()),
                 },
             },
@@ -881,28 +908,37 @@ mod tests {
         full: &[SlotId],
         group: Option<&str>,
     ) -> LedgerIntentWire {
-        let desired: BTreeMap<SlotId, GenerationRef> =
-            keys.iter().map(|k| (k.clone(), gen_ref_for(k))).collect();
+        // THE FROZEN RESULTING SNAPSHOT: one entry per FULL member (the
+        // selected keys, plus the unselected `full` slots a group push
+        // carries forward). The selected slot's desired state IS its
+        // snapshot entry — no separate desired/bindings projections.
+        let snapshot = TargetSnapshot::from_entries(
+            full.iter()
+                .map(|k| {
+                    let g = gen_ref_for(k);
+                    (
+                        k.clone(),
+                        crate::ledger::SnapshotEntry::new(
+                            g.generation.clone(),
+                            g.assignment.artifact.clone(),
+                            binding(k),
+                        ),
+                    )
+                })
+                .collect(),
+        );
         let pre_push: BTreeMap<SlotId, Option<SlotAttemptStateWire>> =
             keys.iter().map(|k| (k.clone(), None)).collect();
-        // The agreeing intent FREEZES each member's physical binding (schema
-        // v6): the binding keys follow the membership so the intent stays
-        // internally agreeing (the property mutates ONE field at a time).
-        let bindings: BTreeMap<SlotId, PhysicalBinding> =
-            keys.iter().map(|k| (k.clone(), binding(k))).collect();
         LedgerIntentWire {
             deployment_schema_version: crate::ledger::LEDGER_SCHEMA_VERSION,
             deployment_id: test_deployment_id("deploy-w"),
-            target: TargetName::new("t1".to_string()),
+            target: TargetName::parse("t1").unwrap(),
             group: group.map(str::to_string),
             slot_ids: keys.to_vec(),
-            selected_membership: keys.to_vec(),
-            full_membership: full.to_vec(),
-            behavior_sha256: "sha256-w".to_string(),
+            behavior_sha256: crate::identity::DIGEST_TEST_HEX_1.to_string(),
             attempted_at: "2026-01-01T00:00:00Z".to_string(),
-            desired,
+            resulting_snapshot: TargetSnapshotWire::from(&snapshot),
             pre_push,
-            bindings,
             slots: BTreeMap::new(),
         }
     }
@@ -921,7 +957,7 @@ mod tests {
     }
     fn agreeing_terminal(keys: &[SlotId], status_idx: u32) -> LedgerTerminalWire {
         let deployment_id = test_deployment_id("deploy-w");
-        let target = TargetName::new("t1".to_string());
+        let target = TargetName::parse("t1").unwrap();
         match status_idx {
             // Successful: EVERY member slot recorded Activated, the
             // COMPLETE rollback payload covers the same membership with
@@ -1043,10 +1079,12 @@ mod tests {
     /// entry (the entry owns identity: the terminal's id is the entry key,
     /// its target must equal the entry's, every outcome key must be a
     /// member of the intent's membership, and the outcome key set must
-    /// agree with the membership BY STATUS: Successful → the FULL-push
-    /// equality leg only (the terminal's own memberships satisfy the
-    /// terminal-local equations; the read requires selected == full when
-    /// the intent has no group), FailedPreflight → empty, every other
+    /// agree with the membership BY STATUS: Successful → the
+    /// ROLLBACK-VS-INTENT legs (the terminal's rollback must EXACTLY equal
+    /// the intent's frozen resulting_snapshot and its activated set the
+    /// intent's selected — via the SHARED validator
+    /// [`crate::ledger::records::validate_successful_rollback_against_intent`]
+    /// the store read runs), FailedPreflight → empty, every other
     /// state → EXACT coverage) — returning the validated domain pair.
     fn pair_to_domain(
         pair: &(LedgerIntentWire, LedgerTerminalWire),
@@ -1065,7 +1103,7 @@ mod tests {
             )));
         }
         for key in pair.1.outcomes.keys() {
-            if !intent.slots.contains_key(key) {
+            if !intent.selected.contains_key(key) {
                 return Err(Error::integrity(format!(
                     "terminal {}: outcome for slot '{key}' is outside the intent's membership",
                     pair.1.deployment_id
@@ -1085,48 +1123,32 @@ mod tests {
         // membership (it is the historical selected set written before the
         // push; the terminal's memberships are proven at terminal time).
         let outcome_keys: BTreeSet<SlotId> = terminal.outcomes().keys().cloned().collect();
-        let membership: BTreeSet<SlotId> = intent.slots.keys().cloned().collect();
+        let membership: BTreeSet<SlotId> = intent.selected.keys().cloned().collect();
         match terminal.status() {
             DeploymentStatus::Successful => {
                 // THE INTENT-BINDING LEGS (the user's requirement): the
-                // terminal's memberships must REPRODUCE the intent's FROZEN
-                // values — the intent froze selected (its table keys) and
-                // full (the complete target membership at plan time), and a
-                // terminal whose memberships diverge is refused. The
-                // FULL-push equality: a FULL push (no group) selects every
-                // target slot, so selected == full; a GROUP push allows a
-                // proper subset (the ⊆ is already enforced by the
-                // conversion).
-                let (selected, full) = match &terminal.disposition {
-                    TerminalDisposition::Successful(st) => {
-                        (st.activated().as_set(), st.full_membership())
-                    }
+                // terminal must REPRODUCE the intent's FROZEN values — the
+                // intent froze selected (its table keys) and full (the
+                // resulting snapshot: the complete target membership at plan
+                // time), and a terminal whose values diverge is refused.
+                // THE SHARED VALIDATOR is the same one the store read runs
+                // (>[`crate::ledger::records::validate_successful_rollback_against_intent`]):
+                // activated == intent.selected AND the terminal's ROLLBACK
+                // must EXACTLY EQUAL the intent's frozen resulting_snapshot
+                // (full equality over ALL slots — a mutated SELECTED or
+                // UNSELECTED snapshot field is refused). The FULL-push
+                // equality (group None → selected == snapshot keys) is
+                // STRUCTURAL in the intent (the conversion enforces it), so
+                // the terminal legs reproduce both sides of it.
+                let (rollback, selected) = match &terminal.disposition {
+                    TerminalDisposition::Successful(st) => (st.rollback(), st.activated().as_set()),
                     _ => {
-                        unreachable!(
-                            "a Successful terminal carries its rollback + activated set + memberships"
-                        )
+                        unreachable!("a Successful terminal carries its rollback + activated set")
                     }
                 };
-                if selected != &intent.selected_membership() {
-                    return Err(Error::integrity(format!(
-                        "terminal {}: Successful records selected membership {selected:?} but the intent froze selected membership {:?} — the terminal must REPRODUCE the immutable intent's frozen selected membership",
-                        pair.1.deployment_id,
-                        intent.selected_membership()
-                    )));
-                }
-                if full != intent.full_membership() {
-                    return Err(Error::integrity(format!(
-                        "terminal {}: Successful records full membership {full:?} but the intent froze full membership {:?} — the terminal must REPRODUCE the immutable intent's frozen full membership (the complete target membership at plan time)",
-                        pair.1.deployment_id,
-                        intent.full_membership()
-                    )));
-                }
-                if intent.group.is_none() && selected != full {
-                    return Err(Error::integrity(format!(
-                        "terminal {}: Successful records selected membership {selected:?} and full membership {full:?} — a FULL push (no group) selects every target slot, so its selected membership must EXACTLY equal its full membership",
-                        pair.1.deployment_id
-                    )));
-                }
+                crate::ledger::records::validate_successful_rollback_against_intent(
+                    &intent, rollback, selected,
+                )?;
             }
             DeploymentStatus::FailedPreflight => {
                 if !outcome_keys.is_empty() {
@@ -1163,19 +1185,20 @@ mod tests {
             domain.releases(),
             BTreeSet::from([test_release_id("slot-1")])
         );
-        assert_eq!(domain.slots.len(), 1, "one table, one member");
+        assert_eq!(domain.selected.len(), 1, "one table, one member");
         assert!(
-            domain.slots[&slot(1)]
-                .desired
-                .artifact
+            domain
+                .resulting_snapshot
+                .get(&slot(1))
+                .expect("selected in snapshot")
+                .artifact()
                 .release
                 .as_str()
                 .starts_with("rel-sha256-")
         );
-        // Round trip: the one table re-expands into the wire split shape and
+        // Round trip: the domain re-expands into the wire split shape and
         // back unchanged.
-        let json = serde_json::to_string(&domain).unwrap();
-        let wire2: LedgerIntentWire = serde_json::from_str(&json).unwrap();
+        let wire2 = LedgerIntentWire::from(&domain);
         assert_eq!(
             wire2.slot_ids,
             vec![slot(1)],
@@ -1201,25 +1224,40 @@ mod tests {
         // (c) an EMPTY membership: the domain's NonEmptySlotTable refuses it.
         let mut bad = wire.clone();
         bad.slot_ids.clear();
-        bad.desired.clear();
         bad.pre_push.clear();
         assert!(
             bad.into_domain().is_err(),
             "an empty membership fails closed"
         );
-        // (d) a MISSING desired key.
+        // (d) a MISSING snapshot entry for a selected slot: the frozen
+        //     snapshot must cover every selected slot (selected ⊆ snapshot).
         let mut bad = wire.clone();
-        bad.desired.remove(&slot(1));
+        let snapshot: TargetSnapshot = bad.resulting_snapshot.clone().into();
+        let mut entries = snapshot.into_entries();
+        entries.remove(&slot(1));
+        bad.resulting_snapshot = TargetSnapshotWire::from(&TargetSnapshot::from_entries(entries));
         assert!(
             bad.into_domain().is_err(),
-            "a missing desired key fails closed"
+            "a missing snapshot entry fails closed"
         );
-        // (e) an EXTRA desired key outside the membership.
+        // (e) an EXTRA snapshot entry beyond the selected membership: a FULL
+        //     push (no group) requires selected == snapshot keys.
         let mut bad = wire.clone();
-        bad.desired.insert(slot(2), gen_ref_for(&slot(2)));
+        let snapshot: TargetSnapshot = bad.resulting_snapshot.clone().into();
+        let mut entries = snapshot.into_entries();
+        let g = gen_ref_for(&slot(2));
+        entries.insert(
+            slot(2),
+            SnapshotEntry::new(
+                g.generation.clone(),
+                g.assignment.artifact.clone(),
+                binding(&slot(2)),
+            ),
+        );
+        bad.resulting_snapshot = TargetSnapshotWire::from(&TargetSnapshot::from_entries(entries));
         assert!(
             bad.into_domain().is_err(),
-            "an extra desired key fails closed"
+            "an extra snapshot key beyond the selected fails closed"
         );
         // (f) a missing pre_push key.
         let mut bad = wire.clone();
@@ -1250,16 +1288,22 @@ mod tests {
             bad.into_domain().is_err(),
             "a slots key outside slot_ids fails closed"
         );
-        // (i) an assignment naming a different placement.
+        // (i) a pre-push wire value with NO generation is unrepresentable as
+        //     a known [`GenerationRef`] (the conversion refuses it
+        //     fail-closed).
         let mut bad = wire.clone();
-        bad.desired
-            .get_mut(&slot(1))
-            .unwrap()
-            .assignment
-            .placement_slot = slot(9);
+        bad.pre_push.insert(
+            slot(1),
+            Some(SlotAttemptStateWire {
+                artifact: ObservationWire::Unknown(ObservationError {
+                    message: "fixture: unknown assignment".to_string(),
+                }),
+                generation: None,
+            }),
+        );
         assert!(
             bad.into_domain().is_err(),
-            "an assignment naming another placement fails closed"
+            "an unrepresentable pre-push wire value fails closed"
         );
     }
 
@@ -1292,8 +1336,7 @@ mod tests {
         // The PERSISTED intent keeps its wire `slots` map EMPTY (the wire
         // conversion never reads the report's map): the intent round-trips
         // without the outcomes.
-        let json = serde_json::to_string(&domain).unwrap();
-        let wire2: LedgerIntentWire = serde_json::from_str(&json).unwrap();
+        let wire2 = LedgerIntentWire::from(&domain);
         assert!(
             wire2.slots.is_empty(),
             "the persisted intent keeps the `slots` map empty (outcomes live in the terminal event and the in-memory report)"
@@ -1410,7 +1453,7 @@ mod tests {
                         crate::identity::GenerationId::new("gen-missing".to_string()),
                         crate::identity::ArtifactRef {
                             release: crate::identity::test_release_id("rel-missing"),
-                            variant: crate::identity::VariantName::new("standard".to_string()),
+                            variant: crate::identity::VariantName::parse("standard").unwrap(),
                             tree: crate::identity::test_tree_digest("missing"),
                         },
                         b.clone(),
@@ -1486,22 +1529,22 @@ mod tests {
         assert_eq!(d_terminal.status(), DeploymentStatus::Successful);
         assert_eq!(
             d_terminal.outcomes().len(),
-            d_intent.slots.len(),
+            d_intent.selected.len(),
             "the outcomes exactly cover the membership"
         );
         let TerminalDisposition::Successful(st) = &d_terminal.disposition else {
             panic!("Successful disposition");
         };
-        assert_eq!(st.rollback().len(), d_intent.slots.len());
-        assert_eq!(st.rollback().len(), d_intent.slots.len());
+        assert_eq!(st.rollback().len(), d_intent.selected.len());
+        assert_eq!(st.rollback().len(), d_intent.selected.len());
         // The PERSISTED memberships are exposed and prove the equations.
         assert_eq!(
             d_terminal.selected_membership(),
-            Some(&BTreeSet::from_iter(keys.iter().cloned()))
+            Some(BTreeSet::from_iter(keys.iter().cloned()))
         );
         assert_eq!(
             d_terminal.full_membership(),
-            Some(&BTreeSet::from_iter(keys.iter().cloned()))
+            Some(BTreeSet::from_iter(keys.iter().cloned()))
         );
 
         // A GROUP push with a PROPER-SUBSET selected → Ok (the group shape
@@ -1552,9 +1595,12 @@ mod tests {
             "Successful with a missing rollback slot fails the conversion (rollback must EXACTLY equal the full_membership)"
         );
 
-        // SUCCESSFUL with an EXTRA rollback slot → Err
-        // (rollback != full — the complete snapshot covers EXACTLY the full
-        // membership).
+        // SUCCESSFUL with an EXTRA rollback slot → Err (the terminal-local
+        // conversion allows a rollback ⊇ selected — the rollback is simply
+        // the complete snapshot — but the ROLLBACK-VS-INTENT leg (the read's
+        // shared validator) requires rollback == intent.resulting_snapshot
+        // (full equality): an extra rollback slot the intent's frozen
+        // snapshot does not cover is a disagreement, refused at the read).
         let mut bad = terminal.clone();
         {
             let rb = bad.rollback.take().unwrap();
@@ -1567,8 +1613,8 @@ mod tests {
             bad.rollback = Some(TargetSnapshot::from_entries(entries));
         }
         assert!(
-            bad.into_domain().is_err(),
-            "Successful with an extra rollback slot fails the conversion"
+            pair_to_domain(&(intent.clone(), bad)).is_err(),
+            "Successful with an extra rollback slot fails the pair read (rollback must EXACTLY equal the intent's frozen resulting_snapshot)"
         );
 
         // SUCCESSFUL with EMPTY outcomes → Err (Successful requires
@@ -1680,7 +1726,7 @@ mod tests {
                 test_generation_id("slot-1"),
                 ArtifactRef {
                     release: test_release_id("slot-1"),
-                    variant: VariantName::new("standard".to_string()),
+                    variant: VariantName::parse("standard").unwrap(),
                     tree: test_tree_digest("slot-1"),
                 },
                 binding(&slot(1)),
@@ -1734,7 +1780,7 @@ mod tests {
                         crate::identity::GenerationId::new("gen-missing".to_string()),
                         crate::identity::ArtifactRef {
                             release: crate::identity::test_release_id("rel-missing"),
-                            variant: crate::identity::VariantName::new("standard".to_string()),
+                            variant: crate::identity::VariantName::parse("standard").unwrap(),
                             tree: crate::identity::test_tree_digest("missing"),
                         },
                         b.clone(),
@@ -1759,7 +1805,7 @@ mod tests {
         };
         let wire = LedgerTerminalWire {
             deployment_id: test_deployment_id("deploy-terminal"),
-            target: TargetName::new("t1".to_string()),
+            target: TargetName::parse("t1").unwrap(),
             status: DeploymentStatus::Successful,
             recorded_at: "2026-01-01T00:00:00Z".to_string(),
             outcomes: BTreeMap::from([(slot(1), outcome())]),
@@ -2080,7 +2126,7 @@ mod tests {
                             crate::identity::GenerationId::new("gen-missing".to_string()),
                             crate::identity::ArtifactRef {
                                 release: crate::identity::test_release_id("rel-missing"),
-                                variant: crate::identity::VariantName::new("standard".to_string()),
+                                variant: crate::identity::VariantName::parse("standard").unwrap(),
                                 tree: crate::identity::test_tree_digest("missing"),
                             },
                             b.clone(),
@@ -2110,8 +2156,10 @@ mod tests {
             LedgerTerminal {
                 recorded_at: "2026-01-01T00:00:00Z".to_string(),
                 disposition: TerminalDisposition::Successful(
-                    crate::ledger::SuccessfulTerminal::try_new(rollback, activated, membership)
-                        .unwrap(),
+                    crate::ledger::SuccessfulTerminal::try_new_with_full(
+                        rollback, activated, membership,
+                    )
+                    .unwrap(),
                 ),
                 reason: None,
             }
@@ -2232,7 +2280,7 @@ mod tests {
         ) {
             let wire = LedgerTerminalWire::try_from_domain(
                 &DeploymentId::new("deploy-prop".to_string()),
-                &TargetName::new("t1".to_string()),
+                &TargetName::parse("t1").unwrap(),
                 &terminal,
             )
             .unwrap();
@@ -2275,27 +2323,34 @@ mod tests {
     /// `None` (each mutation arms sets exactly ONE scalar field).
     fn base_intent_wire() -> LedgerIntentWire {
         let slot_ids = vec![slot(1), slot(2)];
-        let desired = slot_ids
-            .iter()
-            .map(|k| (k.clone(), gen_ref_for(k)))
-            .collect();
+        let snapshot = TargetSnapshot::from_entries(
+            slot_ids
+                .iter()
+                .map(|k| {
+                    let g = gen_ref_for(k);
+                    (
+                        k.clone(),
+                        SnapshotEntry::new(
+                            g.generation.clone(),
+                            g.assignment.artifact.clone(),
+                            binding(k),
+                        ),
+                    )
+                })
+                .collect(),
+        );
         let pre_push: BTreeMap<SlotId, Option<SlotAttemptStateWire>> =
             slot_ids.iter().map(|k| (k.clone(), None)).collect();
-        let bindings: BTreeMap<SlotId, PhysicalBinding> =
-            slot_ids.iter().map(|k| (k.clone(), binding(k))).collect();
         LedgerIntentWire {
             deployment_schema_version: crate::ledger::LEDGER_SCHEMA_VERSION,
             deployment_id: test_deployment_id("deploy-scalar"),
-            target: TargetName::new("t1".to_string()),
+            target: TargetName::parse("t1").unwrap(),
             group: None,
             slot_ids,
-            selected_membership: vec![slot(1), slot(2)],
-            full_membership: vec![slot(1), slot(2)],
             behavior_sha256: crate::identity::DIGEST_TEST_HEX_1.to_string(),
             attempted_at: "2026-01-01T00:00:00Z".to_string(),
-            desired,
+            resulting_snapshot: TargetSnapshotWire::from(&snapshot),
             pre_push,
-            bindings,
             slots: BTreeMap::new(),
         }
     }
@@ -2307,7 +2362,6 @@ mod tests {
     enum ScalarWire {
         Intent(LedgerIntentWire),
         Terminal(LedgerTerminalWire),
-        Report(DeploymentIntent),
     }
 
     fn scalar_mutation_case() -> impl Strategy<Value = (ScalarWire, bool)> {
@@ -2340,15 +2394,13 @@ mod tests {
                 };
                 (ScalarWire::Terminal(terminal), ok)
             }),
-            // report behavior digest: a sha256 digest or rejected (the
-            // in-memory REPORT is the domain record that carries the digest;
-            // its constructor parses it fail-closed).
-            (Just(base_intent_wire()), arbitrary_wire_text()).prop_map(|(w, v)| {
+            // report behavior digest: a sha256 digest or rejected — the
+            // wire carries the digest as a STRING and the wire → domain
+            // conversion parses it fail-closed (a non-digest value refuses).
+            (Just(base_intent_wire()), arbitrary_wire_text()).prop_map(|(mut w, v)| {
                 let ok = BehaviorDigest::parse(&v).is_ok();
-                let domain = w.into_domain().expect("base intent converts");
-                let mut with_digest = domain.clone();
-                with_digest.behavior_sha256 = v;
-                (ScalarWire::Report(with_digest), ok)
+                w.behavior_sha256 = v;
+                (ScalarWire::Intent(w), ok)
             }),
         ]
     }
@@ -2371,7 +2423,6 @@ mod tests {
             let converted = match wire {
                 ScalarWire::Intent(w) => w.into_domain().map(|_| ()),
                 ScalarWire::Terminal(w) => w.into_domain().map(|_| ()),
-                ScalarWire::Report(d) => LedgerIntentReport::from_intent(&d).map(|_| ()),
             };
             match converted {
                 Ok(_) => {
@@ -2413,7 +2464,7 @@ mod tests {
             slot_id: key.clone(),
             artifact: ArtifactRef {
                 release: release.clone(),
-                variant: VariantName::new("standard".to_string()),
+                variant: VariantName::parse("standard").unwrap(),
                 tree: test_tree_digest(&format!("tree-{}", key.as_str())),
             },
             expected_generation: None,
@@ -2476,7 +2527,7 @@ mod tests {
     /// with the plan's own source/target/membership.
     fn agreeing_plan_wire(source_kind: u32, keys: &[SlotId]) -> DeploymentPlanWire {
         let release = test_release_id("rel-plan");
-        let target = TargetName::new("t1".to_string());
+        let target = TargetName::parse("t1").unwrap();
         let slots: BTreeMap<SlotId, SlotPlan> = keys
             .iter()
             .map(|k| (k.clone(), plan_for(k, &release)))
@@ -2533,7 +2584,7 @@ mod tests {
     /// with the plan's own data) to a Head/Deployment plan.
     fn rebinding_added(w: &mut DeploymentPlanWire) {
         let release = test_release_id("rel-plan");
-        let target = TargetName::new("t1".to_string());
+        let target = TargetName::parse("t1").unwrap();
         let keys: Vec<SlotId> = w.slots.keys().cloned().collect();
         w.rebinding = Some(agreeing_rebinding(&release, &target, &keys));
     }
@@ -2561,7 +2612,7 @@ mod tests {
             .rebinding
             .as_mut()
             .expect("a release plan carries a rebinding");
-        rp.target = TargetName::new("t2".to_string());
+        rp.target = TargetName::parse("t2").unwrap();
     }
 
     /// membership: change the claimed membership's agreed set (remove a
@@ -2906,13 +2957,20 @@ mod tests {
         let keys: Vec<SlotId> = outcomes.iter().map(|(k, _)| k.clone()).collect();
         let mut intent_wire = agreeing_intent(&keys);
         for (k, g) in pre_push {
+            // THE PRE-PUSH MUST BE A KNOWN GENERATION REF: the wire → domain
+            // conversion refuses an `Unknown`/`KnownAbsent` pre-push — an
+            // unreadable prior state cannot be frozen into the intent. The
+            // fixture freezes a KNOWN pre-push whose generation is `g` (the
+            // artifact is the slot's own agreeing assignment; the generation
+            // is the fact `remaining_changes` compares against the observed
+            // final state).
             intent_wire.pre_push.insert(
-                k,
-                Some(SlotAttemptStateWire {
-                    artifact: ObservationWire::Unknown(ObservationError {
-                        message: "fixture: unknown assignment".to_string(),
-                    }),
-                    generation: g,
+                k.clone(),
+                g.map(|generation| SlotAttemptStateWire {
+                    artifact: ObservationWire::Known(ArtifactRefWire::from(
+                        &gen_ref_for(&k).assignment.artifact,
+                    )),
+                    generation: Some(generation),
                 }),
             );
         }

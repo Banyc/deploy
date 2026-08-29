@@ -614,7 +614,7 @@ pub(crate) mod push_tests {
         let attempt = single_attempt(&h);
         assert!(
             attempt.slots.is_empty(),
-            "the persisted intent record must carry no outcomes"
+            "the recovered report carries no outcomes (the ledger intent line keeps them empty)"
         );
 
         // The snapshot is built from the OUTCOMES: its per-slot generation

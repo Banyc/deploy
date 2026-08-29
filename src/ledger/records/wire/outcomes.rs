@@ -256,10 +256,10 @@ impl LedgerTerminal {
                     // no change — the slot may have changed; it is UNCERTAIN
                     // and therefore a remaining change.
                     let pre = intent
-                        .slots
+                        .selected
                         .get(sid)
                         .and_then(|s| s.pre_push.as_ref())
-                        .and_then(|p| p.generation.clone());
+                        .map(|p| p.generation.clone());
                     match &r.observation {
                         Observation::Known(og) => {
                             let obs = og.generation.clone();
@@ -305,7 +305,9 @@ mod tests_outcomes {
     use super::*;
     use crate::identity::{GenerationId, SlotId, test_generation_id};
     use crate::ledger::records::{ObservationError, ObservedGeneration};
+    #[cfg(test)]
     use proptest::prelude::*;
+    #[cfg(test)]
     use proptest::test_runner::RngSeed;
 
     // ---- fixtures ----------------------------------------------------------
@@ -333,7 +335,7 @@ mod tests_outcomes {
     fn arbitrary_observation() -> impl Strategy<Value = Observation<ObservedGeneration>> {
         prop_oneof![
             (0u32..6).prop_map(|i| Observation::Known(ObservedGeneration {
-                generation: test_generation_id(&format!("obs-{i}")),
+                generation: test_generation_id(&format!("obs-{i}"))
             })),
             Just(Observation::KnownAbsent),
             prop::sample::select(vec![
@@ -373,7 +375,7 @@ mod tests_outcomes {
         assert_eq!(
             wire.observation,
             ObservationWire::Unknown(ObservationError {
-                message: "status read failed: boom".to_string(),
+                message: "status read failed: boom".to_string()
             }),
             "the Unknown observation is written to the wire's observation"
         );
@@ -396,7 +398,7 @@ mod tests_outcomes {
         assert_eq!(
             back.observation,
             Observation::Unknown(ObservationError {
-                message: "status read failed: boom".to_string(),
+                message: "status read failed: boom".to_string()
             }),
             "the Unknown observation survives the wire untouched"
         );
@@ -453,7 +455,7 @@ mod tests_outcomes {
         assert_eq!(
             unknown.observation,
             ObservationWire::Unknown(ObservationError {
-                message: "status read failed: boom".to_string(),
+                message: "status read failed: boom".to_string()
             }),
             "the observation error lands in the Unknown observation, never in error"
         );
@@ -481,7 +483,7 @@ mod tests_outcomes {
         assert_eq!(
             known.observation,
             ObservationWire::Known(ObservedGenerationWire {
-                generation: GenerationId::new("observed-1".to_string()),
+                generation: GenerationId::new("observed-1".to_string())
             }),
             "the observed generation lands in the Known observation"
         );
@@ -517,8 +519,7 @@ mod tests_outcomes {
                 observation: observation.clone(),
                 compensated: false,
                 error: operation_error.clone(),
-                transition: SlotTransition::AdvanceUnknown,
-            };
+                transition: SlotTransition::AdvanceUnknown};
             // Domain → wire: each fact lands in its OWN wire slot.
             let wire = SlotResult::from_outcome(&slot(0), &outcome);
             assert_eq!(
@@ -565,11 +566,9 @@ mod tests_outcomes {
                 slot_id: slot(0),
                 outcome: SlotOutcomeKind::Failed,
                 observation: ObservationWire::Known(ObservedGenerationWire {
-                    generation: GenerationId::new("desired-0".to_string()),
-                }),
+                    generation: GenerationId::new("desired-0".to_string())}),
                 compensated: false,
-                error: operation_error.clone(),
-            };
+                error: operation_error.clone()};
             // Failure injection: the engine's post-observation pass.
             apply_post_observation(&mut wire, &observation);
             // The operation error is NEVER rewritten by the observation.

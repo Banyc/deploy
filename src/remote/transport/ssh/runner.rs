@@ -510,7 +510,9 @@ mod runner_property_tests {
     use crate::error::Error;
     use crate::remote::transport::Remote;
     use crate::remote::transport::SshTransport;
+    #[cfg(test)]
     use proptest::prelude::*;
+    #[cfg(test)]
     use proptest::test_runner::RngSeed;
     use std::os::unix::process::ExitStatusExt;
     use std::path::Path;

@@ -655,45 +655,50 @@ mod tests {
         test_tree_digest,
     };
     use crate::ledger::{
-        DeploymentIntent, DeploymentStatus, DesiredGeneration, IntentSlot, LedgerTerminal,
-        NonEmptySlotTable, ObservedSlot, TargetSnapshot, TerminalDisposition,
+        DeploymentIntent, DeploymentStatus, LedgerTerminal, NonEmptySlotTable, ObservedSlot,
+        TargetSnapshot, TerminalDisposition,
     };
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
 
     fn pending_attempt(id: &str) -> DeploymentIntent {
-        let p1 = SlotId::new("p1".to_string());
-        // ONE slot table (the membership + desired/pre-push entries).
-        let slots = BTreeMap::from([(
+        let p1 = SlotId::parse("p1").unwrap();
+        let artifact = ArtifactRef {
+            release: test_release_id("rel-1"),
+            variant: VariantName::parse("standard").unwrap(),
+            tree: test_tree_digest("tree-1"),
+        };
+        let binding = crate::ledger::PhysicalBinding {
+            server: ServerId::parse("s1").unwrap(),
+            deploy_dir: "/srv/deploy/p1".to_string(),
+        };
+        let entries = BTreeMap::from([(
             p1.clone(),
-            IntentSlot {
-                desired: DesiredGeneration {
-                    generation: test_generation_id("gen-1"),
-                    artifact: ArtifactRef {
-                        release: test_release_id("rel-1"),
-                        variant: VariantName::new("standard".to_string()),
-                        tree: test_tree_digest("tree-1"),
-                    },
-                },
-                pre_push: None,
-                // The FROZEN plan-time physical binding (schema v6): the
-                // fixture's single slot is bound to server s1 at
-                // /srv/deploy/p1.
-                binding: crate::ledger::PhysicalBinding {
-                    server: ServerId::new("s1".to_string()),
-                    deploy_dir: "/srv/deploy/p1".to_string(),
-                },
-            },
+            crate::ledger::SnapshotEntry::new(
+                test_generation_id("gen-1"),
+                artifact.clone(),
+                binding,
+            ),
         )]);
+        let snapshot = TargetSnapshot::from_entries(entries);
         DeploymentIntent {
             deployment_id: test_deployment_id(id),
-            target: TargetName::new("production".to_string()),
+            target: TargetName::parse("production").unwrap(),
             group: None,
-            behavior_sha256: "sha256-aa".to_string(),
-            attempted_at: "2026-01-01T00:00:00Z".to_string(),
-            slots: NonEmptySlotTable::build(slots)
-                .expect("a seeded attempt always has at least one slot"),
-            full_membership: BTreeSet::from([SlotId::new("p1".to_string())]),
+            resulting_snapshot: snapshot,
+            selected: NonEmptySlotTable::build(BTreeMap::from([(
+                p1.clone(),
+                crate::ledger::SelectedSlotIntent {
+                    pre_push: None,
+                    ..Default::default()
+                },
+            )]))
+            .expect("fixture"),
+            behavior_sha256: crate::identity::BehaviorDigest::parse(
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            )
+            .unwrap(),
+            attempted_at: crate::identity::Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
         }
     }
 
@@ -704,7 +709,7 @@ mod tests {
     /// membership (the membership equations (outcomes == selected == full == rollback slots) are enforced by the conversion).
     fn seed_successful(store: &LocalStore, id: &str, attempted_at: &str) {
         let mut it = pending_attempt(id);
-        it.attempted_at = attempted_at.to_string();
+        it.attempted_at = crate::identity::Timestamp::parse(attempted_at).unwrap();
         store.append_intent("production", &it).unwrap();
         store
             .append_terminal(
@@ -719,7 +724,7 @@ mod tests {
     /// fixture intent (membership `p1`): one Activated outcome, and a
     /// rollback whose slots and bindings key exactly `p1`.
     fn successful_terminal(recorded_at: &str, reason: &str) -> LedgerTerminal {
-        let p1 = SlotId::new("p1".to_string());
+        let p1 = SlotId::parse("p1").unwrap();
         LedgerTerminal {
             recorded_at: recorded_at.to_string(),
             disposition: TerminalDisposition::Successful(
@@ -736,7 +741,7 @@ mod tests {
                                     placement_slot: p1.clone(),
                                     artifact: ArtifactRef {
                                         release: test_release_id("rel-1"),
-                                        variant: VariantName::new("standard".to_string()),
+                                        variant: VariantName::parse("standard").unwrap(),
                                         tree: test_tree_digest("tree-1"),
                                     },
                                 },
@@ -748,7 +753,7 @@ mod tests {
                         > = BTreeMap::from([(
                             p1.clone(),
                             crate::ledger::PhysicalBinding {
-                                server: ServerId::new("s1".to_string()),
+                                server: ServerId::parse("s1").unwrap(),
                                 deploy_dir: "/srv/deploy/p1".to_string(),
                             },
                         )]);
@@ -791,7 +796,6 @@ mod tests {
                     },
                     crate::identity::NonEmptySlotSet::try_new(BTreeSet::from([p1.clone()]))
                         .unwrap(),
-                    BTreeSet::from([p1.clone()]),
                 )
                 .unwrap(),
             ),
@@ -854,7 +858,7 @@ mod tests {
         // the second fails in preflight (producing NO rollback state).
         seed_successful(&store, "deploy-log-ok", "2026-01-01T00:00:00Z");
         let mut a_failed = pending_attempt("deploy-log-failed");
-        a_failed.attempted_at = "2026-01-02T00:00:00Z".to_string();
+        a_failed.attempted_at = crate::identity::Timestamp::parse("2026-01-02T00:00:00Z").unwrap();
         store.append_intent("production", &a_failed).unwrap();
         store
             .append_terminal(
@@ -1007,13 +1011,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let store = LocalStore::with_base(crate::store::local::default_base(&env)).unwrap();
         store
             .write_slot_observed(
-                &SlotId::new("p1".to_string()),
+                &SlotId::parse("p1").unwrap(),
                 &ObservedSlot {
                     assignment: crate::ledger::ObservedAssignment::Known {
                         generation: test_generation_id("gen-41da"),
                         artifact: crate::identity::ArtifactRef {
                             release: test_release_id("rel-sha256-status"),
-                            variant: VariantName::new("standard".to_string()),
+                            variant: VariantName::parse("standard").unwrap(),
                             tree: test_tree_digest("tree-2c4f"),
                         },
                         last_deployment: test_deployment_id("deploy-status-1"),
@@ -1023,7 +1027,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .unwrap();
         store
             .write_slot_observed(
-                &SlotId::new("p2".to_string()),
+                &SlotId::parse("p2").unwrap(),
                 &ObservedSlot {
                     assignment: crate::ledger::ObservedAssignment::Absent,
                 },
@@ -1031,7 +1035,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .unwrap();
         store
             .write_slot_observed(
-                &SlotId::new("p3".to_string()),
+                &SlotId::parse("p3").unwrap(),
                 &ObservedSlot {
                     assignment: crate::ledger::ObservedAssignment::AssignmentUnknown {
                         generation: test_generation_id("gen-p3"),
@@ -1767,7 +1771,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     }
 
     // Property: arbitrary strings — ReleaseId exact, CLI full+bare, reject else.
+    #[cfg(test)]
     use proptest::prelude::*;
+    #[cfg(test)]
     use proptest::test_runner::RngSeed;
 
     fn is_valid_hex64(s: &str) -> bool {

@@ -320,14 +320,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let remote = FakeCapacityRemote::build(dir.path().join("remote"), 100_000, 10_000).unwrap();
         remote.provision_layout().unwrap();
         let helper = RemoteHelper::new(remote.as_ref());
-        let helpers = HashMap::from([(SlotId::new("p1".to_string()), helper)]);
+        let helpers = HashMap::from([(SlotId::parse("p1").unwrap(), helper)]);
 
         let mut config = cfg();
         let assignment = PlannedAssignment {
-            placement_slot: SlotId::new("p1".to_string()),
+            placement_slot: SlotId::parse("p1").unwrap(),
             artifact: ArtifactRef {
                 release: crate::identity::test_release_id("rel-sha256-cap"),
-                variant: VariantName::new("standard".to_string()),
+                variant: VariantName::parse("standard").unwrap(),
                 tree: tree.clone(),
             },
         };
@@ -457,7 +457,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let remote = FakeCapacityRemote::build(dir.path().join("remote"), total, avail).unwrap();
         remote.provision_layout().unwrap();
         let helper = RemoteHelper::new(remote.as_ref());
-        let helpers = HashMap::from([(SlotId::new("p1".to_string()), helper)]);
+        let helpers = HashMap::from([(SlotId::parse("p1").unwrap(), helper)]);
 
         let mut config = cfg();
         config = config
@@ -471,10 +471,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             )
             .unwrap();
         let assignment = PlannedAssignment {
-            placement_slot: SlotId::new("p1".to_string()),
+            placement_slot: SlotId::parse("p1").unwrap(),
             artifact: ArtifactRef {
                 release: crate::identity::test_release_id("rel-sha256-cap"),
-                variant: VariantName::new("standard".to_string()),
+                variant: VariantName::parse("standard").unwrap(),
                 tree,
             },
         };

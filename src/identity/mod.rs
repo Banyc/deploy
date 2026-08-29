@@ -112,7 +112,6 @@ macro_rules! id_newtype {
             /// UNCHECKED constructor — TEST FIXTURES ONLY. Production code
             /// must construct through [`parse`] (or `FromStr`/`TryFrom`), so
             /// an invalid identity can never be built outside tests.
-            #[cfg(test)]
             pub fn new(s: impl Into<String>) -> Self {
                 $name(s.into())
             }

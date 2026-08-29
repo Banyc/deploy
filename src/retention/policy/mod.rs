@@ -286,7 +286,9 @@ mod tests {
     use crate::store::local::LocalStore;
     use crate::verify::release::RELEASE_RECORD_SCHEMA_VERSION;
     use crate::verify::release::build_release;
+    #[cfg(test)]
     use proptest::prelude::*;
+    #[cfg(test)]
     use proptest::test_runner::RngSeed;
     use std::path::{Path, PathBuf};
 
@@ -1440,8 +1442,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             let kind = match kind {
                 0 => PinRecordCorruption::Missing,
                 1 => PinRecordCorruption::Malformed,
-                _ => PinRecordCorruption::Unverifiable,
-            };
+                _ => PinRecordCorruption::Unverifiable};
             let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
             let remote = LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote")).unwrap();
             let helper = RemoteHelper::new(&remote);
@@ -1460,8 +1461,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             c = c
                 .with_pin(Pin {
                     release: ReleaseId::parse(&rec.release_id).unwrap(),
-                    reason: "known-good".into(),
-                })
+                    reason: "known-good".into()})
                 .unwrap();
 
             // Sanity: the valid record pins every variant tree; every garbage
@@ -1503,7 +1503,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             // durable marker (the abort is a maintenance deferral, never a
             // hard push failure); the retry services it once the record is
             // repaired.
-            let slot = SlotId::new("p1".to_string());
+            let slot = SlotId::parse("p1").unwrap();
             let warnings = set_retention_deferred(&store, "t1", &slot, &err.to_string());
             assert!(warnings.is_empty(), "the marker write must succeed: {warnings:?}");
             let debt = store.read_retention_debt("t1").unwrap();
@@ -1795,8 +1795,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                         test_generation_id(&format!("g{}", i - 1)).as_str().to_string()
                     }),
                     release: test_release_id("r").as_str().to_string(),
-                    variant: "standard".to_string(),
-                });
+                    variant: "standard".to_string()});
             }
 
             // Build the fixture history on the remote: tree objects +
@@ -1815,8 +1814,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     artifact: ArtifactRef {
                         release: test_release_id("r"),
                         variant: VariantName::new("standard"),
-                        tree: TreeDigest::parse(&g.tree).unwrap(),
-                    },
+                        tree: TreeDigest::parse(&g.tree).unwrap()},
                     behavior_sha256: "b".into(),
                     prior_generation: g.prior.as_ref().map(|p| GenerationId::parse(p).unwrap()),
                     created_at: g.created_at.to_string(),
@@ -1845,12 +1843,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 per_server: PerServerRetention {
                     keep_distinct_artifacts: keep_distinct,
                     keep_days,
-                    protect_previous,
-                },
+                    protect_previous},
                 deployment: DeploymentRetention {
-                    protect_deployments,
-                },
-            };
+                    protect_deployments}};
             let expected = reference_retained(&history, &current, &policy);
 
             // Healthy sanity: the happy path's retained set is EXACTLY the
@@ -1876,8 +1871,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             let fault_remote: Option<FailOnceInventoryRemote> = match fault {
                 0 => Some(FailOnceInventoryRemote::new(base.clone(), true, false)),
                 1 => Some(FailOnceInventoryRemote::new(base.clone(), false, true)),
-                _ => None,
-            };
+                _ => None};
             match fault {
                 2 => {
                     let p = layout::generation(&history[corrupt_idx].id).join("assignment.json");
@@ -1915,16 +1909,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     let fh = RemoteHelper::new(fr);
                     compute_retained(&fh, &[], &store, &policy).unwrap_err()
                 }
-                None => compute_retained(&helper, &[], &store, &policy).unwrap_err(),
-            };
+                None => compute_retained(&helper, &[], &store, &policy).unwrap_err()};
             let err_text = err.to_string();
             let expected_marker = match fault {
                 0 => "injected fault: generations metadata",
                 1 => "injected fault: generations listing",
                 2 => "parse assignment",
                 3 => "unparseable created_at",
-                _ => "assignment names generation",
-            };
+                _ => "assignment names generation"};
             assert!(
                 err_text.contains(expected_marker),
                 "the {fault}-fault must abort at the injected step, got: {err_text}"
@@ -1955,7 +1947,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             // durable marker (the abort is a maintenance deferral, never a
             // hard push failure); the retry services it once the fault is
             // repaired.
-            let slot = SlotId::new("p1".to_string());
+            let slot = SlotId::parse("p1").unwrap();
             let warnings = set_retention_deferred(&store, "t1", &slot, &err_text);
             assert!(warnings.is_empty(), "the marker write must succeed: {warnings:?}");
             let debt = store.read_retention_debt("t1").unwrap();
@@ -1983,8 +1975,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     let fh = RemoteHelper::new(fr);
                     compute_retained(&fh, &[], &store, &policy).unwrap()
                 }
-                None => compute_retained(&helper, &[], &store, &policy).unwrap(),
-            };
+                None => compute_retained(&helper, &[], &store, &policy).unwrap()};
             assert_eq!(
                 retained, expected,
                 "the retried retention must retain exactly the reference-model set"
@@ -2199,8 +2190,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                         test_generation_id(&format!("g{}", i - 1)).as_str().to_string()
                     }),
                     release: test_release_id("r").as_str().to_string(),
-                    variant: "standard".to_string(),
-                });
+                    variant: "standard".to_string()});
             }
             let mut gens: BTreeMap<GenerationId, GenRecord> = BTreeMap::new();
             for g in &history {
@@ -2216,8 +2206,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                         prior_generation: g
                             .prior
                             .as_ref()
-                            .map(|p| GenerationId::parse(p).unwrap()),
-                    },
+                            .map(|p| GenerationId::parse(p).unwrap())},
                 );
             }
 
@@ -2225,12 +2214,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 per_server: PerServerRetention {
                     keep_distinct_artifacts: keep_distinct,
                     keep_days,
-                    protect_previous: true,
-                },
+                    protect_previous: true},
                 deployment: DeploymentRetention {
-                    protect_deployments,
-                },
-            };
+                    protect_deployments}};
             let last = history.last().unwrap();
 
             // The generated POINTERS: the current id and the current record's
@@ -2387,8 +2373,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                         test_generation_id(&format!("g{}", i - 1)).as_str().to_string()
                     }),
                     release: test_release_id("r").as_str().to_string(),
-                    variant: "standard".to_string(),
-                });
+                    variant: "standard".to_string()});
             }
             let mut assignments: Vec<GenerationAssignment> = Vec::new();
             for g in &history {
@@ -2402,8 +2387,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     artifact: ArtifactRef {
                         release: test_release_id("r"),
                         variant: VariantName::new("standard"),
-                        tree: TreeDigest::parse(&g.tree).unwrap(),
-                    },
+                        tree: TreeDigest::parse(&g.tree).unwrap()},
                     behavior_sha256: "b".into(),
                     prior_generation: g.prior.as_ref().map(|p| GenerationId::parse(p).unwrap()),
                     created_at: g.created_at.to_string(),
@@ -2429,12 +2413,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 per_server: PerServerRetention {
                     keep_distinct_artifacts: keep_distinct,
                     keep_days,
-                    protect_previous: true,
-                },
+                    protect_previous: true},
                 deployment: DeploymentRetention {
-                    protect_deployments,
-                },
-            };
+                    protect_deployments}};
             let expected = reference_retained(&history, &current, &policy);
 
             // Healthy sanity: the happy path's retained set is EXACTLY the
@@ -2557,14 +2538,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     let fh = RemoteHelper::new(w);
                     match compute_retained(&fh, &[], &store, &policy) {
                         Ok(r) => (None, Some(r)),
-                        Err(e) => (Some(e.to_string()), None),
-                    }
+                        Err(e) => (Some(e.to_string()), None)}
                 }
                 None => match compute_retained(&helper, &[], &store, &policy) {
                     Ok(r) => (None, Some(r)),
-                    Err(e) => (Some(e.to_string()), None),
-                },
-            };
+                    Err(e) => (Some(e.to_string()), None)}};
 
             match (&abort_marker, &abort) {
                 // The second-read fault never fires: the retained set is
@@ -2601,8 +2579,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 ),
                 (None, Some(err)) => panic!(
                     "the second-read fault must never fire (the second path is gone), got: {err}"
-                ),
-            }
+                )}
 
             // ZERO DELETIONS on every abort: the receiver inventory is
             // byte-identical and every tree — every history tree AND the
@@ -2630,7 +2607,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 // ROTATION DEBT: the engine's post-commit conversion records
                 // the durable marker; the retry services it once the fault is
                 // repaired.
-                let slot = SlotId::new("p1".to_string());
+                let slot = SlotId::parse("p1").unwrap();
                 let err_text = abort.as_ref().unwrap();
                 let warnings = set_retention_deferred(&store, "t1", &slot, err_text);
                 assert!(warnings.is_empty(), "the marker write must succeed: {warnings:?}");

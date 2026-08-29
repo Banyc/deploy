@@ -332,7 +332,7 @@ mod tests {
                 generation: test_generation_id("evil"),
                 artifact: ArtifactRef {
                     release: crate::identity::test_release_id("rel-sha256-evil"),
-                    variant: VariantName::new("standard".to_string()),
+                    variant: VariantName::parse("standard").unwrap(),
                     tree: test_tree_digest("evil"),
                 },
                 last_deployment: test_deployment_id("evil"),
@@ -350,7 +350,7 @@ mod tests {
         );
         let global = store.read_global_observed().unwrap();
         assert_eq!(
-            global.get(&SlotId::new("_".to_string())),
+            global.get(&SlotId::parse("_").unwrap()),
             Some(&observed),
             "the global slot map keys by the SANITIZED slot directory name"
         );

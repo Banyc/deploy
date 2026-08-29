@@ -461,7 +461,7 @@ pub fn materialize_variant(
                     &dst,
                     &CopyEntryOptions {
                         mode_override,
-                        src_root: Some(&src),
+                        src_root: Some(src.as_path()),
                         dest_root: dest,
                     },
                 )?;
@@ -760,7 +760,9 @@ mod tests_materialize {
         test_deployment_id, test_generation_id, test_tree_digest,
     };
     use crate::remote::canonical::canonicalize_tree;
+    #[cfg(test)]
     use proptest::prelude::*;
+    #[cfg(test)]
     use proptest::test_runner::{FileFailurePersistence, RngSeed};
     use std::os::unix::fs::PermissionsExt;
 
@@ -1465,10 +1467,8 @@ mod tests_materialize {
                         to: "out/".into(),
                         recursive: true,
                         conflict: ConflictPolicy::Error,
-                        mode: None,
-                    },
-                ],
-            }),
+                        mode: None},
+                ]}),
             1 => Just(InvalidCase {
                 kind: InvalidKind::SymlinkSource,
                 mappings: vec![Mapping {
@@ -1476,9 +1476,7 @@ mod tests_materialize {
                     to: "out/run".into(),
                     recursive: false,
                     conflict: ConflictPolicy::Error,
-                    mode: None,
-                }],
-            }),
+                    mode: None}]}),
             1 => Just(InvalidCase {
                 kind: InvalidKind::Overlap,
                 mappings: vec![
@@ -1487,17 +1485,14 @@ mod tests_materialize {
                         to: "out/".into(),
                         recursive: false,
                         conflict: ConflictPolicy::Error,
-                        mode: None,
-                    },
+                        mode: None},
                     Mapping {
                         from: "bin/tool".into(),
                         to: "out/nested/".into(),
                         recursive: false,
                         conflict: ConflictPolicy::Error,
-                        mode: None,
-                    },
-                ],
-            }),
+                        mode: None},
+                ]}),
             1 => Just(InvalidCase {
                 kind: InvalidKind::Overlap,
                 mappings: vec![
@@ -1506,17 +1501,14 @@ mod tests_materialize {
                         to: "out".into(),
                         recursive: false,
                         conflict: ConflictPolicy::Error,
-                        mode: None,
-                    },
+                        mode: None},
                     Mapping {
                         from: "bin/tool".into(),
                         to: "out".into(),
                         recursive: false,
                         conflict: ConflictPolicy::Error,
-                        mode: None,
-                    },
-                ],
-            }),
+                        mode: None},
+                ]}),
             1 => Just(InvalidCase {
                 kind: InvalidKind::EscapeDestination,
                 mappings: vec![Mapping {
@@ -1524,9 +1516,7 @@ mod tests_materialize {
                     to: "../escape".into(),
                     recursive: false,
                     conflict: ConflictPolicy::Error,
-                    mode: None,
-                }],
-            }),
+                    mode: None}]}),
             1 => Just(InvalidCase {
                 kind: InvalidKind::MissingSource,
                 mappings: vec![Mapping {
@@ -1534,9 +1524,7 @@ mod tests_materialize {
                     to: "out/".into(),
                     recursive: false,
                     conflict: ConflictPolicy::Error,
-                    mode: None,
-                }],
-            }),
+                    mode: None}]}),
         ]
     }
 

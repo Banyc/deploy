@@ -507,7 +507,9 @@ fn deployment_form(input: &mut &str, token: &str) -> ModalResult<RefExpr, RefErr
 pub(crate) mod tests {
     use super::*;
     use crate::identity::test_deployment_id;
+    #[cfg(test)]
     use proptest::prelude::*;
+    #[cfg(test)]
     use proptest::test_runner::{FileFailurePersistence, RngSeed};
 
     #[test]
@@ -743,8 +745,7 @@ pub(crate) mod tests {
                 parse_no_panic(&format!("parent(@, {max})")).unwrap(),
                 RefExpr::Relative(RelativeRef {
                     base: RelBase::At,
-                    steps: u64::MAX,
-                }),
+                    steps: u64::MAX}),
             );
             let over = (u64::MAX as u128 + 1).to_string();
             for token in [
@@ -903,8 +904,7 @@ pub(crate) mod tests {
                 Err(err) => assert!(
                     matches!(err, Error::Ref(_)),
                     "parse failure for {token:?} must be a ref error, got: {err}"
-                ),
-            }
+                )}
         }
     }
 
@@ -926,8 +926,7 @@ pub(crate) mod tests {
                 Err(err) => assert!(
                     matches!(err, Error::Ref(_)),
                     "parse failure for {token:?} must be a ref error, got: {err}"
-                ),
-            }
+                )}
         }
     }
 }

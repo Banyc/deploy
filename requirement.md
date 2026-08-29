@@ -919,7 +919,7 @@ Every deployment attempt records TWO lines in the target's ONE ledger: its immut
 ```json
 {
   "kind": "intent",
-  "deployment_schema_version": 7,
+  "deployment_schema_version": 8,
   "deployment_id": "deploy-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b",
   "target": "production",
   "slot_ids": [
@@ -927,67 +927,48 @@ Every deployment attempt records TWO lines in the target's ONE ledger: its immut
     "p2",
     "p3"
   ],
-  "selected_membership": [
-    "p1",
-    "p2",
-    "p3"
-  ],
-  "full_membership": [
-    "p1",
-    "p2",
-    "p3"
-  ],
-  "bindings": {
-    "p1": {
-      "server": "server-01",
-      "deploy_dir": "/srv/deploy/p1"
-    },
-    "p2": {
-      "server": "server-02",
-      "deploy_dir": "/srv/deploy/p2"
-    },
-    "p3": {
-      "server": "server-03",
-      "deploy_dir": "/srv/deploy/p3"
-    }
-  },
-  "behavior_sha256": "70e91105dab5197be955fb4a57416e3c70e91105dab5197be955fb4a57416e3c",
-  "attempted_at": "2026-08-21T10:20:00Z",
-  "desired": {
-    "p1": {
-      "generation": "gen-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b",
-      "assignment": {
-        "placement_slot": "p1",
+  "resulting_snapshot": {
+    "entries": {
+      "p1": {
+        "generation": "gen-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b",
         "artifact": {
           "release": "rel-sha256-41da2f63a950c8494c3c0f1663cf15aacf35b209293b36d3d5c59f8f022805f1",
           "variant": "standard",
           "tree": "4325b42072048fcfadfc32e0ca6ce0404325b42072048fcfadfc32e0ca6ce040"
+        },
+        "binding": {
+          "server": "server-01",
+          "deploy_dir": "/srv/deploy/p1"
         }
-      }
-    },
-    "p2": {
-      "generation": "gen-0290a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b",
-      "assignment": {
-        "placement_slot": "p2",
+      },
+      "p2": {
+        "generation": "gen-0290a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b",
         "artifact": {
           "release": "rel-sha256-41da2f63a950c8494c3c0f1663cf15aacf35b209293b36d3d5c59f8f022805f1",
           "variant": "standard",
           "tree": "256f3a3952ec78031c924ac35af4e591256f3a3952ec78031c924ac35af4e591"
+        },
+        "binding": {
+          "server": "server-02",
+          "deploy_dir": "/srv/deploy/p2"
         }
-      }
-    },
-    "p3": {
-      "generation": "gen-0390a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b",
-      "assignment": {
-        "placement_slot": "p3",
+      },
+      "p3": {
+        "generation": "gen-0390a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b",
         "artifact": {
           "release": "rel-sha256-41da2f63a950c8494c3c0f1663cf15aacf35b209293b36d3d5c59f8f022805f1",
           "variant": "high-capacity",
           "tree": "a097975d638a3e06b90b6f7c5515c95aa097975d638a3e06b90b6f7c5515c95a"
+        },
+        "binding": {
+          "server": "server-03",
+          "deploy_dir": "/srv/deploy/p3"
         }
       }
     }
   },
+  "behavior_sha256": "70e91105dab5197be955fb4a57416e3c70e91105dab5197be955fb4a57416e3c",
+  "attempted_at": "2026-08-21T10:20:00Z",
   "pre_push": {
     "p1": null,
     "p2": null,
@@ -1092,7 +1073,6 @@ Every deployment attempt records TWO lines in the target's ONE ledger: its immut
   "reason": "push completed"
 }
 ```
-
 <!-- END LEDGER WIRE EXAMPLES -->
 
 The successful chain contains only fully successful terminal events, KEYED BY THE DEPLOYMENT ID that produced them (`deploy push production <deployment-id>` restores exactly that deployment's stored state). Failed and degraded attempts remain visible through `deploy log production` (their ledger entries carry their terminals), but are not valid rollback sources (a failed deployment id never resolves). Each successful terminal's rollback payload records every slot's advanced generation AND the complete physical binding it had (`entries`, keyed by slot ID — each entry's `{generation, artifact, binding}`): exact rollback maps generations to slots by slot ID, so the recorded binding is what proves a slot still lives at the exact on-host location it was deployed onto.

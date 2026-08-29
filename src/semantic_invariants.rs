@@ -94,7 +94,9 @@ use crate::testutil::step17_hook;
 use crate::verify::release::{
     canonicalize_slots, release_digest, variant_slots_digest, verify_release_identity,
 };
+#[cfg(test)]
 use proptest::prelude::*;
+#[cfg(test)]
 use proptest::test_runner::RngSeed;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -846,7 +848,7 @@ fn classifier_distinguishes_err_noattempt_from_ok_failed_preflight() {
         correct,
         OutcomeClass::Push {
             boundary: ReturnBoundary::Err,
-            disposition: Disposition::NoAttempt,
+            disposition: Disposition::NoAttempt
         }
     );
 
@@ -867,7 +869,7 @@ fn classifier_distinguishes_err_noattempt_from_ok_failed_preflight() {
         regression,
         OutcomeClass::Push {
             boundary: ReturnBoundary::Ok,
-            disposition: Disposition::FailedPreflight,
+            disposition: Disposition::FailedPreflight
         }
     );
     assert_ne!(
@@ -1276,7 +1278,7 @@ impl Fixture {
             Action::Push(t) | Action::Retry(t) => self.push_prop(t, None, class),
             Action::Rollback(t, i) => {
                 let token = self.rollback_token(t, *i);
-                self.push_prop(t, Some(&token), class)
+                self.push_prop(t, Some(token.as_str()), class)
             }
             Action::Checkpoint(t, k) => self.checkpoint_prop(t, *k),
             other => {
@@ -1803,7 +1805,7 @@ impl Fixture {
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         match kind {
             TamperKind::AssignmentVariant => {
-                stored.artifact.variant = VariantName::new("canary".to_string())
+                stored.artifact.variant = VariantName::parse("canary").unwrap()
             }
             TamperKind::AssignmentRelease => {
                 stored.artifact.release = crate::identity::test_release_id("rel-sha256-tampered")
@@ -3447,10 +3449,10 @@ fn run_remaining_changes_case(policy: FailurePolicy, position: usize) {
                 _ => None,
             });
             let pre_gen = intent
-                .slots
+                .selected
                 .get(sid)
                 .and_then(|s| s.pre_push.as_ref())
-                .and_then(|p| p.generation.clone());
+                .map(|p| p.generation.clone());
             observed_gen != pre_gen
         })
         .collect();
@@ -3633,7 +3635,7 @@ fn identity_duplicates_are_rejected_and_canonicalize_identically() {
 fn identity_canonical_serialization_round_trips() {
     let art = ArtifactRef {
         release: crate::identity::test_release_id("rel-sha256-abc"),
-        variant: VariantName::new("standard".to_string()),
+        variant: VariantName::parse("standard").unwrap(),
         tree: test_tree_digest("tree-1"),
     };
     let bytes = serde_json::to_vec(&art).unwrap();
@@ -4627,7 +4629,7 @@ fn integrity_incoming_record_field_deletion_fails_closed() {
         "slot_ids",
         "behavior_sha256",
         "attempted_at",
-        "desired",
+        "resulting_snapshot",
         "pre_push",
     ] {
         let mut v: serde_json::Value = serde_json::from_str(intent_line.trim()).unwrap();
@@ -4914,14 +4916,11 @@ impl Model {
                 (
                     "t1",
                     BTreeMap::from([
-                        (SlotId::new("p1".to_string()), None),
-                        (SlotId::new("p2".to_string()), None),
+                        (SlotId::parse("p1").unwrap(), None),
+                        (SlotId::parse("p2").unwrap(), None),
                     ]),
                 ),
-                (
-                    "t2",
-                    BTreeMap::from([(SlotId::new("p3".to_string()), None)]),
-                ),
+                ("t2", BTreeMap::from([(SlotId::parse("p3").unwrap(), None)])),
             ]),
             raw_snapshots: BTreeMap::from([("t1", Vec::new()), ("t2", Vec::new())]),
             raw_attempts: BTreeMap::from([("t1", Vec::new()), ("t2", Vec::new())]),
@@ -4956,8 +4955,8 @@ impl Model {
     /// pushes and are never touched by another target's.
     fn target_slots(t: &str) -> Vec<SlotId> {
         match t {
-            "t1" => vec![SlotId::new("p1".to_string()), SlotId::new("p2".to_string())],
-            "t2" => vec![SlotId::new("p3".to_string())],
+            "t1" => vec![SlotId::parse("p1").unwrap(), SlotId::parse("p2").unwrap()],
+            "t2" => vec![SlotId::parse("p3").unwrap()],
             other => panic!("unknown fixture target {other}"),
         }
     }
@@ -5069,7 +5068,7 @@ impl Model {
                 }
             }
             Action::Tamper(_) => {
-                if self.current.contains_key(&SlotId::new("p1".to_string())) {
+                if self.current.contains_key(&SlotId::parse("p1").unwrap()) {
                     // The fixture requires a live generation to tamper; with
                     // none, the property test skips the action entirely. The
                     // tamper always targets the `s1` slot (`p1`).
@@ -6008,7 +6007,13 @@ fn assert_semantic_invariants(model: &Model, system: &Fixture) {
                 "{ctx}: attempt id order for {t}"
             );
             let pid = Model::target_slots(t)[0].clone();
-            let art = sa.intent.slots[&pid].desired.artifact.clone();
+            let art = sa
+                .intent
+                .resulting_snapshot
+                .get(&pid)
+                .unwrap()
+                .artifact()
+                .clone();
             learn_artifact(&mut learned, &ctx, *mv, art, "attempt {t}");
         }
     }

@@ -1,30 +1,34 @@
 //! The INTENT records of the deployment ledger (feature area A2 "two line
 //! kinds — intent"): the durable intent wire/domain pair
 //! ([`LedgerIntentWire`] / [`DeploymentIntent`]) with the VERIFYING
-//! CONVERSION, the per-slot payload types ([`IntentSlot`],
-//! [`DesiredGeneration`], [`PreviousGeneration`]), and the in-memory push
-//! report ([`LedgerIntentReport`]). The physical [`crate::ledger::finalize::LedgerLine::Intent`]
-//! line lives in [`crate::ledger::finalize`].
+//! CONVERSION, the per-slot payload types ([`SelectedSlotIntent`]),
+//! and the in-memory push report ([`LedgerIntentReport`]). The physical
+//! [`crate::ledger::finalize::LedgerLine::Intent`] line lives in
+//! [`crate::ledger::finalize`].
 
 use crate::error::{Error, Result};
 use crate::identity::{
     ArtifactRef, BehaviorDigest, DeploymentId, GenerationId, GenerationRef,
     PlacementSlotAssignment, ReleaseId, RolloutGroupName, SlotId, TargetName, Timestamp,
 };
-use crate::ledger::records::PhysicalBinding;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::super::TargetSnapshotWire;
 use super::super::observation::{ArtifactRefWire, Observation, ObservationWire};
-use super::super::{NonEmptySlotTable, SlotAttemptState};
+use super::super::{NonEmptySlotTable, SlotAttemptState, TargetSnapshot};
+
 /// The WIRE shape of a durable intent line: the RAW serde form the ledger's
-/// JSONL carries, holding every redundant member the domain reconciles (the
-/// per-slot maps' key sets next to the authoritative `slot_ids` membership,
-/// each [`crate::identity::GenerationRef`]'s assignment slot next to its map
-/// key, and — since schema v4 — the FROZEN MEMBERSHIPS next to the table).
-/// [`crate::ledger::finalize::LedgerLine::Intent`] serializes this type; the ledger's wire
-/// format is therefore unchanged for writers (existing ledgers keep loading
-/// the current format). The VERIFYING CONVERSION
+/// JSONL carries. Since schema v8 the intent FREEZES the COMPLETE RESULTING
+/// SNAPSHOT: `resulting_snapshot` carries every target slot's generation,
+/// artifact and physical binding (its keys ARE the frozen full membership),
+/// while `slot_ids` (the SELECTED membership, in deployment order, the
+/// authoritative key set for the `pre_push` map) + `pre_push` record the
+/// selected slots' pre-push state. The old redundant projections
+/// (`desired` / `bindings` / `selected_membership` / `full_membership`) are
+/// GONE — a selected slot's desired generation/artifact/binding is its entry
+/// in `resulting_snapshot` (no duplication), and the full membership is the
+/// snapshot's key set. The VERIFYING CONVERSION
 /// ([`LedgerIntentWire::into_domain`]) checks every duplicate projection and
 /// exposes only the validated [`DeploymentIntent`] domain type.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,130 +38,84 @@ pub struct LedgerIntentWire {
     pub target: TargetName,
     /// The optional rollout group this attempt selected (`deploy push
     /// <target> --group <name>`). `None` means the attempt selected every
-    /// slot owned by the target. The group name is DESCRIPTIVE (later
-    /// releases may change group membership); the exact selected slot IDs in
-    /// `slot_ids` are the authoritative historical evidence.
+    /// slot of the target (a full push).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
-    /// The placement slots participating in this deployment, in deployment
-    /// order (the same set the commit marker `slots` payload records). This
-    /// is the AUTHORITATIVE membership: it must be DUPLICATE-FREE, and the
-    /// `desired` / `pre_push` maps' key sets must EQUAL it EXACTLY (every
-    /// member slot has exactly one desired + one pre_push entry), verified by
-    /// the wire → domain conversion. It is the FROZEN SELECTED membership —
-    /// the exact slots this attempt planned to deploy.
+    /// The SELECTED membership, in deployment order — the authoritative key
+    /// set of the `pre_push` map. DUPLICATE-FREE and NON-EMPTY (verified by
+    /// the conversion, fail closed).
     pub slot_ids: Vec<SlotId>,
-    /// THE FROZEN SELECTED MEMBERSHIP, persisted EXPLICITLY so the intent is
-    /// SELF-PROVING: the duplicate projection of `slot_ids` (the wire →
-    /// domain conversion re-checks the two AGREE — the selected set IS the
-    /// slot table's keys, no divergence). REQUIRED since schema v4 (no serde
-    /// default — an old-shape intent line fails deserialization fail
-    /// closed).
-    pub selected_membership: Vec<SlotId>,
-    /// THE FROZEN FULL MEMBERSHIP: the COMPLETE target membership at PLAN
-    /// TIME (every slot `config.target_slots(target)` owned when this
-    /// immutable intent was written — a group push's unselected slots
-    /// included, a full push's every target slot). REQUIRED since schema v4
-    /// (no serde default): the conversion requires it DUPLICATE-FREE and a
-    /// SUPERSET of the selected membership (selected ⊆ full — the frozen
-    /// intent's own consistency). The terminal event must REPRODUCE these
-    /// frozen values and recovery must finalize from them — never from the
-    /// live configuration, which may have changed arbitrarily since the
-    /// intent was written.
-    pub full_membership: Vec<SlotId>,
-    /// THE FROZEN PHYSICAL BINDINGS: each SELECTED slot's COMPLETE physical
-    /// binding (`{server, deploy_dir}` — [`PhysicalBinding`]) resolved AT
-    /// PLAN TIME, when the immutable intent was written. REQUIRED since
-    /// schema v6 (no serde default — an old-shape intent line fails
-    /// deserialization fail closed, alongside the version gate): the
-    /// conversion requires the key set to EQUAL the selected membership
-    /// EXACTLY (every member slot has exactly one frozen binding). This is
-    /// the HISTORICAL fact recovery must finalize from: the live
-    /// configuration may have changed arbitrarily since the intent was
-    /// written (a server rebound, a `deploy_dir` moved), and recording the
-    /// LIVE bindings as if they were the plan-time bindings would be a
-    /// false record — exact rollback would later verify against the wrong
-    /// host/location. Recovery compares each selected slot's live binding
-    /// against this frozen value and finalizes from the FROZEN binding on
-    /// equality or marks the attempt Degraded on drift.
-    pub bindings: BTreeMap<SlotId, PhysicalBinding>,
+    /// THE FROZEN RESULTING SNAPSHOT: every target slot's generation,
+    /// artifact and physical binding, exactly as the plan computed it (the
+    /// selected slots at their minted generations with their planned
+    /// artifacts and plan-time bindings; a group push's unselected slots
+    /// carried forward from the base). Its keys ARE the frozen FULL
+    /// membership — there is no separate full_membership projection. The
+    /// selected slots' entries double as their DESIRED state (the selected
+    /// slot's desired generation/artifact/binding is derived from its
+    /// snapshot entry — no duplication). REQUIRED (no serde default — an
+    /// old-shape line fails deserialization fail closed).
+    pub resulting_snapshot: TargetSnapshotWire,
     pub behavior_sha256: String,
     pub attempted_at: String,
-    /// Desired per-slot assignments (what the plan intended): each slot's
-    /// minted generation for its planned artifact. The key set must equal
-    /// `slot_ids` EXACTLY, and each `GenerationRef`'s assignment must name
-    /// its own map key.
-    pub desired: BTreeMap<SlotId, GenerationRef>,
     /// Pre-push per-slot state before mutation (`None` if first deployment).
-    /// Each entry's assignment artifact is a THREE-STATE observation in its
-    /// STRICT WIRE form ([`ObservationWire<ArtifactRefWire>`]: `Known` /
-    /// `KnownAbsent` / `Unknown`, adjacently tagged with
-    /// `deny_unknown_fields`) — an unreadable pre-push assignment is
-    /// `Unknown(error)`, a distinct value that can never be mistaken for a
-    /// known artifact, and the persisted document rejects any observation
-    /// shape that is not EXACTLY one variant. The key set must equal
-    /// `slot_ids` EXACTLY.
+    /// The key set must EQUAL `slot_ids` EXACTLY, and the per-slot wire value
+    /// must be representable as a known [`GenerationRef`] (the conversion
+    /// refuses an `Unknown` / `KnownAbsent` observation or a missing
+    /// generation — an unreadable pre-push cannot be frozen into the intent).
     pub pre_push: BTreeMap<SlotId, Option<SlotAttemptStateWire>>,
-    /// Actual per-slot result after the attempt, in its STRICT WIRE form
-    /// ([`SlotAttemptStateWire`] — the artifact observation adjacently
-    /// tagged with `deny_unknown_fields`). The persisted ledger intent
-    /// keeps this map EMPTY (outcomes are recorded in the terminal event's
-    /// `outcomes` map); the in-memory REPORT ([`LedgerIntentReport`]) carries
-    /// the observed actuals for display — the verified domain [`DeploymentIntent`]
-    /// does NOT carry this map, so it is not part of the intent's key-set
-    /// invariant. Every key must be a member of `slot_ids`.
+    /// Actual per-slot result after the attempt, in its STRICT WIRE form.
+    /// The persisted ledger intent keeps this map EMPTY (outcomes are
+    /// recorded in the terminal event's `outcomes` map); the in-memory
+    /// REPORT ([`LedgerIntentReport`]) carries the observed actuals for
+    /// display. Every key must be a member of `slot_ids`.
     pub slots: BTreeMap<SlotId, SlotAttemptStateWire>,
 }
 
 impl LedgerIntentWire {
     /// VERIFYING CONVERSION (wire → domain): every duplicate projection must
     /// AGREE, and the DOMAIN then enforces the key-set invariant
-    /// STRUCTURALLY. The authoritative membership is `slot_ids`, which must
-    /// be DUPLICATE-FREE and NON-EMPTY, and the `desired` / `pre_push` key
-    /// sets must EQUAL it EXACTLY — every member slot has exactly one
-    /// desired + one pre_push entry; a missing OR extra key (and a duplicated
-    /// member id) fails closed, so an incomplete authoritative projection is
-    /// never read as if the maps were authoritative. Each desired
-    /// [`crate::identity::GenerationRef`]'s assignment must name its own map key,
-    /// and every wire `slots` (actuals) key must be a member of `slot_ids`
-    /// (the persisted intent keeps that map EMPTY — outcomes live in the
-    /// terminal event's `outcomes` map and the in-memory report
-    /// [`LedgerIntentReport`]). The AGREED slots are then COLLAPSED into ONE
-    /// authoritative [`NonEmptySlotTable`] (the domain's
-    /// [`DeploymentIntent::slots`]): the membership + the per-slot maps are a
-    /// single table, so the exact-key-set invariant is STRUCTURAL in the
-    /// domain (no duplicates, no missing keys — `BTreeMap` uniqueness + the
-    /// non-empty refusal below). A disagreement is an [`Error::integrity`]
-    /// error (fail closed — a hand-constructed record can never be read as
-    /// whichever projection a consumer happens to use).
+    /// STRUCTURALLY. The authoritative selected membership is `slot_ids`
+    /// (DUPLICATE-FREE and NON-EMPTY, and the `pre_push` key set must EQUAL
+    /// it EXACTLY); the snapshot is non-empty and its keys ARE the full
+    /// membership. The two membership invariants are enforced here, fail
+    /// closed: `selected ⊆ snapshot keys` (a deployment can only select
+    /// slots the frozen snapshot covers) and — for a FULL push (no group) —
+    /// `selected == snapshot keys` (a full push selects every target slot).
+    /// Each selected slot's pre-push wire value converts to a KNOWN
+    /// [`GenerationRef`] (`None` = first deployment; `Unknown` / `KnownAbsent`
+    /// / missing-generation values are refused — an unreadable pre-push
+    /// cannot be frozen into the intent). A disagreement is an
+    /// [`Error::integrity`] error (fail closed — a hand-constructed record
+    /// can never be read as whichever projection a consumer happens to use).
     pub fn into_domain(self) -> Result<DeploymentIntent> {
         // The scalar invariants are validated HERE (fail closed): the attempt
-        // timestamp must parse as RFC 3339, and the optional rollout group
-        // must be a well-formed group name. A wire record violating either is
-        // refused with an integrity error before any membership check runs.
-        // (The stored `behavior_sha256` is NOT format-gated here: legacy
-        // records may carry a snapshot-wide digest that is only carried, and
-        // the canonical sha256-form digest is enforced where the value is
-        // INTERPRETED — the in-memory report's [`BehaviorDigest`] and the
-        // plan conversion's derived-digest check.)
-        Timestamp::parse(&self.attempted_at).map_err(|_| {
+        // timestamp must parse as RFC 3339, the stored digest as sha256, and
+        // the optional rollout group must be a well-formed group name.
+        let attempted_at = Timestamp::parse(&self.attempted_at).map_err(|_| {
             Error::integrity(format!(
                 "intent {}: attempted_at {:?} is not an RFC 3339 timestamp",
                 self.deployment_id, self.attempted_at
             ))
         })?;
-        if let Some(g) = &self.group {
-            RolloutGroupName::parse(g).map_err(|_| {
+        let group = match &self.group {
+            Some(g) => Some(RolloutGroupName::parse(g).map_err(|_| {
                 Error::integrity(format!(
                     "intent {}: rollout group {g:?} is not a valid group name",
                     self.deployment_id
                 ))
-            })?;
-        }
-        // `slot_ids` is the AUTHORITATIVE membership and must be
+            })?),
+            None => None,
+        };
+        let behavior_sha256 = BehaviorDigest::parse(&self.behavior_sha256).map_err(|_| {
+            Error::integrity(format!(
+                "intent {}: stored behavior_sha256 {:?} is not a sha256 digest",
+                self.deployment_id, self.behavior_sha256
+            ))
+        })?;
+        // `slot_ids` is the AUTHORITATIVE selected membership and must be
         // DUPLICATE-FREE: a duplicated member would silently weaken the
-        // key-set equality below (a set collapses the duplicate, so the
-        // duplicated id would never be checked against the maps).
+        // key-set equality below.
         let mut seen: BTreeSet<&SlotId> = BTreeSet::new();
         for sid in &self.slot_ids {
             if !seen.insert(sid) {
@@ -167,114 +125,26 @@ impl LedgerIntentWire {
                 )));
             }
         }
-        // THE FROZEN MEMBERSHIPS (schema v4) are validated FIRST, before the
-        // key-set agreement: each persisted membership list must be
-        // DUPLICATE-FREE — a duplicated member would silently weaken the set
-        // equations (the set collapses the duplicate, so the duplicated id
-        // would never be checked against the maps). The validated forms are
-        // the SORTED UNIQUE SETS the domain carries.
-        let mut seen_selected: BTreeSet<&SlotId> = BTreeSet::new();
-        for sid in &self.selected_membership {
-            if !seen_selected.insert(sid) {
-                return Err(Error::integrity(format!(
-                    "intent {}: selected_membership carries duplicate slot '{sid}' — the frozen membership must be unique",
-                    self.deployment_id
-                )));
-            }
-        }
-        let mut seen_full: BTreeSet<&SlotId> = BTreeSet::new();
-        for sid in &self.full_membership {
-            if !seen_full.insert(sid) {
-                return Err(Error::integrity(format!(
-                    "intent {}: full_membership carries duplicate slot '{sid}' — the frozen membership must be unique",
-                    self.deployment_id
-                )));
-            }
-        }
         let membership: BTreeSet<&SlotId> = self.slot_ids.iter().collect();
-        let selected_membership: BTreeSet<&SlotId> = self.selected_membership.iter().collect();
-        let full_membership: BTreeSet<&SlotId> = self.full_membership.iter().collect();
-        // NO DIVERGENCE: the persisted selected membership must EQUAL the
-        // authoritative `slot_ids` — the intent's table keys ARE its frozen
-        // selected set, and the wire persists both projections so the record
-        // is self-proving. A disagreement is a hand-constructed record,
-        // refused fail-closed.
-        if membership != selected_membership {
-            return Err(Error::integrity(format!(
-                "intent {}: selected_membership {:?} disagrees with the slot table keys {:?} — the frozen selected membership IS the slot table's keys (no divergence)",
-                self.deployment_id, selected_membership, membership
-            )));
-        }
-        // THE FROZEN INTENT'S OWN CONSISTENCY: selected ⊆ full — the frozen
-        // full membership is the COMPLETE target membership at plan time, so
-        // it must cover the slots the attempt selected. (A full push's
-        // selected == full naturally; a group push's selected is a subset.)
-        if !selected_membership.is_subset(&full_membership) {
-            let outside: Vec<&SlotId> = selected_membership
-                .difference(&full_membership)
-                .cloned()
-                .collect();
-            return Err(Error::integrity(format!(
-                "intent {}: the frozen selected membership includes slots outside the frozen full membership {outside:?} — selected ⊆ full is the intent's own consistency (the full membership is the complete target at plan time)",
-                self.deployment_id
-            )));
-        }
-        let desired_keys: BTreeSet<&SlotId> = self.desired.keys().collect();
-        let pre_push_keys: BTreeSet<&SlotId> = self.pre_push.keys().collect();
-        // EXACT KEY-SET EQUALITY: every member slot has exactly one desired +
-        // one pre_push entry, and neither map carries a slot the membership
-        // omits — a missing OR extra key fails the conversion (an incomplete
-        // authoritative projection is a disagreement, never read as if the
-        // maps were the membership).
-        if membership != desired_keys {
-            return Err(Error::integrity(format!(
-                "intent {}: slot_ids {:?} disagrees with the desired key set {:?} — every member slot needs exactly one desired entry",
-                self.deployment_id, membership, desired_keys
-            )));
-        }
-        if membership != pre_push_keys {
-            return Err(Error::integrity(format!(
-                "intent {}: slot_ids {:?} disagrees with the pre_push key set {:?} — every member slot needs exactly one pre_push entry",
-                self.deployment_id, membership, pre_push_keys
-            )));
-        }
-        // THE FROZEN PHYSICAL BINDINGS (schema v6) are a THIRD exact-key
-        // projection: the `bindings` key set must EQUAL the selected
-        // membership EXACTLY — every member slot was planned against exactly
-        // one physical location (server + deploy_dir), and a binding for a
-        // non-member (or a member without a binding) is a hand-constructed
-        // record refused fail-closed. The binding is a NEW FROZEN FACT: it
-        // must stay CONSISTENT with the assignment/desired facts (they name
-        // the same member set), and it is what recovery finalizes from.
-        let binding_keys: BTreeSet<&SlotId> = self.bindings.keys().collect();
-        if membership != binding_keys {
-            return Err(Error::integrity(format!(
-                "intent {}: slot_ids {:?} disagrees with the bindings key set {:?} — every member slot has exactly one frozen physical binding (server + deploy_dir), no more, no fewer",
-                self.deployment_id, membership, binding_keys
-            )));
-        }
-        // An EMPTY membership is refused here: the domain intent's slots are
-        // a [`NonEmptySlotTable`], so a deployment that selects no slot is
-        // unrepresentable in the domain (and meaningless — a push always
-        // selects at least one slot).
+        // An EMPTY selected membership is refused: a push always selects at
+        // least one slot.
         if membership.is_empty() {
             return Err(Error::integrity(format!(
                 "intent {}: slot_ids is empty — the domain refuses an empty deployment membership",
                 self.deployment_id
             )));
         }
-        for (key, g) in &self.desired {
-            if &g.assignment.placement_slot != key {
-                return Err(Error::integrity(format!(
-                    "intent {}: desired assignment for slot '{key}' names placement '{}'",
-                    self.deployment_id, g.assignment.placement_slot
-                )));
-            }
+        // EXACT KEY-SET EQUALITY: every selected slot has exactly one
+        // pre_push entry, and the map carries no slot the membership omits.
+        let pre_push_keys: BTreeSet<&SlotId> = self.pre_push.keys().collect();
+        if membership != pre_push_keys {
+            return Err(Error::integrity(format!(
+                "intent {}: slot_ids {:?} disagrees with the pre_push key set {:?} — every member slot needs exactly one pre_push entry",
+                self.deployment_id, membership, pre_push_keys
+            )));
         }
-        // The wire `slots` (actuals) map is the REPORT's map in the old
-        // single-datatype design; it is persisted EMPTY. The domain intent
-        // does NOT carry it; any wire key must still be a member — fail
-        // closed.
+        // The wire `slots` (actuals) map is the REPORT's map; it is persisted
+        // EMPTY. Any wire key must still be a member — fail closed.
         for key in self.slots.keys() {
             if !membership.contains(key) {
                 return Err(Error::integrity(format!(
@@ -283,122 +153,125 @@ impl LedgerIntentWire {
                 )));
             }
         }
-        // COLLAPSE the three projections into ONE table, in the wire's
-        // `slot_ids` SEQUENCE order (the deployment order) — never the
-        // sorted-by-id order of the per-slot maps. The exact-key-set
-        // equality verified above guarantees every member has its desired +
-        // pre_push entry, so each member's facts are read by member id.
-        let slots: Result<Vec<(SlotId, IntentSlot)>> = self
+        // THE RESULTING SNAPSHOT: its keys ARE the frozen full membership.
+        let snapshot: TargetSnapshot = self.resulting_snapshot.into();
+        if snapshot.is_empty() {
+            return Err(Error::integrity(format!(
+                "intent {}: resulting_snapshot is empty — the domain refuses an empty snapshot",
+                self.deployment_id
+            )));
+        }
+        let snapshot_keys: BTreeSet<SlotId> = snapshot.keys().cloned().collect();
+        let selected_set: BTreeSet<SlotId> = self.slot_ids.iter().cloned().collect();
+        // INVARIANT 1: selected ⊆ snapshot keys — a deployment can only
+        // select slots its frozen snapshot covers.
+        if !selected_set.is_subset(&snapshot_keys) {
+            let outside: Vec<SlotId> = selected_set.difference(&snapshot_keys).cloned().collect();
+            return Err(Error::integrity(format!(
+                "intent {}: selected slots {outside:?} are not in resulting_snapshot keys {snapshot_keys:?} — selected ⊆ snapshot",
+                self.deployment_id
+            )));
+        }
+        // INVARIANT 2: a FULL push (no group) selects every target slot, so
+        // selected == snapshot keys.
+        if group.is_none() && selected_set != snapshot_keys {
+            return Err(Error::integrity(format!(
+                "intent {}: group None requires selected == resulting_snapshot keys (selected {selected_set:?} vs snapshot {snapshot_keys:?}) — a full push selects every target slot",
+                self.deployment_id
+            )));
+        }
+        // COLLAPSE into ONE selected table, in the wire's `slot_ids` SEQUENCE
+        // order (the deployment order). Each selected slot's pre-push state
+        // converts to a KNOWN GenerationRef or `None` (its desired
+        // generation/artifact/binding comes from the snapshot entry — never
+        // duplicated here).
+        let selected_entries: Result<Vec<(SlotId, SelectedSlotIntent)>> = self
             .slot_ids
             .iter()
             .map(|key| {
-                let desired = &self.desired[key];
                 let pre_push = self
                     .pre_push
                     .get(key)
                     .and_then(|p| p.clone())
-                    // WIRE → DOMAIN (fail closed): the strict wire
-                    // observation converts to the permissive domain
-                    // observation; a wire value that is not
-                    // representable is refused here, at the conversion.
-                    .map(|p| -> Result<PreviousGeneration> {
-                        let p: SlotAttemptState = p.into_domain()?;
-                        Ok(PreviousGeneration {
-                            artifact: p.artifact,
-                            generation: p.generation,
-                        })
+                    .map(|p| -> Result<GenerationRef> {
+                        let generation = p.generation.clone().ok_or_else(|| {
+                            Error::integrity(format!(
+                                "intent {}: pre_push for slot '{key}' has no generation — unrepresentable as a known GenerationRef",
+                                self.deployment_id
+                            ))
+                        })?;
+                        match p.artifact {
+                            ObservationWire::Known(a) => {
+                                let obs: Observation<ArtifactRef> =
+                                    ObservationWire::Known(a).try_into().map_err(|_| {
+                                        Error::integrity(format!(
+                                            "intent {}: pre_push for slot '{key}' carries an invalid artifact",
+                                            self.deployment_id
+                                        ))
+                                    })?;
+                                let artifact: ArtifactRef = match obs {
+                                    Observation::Known(a) => a,
+                                    _ => unreachable!(),
+                                };
+                                Ok(GenerationRef {
+                                    generation,
+                                    assignment: PlacementSlotAssignment {
+                                        placement_slot: key.clone(),
+                                        artifact,
+                                    },
+                                })
+                            }
+                            ObservationWire::KnownAbsent => Err(Error::integrity(format!(
+                                "intent {}: pre_push for slot '{key}' is KnownAbsent — an unreadable pre-push cannot be frozen (the intent records a KNOWN prior state or None)",
+                                self.deployment_id
+                            ))),
+                            ObservationWire::Unknown(_) => Err(Error::integrity(format!(
+                                "intent {}: pre_push for slot '{key}' is Unknown — an unreadable pre-push cannot be frozen (the push must retry rather than freeze an unknown prior state)",
+                                self.deployment_id
+                            ))),
+                        }
                     })
                     .transpose()?;
-                Ok((
-                    key.clone(),
-                    IntentSlot {
-                        desired: DesiredGeneration {
-                            generation: desired.generation.clone(),
-                            artifact: desired.assignment.artifact.clone(),
-                        },
-                        pre_push,
-                        // THE FROZEN PHYSICAL BINDING: the wire's per-member
-                        // `bindings` entry, re-checked above to exist for
-                        // exactly this key (membership == bindings keys).
-                        binding: self.bindings[key].clone(),
-                    },
-                ))
+                Ok((key.clone(), SelectedSlotIntent { pre_push }))
             })
             .collect();
+        let selected = NonEmptySlotTable::build(selected_entries?)?;
         Ok(DeploymentIntent {
             deployment_id: self.deployment_id,
             target: self.target,
-            group: self.group,
-            behavior_sha256: self.behavior_sha256,
-            attempted_at: self.attempted_at,
-            slots: NonEmptySlotTable::build(slots?)?,
-            full_membership: full_membership
-                .into_iter()
-                .cloned()
-                .collect::<BTreeSet<SlotId>>(),
+            group,
+            resulting_snapshot: snapshot,
+            selected,
+            behavior_sha256,
+            attempted_at,
         })
     }
 }
 
-/// ONE member slot's slot-table entry: the DESIRED assignment (the
-/// generation the plan minted for the slot's planned artifact), the
-/// OPTIONAL PRE-PUSH state (what the slot ran before the attempt — `None`
-/// for a first deployment), and the FROZEN PHYSICAL BINDING (the
-/// `{server, deploy_dir}` the plan resolved at PLAN TIME — recovery
-/// finalizes from it or marks the attempt Degraded on drift, never from the
-/// live configuration). The slot id itself is the enclosing
-/// [`NonEmptySlotTable`] key — the enclosing object owns identity, so
-/// neither payload re-declares it (the wire's redundant projections are
-/// verified and dropped by the conversion).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IntentSlot {
-    pub desired: DesiredGeneration,
-    pub pre_push: Option<PreviousGeneration>,
-    /// THE FROZEN PHYSICAL BINDING of this slot at PLAN TIME: the actual
-    /// server (`ServerId`) AND the absolute on-server `deploy_dir` the plan
-    /// resolved for this member — a single frozen fact the wire persists in
-    /// [`LedgerIntentWire::bindings`] and the conversion re-checks against
-    /// the table keys.
-    pub binding: PhysicalBinding,
-}
-
-/// One slot's DESIRED generation: the generation the plan minted for the
-/// slot's planned artifact. The DOMAIN form of the wire's per-slot
-/// [`crate::identity::GenerationRef`] with the REDUNDANT assignment slot
-/// dropped (the enclosing table key owns the slot identity — "store each
-/// fact exactly once"); the wire conversion verifies the assignment named
-/// its own map key before dropping it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DesiredGeneration {
-    pub generation: GenerationId,
-    /// The artifact (release, variant, tree) the slot planned to advance to.
-    pub artifact: ArtifactRef,
-}
-
-/// One slot's PRE-PUSH state before the attempt: what the slot ran
-/// (`artifact`, a three-state observation) and the generation it was on
-/// (`None` when only the pre-push state is unknown / the slot was never
-/// deployed). The DOMAIN form of the wire's [`SlotAttemptState`] under the
-/// table's name; the enclosing table key owns the slot. The artifact is an
-/// [`Observation`]: an unreadable pre-push assignment is `Unknown(error)` —
-/// a distinct value, never a valid-looking artifact.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PreviousGeneration {
-    pub artifact: Observation<ArtifactRef>,
-    pub generation: Option<GenerationId>,
+/// ONE selected slot's slot-table entry: ONLY the OPTIONAL PRE-PUSH state (a
+/// known [`GenerationRef`] — what the slot ran before the attempt; `None` for
+/// a first deployment / no prior state). The slot's DESIRED state — the
+/// generation, artifact and physical binding the plan minted — is DERIVED
+/// from its entry in [`DeploymentIntent::resulting_snapshot`], so it is never
+/// duplicated here (the wire's snapshot is the single source of the planned
+/// facts). The slot id itself is the enclosing table key — the enclosing
+/// object owns identity, so the payload never re-declares it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SelectedSlotIntent {
+    pub pre_push: Option<GenerationRef>,
 }
 
 /// THE WIRE FORM of a [`SlotAttemptState`] — the pre-push / actuals entry
-/// the PERSISTED intent line carries: the shared-core shape with its
-/// artifact observation in the STRICT adjacently-tagged wire form
+/// the PERSISTED intent line carries (`[LedgerIntentWire::pre_push]` and
+/// `[LedgerIntentWire::slots]`): the shared-core shape with its artifact
+/// observation in the STRICT adjacently-tagged wire form
 /// ([`ObservationWire<ArtifactRefWire>`], `deny_unknown_fields`), so the
 /// raw wire document rejects any field beyond `artifact`/`generation` and
 /// any observation shape that is not EXACTLY one variant. The DOMAIN
-/// [`SlotAttemptState`] (and its domain sibling [`PreviousGeneration`])
-/// keeps the permissive in-memory [`Observation<ArtifactRef>`]; the wire →
-/// domain conversion ([`SlotAttemptStateWire::into_domain`], fail closed)
-/// and the domain → wire re-expansion ([`From<&SlotAttemptState>`])
-/// convert between the two — the wire ↔ domain bijection is EXACT.
+/// [`SlotAttemptState`] keeps the permissive in-memory
+/// [`Observation<ArtifactRef>`]; the wire → domain conversion and the
+/// domain → wire re-expansion convert between the two — the wire ↔ domain
+/// bijection is EXACT.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SlotAttemptStateWire {
@@ -439,159 +312,107 @@ impl From<&SlotAttemptState> for SlotAttemptStateWire {
 }
 
 /// The durable INTENT of one deployment attempt, the VALIDATED DOMAIN form
-/// of [`LedgerIntentWire`]: what was planned and observed BEFORE any server
-/// mutation. Appended once to the target's ledger ([`crate::ledger::finalize::LedgerLine::Intent`])
-/// BEFORE the remote mutation phase (a crash after servers advanced to new
-/// generations can never lose the deployment: the intent is already durable
-/// and the next push reconciles it) and never edited. The attempt's STATUS,
-/// per-slot OUTCOMES and (when successful) ROLLBACK STATE come from its
-/// TERMINAL EVENT ([`crate::ledger::LedgerTerminal`]), never from this record.
+/// of [`LedgerIntentWire`]: what was planned and frozen BEFORE any server
+/// mutation. Appended once to the target's ledger
+/// ([`crate::ledger::finalize::LedgerLine::Intent`]) BEFORE the remote
+/// mutation phase and never edited. The attempt's STATUS, per-slot OUTCOMES
+/// and (when successful) ROLLBACK STATE come from its TERMINAL EVENT
+/// ([`crate::ledger::LedgerTerminal`]), never from this record.
 ///
-/// STORE EACH FACT EXACTLY ONCE: the wire's `slot_ids` / `desired` /
-/// `pre_push` split collapses into ONE authoritative table
-/// [`DeploymentIntent::slots`] — the membership AND the per-slot maps are a
-/// single [`NonEmptySlotTable<IntentSlot>`], so the exact-key-set invariant
-/// (`slot_ids == desired == pre_push`, no duplicates) is STRUCTURAL: the
-/// table has no duplicates (`BTreeMap` keys) and no missing keys (non-empty,
-/// every member carries its desired + pre_push entry). The SELECTED
-/// membership is that table's keys — the wire persists it redundantly
-/// (`selected_membership`, re-checked EQUAL to the keys by the conversion)
-/// so the record is SELF-PROVING — and the FROZEN FULL MEMBERSHIP is a
-/// SINGLE fact stored once (`full_membership`, the complete target
-/// membership at plan time). The `group`, `behavior_sha256` and
-/// `attempted_at` members are SINGLE facts (display / rollback context),
-/// not duplicated projections — they are not part of the reshape. The wire
-/// `deployment_schema_version` is a WIRE format concern (checked by the
-/// reader on the wire, refused if not
-/// `crate::ledger::LEDGER_SCHEMA_VERSION`); the validated domain does not
-/// carry it and writers emit exactly the constant.
+/// STORE EACH FACT EXACTLY ONCE: the COMPLETE RESULTING SNAPSHOT
+/// ([`resulting_snapshot`]) carries every target slot's generation, artifact
+/// and physical binding (its keys ARE the frozen full membership — the
+/// selected slot's desired state is its snapshot entry), and the SELECTED
+/// table ([`selected`]) carries only each selected slot's pre-push state.
+/// The two memberships are therefore structural: `selected.keys` is the
+/// frozen selected set, `resulting_snapshot.keys` the frozen full set, and
+/// the two invariants — selected ⊆ snapshot and (group = None → selected ==
+/// snapshot) — are enforced by the conversion, fail closed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeploymentIntent {
     pub deployment_id: DeploymentId,
     pub target: TargetName,
-    /// The optional rollout group this attempt selected (`deploy push
-    /// <target> --group <name>`). `None` means the attempt selected every
-    /// slot owned by the target. The group name is DESCRIPTIVE (later
-    /// releases may change group membership); the exact selected slot IDs in
-    /// `slots` are the authoritative historical evidence. Single fact
-    /// (display), not a duplicated projection.
-    pub group: Option<String>,
-    /// The attempt's behavior digest (see [`LedgerIntentWire`]). Single
-    /// fact (wire round-trip), not a duplicated projection.
-    pub behavior_sha256: String,
-    /// When the intent was recorded (RFC 3339). Single fact (display).
-    pub attempted_at: String,
-    /// THE AUTHORITATIVE SLOT TABLE: the deployment's membership (the keys)
-    /// and each member's desired + pre-push entries, ONE table. Non-empty +
-    /// unique by construction ([`NonEmptySlotTable`]) — the exact-key-set
-    /// invariant is structural here, not checked.
-    pub slots: NonEmptySlotTable<IntentSlot>,
-    /// THE FROZEN FULL MEMBERSHIP: the COMPLETE target membership at PLAN
-    /// TIME (when this immutable intent was written) — the terminal event
-    /// must REPRODUCE it and recovery must finalize from it, never from the
-    /// live configuration (which may have changed arbitrarily since the
-    /// intent was written). THE AUTHORITATIVE FROZEN FACT alongside the
-    /// selected membership (the `slots` table's keys — the wire persists
-    /// both; the conversion re-checks the selected projection against the
-    /// table keys, no divergence).
-    pub full_membership: BTreeSet<SlotId>,
+    /// The optional rollout group this attempt selected. `None` means the
+    /// attempt selected every slot of the target (a full push —
+    /// `selected.keys == snapshot.keys`).
+    pub group: Option<RolloutGroupName>,
+    /// THE FROZEN RESULTING SNAPSHOT: every target slot's generation,
+    /// artifact and physical binding as planned. Its keys ARE the full
+    /// membership; the selected slots' entries are their desired state.
+    pub resulting_snapshot: TargetSnapshot,
+    /// THE SELECTED SLOTS: the non-empty membership (the keys, in
+    /// deployment order) and each selected slot's pre-push state only.
+    pub selected: NonEmptySlotTable<SelectedSlotIntent>,
+    pub behavior_sha256: BehaviorDigest,
+    pub attempted_at: Timestamp,
 }
 
 impl DeploymentIntent {
-    /// The deployment's membership: the AUTHORITATIVE selected placement
-    /// slots (in deployment order — the table's key order).
+    /// The deployment's SELECTED membership, in deployment order (the
+    /// selected table's key order).
     pub fn membership(&self) -> Vec<SlotId> {
-        self.slots.keys().cloned().collect()
+        self.selected.keys().cloned().collect()
     }
 
-    /// THE FROZEN SELECTED MEMBERSHIP, as the SORTED UNIQUE SET — the slot
-    /// table's keys (the persisted wire projection is re-checked against the
-    /// table by the conversion, so this is the domain's ONE selected fact).
+    /// THE FROZEN SELECTED MEMBERSHIP, as the SORTED UNIQUE SET — the
+    /// selected table's keys.
     pub fn selected_membership(&self) -> BTreeSet<SlotId> {
-        self.slots.keys().cloned().collect()
+        self.selected.keys().cloned().collect()
     }
 
     /// THE FROZEN FULL MEMBERSHIP — the COMPLETE target membership at plan
-    /// time, THE authoritative frozen fact the terminal must reproduce and
-    /// recovery must finalize from (never derived from the live
-    /// configuration).
-    pub fn full_membership(&self) -> &BTreeSet<SlotId> {
-        &self.full_membership
+    /// time, DERIVED from the resulting snapshot's keys (never stored
+    /// separately, never the live configuration).
+    pub fn full_membership(&self) -> BTreeSet<SlotId> {
+        self.resulting_snapshot.keys().cloned().collect()
     }
 
-    /// The distinct releases referenced by the intent's per-slot desired
-    /// assignments — DERIVED from the authoritative `slots` table, never
-    /// stored separately (a partial snapshot can span several releases).
+    /// The distinct releases referenced by the SELECTED slots' desired
+    /// assignments — DERIVED from the resulting snapshot's entries for the
+    /// selected keys (a partial snapshot can span several releases).
     pub fn releases(&self) -> BTreeSet<ReleaseId> {
-        self.slots
-            .values()
-            .map(|s| s.desired.artifact.release.clone())
+        self.selected
+            .keys()
+            .filter_map(|sid| self.resulting_snapshot.get(sid))
+            .map(|e| e.artifact().release.clone())
             .collect()
     }
 }
 
 impl From<&DeploymentIntent> for LedgerIntentWire {
     fn from(i: &DeploymentIntent) -> Self {
-        // Re-expand the ONE table into the wire's split shape (slot_ids +
-        // desired + pre_push) for serialization; the reader re-collapses it.
-        // The member order is the table's key order (deployment order).
-        let slot_ids: Vec<SlotId> = i.slots.keys().cloned().collect();
-        let desired: BTreeMap<SlotId, GenerationRef> = i
-            .slots
-            .iter()
-            .map(|(key, s)| {
-                (
-                    key.clone(),
-                    GenerationRef {
-                        generation: s.desired.generation.clone(),
-                        assignment: PlacementSlotAssignment {
-                            placement_slot: key.clone(),
-                            artifact: s.desired.artifact.clone(),
-                        },
-                    },
-                )
-            })
-            .collect();
+        // Re-expand the domain into the wire's split shape: the selected
+        // membership (in deployment order), the per-selected-slot pre_push
+        // (as the strict wire observation), and the frozen resulting snapshot
+        // (the full membership, one entry per target slot).
+        let slot_ids: Vec<SlotId> = i.selected.keys().cloned().collect();
         let pre_push: BTreeMap<SlotId, Option<SlotAttemptStateWire>> = i
-            .slots
+            .selected
             .iter()
             .map(|(key, s)| {
-                (
-                    key.clone(),
-                    // DOMAIN → WIRE: the permissive in-memory observation
-                    // converts to its EXACT strict wire form (the bijection
-                    // is exact — every domain value has one wire form).
-                    s.pre_push.as_ref().map(|p| SlotAttemptStateWire {
-                        artifact: ObservationWire::from(&p.artifact),
-                        generation: p.generation.clone(),
-                    }),
-                )
+                let wire = s.pre_push.as_ref().map(|gr| SlotAttemptStateWire {
+                    artifact: ObservationWire::Known(ArtifactRefWire::from(
+                        &gr.assignment.artifact,
+                    )),
+                    generation: Some(gr.generation.clone()),
+                });
+                (key.clone(), wire)
             })
             .collect();
         LedgerIntentWire {
             deployment_schema_version: crate::ledger::LEDGER_SCHEMA_VERSION,
             deployment_id: i.deployment_id.clone(),
             target: i.target.clone(),
-            group: i.group.clone(),
+            group: i.group.as_ref().map(|g| g.as_str().to_string()),
             slot_ids,
-            selected_membership: i.slots.keys().cloned().collect(),
-            full_membership: i.full_membership.iter().cloned().collect(),
-            behavior_sha256: i.behavior_sha256.clone(),
-            attempted_at: i.attempted_at.clone(),
-            desired,
+            resulting_snapshot: TargetSnapshotWire::from(&i.resulting_snapshot),
+            behavior_sha256: i.behavior_sha256.as_str().to_string(),
+            attempted_at: i.attempted_at.to_string(),
             pre_push,
-            // Re-expand each member's frozen physical binding from the ONE
-            // slot table (the wire's split `bindings` projection; the reader
-            // re-collapses it and re-checks the keys equal the membership).
-            bindings: i
-                .slots
-                .iter()
-                .map(|(key, s)| (key.clone(), s.binding.clone()))
-                .collect(),
             // The persisted intent carries NO outcomes: the wire keeps the
             // `slots` member EMPTY (outcomes live in the terminal event's
-            // `outcomes` map; the in-memory report [`LedgerIntentReport`]
-            // carries the observed actuals).
+            // `outcomes` map; the in-memory report carries the observed
+            // actuals).
             slots: BTreeMap::new(),
         }
     }
@@ -600,85 +421,59 @@ impl From<&DeploymentIntent> for LedgerIntentWire {
 /// The in-memory push REPORT form of a deployment attempt: the verified
 /// intent fields PLUS the observed per-slot ACTUALS (`slots`). Built in
 /// memory from the durable intent at push time and NEVER persisted: the
-/// ledger's intent line carries NO outcomes (the wire [`LedgerIntentWire`]
-/// keeps its `slots` map empty; outcomes live in the terminal event's
-/// `outcomes` map and the rollback payload). Keeping the report as its OWN
-/// type — rather than reusing [`DeploymentIntent`] — means the verified
-/// intent object never carries an outcomes map, so the intent's structural
-/// key-set invariant is not weakened by a report map that is not part of it.
+/// ledger's intent line carries NO outcomes. The report is display-facing and
+/// keeps the split shape: the display `desired` map re-expands each SELECTED
+/// slot's entry from the frozen snapshot (its desired generation/artifact).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LedgerIntentReport {
     pub deployment_id: DeploymentId,
     pub target: TargetName,
-    /// The optional rollout group this attempt selected, as a validated
-    /// [`RolloutGroupName`] (parsed from the verified intent's group string).
     pub group: Option<RolloutGroupName>,
     pub slot_ids: Vec<SlotId>,
-    /// The attempt's behavior digest, as a validated [`BehaviorDigest`]
-    /// (parsed from the wire's `behavior_sha256` string).
     pub behavior_sha256: BehaviorDigest,
-    /// When the attempt was recorded, as a parsed RFC 3339 [`Timestamp`].
     pub attempted_at: Timestamp,
-    /// Desired per-slot assignments, re-expanded from the domain table (the
-    /// report is display-facing and keeps the wire's split shape).
     pub desired: BTreeMap<SlotId, GenerationRef>,
-    /// Pre-push per-slot state before mutation, re-expanded from the domain
-    /// table (the report is IN-MEMORY and display-facing, so it carries the
-    /// DOMAIN [`SlotAttemptState`] with its permissive
-    /// [`Observation<ArtifactRef>`] — an unknown assignment is
-    /// `Observation::Unknown`, never a sentinel artifact — while the
-    /// PERSISTED wire carries the strict [`SlotAttemptStateWire`]).
     pub pre_push: BTreeMap<SlotId, Option<SlotAttemptState>>,
-    /// Actual per-slot result after the attempt, for display. The report is
-    /// in-memory only — the persisted intent never carries this map.
     pub slots: BTreeMap<SlotId, SlotAttemptState>,
 }
 
 impl LedgerIntentReport {
-    /// Build the in-memory report from a verified domain intent, parsing the
-    /// intent's bare strings into the validated scalars AND re-expanding the
-    /// one slot table into the display-facing split maps. The intent's values
-    /// were already scalar-gated by the wire → domain conversion
-    /// ([`LedgerIntentWire::into_domain`]), so the parses succeed in
-    /// practice; a violation still fails closed with an integrity error
-    /// rather than constructing an invalid report.
+    /// Build the in-memory report from a verified domain intent, re-expanding
+    /// the one selected table + frozen snapshot into the display-facing split
+    /// maps. The intent's values are already scalar-gated by the wire → domain
+    /// conversion, so no re-parsing is needed here.
     pub fn from_intent(i: &DeploymentIntent) -> Result<LedgerIntentReport> {
-        let group = match &i.group {
-            Some(g) => Some(RolloutGroupName::parse(g).map_err(|_| {
-                Error::integrity(format!(
-                    "intent {}: rollout group {g:?} is not a valid group name",
-                    i.deployment_id
-                ))
-            })?),
-            None => None,
-        };
-        // Re-expand the ONE table into the display-facing split maps.
-        let slot_ids: Vec<SlotId> = i.slots.keys().cloned().collect();
+        let slot_ids: Vec<SlotId> = i.selected.keys().cloned().collect();
+        // THE SELECTED SLOT'S DESIRED STATE IS ITS SNAPSHOT ENTRY: the
+        // report's desired map re-expands each selected slot's generation +
+        // artifact from the frozen resulting snapshot (selected ⊆ snapshot is
+        // enforced by the conversion, so every selected key has an entry).
         let desired: BTreeMap<SlotId, GenerationRef> = i
-            .slots
-            .iter()
-            .map(|(key, s)| {
-                (
-                    key.clone(),
+            .selected
+            .keys()
+            .filter_map(|k| {
+                let entry = i.resulting_snapshot.get(k)?;
+                Some((
+                    k.clone(),
                     GenerationRef {
-                        generation: s.desired.generation.clone(),
+                        generation: entry.generation().clone(),
                         assignment: PlacementSlotAssignment {
-                            placement_slot: key.clone(),
-                            artifact: s.desired.artifact.clone(),
+                            placement_slot: k.clone(),
+                            artifact: entry.artifact().clone(),
                         },
                     },
-                )
+                ))
             })
             .collect();
         let pre_push: BTreeMap<SlotId, Option<SlotAttemptState>> = i
-            .slots
+            .selected
             .iter()
             .map(|(key, s)| {
                 (
                     key.clone(),
-                    s.pre_push.as_ref().map(|p| SlotAttemptState {
-                        artifact: p.artifact.clone(),
-                        generation: p.generation.clone(),
+                    s.pre_push.as_ref().map(|gr| SlotAttemptState {
+                        artifact: Observation::Known(gr.assignment.artifact.clone()),
+                        generation: Some(gr.generation.clone()),
                     }),
                 )
             })
@@ -686,20 +481,10 @@ impl LedgerIntentReport {
         Ok(LedgerIntentReport {
             deployment_id: i.deployment_id.clone(),
             target: i.target.clone(),
-            group,
+            group: i.group.clone(),
             slot_ids,
-            behavior_sha256: BehaviorDigest::parse(&i.behavior_sha256).map_err(|_| {
-                Error::integrity(format!(
-                    "intent {}: stored behavior_sha256 {:?} is not a sha256 digest",
-                    i.deployment_id, i.behavior_sha256
-                ))
-            })?,
-            attempted_at: Timestamp::parse(&i.attempted_at).map_err(|_| {
-                Error::integrity(format!(
-                    "intent {}: attempted_at {:?} is not an RFC 3339 timestamp",
-                    i.deployment_id, i.attempted_at
-                ))
-            })?,
+            behavior_sha256: i.behavior_sha256.clone(),
+            attempted_at: i.attempted_at,
             desired,
             pre_push,
             slots: BTreeMap::new(),
@@ -724,5 +509,59 @@ impl<'de> Deserialize<'de> for DeploymentIntent {
         let wire = LedgerIntentWire::deserialize(deserializer)?;
         wire.into_domain()
             .map_err(|e| serde::de::Error::custom(e.to_string()))
+    }
+}
+
+/// A DEFAULT valid intent for test fixtures: one slot `p1` at a deterministic
+/// generation/artifact/binding, full push (`group: None`, selected ==
+/// snapshot), no pre-push state. Fixtures override the fields they need via
+/// struct-update syntax.
+impl Default for DeploymentIntent {
+    fn default() -> Self {
+        let p1 = SlotId::parse("p1").unwrap();
+        let artifact = ArtifactRef {
+            release: ReleaseId::parse(
+                "rel-sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .unwrap(),
+            variant: crate::identity::VariantName::parse("standard").unwrap(),
+            tree: crate::identity::TreeDigest::parse(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .unwrap(),
+        };
+        let binding = crate::ledger::PhysicalBinding {
+            server: crate::identity::ServerId::parse("s1").unwrap(),
+            deploy_dir: "/srv/deploy/p1".to_string(),
+        };
+        let entries = BTreeMap::from([(
+            p1.clone(),
+            crate::ledger::SnapshotEntry::new(
+                crate::identity::GenerationId::parse("gen-00000000-0000-7000-8000-000000000001")
+                    .unwrap(),
+                artifact,
+                binding,
+            ),
+        )]);
+        let snapshot = TargetSnapshot::from_entries(entries);
+        DeploymentIntent {
+            deployment_id: crate::identity::DeploymentId::parse(
+                "deploy-00000000-0000-7000-8000-000000000001",
+            )
+            .unwrap(),
+            target: TargetName::parse("t1").unwrap(),
+            group: None,
+            resulting_snapshot: snapshot,
+            selected: NonEmptySlotTable::build(BTreeMap::from([(
+                p1,
+                SelectedSlotIntent { pre_push: None },
+            )]))
+            .expect("the default fixture has one slot"),
+            behavior_sha256: BehaviorDigest::parse(
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            )
+            .unwrap(),
+            attempted_at: Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
+        }
     }
 }

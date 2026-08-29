@@ -14,13 +14,15 @@
 /// version themselves separately from the configuration format, so bumping
 /// one never invalidates the other.
 ///
-/// The current format is version 7 (the ONLY version writers emit and
-/// readers accept): deployment records use the canonical
-/// placement-slot-keyed shape (`BTreeMap<SlotId, _>` maps, nested
-/// artifact/generation refs), carry the exclusive owning target + the
-/// optional rollout group of the attempt, the PERSISTED MEMBERSHIPS
-/// (`selected_membership` / `full_membership` on the intent AND the
-/// terminal), the FROZEN PHYSICAL BINDINGS (the intent half), and the
+/// The current format is version 8 (the ONLY version writers emit and
+/// readers accept): the intent freezes the COMPLETE resulting snapshot
+/// (`resulting_snapshot` — every target slot's generation+artifact+binding,
+/// keys = full membership) plus the selected slots' pre-push states;
+/// the intent wire drops `selected_membership`/`full_membership`/`desired`/
+/// `bindings`; the terminal wire drops `full_membership`. The deployment
+/// records still use the canonical placement-slot-keyed shape
+/// (`BTreeMap<SlotId, _>` maps, nested artifact/generation refs), carry
+/// the exclusive owning target + the optional rollout group, and the
 /// STRICT WIRE OBSERVATIONS — the pre-push assignments' artifact and the
 /// per-slot outcomes' post-mutation observation serialize as the
 /// ADJACENTLY-TAGGED [`crate::ledger::records::ObservationWire`]
@@ -35,7 +37,14 @@
 /// current one is REJECTED on read (no compatibility fallback), so a
 /// record is interpreted only under exactly the schema that wrote it:
 ///
-/// * version 7 (CURRENT): the rollback payload is a single `entries: BTreeMap<SlotId, SnapshotEntry>` map (generation + artifact + binding per slot) serialized directly; the schema version gates old shapes.
+/// * version 8 (CURRENT): the INTENT record FREEZES the COMPLETE resulting
+///   snapshot (`resulting_snapshot: TargetSnapshotWire` — every target slot's
+///   generation+artifact+binding, keys = full membership) plus the selected
+///   slots' pre-push states (`selected` table); the intent wire DROPS the
+///   redundant duplicate projections (`selected_membership`,
+///   `full_membership`, `desired`, `bindings`); the TERMINAL wire DROPS its
+///   `full_membership` (derivable from the snapshot keys).
+/// * version 7: the rollback payload is a single `entries: BTreeMap<SlotId, SnapshotEntry>` map (generation + artifact + binding per slot) serialized directly; the schema version gates old shapes.
 /// * version 6: the INTENT record FREEZES each selected slot's
 ///   PHYSICAL BINDING — a required `bindings: BTreeMap<SlotId,
 ///   PhysicalBinding>` projection whose key set must EQUAL the selected
@@ -94,7 +103,7 @@
 /// frozen bindings are REQUIRED, no serde default). A hypothetical
 /// pre-rekeying shape that keyed these maps by server ID with flat
 /// artifact fields is NOT the current schema and never loads.
-pub(crate) const LEDGER_SCHEMA_VERSION: u32 = 7;
+pub(crate) const LEDGER_SCHEMA_VERSION: u32 = 8;
 
 /// The `pins.json` record format version (`Pins.schema_version`). Pins are
 /// durable, store-global retention anchors for artifact CONTENT ONLY (see

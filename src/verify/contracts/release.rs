@@ -1027,7 +1027,9 @@ mod tests {
     //    lists, duplicate targets, or textually-different-but-lexically-
     //    equivalent `deploy_dir` spellings canonicalizes to the SAME digest.
 
+    #[cfg(test)]
     use proptest::prelude::*;
+    #[cfg(test)]
     use proptest::test_runner::{FileFailurePersistence, RngSeed};
 
     /// One generated release component set: the frozen mapping digest, the
