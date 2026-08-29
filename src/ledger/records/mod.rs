@@ -130,10 +130,10 @@ pub(crate) use validation::{
 pub use validation::{FrozenSlotTopology, RebindingPlan, VerifiedReleaseRebinding};
 pub(crate) use validation::{LEDGER_SCHEMA_VERSION, PINS_SCHEMA_VERSION};
 pub use wire::{
-    CompensationReport, DeploymentIntent, DesiredGeneration, IntentSlot, LedgerEntry,
-    LedgerIntentReport, LedgerIntentWire, LedgerTerminal, LedgerTerminalWire, PreviousGeneration,
-    SlotAttemptStateWire, SlotOutcome, SlotOutcomeKind, SlotResult, SlotTransition,
-    SuccessfulTerminal, TerminalDisposition,
+    CompensationReport, DegradedTerminal, DeploymentIntent, DesiredGeneration, IntentSlot,
+    LedgerEntry, LedgerIntentReport, LedgerIntentWire, LedgerTerminal, LedgerTerminalWire,
+    PreviousGeneration, SlotAttemptStateWire, SlotOutcome, SlotOutcomeKind, SlotResult,
+    SlotTransition, SuccessfulTerminal, TerminalDisposition,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1353,10 +1353,7 @@ mod tests {
         let wire = agreeing_terminal(&keys, 3);
         let d = wire.into_domain().unwrap();
         let intent = agreeing_intent(&keys).into_domain().unwrap();
-        assert!(matches!(
-            d.disposition,
-            TerminalDisposition::Degraded { .. }
-        ));
+        assert!(matches!(d.disposition, TerminalDisposition::Degraded(_)));
         assert_eq!(
             d.remaining_changes(&intent)
                 .expect("derived remaining changes")
@@ -1777,13 +1774,16 @@ mod tests {
             matches!(&domain.disposition, TerminalDisposition::Successful(_)),
             "Successful carries its rollback"
         );
-        // The domain terminal round-trips through the wire shape; `from_domain`
+        // The domain terminal round-trips through the wire shape; `try_from_domain`
         // supplies the entry-owned deployment id / target.
-        let json = serde_json::to_string(&LedgerTerminalWire::from_domain(
-            &test_deployment_id("deploy-terminal"),
-            &TargetName::new("t1".to_string()),
-            &domain,
-        ))
+        let json = serde_json::to_string(
+            &LedgerTerminalWire::try_from_domain(
+                &test_deployment_id("deploy-terminal"),
+                &TargetName::new("t1".to_string()),
+                &domain,
+            )
+            .unwrap(),
+        )
         .unwrap();
         let wire2: LedgerTerminalWire = serde_json::from_str(&json).unwrap();
         assert_eq!(
@@ -1903,12 +1903,13 @@ mod tests {
         );
         // Degraded: the disposition owns the remaining-changes source.
         let d = agreeing_terminal(&keys, 3).into_domain().unwrap();
-        let TerminalDisposition::Degraded { outcomes } = &d.disposition else {
+        let TerminalDisposition::Degraded(dt) = &d.disposition else {
             panic!("Degraded carries its outcomes");
         };
+        let outcomes = dt.outcomes();
         assert_eq!(
             &d.outcomes(),
-            outcomes,
+            &SlotTable::from_map(outcomes.clone().into_map()),
             "the accessor reads the disposition's OWN table"
         );
         assert_eq!(
@@ -1944,9 +1945,10 @@ mod tests {
         // Degraded: remaining_changes() derives from the disposition's OWN
         // outcomes (every non-restored outcome with a recorded generation).
         let d = agreeing_terminal(&keys, 3).into_domain().unwrap();
-        let TerminalDisposition::Degraded { outcomes } = &d.disposition else {
+        let TerminalDisposition::Degraded(dt) = &d.disposition else {
             panic!("Degraded carries its outcomes");
         };
+        let outcomes = dt.outcomes();
         assert!(d.compensation().is_none());
         let remaining = d.remaining_changes(&intent).unwrap();
         let expected: BTreeMap<SlotId, Observation<ObservedGeneration>> = outcomes
@@ -2184,11 +2186,11 @@ mod tests {
         )
             .prop_map(|(key, first, mut extras)| {
                 extras.insert(key, first);
+                let ne = NonEmptySlotTable::build(extras.into_iter()).unwrap();
+                let dt = DegradedTerminal::try_new(ne).unwrap();
                 LedgerTerminal {
                     recorded_at: "2026-01-01T00:00:00Z".to_string(),
-                    disposition: TerminalDisposition::Degraded {
-                        outcomes: SlotTable::from_map(extras),
-                    },
+                    disposition: TerminalDisposition::Degraded(dt),
                     reason: None,
                 }
             })
@@ -2228,11 +2230,12 @@ mod tests {
         fn arbitrary_domain_terminals_round_trip_exactly(
             terminal in arbitrary_domain_terminal()
         ) {
-            let wire = LedgerTerminalWire::from_domain(
+            let wire = LedgerTerminalWire::try_from_domain(
                 &DeploymentId::new("deploy-prop".to_string()),
                 &TargetName::new("t1".to_string()),
                 &terminal,
-            );
+            )
+            .unwrap();
             let back = wire.into_domain().expect(
                 "a disposition's own payloads are self-consistent — the round trip must convert",
             );
@@ -2914,19 +2917,15 @@ mod tests {
             );
         }
         let intent = intent_wire.into_domain().unwrap();
+        let outcomes_map: BTreeMap<SlotId, SlotOutcome> = outcomes
+            .into_iter()
+            .map(|(k, r)| (k, SlotOutcome::from_wire(r).unwrap()))
+            .collect();
+        let ne = NonEmptySlotTable::build(outcomes_map.into_iter()).unwrap();
+        let dt = DegradedTerminal::new_unchecked(ne);
         let terminal = LedgerTerminal {
             recorded_at: "2026-01-01T00:00:00Z".to_string(),
-            disposition: TerminalDisposition::Degraded {
-                // WIRE → DOMAIN (fail closed): the fixture's wire outcomes
-                // convert to the domain outcomes, deriving each slot's
-                // transition state ([`SlotOutcome::from_wire`]).
-                outcomes: SlotTable::from_map(
-                    outcomes
-                        .into_iter()
-                        .map(|(k, r)| (k, SlotOutcome::from_wire(r).unwrap()))
-                        .collect(),
-                ),
-            },
+            disposition: TerminalDisposition::Degraded(dt),
             reason: None,
         };
         (intent, terminal)

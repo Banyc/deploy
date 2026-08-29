@@ -8,7 +8,9 @@ use crate::identity::DeploymentId;
 use crate::identity::GenerationId;
 use crate::identity::OperationId;
 use crate::identity::SlotId;
+use crate::ledger::DegradedTerminal;
 use crate::ledger::DeploymentStatus;
+use crate::ledger::NonEmptySlotTable;
 use crate::ledger::SlotOutcome;
 use crate::ledger::SlotOutcomeKind;
 use crate::ledger::SlotResult;
@@ -183,16 +185,20 @@ pub(crate) fn disposition_for(
             // never-advanced (e.g. a `leave_changed` failure that advanced
             // nothing) is legitimate — the policy marks the attempt Degraded
             // even though no slot changed.
-            if outcomes
-                .values()
-                .all(|r| r.outcome == SlotOutcomeKind::Restored)
-            {
-                return Err(Error::store(
-                    "a Degraded terminal requires at least one non-restored outcome — none recorded"
-                        .to_string(),
-                ));
-            }
-            TerminalDisposition::Degraded { outcomes }
+            let non_empty = NonEmptySlotTable::build(
+                outcomes.iter().map(|(k, v)| (k.clone(), v.clone())),
+            )
+            .map_err(|e| {
+                Error::store(format!(
+                    "a Degraded terminal requires at least one non-restored outcome — none recorded: {e}"
+                ))
+            })?;
+            let dt = DegradedTerminal::try_new(non_empty).map_err(|e| {
+                Error::store(format!(
+                    "a Degraded terminal requires at least one non-restored outcome — none recorded: {e}"
+                ))
+            })?;
+            TerminalDisposition::Degraded(dt)
         }
         other => {
             return Err(Error::store(format!(

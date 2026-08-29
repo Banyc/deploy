@@ -586,11 +586,12 @@ mod tests_rollback {
         let read_store =
             crate::store::local::LocalStore::with_base(tmp2.path().join("store")).unwrap();
         let intent_wire = crate::ledger::records::LedgerIntentWire::from(&intent);
-        let terminal_wire = crate::ledger::records::LedgerTerminalWire::from_domain(
+        let terminal_wire = crate::ledger::records::LedgerTerminalWire::try_from_domain(
             &intent.deployment_id,
             &intent.target,
             &mutated_terminal,
-        );
+        )
+        .unwrap();
         let line1 =
             serde_json::to_string(&crate::ledger::finalize::LedgerLine::Intent(intent_wire))
                 .unwrap();
@@ -653,11 +654,11 @@ mod tests_rollback {
             let tmp2 = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
             let read_store = crate::store::local::LocalStore::with_base(tmp2.path().join("store")).unwrap();
             let intent_wire = crate::ledger::records::LedgerIntentWire::from(&intent);
-            let terminal_wire = crate::ledger::records::LedgerTerminalWire::from_domain(
+            let terminal_wire = crate::ledger::records::LedgerTerminalWire::try_from_domain(
                 &intent.deployment_id,
                 &intent.target,
                 &mutated_terminal,
-            );
+            ).unwrap();
             let line1 = serde_json::to_string(&crate::ledger::finalize::LedgerLine::Intent(intent_wire)).unwrap();
             let line2 = serde_json::to_string(&crate::ledger::finalize::LedgerLine::Terminal(terminal_wire)).unwrap();
             let p = read_store.ledger_path(intent.target.as_str());

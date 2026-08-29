@@ -335,7 +335,7 @@ impl LocalStore {
                 }
             }
         }
-        let wire = LedgerTerminalWire::from_domain(deployment_id, &entry.target, terminal);
+        let wire = LedgerTerminalWire::try_from_domain(deployment_id, &entry.target, terminal)?;
         verify_terminal_against_entry(target, entry, wire.clone())?;
         let line = serde_json::to_string(&LedgerLine::Terminal(wire))
             .map_err(|e| Error::store(format!("serialize ledger terminal: {e}")))?;
@@ -998,20 +998,24 @@ mod tests {
                     // changed (never restored): the conversion derives the
                     // Degraded disposition's non-empty remaining changes
                     // from the disposition's OWN outcomes.
-                    disposition: TerminalDisposition::Degraded {
-                        outcomes: SlotTable::from_map(BTreeMap::from([(
-                            SlotId::new("p1".to_string()),
-                            SlotOutcome {
-                                outcome: SlotOutcomeKind::Skipped,
-                                observation: Observation::Known(ObservedGeneration {
-                                    generation: test_generation_id("1"),
-                                }),
-                                compensated: false,
-                                error: None,
-                                transition: SlotTransition::NeverAdvanced,
-                            },
-                        )])),
-                    },
+                    disposition: TerminalDisposition::Degraded(
+                        crate::ledger::DegradedTerminal::try_new(
+                            crate::ledger::NonEmptySlotTable::build(BTreeMap::from([(
+                                SlotId::new("p1".to_string()),
+                                SlotOutcome {
+                                    outcome: SlotOutcomeKind::Failed,
+                                    observation: Observation::Known(ObservedGeneration {
+                                        generation: test_generation_id("1"),
+                                    }),
+                                    compensated: false,
+                                    error: None,
+                                    transition: SlotTransition::AdvanceUnknown,
+                                },
+                            )]))
+                            .unwrap(),
+                        )
+                        .unwrap(),
+                    ),
                     reason: Some("boom".to_string()),
                 },
             )
@@ -1242,11 +1246,14 @@ mod tests {
                 );
                 assert_eq!(
                     after.last().unwrap(),
-                    &serde_json::to_string(&LedgerLine::Terminal(LedgerTerminalWire::from_domain(
-                        &test_deployment_id(&id),
-                        &TargetName::parse(target).expect("target name is a safe segment"),
-                        &successful_terminal(),
-                    ),))
+                    &serde_json::to_string(&LedgerLine::Terminal(
+                        LedgerTerminalWire::try_from_domain(
+                            &test_deployment_id(&id),
+                            &TargetName::parse(target).expect("target name is a safe segment"),
+                            &successful_terminal(),
+                        )
+                        .unwrap(),
+                    ))
                     .unwrap(),
                     "{stage}: the wholly-new ledger's last line is the appended terminal"
                 );
@@ -1353,11 +1360,14 @@ mod tests {
         );
         assert_eq!(
             visible[1],
-            serde_json::to_string(&LedgerLine::Terminal(LedgerTerminalWire::from_domain(
-                &test_deployment_id("deploy-a"),
-                &TargetName::parse(target).expect("target name is a safe segment"),
-                &successful_terminal(),
-            )))
+            serde_json::to_string(&LedgerLine::Terminal(
+                LedgerTerminalWire::try_from_domain(
+                    &test_deployment_id("deploy-a"),
+                    &TargetName::parse(target).expect("target name is a safe segment"),
+                    &successful_terminal(),
+                )
+                .unwrap()
+            ))
             .unwrap()
         );
         assert_eq!(
@@ -1376,11 +1386,14 @@ mod tests {
         );
         assert_eq!(
             visible[4],
-            serde_json::to_string(&LedgerLine::Terminal(LedgerTerminalWire::from_domain(
-                &test_deployment_id("deploy-d"),
-                &TargetName::parse(target).expect("target name is a safe segment"),
-                &successful_terminal(),
-            )))
+            serde_json::to_string(&LedgerLine::Terminal(
+                LedgerTerminalWire::try_from_domain(
+                    &test_deployment_id("deploy-d"),
+                    &TargetName::parse(target).expect("target name is a safe segment"),
+                    &successful_terminal(),
+                )
+                .unwrap()
+            ))
             .unwrap()
         );
         // Every line parses and merges into consistent entries.
@@ -1530,11 +1543,12 @@ mod tests {
                     let terminal = successful_terminal();
                     let deployment_id = test_deployment_id(&id);
                     let line = serde_json::to_string(&LedgerLine::Terminal(
-                        LedgerTerminalWire::from_domain(
+                        LedgerTerminalWire::try_from_domain(
                             &deployment_id,
                             &TargetName::parse(target).expect("target name is a safe segment"),
                             &terminal,
-                        ),
+                        )
+                        .unwrap(),
                     ))
                     .unwrap();
                     if let Some(stage) = stage {
@@ -2574,12 +2588,18 @@ mod tests {
                     );
                     *st = new_st;
                 }
-                TerminalDisposition::FailedRolledBack { outcomes: o }
-                | TerminalDisposition::Degraded { outcomes: o } => {
+                TerminalDisposition::FailedRolledBack { outcomes: o } => {
                     let mut map = o.clone().into_map();
                     let result = map.remove(key).unwrap();
                     map.insert(renamed, result);
                     *o = SlotTable::from_map(map);
+                }
+                TerminalDisposition::Degraded(dt) => {
+                    let mut map = dt.outcomes().clone().into_map();
+                    let result = map.remove(key).unwrap();
+                    map.insert(renamed, result);
+                    let ne = crate::ledger::NonEmptySlotTable::build(map).unwrap();
+                    *dt = crate::ledger::DegradedTerminal::try_new(ne).unwrap();
                 }
                 TerminalDisposition::FailedPreflight => {
                     unreachable!("a preflight terminal carries no outcomes to rename")
@@ -2777,29 +2797,32 @@ mod tests {
 
         // (a) TRUTH TABLE, direction 1 (wire): a Successful terminal
         // without its rollback payload.
-        let mut bad = LedgerTerminalWire::from_domain(
+        let mut bad = LedgerTerminalWire::try_from_domain(
             &test_deployment_id(id),
             &TargetName::parse(target).expect("target name is a safe segment"),
             &terminal,
-        );
+        )
+        .unwrap();
         bad.rollback = None;
         assert_wire_terminal_refused(&tmp, target, &intent, &bad, "a");
         // (b) TRUTH TABLE, direction 2 (wire): a failed status carrying a
         // rollback.
-        let mut bad = LedgerTerminalWire::from_domain(
+        let mut bad = LedgerTerminalWire::try_from_domain(
             &test_deployment_id(id),
             &TargetName::parse(target).expect("target name is a safe segment"),
             &terminal,
-        );
+        )
+        .unwrap();
         bad.status = DeploymentStatus::Degraded;
         assert_wire_terminal_refused(&tmp, target, &intent, &bad, "b");
         // (c) TARGET EQUALITY, terminal leg (wire): the terminal names a
         // different target than the path and its entry.
-        let mut bad = LedgerTerminalWire::from_domain(
+        let mut bad = LedgerTerminalWire::try_from_domain(
             &test_deployment_id(id),
             &TargetName::parse(target).expect("target name is a safe segment"),
             &terminal,
-        );
+        )
+        .unwrap();
         bad.target = TargetName::new("other-target".to_string());
         assert_wire_terminal_refused(&tmp, target, &intent, &bad, "c");
         // (d) EXACT BINDING KEYS: a generation without its binding.

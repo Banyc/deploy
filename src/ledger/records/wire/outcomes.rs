@@ -239,10 +239,11 @@ impl LedgerTerminal {
         // The derivation reads the Degraded disposition's OWN outcome table
         // directly (never the materialized [`LedgerTerminal::outcomes`]
         // accessor — a Degraded terminal stores its table).
-        let TerminalDisposition::Degraded { outcomes } = &self.disposition else {
+        let TerminalDisposition::Degraded(dt) = &self.disposition else {
             return None;
         };
-        let remaining: BTreeMap<SlotId, Observation<ObservedGeneration>> = outcomes
+        let remaining: BTreeMap<SlotId, Observation<ObservedGeneration>> = dt
+            .outcomes()
             .iter()
             .filter(|(sid, r)| match r.transition {
                 SlotTransition::NeverAdvanced | SlotTransition::Restored => false,

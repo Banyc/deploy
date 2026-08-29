@@ -14,7 +14,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::super::observation::{Observation, ObservedGeneration};
-use super::super::{CompleteRollback, DeploymentStatus, SlotTable, TargetSnapshot};
+use super::super::{
+    CompleteRollback, DeploymentStatus, NonEmptySlotTable, SlotTable, TargetSnapshot,
+};
 use super::outcomes::{SlotOutcome, SlotOutcomeKind, SlotResult, SlotTransition};
 /// The DISPOSITION of a deployment's terminal event — the DOMAIN replaces
 /// the wire's `status: String` + optional rollback TAG-PLUS-OPTIONAL-PAYLOAD
@@ -135,6 +137,32 @@ impl SuccessfulTerminal {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DegradedTerminal {
+    outcomes: NonEmptySlotTable<SlotOutcome>,
+}
+
+impl DegradedTerminal {
+    pub fn try_new(outcomes: NonEmptySlotTable<SlotOutcome>) -> Result<Self> {
+        if outcomes
+            .values()
+            .all(|r| r.outcome == SlotOutcomeKind::Restored)
+        {
+            return Err(Error::integrity(
+                "a fully restored attempt is FailedRolledBack, not Degraded",
+            ));
+        }
+        Ok(Self { outcomes })
+    }
+    pub fn outcomes(&self) -> &NonEmptySlotTable<SlotOutcome> {
+        &self.outcomes
+    }
+    #[cfg(test)]
+    pub fn new_unchecked(outcomes: NonEmptySlotTable<SlotOutcome>) -> Self {
+        Self { outcomes }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerminalDisposition {
     /// The deployment succeeded: the complete rollback payload (the full
     /// snapshot: per-slot generations + physical bindings — THE single
@@ -181,8 +209,10 @@ pub enum TerminalDisposition {
     /// recorded) are DERIVED from that table via
     /// [`LedgerTerminal::remaining_changes`] (NON-EMPTY by construction —
     /// the conversion refuses a Degraded wire whose outcomes show
-    /// all-restored).
-    Degraded { outcomes: SlotTable<SlotOutcome> },
+    /// all-restored). The payload is validated by [`DegradedTerminal::try_new`]
+    /// (non-empty by TYPE via [`NonEmptySlotTable`] and at least one
+    /// non-`Restored` outcome).
+    Degraded(DegradedTerminal),
 }
 
 impl TerminalDisposition {
@@ -194,7 +224,7 @@ impl TerminalDisposition {
             TerminalDisposition::Successful(_) => DeploymentStatus::Successful,
             TerminalDisposition::FailedPreflight => DeploymentStatus::FailedPreflight,
             TerminalDisposition::FailedRolledBack { .. } => DeploymentStatus::FailedRolledBack,
-            TerminalDisposition::Degraded { .. } => DeploymentStatus::Degraded,
+            TerminalDisposition::Degraded(_) => DeploymentStatus::Degraded,
         }
     }
 
@@ -296,8 +326,10 @@ impl LedgerTerminal {
                 SlotTable::from_map(map)
             }
             TerminalDisposition::FailedPreflight => SlotTable::new(),
-            TerminalDisposition::FailedRolledBack { outcomes }
-            | TerminalDisposition::Degraded { outcomes } => outcomes.clone(),
+            TerminalDisposition::FailedRolledBack { outcomes } => outcomes.clone(),
+            TerminalDisposition::Degraded(dt) => {
+                SlotTable::from_map(dt.outcomes().clone().into_map())
+            }
         }
     }
 
@@ -674,16 +706,22 @@ impl LedgerTerminalWire {
                 // legitimate: the policy marks the attempt Degraded even
                 // though no slot changed, and the derived remaining-changes
                 // set is empty.
-                if outcomes
-                    .values()
-                    .all(|r| r.outcome == SlotOutcomeKind::Restored)
-                {
-                    return Err(Error::integrity(format!(
-                        "terminal {}: status Degraded requires at least one non-restored outcome (an all-restored attempt is FailedRolledBack, never Degraded)",
+                let non_empty = NonEmptySlotTable::build(
+                    outcomes.iter().map(|(k, v)| (k.clone(), v.clone())),
+                )
+                .map_err(|e| {
+                    Error::integrity(format!(
+                        "terminal {}: status Degraded requires at least one non-restored outcome (an all-restored attempt is FailedRolledBack, never Degraded): {e}",
                         self.deployment_id
-                    )));
-                }
-                TerminalDisposition::Degraded { outcomes }
+                    ))
+                })?;
+                let dt = DegradedTerminal::try_new(non_empty).map_err(|e| {
+                    Error::integrity(format!(
+                        "terminal {}: status Degraded requires at least one non-restored outcome (an all-restored attempt is FailedRolledBack, never Degraded): {e}",
+                        self.deployment_id
+                    ))
+                })?;
+                TerminalDisposition::Degraded(dt)
             }
             (DeploymentStatus::Degraded, Some(_)) => {
                 return Err(Error::integrity(format!(
@@ -738,14 +776,12 @@ impl LedgerTerminalWire {
                 st.full_membership().clone(),
             )?;
         }
-        Ok(Self::from_domain(deployment_id, target, t))
-    }
-
-    pub fn from_domain(
-        deployment_id: &DeploymentId,
-        target: &TargetName,
-        t: &LedgerTerminal,
-    ) -> Self {
+        if let TerminalDisposition::Degraded(dt) = &t.disposition {
+            // Validate the Degraded payload so the emitted wire can never be
+            // refused by `into_domain` (non-empty by TYPE and at least one
+            // non-Restored outcome).
+            DegradedTerminal::try_new(dt.outcomes().clone())?;
+        }
         let rollback = match &t.disposition {
             TerminalDisposition::Successful(st) => Some(st.rollback().clone()),
             _ => None,
@@ -757,7 +793,7 @@ impl LedgerTerminalWire {
             ),
             _ => (Vec::new(), Vec::new()),
         };
-        LedgerTerminalWire {
+        Ok(LedgerTerminalWire {
             deployment_id: deployment_id.clone(),
             target: target.clone(),
             status: t.disposition.status(),
@@ -775,7 +811,7 @@ impl LedgerTerminalWire {
             selected_membership,
             full_membership,
             reason: t.reason.clone(),
-        }
+        })
     }
 }
 
@@ -947,5 +983,162 @@ mod tests_terminal {
             &term5,
         )
         .unwrap();
+    }
+
+    fn arb_slot_outcome() -> impl Strategy<Value = crate::ledger::records::SlotOutcome> {
+        (
+            prop_oneof![
+                Just(crate::ledger::records::SlotOutcomeKind::Activated),
+                Just(crate::ledger::records::SlotOutcomeKind::Failed),
+                Just(crate::ledger::records::SlotOutcomeKind::Restored),
+                Just(crate::ledger::records::SlotOutcomeKind::Skipped),
+                Just(crate::ledger::records::SlotOutcomeKind::Compensated),
+            ],
+            any::<bool>(),
+            prop::option::of("boom".prop_map(|s: String| s)),
+        )
+            .prop_map(|(kind, compensated, error)| {
+                let transition = match &kind {
+                    crate::ledger::records::SlotOutcomeKind::Restored => {
+                        crate::ledger::records::SlotTransition::Restored
+                    }
+                    crate::ledger::records::SlotOutcomeKind::Skipped => {
+                        crate::ledger::records::SlotTransition::NeverAdvanced
+                    }
+                    crate::ledger::records::SlotOutcomeKind::Activated => {
+                        crate::ledger::records::SlotTransition::Advanced
+                    }
+                    crate::ledger::records::SlotOutcomeKind::Failed => {
+                        if compensated {
+                            crate::ledger::records::SlotTransition::Restored
+                        } else {
+                            crate::ledger::records::SlotTransition::AdvanceUnknown
+                        }
+                    }
+                    crate::ledger::records::SlotOutcomeKind::Compensated => {
+                        crate::ledger::records::SlotTransition::Restored
+                    }
+                };
+                crate::ledger::records::SlotOutcome {
+                    outcome: kind,
+                    observation: crate::ledger::records::Observation::Known(
+                        crate::ledger::records::ObservedGeneration {
+                            generation: test_generation_id("gen-1"),
+                        },
+                    ),
+                    compensated,
+                    error,
+                    transition,
+                }
+            })
+    }
+
+    fn arb_outcome_table()
+    -> impl Strategy<Value = BTreeMap<SlotId, crate::ledger::records::SlotOutcome>> {
+        prop::collection::btree_map((0u32..4).prop_map(slot), arb_slot_outcome(), 0..4)
+    }
+
+    proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: crate::testutil::proptest_cases(64),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..Default::default()
+        })]
+        #[test]
+        fn degraded_terminal_protected_constructor(
+            outcomes_map in arb_outcome_table()
+        ) {
+            let is_empty = outcomes_map.is_empty();
+            let all_restored = !is_empty && outcomes_map.values().all(|r| r.outcome == crate::ledger::records::SlotOutcomeKind::Restored);
+            let has_non_restored = outcomes_map.values().any(|r| r.outcome != crate::ledger::records::SlotOutcomeKind::Restored);
+            let non_empty_res = crate::ledger::records::NonEmptySlotTable::build(
+                outcomes_map.clone().into_iter()
+            );
+            if is_empty {
+                prop_assert!(non_empty_res.is_err(), "empty table must fail NonEmptySlotTable::build");
+            } else {
+                prop_assert!(non_empty_res.is_ok(), "non-empty table must build");
+                let ne = non_empty_res.unwrap();
+                let res = DegradedTerminal::try_new(ne);
+                if all_restored {
+                    prop_assert!(res.is_err(), "all-restored must be rejected");
+                    prop_assert!(matches!(res.unwrap_err(), crate::error::Error::Integrity(_)));
+                } else if has_non_restored {
+                    prop_assert!(res.is_ok(), "non-empty with >=1 non-restored must be accepted");
+                } else {
+                    prop_assert!(res.is_err());
+                }
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: crate::testutil::proptest_cases(64),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..Default::default()
+        })]
+        #[test]
+        fn terminal_wire_round_trip(
+            rollback in arb_rollback(),
+            outcomes_map in arb_outcome_table(),
+            degraded_map in arb_outcome_table(),
+            status_choice in 0u32..4,
+        ) {
+            let deployment_id = DeploymentId::new("deploy-00000000-0000-7000-8000-000000000001".to_string());
+            let target = TargetName::new("t1".to_string());
+            let terminal_opt: Option<LedgerTerminal> = match status_choice {
+                0 => {
+                    let rollback_keys: BTreeSet<SlotId> = rollback.keys().cloned().collect();
+                    if rollback_keys.is_empty() {
+                        None
+                    } else {
+                        let activated = crate::identity::NonEmptySlotSet::try_new(rollback_keys.clone()).unwrap();
+                        let st = SuccessfulTerminal::try_new(rollback.clone(), activated, rollback_keys);
+                        st.ok().map(|st| LedgerTerminal {
+                            recorded_at: "2026-01-01T00:00:00Z".to_string(),
+                            disposition: TerminalDisposition::Successful(st),
+                            reason: None,
+                        })
+                    }
+                }
+                1 => Some(LedgerTerminal {
+                    recorded_at: "2026-01-01T00:00:00Z".to_string(),
+                    disposition: TerminalDisposition::FailedPreflight,
+                    reason: None,
+                }),
+                2 => Some(LedgerTerminal {
+                    recorded_at: "2026-01-01T00:00:00Z".to_string(),
+                    disposition: TerminalDisposition::FailedRolledBack {
+                        outcomes: crate::ledger::records::SlotTable::from_map(outcomes_map.clone()),
+                    },
+                    reason: None,
+                }),
+                _ => {
+                    if degraded_map.is_empty() || degraded_map.values().all(|r| r.outcome == crate::ledger::records::SlotOutcomeKind::Restored) {
+                        None
+                    } else {
+                        let ne = crate::ledger::records::NonEmptySlotTable::build(degraded_map.clone().into_iter()).ok();
+                        match ne.and_then(|t| DegradedTerminal::try_new(t).ok()) {
+                            Some(dt) => Some(LedgerTerminal {
+                                recorded_at: "2026-01-01T00:00:00Z".to_string(),
+                                disposition: TerminalDisposition::Degraded(dt),
+                                reason: None,
+                            }),
+                            None => None,
+                        }
+                    }
+                }
+            };
+            if let Some(terminal) = terminal_opt {
+                let wire = LedgerTerminalWire::try_from_domain(&deployment_id, &target, &terminal).expect("try_from_domain must succeed for valid terminal");
+                let json = serde_json::to_string(&wire).unwrap();
+                let wire2: LedgerTerminalWire = serde_json::from_str(&json).unwrap();
+                let back = wire2.into_domain().expect("into_domain must succeed for wire produced by try_from_domain");
+                prop_assert_eq!(back, terminal);
+            }
+        }
     }
 }

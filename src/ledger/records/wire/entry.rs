@@ -49,7 +49,8 @@ mod tests_entry {
     use crate::ledger::records::{DeploymentIntent, LedgerIntentWire};
     use crate::ledger::records::{
         DeploymentStatus, Observation, ObservationError, ObservationWire, ObservedGeneration,
-        ObservedGenerationWire, PhysicalBinding, SlotAttemptStateWire, SlotResult, TargetSnapshot,
+        ObservedGenerationWire, PhysicalBinding, SlotAttemptStateWire, SlotResult, SlotTable,
+        TargetSnapshot,
     };
     use crate::ledger::records::{LedgerTerminal, LedgerTerminalWire, TerminalDisposition};
     use crate::store::local::LocalStore;
@@ -523,7 +524,7 @@ mod tests_entry {
                     "the compensation records the restored slots"
                 );
             }
-            (TerminalDisposition::Degraded { .. }, 3) => {
+            (TerminalDisposition::Degraded(_), 3) => {
                 let remaining_changes = terminal
                     .remaining_changes(intent)
                     .expect("a Degraded terminal derives its remaining changes from the outcomes");
@@ -539,12 +540,13 @@ mod tests_entry {
                 // The Degraded disposition OWNS its outcome table: the
                 // accessor returns the disposition's OWN table (the
                 // remaining changes derive from it).
-                let TerminalDisposition::Degraded { outcomes } = &terminal.disposition else {
+                let TerminalDisposition::Degraded(dt) = &terminal.disposition else {
                     unreachable!("matched above");
                 };
+                let outcomes = dt.outcomes();
                 assert_eq!(
                     &terminal.outcomes(),
-                    outcomes,
+                    &SlotTable::from_map(outcomes.clone().into_map()),
                     "the accessor reads the disposition's OWN table"
                 );
             }

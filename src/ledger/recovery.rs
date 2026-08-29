@@ -16,10 +16,12 @@
 //! commit markers, and appends the terminal before releasing the locks.
 
 use crate::config::ProjectConfig;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::identity::{OperationId, SlotId};
 use crate::ledger::finalize::{FinalizeOutcome, FinalizeSettings, finalize_successful_locked};
+use crate::ledger::records::DegradedTerminal;
 use crate::ledger::records::DeploymentIntent;
+use crate::ledger::records::NonEmptySlotTable;
 use crate::ledger::records::SlotTable;
 use crate::ledger::records::{LedgerTerminal, TerminalDisposition};
 use crate::ledger::records::{Observation, ObservedGeneration};
@@ -257,24 +259,14 @@ fn append_degraded(
         })
         .collect();
     let outcomes: SlotTable<SlotOutcome> = SlotTable::from_map(outcomes);
-    // Verify the disposition is not all-restored (fail fast — the read path
-    // refuses a Degraded wire whose outcomes are ALL restored; a
-    // fully-compensated attempt must be `FailedRolledBack`, never Degraded).
-    if outcomes
-        .values()
-        .all(|r| r.outcome == SlotOutcomeKind::Restored)
-    {
-        return Err(Error::store(
-            "a Degraded terminal requires at least one non-restored outcome — none recorded"
-                .to_string(),
-        ));
-    }
+    let non_empty = NonEmptySlotTable::build(outcomes.iter().map(|(k, v)| (k.clone(), v.clone())))?;
+    let dt = DegradedTerminal::try_new(non_empty)?;
     store.append_terminal(
         target_name,
         &attempt.deployment_id,
         &LedgerTerminal {
             recorded_at: crate::remote::helper::now_rfc3339(),
-            disposition: TerminalDisposition::Degraded { outcomes },
+            disposition: TerminalDisposition::Degraded(dt),
             reason: Some(reason.to_string()),
         },
     )
