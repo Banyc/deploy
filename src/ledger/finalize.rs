@@ -59,9 +59,12 @@
 //! write path; see the "append / read line kinds" section below.
 
 use crate::error::{Error, Result};
-use crate::identity::{GenerationRef, OperationId, PlacementSlotAssignment, SlotId};
+use crate::identity::{
+    GenerationRef, NonEmptySlotSet, OperationId, PlacementSlotAssignment, SlotId,
+};
 use crate::ledger::records::{
-    BoundGeneration, build_rollback, validate_successful_rollback_against_intent,
+    BoundGeneration, SuccessfulTerminal, build_rollback,
+    validate_successful_rollback_against_intent,
 };
 pub use crate::ledger::records::{
     DeploymentIntent, LedgerEntry, LedgerIntentWire, LedgerRollback, LedgerTerminal,
@@ -375,6 +378,14 @@ pub fn finalize_successful_locked(
     //    commit of the finalize); a failure propagates as an `Err` — the
     //    caller aborts and the next push replays the whole finalize. The
     //    guards drop after this line, releasing every lock.
+    let activated_set = NonEmptySlotSet::try_new(selected.iter().map(|sid| (*sid).clone()))
+        .ok_or_else(|| {
+            Error::integrity(format!(
+                "finalize {}: activated must be non-empty (SuccessfulTerminal requires NonEmptySlotSet)",
+                attempt.deployment_id
+            ))
+        })?;
+    let st = SuccessfulTerminal::try_new(rollback, activated_set, current)?;
     let terminal = LedgerTerminal {
         recorded_at: crate::remote::helper::now_rfc3339(),
         // The Successful disposition ALWAYS carries the complete rollback
@@ -390,15 +401,7 @@ pub fn finalize_successful_locked(
         // (activated == selected, rollback == full, selected ⊆ full,
         // full-push selected == full) AND REPRODUCES the intent's frozen
         // values (the read's intent-binding legs refuse a divergence).
-        disposition: TerminalDisposition::Successful {
-            rollback,
-            // SUCCESS IS THE ACTIVATED SLOT-ID SET — DERIVED FROM THE
-            // INTENT: the selected slot set of the attempt (every selected
-            // slot is activated; the per-slot generation/artifact facts
-            // are DERIVED from the rollback — the single source of truth).
-            activated: selected.iter().map(|sid| (*sid).clone()).collect(),
-            full_membership: current,
-        },
+        disposition: TerminalDisposition::Successful(st),
         reason: Some(reason.to_string()),
     };
     store.append_terminal(attempt.target.as_str(), &attempt.deployment_id, &terminal)?;
@@ -847,20 +850,16 @@ mod tests {
         // values. The ACTIVATED set is the INTENT's selected slot set.
         let entries = store.read_ledger(target.as_str()).unwrap();
         let terminal = entries[0].terminal.as_ref().expect("terminal appended");
-        let TerminalDisposition::Successful {
-            rollback,
-            activated,
-            ..
-        } = &terminal.disposition
-        else {
+        let TerminalDisposition::Successful(st) = &terminal.disposition else {
             panic!("the finalization must append a Successful terminal");
         };
         assert_eq!(
-            activated,
+            st.activated().as_set(),
             &BTreeSet::from([SlotId::new("p1")]),
             "the activated slot-id set is derived from the intent's selected slots"
         );
-        let rb = rollback
+        let rb = st
+            .rollback()
             .get(&SlotId::new("p1"))
             .expect("the rollback covers the selected slot");
         assert_eq!(

@@ -193,7 +193,7 @@ impl LocalStore {
                 "checkpoint requires a SUCCESSFUL deployment: deployment '{checkpoint_id}' on target '{target}' has no terminal event (the deployment is still in flight or pending)"
             ))
         })?;
-        if !matches!(terminal.disposition, TerminalDisposition::Successful { .. }) {
+        if !matches!(terminal.disposition, TerminalDisposition::Successful(_)) {
             return Err(Error::r#ref(format!(
                 "checkpoint requires a successful deployment: deployment '{checkpoint_id}' on target '{target}' ended {:?} — only successful deployments carry a rollback state",
                 terminal.status()
@@ -407,9 +407,9 @@ impl LocalStore {
                 // several releases, so reachability is derived per slot —
                 // there is no snapshot-wide release.
                 if let Some(t) = entry.terminal.as_ref()
-                    && let TerminalDisposition::Successful { rollback, .. } = &t.disposition
+                    && let TerminalDisposition::Successful(st) = &t.disposition
                 {
-                    for (_, e) in rollback.iter() {
+                    for (_, e) in st.rollback().iter() {
                         out.releases
                             .insert(e.artifact().release.as_str().to_string());
                         out.trees.insert(e.artifact().tree.as_str().to_string());
@@ -808,60 +808,59 @@ impl LocalStore {
         // `Degraded` one needs its remaining changes, which a status-only
         // append cannot supply).
         let disposition = match status {
-            DeploymentStatus::Successful => TerminalDisposition::Successful {
-                rollback: {
-                    let __slots: BTreeMap<crate::identity::SlotId, crate::identity::GenerationRef> =
-                        BTreeMap::new();
-                    let __bindings: BTreeMap<
-                        crate::identity::SlotId,
-                        crate::ledger::records::PhysicalBinding,
-                    > = BTreeMap::new();
-                    let mut __entries: BTreeMap<
-                        crate::identity::SlotId,
-                        crate::ledger::records::RollbackEntry,
-                    > = BTreeMap::new();
-                    for (k, v) in __slots.clone() {
-                        let b = __bindings.get(&k).cloned().unwrap_or(
-                            crate::ledger::records::PhysicalBinding {
-                                server: crate::identity::ServerId::new("s1"),
-                                deploy_dir: format!("/srv/deploy/{}", k.as_str()),
-                            },
-                        );
-                        __entries.insert(
-                            k.clone(),
-                            crate::ledger::records::RollbackEntry::new(
-                                v.generation.clone(),
-                                v.assignment.artifact.clone(),
-                                b,
-                            ),
-                        );
-                    }
-                    for (k, b) in __bindings.clone() {
-                        __entries.entry(k.clone()).or_insert_with(|| {
-                            crate::ledger::records::RollbackEntry::new(
-                                crate::identity::GenerationId::new("gen-missing".to_string()),
-                                crate::identity::ArtifactRef {
-                                    release: crate::identity::test_release_id("rel-missing"),
-                                    variant: crate::identity::VariantName::new(
-                                        "standard".to_string(),
-                                    ),
-                                    tree: crate::identity::test_tree_digest("missing"),
+            DeploymentStatus::Successful => TerminalDisposition::Successful(
+                crate::ledger::SuccessfulTerminal::try_new(
+                    {
+                        let __slots: BTreeMap<
+                            crate::identity::SlotId,
+                            crate::identity::GenerationRef,
+                        > = BTreeMap::new();
+                        let __bindings: BTreeMap<
+                            crate::identity::SlotId,
+                            crate::ledger::records::PhysicalBinding,
+                        > = BTreeMap::new();
+                        let mut __entries: BTreeMap<
+                            crate::identity::SlotId,
+                            crate::ledger::records::RollbackEntry,
+                        > = BTreeMap::new();
+                        for (k, v) in __slots.clone() {
+                            let b = __bindings.get(&k).cloned().unwrap_or(
+                                crate::ledger::records::PhysicalBinding {
+                                    server: crate::identity::ServerId::new("s1"),
+                                    deploy_dir: format!("/srv/deploy/{}", k.as_str()),
                                 },
-                                b.clone(),
-                            )
-                        });
-                    }
-                    LedgerRollback::from_entries(__entries)
-                },
-                // Status-only append: no memberships are supplied. NOTE: a
-                // Successful terminal with EMPTY memberships is refused by
-                // the read path (a successful deployment proves its
-                // memberships) — this TEST adapter only ever appends; the
-                // successful variant exists for compile/type symmetry and is
-                // not expected to round-trip through a read.
-                activated: BTreeSet::new(),
-                full_membership: BTreeSet::new(),
-            },
+                            );
+                            __entries.insert(
+                                k.clone(),
+                                crate::ledger::records::RollbackEntry::new(
+                                    v.generation.clone(),
+                                    v.assignment.artifact.clone(),
+                                    b,
+                                ),
+                            );
+                        }
+                        for (k, b) in __bindings.clone() {
+                            __entries.entry(k.clone()).or_insert_with(|| {
+                                crate::ledger::records::RollbackEntry::new(
+                                    crate::identity::GenerationId::new("gen-missing".to_string()),
+                                    crate::identity::ArtifactRef {
+                                        release: crate::identity::test_release_id("rel-missing"),
+                                        variant: crate::identity::VariantName::new(
+                                            "standard".to_string(),
+                                        ),
+                                        tree: crate::identity::test_tree_digest("missing"),
+                                    },
+                                    b.clone(),
+                                )
+                            });
+                        }
+                        LedgerRollback::from_entries(__entries)
+                    },
+                    crate::identity::NonEmptySlotSet::try_new(BTreeSet::new()).unwrap(),
+                    BTreeSet::new(),
+                )
+                .unwrap(),
+            ),
             DeploymentStatus::FailedPreflight => TerminalDisposition::FailedPreflight,
             DeploymentStatus::FailedRolledBack => TerminalDisposition::FailedRolledBack {
                 outcomes: SlotTable::new(),

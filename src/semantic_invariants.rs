@@ -5975,7 +5975,7 @@ fn assert_semantic_invariants(model: &Model, system: &Fixture) {
                  must never resolve to a different deployment (no duplicate, no re-append)"
             );
             let rollback = match &ss.terminal.as_ref().expect("terminal").disposition {
-                crate::ledger::TerminalDisposition::Successful { rollback, .. } => rollback,
+                crate::ledger::TerminalDisposition::Successful(st) => st.rollback(),
                 _ => panic!("a successful entry carries a rollback state"),
             };
             // The snapshot's OWN first slot (a slot has exactly one owning

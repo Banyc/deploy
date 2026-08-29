@@ -575,14 +575,17 @@ mod tests {
             // the rollback slots — are enforced by the conversion; the
             // per-slot generation/artifact facts are DERIVED from the
             // rollback, never stored/trusted separately).
-            disposition: TerminalDisposition::Successful {
-                rollback: rollback_for(release),
-                activated: BTreeSet::from([SlotId::new("p1".to_string())]),
-                // THE EXACT-EQUAL MEMBERSHIPS: activated == full == the
-                // one-slot membership (the rollback's slots) — the proven
-                // shape the conversion + read require.
-                full_membership: BTreeSet::from([SlotId::new("p1".to_string())]),
-            },
+            disposition: TerminalDisposition::Successful(
+                crate::ledger::SuccessfulTerminal::try_new(
+                    rollback_for(release),
+                    crate::identity::NonEmptySlotSet::try_new(BTreeSet::from([SlotId::new(
+                        "p1".to_string(),
+                    )]))
+                    .unwrap(),
+                    BTreeSet::from([SlotId::new("p1".to_string())]),
+                )
+                .unwrap(),
+            ),
             reason: None,
         }
     }
@@ -861,12 +864,12 @@ interval_seconds = 0
         store.append_intent(target, &matching_intent).unwrap();
         let mut term = terminal_for(release);
         // Rewrite the rollback's per-slot tree to the caller's tree.
-        let rollback = match &mut term.disposition {
-            TerminalDisposition::Successful { rollback, .. } => rollback,
-            _ => unreachable!("seed_success always builds a Successful terminal"),
-        };
-        {
-            let entries = rollback.clone().into_entries();
+        let new_rollback = {
+            let st = match &term.disposition {
+                TerminalDisposition::Successful(st) => st,
+                _ => unreachable!("seed_success always builds a Successful terminal"),
+            };
+            let entries = st.rollback().clone().into_entries();
             let mut new_entries = BTreeMap::new();
             for (k, e) in entries {
                 let mut art = e.artifact().clone();
@@ -880,7 +883,15 @@ interval_seconds = 0
                     ),
                 );
             }
-            *rollback = crate::ledger::records::LedgerRollback::from_entries(new_entries);
+            crate::ledger::records::LedgerRollback::from_entries(new_entries)
+        };
+        if let TerminalDisposition::Successful(st) = &mut term.disposition {
+            let new_st = crate::ledger::SuccessfulTerminal::new_unchecked(
+                new_rollback,
+                st.activated().clone(),
+                st.full_membership().clone(),
+            );
+            *st = new_st;
         }
         store
             .append_terminal(target, &test_deployment_id(id), &term)

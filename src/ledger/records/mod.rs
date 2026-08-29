@@ -133,7 +133,7 @@ pub use wire::{
     CompensationReport, DeploymentIntent, DesiredGeneration, IntentSlot, LedgerEntry,
     LedgerIntentReport, LedgerIntentWire, LedgerTerminal, LedgerTerminalWire, PreviousGeneration,
     SlotAttemptStateWire, SlotOutcome, SlotOutcomeKind, SlotResult, SlotTransition,
-    TerminalDisposition,
+    SuccessfulTerminal, TerminalDisposition,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1098,11 +1098,9 @@ mod tests {
                 // proper subset (the ⊆ is already enforced by the
                 // conversion).
                 let (selected, full) = match &terminal.disposition {
-                    TerminalDisposition::Successful {
-                        activated,
-                        full_membership,
-                        ..
-                    } => (activated, full_membership),
+                    TerminalDisposition::Successful(st) => {
+                        (st.activated().as_set(), st.full_membership())
+                    }
                     _ => {
                         unreachable!(
                             "a Successful terminal carries its rollback + activated set + memberships"
@@ -1321,17 +1319,12 @@ mod tests {
         let wire = agreeing_terminal(&keys, 0);
         let d = wire.into_domain().unwrap();
         assert_eq!(d.status(), DeploymentStatus::Successful);
-        let TerminalDisposition::Successful {
-            rollback,
-            activated,
-            ..
-        } = d.disposition
-        else {
+        let TerminalDisposition::Successful(st) = d.disposition else {
             panic!("Successful maps to Successful {{ rollback, activated, full_membership }}");
         };
-        assert_eq!(rollback.len(), 2, "the complete rollback payload");
+        assert_eq!(st.rollback().len(), 2, "the complete rollback payload");
         assert_eq!(
-            activated.len(),
+            st.activated().as_set().len(),
             2,
             "the Successful disposition owns the activated slot-id set"
         );
@@ -1499,11 +1492,11 @@ mod tests {
             d_intent.slots.len(),
             "the outcomes exactly cover the membership"
         );
-        let TerminalDisposition::Successful { rollback, .. } = &d_terminal.disposition else {
+        let TerminalDisposition::Successful(st) = &d_terminal.disposition else {
             panic!("Successful disposition");
         };
-        assert_eq!(rollback.len(), d_intent.slots.len());
-        assert_eq!(rollback.len(), d_intent.slots.len());
+        assert_eq!(st.rollback().len(), d_intent.slots.len());
+        assert_eq!(st.rollback().len(), d_intent.slots.len());
         // The PERSISTED memberships are exposed and prove the equations.
         assert_eq!(
             d_terminal.selected_membership(),
@@ -1781,7 +1774,7 @@ mod tests {
         let domain = wire.clone().into_domain().unwrap();
         assert_eq!(domain.status(), DeploymentStatus::Successful);
         assert!(
-            matches!(&domain.disposition, TerminalDisposition::Successful { .. }),
+            matches!(&domain.disposition, TerminalDisposition::Successful(_)),
             "Successful carries its rollback"
         );
         // The domain terminal round-trips through the wire shape; `from_domain`
@@ -1859,16 +1852,11 @@ mod tests {
         // rollback; the accessor materializes the DERIVED view (every
         // activated slot's facts ARE the rollback's generation).
         let d = agreeing_terminal(&keys, 0).into_domain().unwrap();
-        let TerminalDisposition::Successful {
-            rollback,
-            activated,
-            ..
-        } = &d.disposition
-        else {
+        let TerminalDisposition::Successful(st) = &d.disposition else {
             panic!("Successful carries rollback + activated set + memberships");
         };
         let outcomes = d.outcomes();
-        assert_eq!(outcomes.len(), activated.len());
+        assert_eq!(outcomes.len(), st.activated().as_set().len());
         assert!(outcomes.len() == 2);
         assert!(
             outcomes
@@ -1877,13 +1865,13 @@ mod tests {
         );
         for key in outcomes.keys() {
             assert!(
-                rollback.get(key).is_some(),
+                st.rollback().get(key).is_some(),
                 "every activated slot is covered by the rollback (the facts source)"
             );
             assert_eq!(
                 outcomes[key].observation,
                 Observation::Known(ObservedGeneration {
-                    generation: rollback.get(key).unwrap().generation().clone(),
+                    generation: st.rollback().get(key).unwrap().generation().clone(),
                 }),
                 "the derived view's generation EQUALS the rollback's authoritative generation"
             );
@@ -2116,13 +2104,13 @@ mod tests {
             // and the memberships equal that set — the proven shape the
             // round trip preserves.
             let membership: BTreeSet<SlotId> = rollback.keys().cloned().collect();
+            let activated = crate::identity::NonEmptySlotSet::try_new(membership.clone()).unwrap();
             LedgerTerminal {
                 recorded_at: "2026-01-01T00:00:00Z".to_string(),
-                disposition: TerminalDisposition::Successful {
-                    rollback,
-                    activated: membership.clone(),
-                    full_membership: membership,
-                },
+                disposition: TerminalDisposition::Successful(
+                    crate::ledger::SuccessfulTerminal::try_new(rollback, activated, membership)
+                        .unwrap(),
+                ),
                 reason: None,
             }
         })

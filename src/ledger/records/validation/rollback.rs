@@ -560,11 +560,14 @@ mod tests_rollback {
             .unwrap();
         let mutated_terminal = crate::ledger::records::LedgerTerminal {
             recorded_at: "2026-01-01T00:00:00Z".to_string(),
-            disposition: crate::ledger::records::TerminalDisposition::Successful {
-                rollback: mutated_rollback.clone(),
-                activated: activated.clone(),
-                full_membership: activated.clone(),
-            },
+            disposition: crate::ledger::records::TerminalDisposition::Successful(
+                crate::ledger::SuccessfulTerminal::try_new(
+                    mutated_rollback.clone(),
+                    crate::identity::NonEmptySlotSet::try_new(activated.clone()).unwrap(),
+                    activated.clone(),
+                )
+                .unwrap(),
+            ),
             reason: None,
         };
         let append_res = store.append_terminal(
@@ -641,11 +644,7 @@ mod tests_rollback {
             store.append_intent(intent.target.as_str(), &intent).unwrap();
             let mutated_terminal = crate::ledger::records::LedgerTerminal {
                 recorded_at: "2026-01-01T00:00:00Z".to_string(),
-                disposition: crate::ledger::records::TerminalDisposition::Successful {
-                    rollback: mutated_rollback.clone(),
-                    activated: activated.clone(),
-                    full_membership: activated.clone(),
-                },
+                disposition: crate::ledger::records::TerminalDisposition::Successful(crate::ledger::SuccessfulTerminal::try_new(mutated_rollback.clone(), crate::identity::NonEmptySlotSet::try_new(activated.clone()).unwrap(), activated.clone()).unwrap()),
                 reason: None,
             };
             let append_res = store.append_terminal(intent.target.as_str(), &intent.deployment_id, &mutated_terminal);

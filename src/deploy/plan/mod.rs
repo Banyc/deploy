@@ -130,9 +130,9 @@ pub(crate) fn latest_successful_rollback(
 ) -> Result<Option<LedgerRollback>> {
     for entry in store.read_ledger(target)?.into_iter().rev() {
         if let Some(t) = entry.terminal
-            && let crate::ledger::TerminalDisposition::Successful { rollback, .. } = t.disposition
+            && let crate::ledger::TerminalDisposition::Successful(st) = t.disposition
         {
-            return Ok(Some(rollback));
+            return Ok(Some(st.rollback().clone()));
         }
     }
     Ok(None)
@@ -789,64 +789,64 @@ interval_seconds = 0
                     // the rollback, the single source of truth; a seeded
                     // Successful terminal must carry one activated slot per
                     // slotted generation).
-                    disposition: TerminalDisposition::Successful {
-                        rollback: {
-                            let __slots: BTreeMap<
-                                crate::identity::SlotId,
-                                crate::identity::GenerationRef,
-                            > = slots.clone();
-                            let __bindings: BTreeMap<
-                                crate::identity::SlotId,
-                                crate::ledger::records::PhysicalBinding,
-                            > = bindings;
-                            let mut __entries: BTreeMap<
-                                crate::identity::SlotId,
-                                crate::ledger::records::RollbackEntry,
-                            > = BTreeMap::new();
-                            for (k, v) in __slots.clone() {
-                                let b = __bindings.get(&k).cloned().unwrap_or(
-                                    crate::ledger::records::PhysicalBinding {
-                                        server: crate::identity::ServerId::new("s1"),
-                                        deploy_dir: format!("/srv/deploy/{}", k.as_str()),
-                                    },
-                                );
-                                __entries.insert(
-                                    k.clone(),
-                                    crate::ledger::records::RollbackEntry::new(
-                                        v.generation.clone(),
-                                        v.assignment.artifact.clone(),
-                                        b,
-                                    ),
-                                );
-                            }
-                            for (k, b) in __bindings.clone() {
-                                __entries.entry(k.clone()).or_insert_with(|| {
-                                    crate::ledger::records::RollbackEntry::new(
-                                        crate::identity::GenerationId::new(
-                                            "gen-missing".to_string(),
-                                        ),
-                                        crate::identity::ArtifactRef {
-                                            release: crate::identity::test_release_id(
-                                                "rel-missing",
-                                            ),
-                                            variant: crate::identity::VariantName::new(
-                                                "standard".to_string(),
-                                            ),
-                                            tree: crate::identity::test_tree_digest("missing"),
+                    disposition: TerminalDisposition::Successful(
+                        crate::ledger::SuccessfulTerminal::try_new(
+                            {
+                                let __slots: BTreeMap<
+                                    crate::identity::SlotId,
+                                    crate::identity::GenerationRef,
+                                > = slots.clone();
+                                let __bindings: BTreeMap<
+                                    crate::identity::SlotId,
+                                    crate::ledger::records::PhysicalBinding,
+                                > = bindings;
+                                let mut __entries: BTreeMap<
+                                    crate::identity::SlotId,
+                                    crate::ledger::records::RollbackEntry,
+                                > = BTreeMap::new();
+                                for (k, v) in __slots.clone() {
+                                    let b = __bindings.get(&k).cloned().unwrap_or(
+                                        crate::ledger::records::PhysicalBinding {
+                                            server: crate::identity::ServerId::new("s1"),
+                                            deploy_dir: format!("/srv/deploy/{}", k.as_str()),
                                         },
-                                        b.clone(),
-                                    )
-                                });
-                            }
-                            LedgerRollback::from_entries(__entries)
-                        },
-                        activated: slots.keys().cloned().collect(),
-                        // THE EXACT-EQUAL MEMBERSHIPS: activated == full ==
-                        // the slotted generations' keys (the rollback's
-                        // slots) — the proven shape the conversion + read
-                        // require.
-                        full_membership: slots.keys().cloned().collect(),
-                    },
+                                    );
+                                    __entries.insert(
+                                        k.clone(),
+                                        crate::ledger::records::RollbackEntry::new(
+                                            v.generation.clone(),
+                                            v.assignment.artifact.clone(),
+                                            b,
+                                        ),
+                                    );
+                                }
+                                for (k, b) in __bindings.clone() {
+                                    __entries.entry(k.clone()).or_insert_with(|| {
+                                        crate::ledger::records::RollbackEntry::new(
+                                            crate::identity::GenerationId::new(
+                                                "gen-missing".to_string(),
+                                            ),
+                                            crate::identity::ArtifactRef {
+                                                release: crate::identity::test_release_id(
+                                                    "rel-missing",
+                                                ),
+                                                variant: crate::identity::VariantName::new(
+                                                    "standard".to_string(),
+                                                ),
+                                                tree: crate::identity::test_tree_digest("missing"),
+                                            },
+                                            b.clone(),
+                                        )
+                                    });
+                                }
+                                LedgerRollback::from_entries(__entries)
+                            },
+                            crate::identity::NonEmptySlotSet::try_new(slots.keys().cloned())
+                                .unwrap(),
+                            slots.keys().cloned().collect(),
+                        )
+                        .unwrap(),
+                    ),
                     reason: None,
                 },
             )
@@ -1557,11 +1557,14 @@ interval_seconds = 0
         };
         let legacy_terminal = LedgerTerminal {
             recorded_at: "2026-01-01T00:00:00Z".to_string(),
-            disposition: TerminalDisposition::Successful {
-                rollback: crate::ledger::records::LedgerRollback::from_entries(BTreeMap::new()),
-                activated: BTreeSet::new(),
-                full_membership: BTreeSet::from([slot_p1.clone()]),
-            },
+            disposition: TerminalDisposition::Successful(
+                crate::ledger::SuccessfulTerminal::new_unchecked(
+                    crate::ledger::records::LedgerRollback::from_entries(BTreeMap::new()),
+                    crate::identity::NonEmptySlotSet::try_new(BTreeSet::from([slot_p1.clone()]))
+                        .unwrap(),
+                    BTreeSet::from([slot_p1.clone()]),
+                ),
+            ),
             reason: None,
         };
         // THE WRITER REFUSES the missing-binding pair (the hard guarantee):

@@ -213,7 +213,7 @@ pub fn resolve_deployment(
         ))
     })?;
     match &terminal.disposition {
-        TerminalDisposition::Successful { rollback, .. } => Ok(rollback.clone()),
+        TerminalDisposition::Successful(st) => Ok(st.rollback().clone()),
         other => Err(Error::r#ref(format!(
             "deployment '{deployment_id}' on target '{target}' ended {:?} — only successful deployments carry a rollback state",
             other.status()
@@ -254,10 +254,8 @@ pub fn deployment_index(
 ) -> Result<BTreeMap<String, LedgerRollback>> {
     let mut out = BTreeMap::new();
     for e in successful_deployments(store, target)? {
-        if let TerminalDisposition::Successful { rollback, .. } =
-            &e.terminal.as_ref().unwrap().disposition
-        {
-            out.insert(ref_name(target, &e.deployment_id), rollback.clone());
+        if let TerminalDisposition::Successful(st) = &e.terminal.as_ref().unwrap().disposition {
+            out.insert(ref_name(target, &e.deployment_id), st.rollback().clone());
         }
     }
     Ok(out)
@@ -338,10 +336,13 @@ mod tests {
             // The EXACT-EQUAL shape: one Activated outcome per slotted
             // generation (the membership equations — outcomes == selected ==
             // full == rollback slots — are enforced by the conversion).
-            disposition: TerminalDisposition::Successful {
-                rollback: {
-                    let __slots: BTreeMap<crate::identity::SlotId, crate::identity::GenerationRef> =
-                        BTreeMap::from([(
+            disposition: TerminalDisposition::Successful(
+                crate::ledger::SuccessfulTerminal::try_new(
+                    {
+                        let __slots: BTreeMap<
+                            crate::identity::SlotId,
+                            crate::identity::GenerationRef,
+                        > = BTreeMap::from([(
                             SlotId::new("p1".to_string()),
                             GenerationRef {
                                 generation: test_generation_id(&format!("gen-{dep}")),
@@ -355,62 +356,61 @@ mod tests {
                                 },
                             },
                         )]);
-                    let __bindings: BTreeMap<
-                        crate::identity::SlotId,
-                        crate::ledger::records::PhysicalBinding,
-                    > = BTreeMap::from([(
-                        SlotId::new("p1".to_string()),
-                        PhysicalBinding {
-                            server: ServerId::new("server-01".to_string()),
-                            deploy_dir: "/srv/deploy/p1".to_string(),
-                        },
-                    )]);
-                    let mut __entries: BTreeMap<
-                        crate::identity::SlotId,
-                        crate::ledger::records::RollbackEntry,
-                    > = BTreeMap::new();
-                    for (k, v) in __slots.clone() {
-                        let b = __bindings.get(&k).cloned().unwrap_or(
-                            crate::ledger::records::PhysicalBinding {
-                                server: crate::identity::ServerId::new("s1"),
-                                deploy_dir: format!("/srv/deploy/{}", k.as_str()),
+                        let __bindings: BTreeMap<
+                            crate::identity::SlotId,
+                            crate::ledger::records::PhysicalBinding,
+                        > = BTreeMap::from([(
+                            SlotId::new("p1".to_string()),
+                            PhysicalBinding {
+                                server: ServerId::new("server-01".to_string()),
+                                deploy_dir: "/srv/deploy/p1".to_string(),
                             },
-                        );
-                        __entries.insert(
-                            k.clone(),
-                            crate::ledger::records::RollbackEntry::new(
-                                v.generation.clone(),
-                                v.assignment.artifact.clone(),
-                                b,
-                            ),
-                        );
-                    }
-                    for (k, b) in __bindings.clone() {
-                        __entries.entry(k.clone()).or_insert_with(|| {
-                            crate::ledger::records::RollbackEntry::new(
-                                crate::identity::GenerationId::new("gen-missing".to_string()),
-                                crate::identity::ArtifactRef {
-                                    release: crate::identity::test_release_id("rel-missing"),
-                                    variant: crate::identity::VariantName::new(
-                                        "standard".to_string(),
-                                    ),
-                                    tree: crate::identity::test_tree_digest("missing"),
+                        )]);
+                        let mut __entries: BTreeMap<
+                            crate::identity::SlotId,
+                            crate::ledger::records::RollbackEntry,
+                        > = BTreeMap::new();
+                        for (k, v) in __slots.clone() {
+                            let b = __bindings.get(&k).cloned().unwrap_or(
+                                crate::ledger::records::PhysicalBinding {
+                                    server: crate::identity::ServerId::new("s1"),
+                                    deploy_dir: format!("/srv/deploy/{}", k.as_str()),
                                 },
-                                b.clone(),
-                            )
-                        });
-                    }
-                    crate::ledger::records::LedgerRollback::from_entries(__entries)
-                },
-                // SUCCESS IS THE ACTIVATED SLOT-ID SET: the per-slot
-                // generation/artifact facts are DERIVED from the rollback
-                // (never stored/trusted separately).
-                activated: BTreeSet::from([SlotId::new("p1".to_string())]),
-                // THE EXACT-EQUAL MEMBERSHIPS: activated == full == the
-                // one-slot membership (the rollback's slots) — the proven
-                // shape the conversion + read require.
-                full_membership: BTreeSet::from([SlotId::new("p1".to_string())]),
-            },
+                            );
+                            __entries.insert(
+                                k.clone(),
+                                crate::ledger::records::RollbackEntry::new(
+                                    v.generation.clone(),
+                                    v.assignment.artifact.clone(),
+                                    b,
+                                ),
+                            );
+                        }
+                        for (k, b) in __bindings.clone() {
+                            __entries.entry(k.clone()).or_insert_with(|| {
+                                crate::ledger::records::RollbackEntry::new(
+                                    crate::identity::GenerationId::new("gen-missing".to_string()),
+                                    crate::identity::ArtifactRef {
+                                        release: crate::identity::test_release_id("rel-missing"),
+                                        variant: crate::identity::VariantName::new(
+                                            "standard".to_string(),
+                                        ),
+                                        tree: crate::identity::test_tree_digest("missing"),
+                                    },
+                                    b.clone(),
+                                )
+                            });
+                        }
+                        crate::ledger::records::LedgerRollback::from_entries(__entries)
+                    },
+                    crate::identity::NonEmptySlotSet::try_new(BTreeSet::from([SlotId::new(
+                        "p1".to_string(),
+                    )]))
+                    .unwrap(),
+                    BTreeSet::from([SlotId::new("p1".to_string())]),
+                )
+                .unwrap(),
+            ),
             reason: None,
         }
     }
@@ -702,7 +702,7 @@ mod tests {
             .filter_map(|e| {
                 e.terminal
                     .and_then(|t| match &t.disposition {
-                        TerminalDisposition::Successful { rollback, .. } => Some(rollback.clone()),
+                        TerminalDisposition::Successful(st) => Some(st.rollback().clone()),
                         _ => None,
                     })
                     .map(|rb| (e.deployment_id.as_str().to_string(), rb))

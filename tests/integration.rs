@@ -35,7 +35,7 @@ fn rollback_of(e: &LedgerEntry) -> &LedgerRollback {
         .expect("a successful entry has a terminal")
         .disposition
     {
-        deploy::ledger::TerminalDisposition::Successful { rollback, .. } => rollback,
+        deploy::ledger::TerminalDisposition::Successful(st) => st.rollback(),
         _ => panic!("a successful entry carries a rollback state"),
     }
 }

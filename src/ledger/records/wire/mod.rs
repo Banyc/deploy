@@ -28,4 +28,4 @@ pub use intent::{
     PreviousGeneration, SlotAttemptStateWire,
 };
 pub use outcomes::{CompensationReport, SlotOutcome, SlotOutcomeKind, SlotResult, SlotTransition};
-pub use terminal::{LedgerTerminal, LedgerTerminalWire, TerminalDisposition};
+pub use terminal::{LedgerTerminal, LedgerTerminalWire, SuccessfulTerminal, TerminalDisposition};

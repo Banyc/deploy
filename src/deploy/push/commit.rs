@@ -1591,16 +1591,16 @@ pub(crate) mod commit_tests {
             Some(&full_membership),
             "the terminal PERSISTS the full membership == the complete target membership"
         );
-        let TerminalDisposition::Successful { rollback, .. } = &terminal.disposition else {
+        let TerminalDisposition::Successful(st) = &terminal.disposition else {
             panic!("the full push is Successful");
         };
         assert_eq!(
-            rollback.keys().cloned().collect::<BTreeSet<_>>(),
+            st.rollback().keys().cloned().collect::<BTreeSet<_>>(),
             full_membership,
             "the full push's rollback slots equal the membership"
         );
         assert_eq!(
-            rollback.keys().cloned().collect::<BTreeSet<_>>(),
+            st.rollback().keys().cloned().collect::<BTreeSet<_>>(),
             full_membership,
             "the full push's rollback bindings equal the membership"
         );
@@ -2567,14 +2567,12 @@ pub(crate) mod commit_tests {
                         .terminal
                         .as_ref()
                         .expect("the successful finalization appended its terminal");
-                    let ledger::TerminalDisposition::Successful { rollback, .. } =
-                        &terminal.disposition
-                    else {
+                    let ledger::TerminalDisposition::Successful(st) = &terminal.disposition else {
                         panic!("a successful finalization appends a Successful terminal");
                     };
                     assert_eq!(
-                        rollback.keys().collect::<BTreeSet<_>>(),
-                        rollback.keys().collect::<BTreeSet<_>>(),
+                        st.rollback().keys().collect::<BTreeSet<_>>(),
+                        st.rollback().keys().collect::<BTreeSet<_>>(),
                         "the appended rollback's bindings key EXACTLY its slots (one validated map — no parallel maps to drift)"
                     );
                 }

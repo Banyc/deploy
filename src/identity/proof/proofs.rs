@@ -51,15 +51,19 @@ impl SlotSet {
 }
 
 /// The NON-EMPTY, UNIQUE slot-ID set: the canonical membership/slot-set
-/// type carried by the proof-bearing types. Construction is gated on
-/// non-emptiness ([`NonEmptySlotSet::try_new`] refuses an empty input) — a
-/// target with zero slots is never a valid resolution or membership proof
-/// (the raw -> domain conversion rejects targets without slots), so the
-/// invariant holds by construction. This is the SET form; the sibling
-/// records-shape work carries the companion [`NonEmptySlotTable`]-shaped
-/// (map-keyed) non-empty tables the records use.
+/// type carried by the proof-bearing types AND the ledger's
+/// [`crate::ledger::TerminalDisposition::Successful`] activated set.
+/// Construction is gated on non-emptiness ([`NonEmptySlotSet::try_new`]
+/// refuses an empty input) — a target with zero slots is never a valid
+/// resolution or membership proof (the raw -> domain conversion rejects
+/// targets without slots), so the invariant holds by construction. This is
+/// the SET form; the sibling records-shape work carries the companion
+/// [`NonEmptySlotTable`]-shaped (map-keyed) non-empty tables the records
+/// use. Shared by the identity proofs and the ledger's SuccessfulTerminal
+/// — the non-empty invariant is the same structural guarantee (activated
+/// ⊆ full ∧ full == rollback.keys, with activated non-empty by TYPE).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct NonEmptySlotSet(BTreeSet<SlotId>);
+pub struct NonEmptySlotSet(BTreeSet<SlotId>);
 
 impl NonEmptySlotSet {
     /// Build from slot ids; `None` when the input is EMPTY (a non-empty set
@@ -81,9 +85,14 @@ impl NonEmptySlotSet {
     }
 
     /// Whether the set contains the slot id.
-    #[cfg(test)]
-    pub fn contains(&self, id: &SlotId) -> bool {
+    #[allow(dead_code)]
+    pub(crate) fn contains(&self, id: &SlotId) -> bool {
         self.0.contains(id)
+    }
+
+    /// Whether this set is a subset of `full` (activated ⊆ full).
+    pub(crate) fn is_subset_of(&self, full: &BTreeSet<SlotId>) -> bool {
+        self.0.is_subset(full)
     }
 
     /// The backing set as a read-only view (composes with the sibling

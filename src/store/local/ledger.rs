@@ -138,12 +138,12 @@ fn verify_terminal_against_entry(
             // subset (activated ⊆ full is already enforced by the
             // conversion).
             let (rollback, activated, selected, full) = match &terminal.disposition {
-                TerminalDisposition::Successful {
-                    rollback,
-                    activated,
-                    full_membership,
-                    ..
-                } => (rollback, activated, activated, full_membership),
+                TerminalDisposition::Successful(st) => (
+                    st.rollback(),
+                    st.activated().as_set(),
+                    st.activated().as_set(),
+                    st.full_membership(),
+                ),
                 _ => unreachable!(
                     "a Successful terminal carries its rollback + activated set + memberships"
                 ),
@@ -325,14 +325,9 @@ impl LocalStore {
         // — a successful terminal whose activated slots are not covered by
         // its rollback is structurally inconsistent and is refused here
         // before `from_domain` would panic when deriving `outcomes`.
-        if let crate::ledger::records::TerminalDisposition::Successful {
-            rollback,
-            activated,
-            ..
-        } = &terminal.disposition
-        {
-            for sid in activated.iter() {
-                if rollback.get(sid).is_none() {
+        if let crate::ledger::records::TerminalDisposition::Successful(st) = &terminal.disposition {
+            for sid in st.activated().iter() {
+                if st.rollback().get(sid).is_none() {
                     return Err(crate::error::Error::integrity(format!(
                         "terminal {}: activated slot '{}' not covered by rollback — the successful terminal's activated slots must be subset of its rollback (the single-map shape)",
                         deployment_id, sid
@@ -704,85 +699,81 @@ mod tests {
     }
 
     fn successful_terminal() -> LedgerTerminal {
+        let rollback = {
+            let __slots: BTreeMap<crate::identity::SlotId, crate::identity::GenerationRef> =
+                BTreeMap::from([(
+                    SlotId::new("p1".to_string()),
+                    GenerationRef {
+                        generation: test_generation_id("1"),
+                        assignment: PlacementSlotAssignment {
+                            placement_slot: SlotId::new("p1".to_string()),
+                            artifact: ArtifactRef {
+                                release: crate::identity::test_release_id("rel-1"),
+                                variant: VariantName::new("standard".to_string()),
+                                tree: test_tree_digest("1"),
+                            },
+                        },
+                    },
+                )]);
+            let __bindings: BTreeMap<
+                crate::identity::SlotId,
+                crate::ledger::records::PhysicalBinding,
+            > = BTreeMap::from([(
+                SlotId::new("p1".to_string()),
+                crate::ledger::PhysicalBinding {
+                    server: crate::identity::ServerId::new("s1".to_string()),
+                    deploy_dir: "/srv/deploy/p1".to_string(),
+                },
+            )]);
+            let mut __entries: BTreeMap<
+                crate::identity::SlotId,
+                crate::ledger::records::RollbackEntry,
+            > = BTreeMap::new();
+            for (k, v) in __slots.clone() {
+                let b = __bindings.get(&k).cloned().unwrap_or(
+                    crate::ledger::records::PhysicalBinding {
+                        server: crate::identity::ServerId::new("s1"),
+                        deploy_dir: format!("/srv/deploy/{}", k.as_str()),
+                    },
+                );
+                __entries.insert(
+                    k.clone(),
+                    crate::ledger::records::RollbackEntry::new(
+                        v.generation.clone(),
+                        v.assignment.artifact.clone(),
+                        b,
+                    ),
+                );
+            }
+            for (k, b) in __bindings.clone() {
+                __entries.entry(k.clone()).or_insert_with(|| {
+                    crate::ledger::records::RollbackEntry::new(
+                        crate::identity::GenerationId::new("gen-missing".to_string()),
+                        crate::identity::ArtifactRef {
+                            release: crate::identity::test_release_id("rel-missing"),
+                            variant: crate::identity::VariantName::new("standard".to_string()),
+                            tree: crate::identity::test_tree_digest("missing"),
+                        },
+                        b.clone(),
+                    )
+                });
+            }
+            LedgerRollback::from_entries(__entries)
+        };
+        let activated = crate::identity::NonEmptySlotSet::try_new(BTreeSet::from([SlotId::new(
+            "p1".to_string(),
+        )]))
+        .unwrap();
+        let full_membership = BTreeSet::from([SlotId::new("p1".to_string())]);
+        let st = crate::ledger::SuccessfulTerminal::try_new(rollback, activated, full_membership)
+            .unwrap();
         LedgerTerminal {
             recorded_at: "2026-01-01T00:00:00Z".to_string(),
             // A Successful disposition ALWAYS carries its complete rollback
             // payload (the truth table is structural in the domain) AND its
             // OWN outcomes table (every outcome Activated, each key covered
             // by the rollback's slots).
-            disposition: TerminalDisposition::Successful {
-                rollback: {
-                    let __slots: BTreeMap<crate::identity::SlotId, crate::identity::GenerationRef> =
-                        BTreeMap::from([(
-                            SlotId::new("p1".to_string()),
-                            GenerationRef {
-                                generation: test_generation_id("1"),
-                                assignment: PlacementSlotAssignment {
-                                    placement_slot: SlotId::new("p1".to_string()),
-                                    artifact: ArtifactRef {
-                                        release: crate::identity::test_release_id("rel-1"),
-                                        variant: VariantName::new("standard".to_string()),
-                                        tree: test_tree_digest("1"),
-                                    },
-                                },
-                            },
-                        )]);
-                    let __bindings: BTreeMap<
-                        crate::identity::SlotId,
-                        crate::ledger::records::PhysicalBinding,
-                    > = BTreeMap::from([(
-                        SlotId::new("p1".to_string()),
-                        crate::ledger::PhysicalBinding {
-                            server: crate::identity::ServerId::new("s1".to_string()),
-                            deploy_dir: "/srv/deploy/p1".to_string(),
-                        },
-                    )]);
-                    let mut __entries: BTreeMap<
-                        crate::identity::SlotId,
-                        crate::ledger::records::RollbackEntry,
-                    > = BTreeMap::new();
-                    for (k, v) in __slots.clone() {
-                        let b = __bindings.get(&k).cloned().unwrap_or(
-                            crate::ledger::records::PhysicalBinding {
-                                server: crate::identity::ServerId::new("s1"),
-                                deploy_dir: format!("/srv/deploy/{}", k.as_str()),
-                            },
-                        );
-                        __entries.insert(
-                            k.clone(),
-                            crate::ledger::records::RollbackEntry::new(
-                                v.generation.clone(),
-                                v.assignment.artifact.clone(),
-                                b,
-                            ),
-                        );
-                    }
-                    for (k, b) in __bindings.clone() {
-                        __entries.entry(k.clone()).or_insert_with(|| {
-                            crate::ledger::records::RollbackEntry::new(
-                                crate::identity::GenerationId::new("gen-missing".to_string()),
-                                crate::identity::ArtifactRef {
-                                    release: crate::identity::test_release_id("rel-missing"),
-                                    variant: crate::identity::VariantName::new(
-                                        "standard".to_string(),
-                                    ),
-                                    tree: crate::identity::test_tree_digest("missing"),
-                                },
-                                b.clone(),
-                            )
-                        });
-                    }
-                    LedgerRollback::from_entries(__entries)
-                },
-                // SUCCESS IS THE ACTIVATED SLOT-ID SET: the per-slot
-                // generation/artifact facts are DERIVED from the rollback
-                // (never stored/trusted separately).
-                activated: BTreeSet::from([SlotId::new("p1".to_string())]),
-                // THE EXACT-EQUAL MEMBERSHIPS: activated == full == the
-                // one-slot membership (the rollback's slots) — the proven
-                // shape the conversion + read require.
-                full_membership: BTreeSet::from([SlotId::new("p1".to_string())]),
-            },
+            disposition: TerminalDisposition::Successful(st),
             reason: None,
         }
     }
@@ -820,7 +811,7 @@ mod tests {
         );
         assert_eq!(
             match &entries[0].terminal.as_ref().unwrap().disposition {
-                TerminalDisposition::Successful { rollback, .. } => rollback,
+                TerminalDisposition::Successful(st) => st.rollback(),
                 _ => panic!("the successful terminal carries its rollback"),
             }
             .get(&SlotId::new("p1"))
@@ -2315,62 +2306,61 @@ mod tests {
         // activated == full is a legal subset).
         let membership: BTreeSet<SlotId> = intent.slots.keys().cloned().collect();
         let disposition = if successful {
-            TerminalDisposition::Successful {
-                rollback: {
-                    let __slots: BTreeMap<crate::identity::SlotId, crate::identity::GenerationRef> =
-                        intent
-                            .slots
-                            .keys()
-                            .map(|k| (k.clone(), gen_ref(k)))
-                            .collect();
-                    let __bindings: BTreeMap<
-                        crate::identity::SlotId,
-                        crate::ledger::records::PhysicalBinding,
-                    > = intent
+            let rollback = {
+                let __slots: BTreeMap<crate::identity::SlotId, crate::identity::GenerationRef> =
+                    intent
                         .slots
                         .keys()
-                        .map(|k| (k.clone(), binding_for(k)))
+                        .map(|k| (k.clone(), gen_ref(k)))
                         .collect();
-                    let mut __entries: BTreeMap<
-                        crate::identity::SlotId,
-                        crate::ledger::records::RollbackEntry,
-                    > = BTreeMap::new();
-                    for (k, v) in __slots.clone() {
-                        let b = __bindings.get(&k).cloned().unwrap_or(
-                            crate::ledger::records::PhysicalBinding {
-                                server: crate::identity::ServerId::new("s1"),
-                                deploy_dir: format!("/srv/deploy/{}", k.as_str()),
+                let __bindings: BTreeMap<
+                    crate::identity::SlotId,
+                    crate::ledger::records::PhysicalBinding,
+                > = intent
+                    .slots
+                    .keys()
+                    .map(|k| (k.clone(), binding_for(k)))
+                    .collect();
+                let mut __entries: BTreeMap<
+                    crate::identity::SlotId,
+                    crate::ledger::records::RollbackEntry,
+                > = BTreeMap::new();
+                for (k, v) in __slots.clone() {
+                    let b = __bindings.get(&k).cloned().unwrap_or(
+                        crate::ledger::records::PhysicalBinding {
+                            server: crate::identity::ServerId::new("s1"),
+                            deploy_dir: format!("/srv/deploy/{}", k.as_str()),
+                        },
+                    );
+                    __entries.insert(
+                        k.clone(),
+                        crate::ledger::records::RollbackEntry::new(
+                            v.generation.clone(),
+                            v.assignment.artifact.clone(),
+                            b,
+                        ),
+                    );
+                }
+                for (k, b) in __bindings.clone() {
+                    __entries.entry(k.clone()).or_insert_with(|| {
+                        crate::ledger::records::RollbackEntry::new(
+                            crate::identity::GenerationId::new("gen-missing".to_string()),
+                            crate::identity::ArtifactRef {
+                                release: crate::identity::test_release_id("rel-missing"),
+                                variant: crate::identity::VariantName::new("standard".to_string()),
+                                tree: crate::identity::test_tree_digest("missing"),
                             },
-                        );
-                        __entries.insert(
-                            k.clone(),
-                            crate::ledger::records::RollbackEntry::new(
-                                v.generation.clone(),
-                                v.assignment.artifact.clone(),
-                                b,
-                            ),
-                        );
-                    }
-                    for (k, b) in __bindings.clone() {
-                        __entries.entry(k.clone()).or_insert_with(|| {
-                            crate::ledger::records::RollbackEntry::new(
-                                crate::identity::GenerationId::new("gen-missing".to_string()),
-                                crate::identity::ArtifactRef {
-                                    release: crate::identity::test_release_id("rel-missing"),
-                                    variant: crate::identity::VariantName::new(
-                                        "standard".to_string(),
-                                    ),
-                                    tree: crate::identity::test_tree_digest("missing"),
-                                },
-                                b.clone(),
-                            )
-                        });
-                    }
-                    LedgerRollback::from_entries(__entries)
-                },
-                activated: membership.clone(),
-                full_membership: membership,
-            }
+                            b.clone(),
+                        )
+                    });
+                }
+                LedgerRollback::from_entries(__entries)
+            };
+            let activated = crate::identity::NonEmptySlotSet::try_new(membership.clone()).unwrap();
+            TerminalDisposition::Successful(
+                crate::ledger::SuccessfulTerminal::try_new(rollback, activated, membership.clone())
+                    .unwrap(),
+            )
         } else {
             TerminalDisposition::FailedRolledBack { outcomes }
         };
@@ -2481,15 +2471,12 @@ mod tests {
         let mut out: Vec<(LedgerTerminal, String)> = Vec::new();
         // (1) BINDING KEY — add one, remove one, move (rename) one. Only
         // meaningful when the disposition carries a rollback.
-        if let TerminalDisposition::Successful { rollback, .. } = &terminal.disposition {
-            let first = rollback.keys().next().cloned().unwrap();
+        if let TerminalDisposition::Successful(st) = &terminal.disposition {
+            let first = st.rollback().keys().next().cloned().unwrap();
             // (1a) an EXTRA binding key (no generation for it)
             let mut t = terminal.clone();
-            let TerminalDisposition::Successful { rollback, .. } = &mut t.disposition else {
-                unreachable!("cloned above");
-            };
-            {
-                let mut entries = rollback.clone().into_entries();
+            if let TerminalDisposition::Successful(st2) = &t.disposition {
+                let mut entries = st2.rollback().clone().into_entries();
                 entries.insert(
                     SlotId::new("ghost-slot".to_string()),
                     crate::ledger::records::RollbackEntry::new(
@@ -2505,7 +2492,13 @@ mod tests {
                         },
                     ),
                 );
-                *rollback = crate::ledger::records::LedgerRollback::from_entries(entries);
+                let new_rollback = crate::ledger::records::LedgerRollback::from_entries(entries);
+                let new_st = crate::ledger::SuccessfulTerminal::new_unchecked(
+                    new_rollback,
+                    st2.activated().clone(),
+                    st2.full_membership().clone(),
+                );
+                t.disposition = TerminalDisposition::Successful(new_st);
             }
             out.push((
                 t,
@@ -2513,13 +2506,16 @@ mod tests {
             ));
             // (1b) a MISSING binding key (a generation without its binding)
             let mut t = terminal.clone();
-            let TerminalDisposition::Successful { rollback, .. } = &mut t.disposition else {
-                unreachable!("cloned above");
-            };
-            {
-                let mut entries = rollback.clone().into_entries();
+            if let TerminalDisposition::Successful(st2) = &t.disposition {
+                let mut entries = st2.rollback().clone().into_entries();
                 entries.remove(&first);
-                *rollback = crate::ledger::records::LedgerRollback::from_entries(entries);
+                let new_rollback = crate::ledger::records::LedgerRollback::from_entries(entries);
+                let new_st = crate::ledger::SuccessfulTerminal::new_unchecked(
+                    new_rollback,
+                    st2.activated().clone(),
+                    st2.full_membership().clone(),
+                );
+                t.disposition = TerminalDisposition::Successful(new_st);
             }
             out.push((
                 t,
@@ -2528,14 +2524,17 @@ mod tests {
             ));
             // (1c) a binding key RENAMED (moved out of the slot set)
             let mut t = terminal.clone();
-            let TerminalDisposition::Successful { rollback, .. } = &mut t.disposition else {
-                unreachable!("cloned above");
-            };
-            {
-                let mut entries = rollback.clone().into_entries();
+            if let TerminalDisposition::Successful(st2) = &t.disposition {
+                let mut entries = st2.rollback().clone().into_entries();
                 let value = entries.remove(&first).unwrap();
                 entries.insert(SlotId::new("renamed-slot".to_string()), value);
-                *rollback = crate::ledger::records::LedgerRollback::from_entries(entries);
+                let new_rollback = crate::ledger::records::LedgerRollback::from_entries(entries);
+                let new_st = crate::ledger::SuccessfulTerminal::new_unchecked(
+                    new_rollback,
+                    st2.activated().clone(),
+                    st2.full_membership().clone(),
+                );
+                t.disposition = TerminalDisposition::Successful(new_st);
             }
             out.push((
                 t,
@@ -2557,20 +2556,23 @@ mod tests {
             let mut t = terminal.clone();
             let renamed = SlotId::new("renamed-outcome".to_string());
             match &mut t.disposition {
-                TerminalDisposition::Successful {
-                    rollback,
-                    activated,
-                    ..
-                } => {
-                    activated.remove(key);
-                    activated.insert(renamed.clone());
-                    {
-                        let mut entries = rollback.clone().into_entries();
-                        if let Some(e) = entries.remove(key) {
-                            entries.insert(renamed.clone(), e);
-                        }
-                        *rollback = crate::ledger::records::LedgerRollback::from_entries(entries);
+                TerminalDisposition::Successful(st) => {
+                    let mut act_set: BTreeSet<SlotId> = st.activated().as_set().clone();
+                    act_set.remove(key);
+                    act_set.insert(renamed.clone());
+                    let new_activated = crate::identity::NonEmptySlotSet::try_new(act_set).unwrap();
+                    let mut entries = st.rollback().clone().into_entries();
+                    if let Some(e) = entries.remove(key) {
+                        entries.insert(renamed.clone(), e);
                     }
+                    let new_rollback =
+                        crate::ledger::records::LedgerRollback::from_entries(entries);
+                    let new_st = crate::ledger::SuccessfulTerminal::new_unchecked(
+                        new_rollback,
+                        new_activated,
+                        st.full_membership().clone(),
+                    );
+                    *st = new_st;
                 }
                 TerminalDisposition::FailedRolledBack { outcomes: o }
                 | TerminalDisposition::Degraded { outcomes: o } => {
@@ -2658,33 +2660,61 @@ mod tests {
                     before, after,
                     "{why}: a rejected terminal NEVER writes — the ledger bytes are unchanged"
                 );
-                // The READ path's refusal, on a directly-written copy of the
-                // same mutation: every consumer fails with the SAME
-                // integrity error at conversion time. For mutations where
-                // `activated` is not subset of `rollback` (the single-map
-                // shape), `from_domain` would panic when deriving `outcomes`
-                // — that panic is the expected refusal of the structurally
-                // inconsistent shape.
-                let wire_result = std::panic::catch_unwind(|| {
-                    LedgerTerminalWire::from_domain(
-                        &intent.deployment_id,
-                        &TargetName::parse(target).expect("target name is a safe segment"),
-                        &mutated,
-                    )
-                });
-                if let Ok(wire) = wire_result {
-                    write_wire_pair(&store, target, &LedgerIntentWire::from(intent), &wire);
-                    assert_consumers_refuse_with_integrity(
-                        &store,
-                        &config,
-                        target,
-                        "deploy-pair",
-                        &why,
-                    );
-                } else {
-                    // `from_domain` panicked due to `activated` not subset of `rollback`
-                    // — this is the expected refusal for the single-map shape.
+                // The READ path's refusal: invalid wire data must return `Error::Integrity`,
+                // and invalid domain data is now unconstructible via `try_new`. For the
+                // mutated domain (constructed via `new_unchecked`), `try_from_domain`
+                // validates and returns `Integrity` — no panic is involved.
+                let wire_res = LedgerTerminalWire::try_from_domain(
+                    &intent.deployment_id,
+                    &TargetName::parse(target).expect("target name is a safe segment"),
+                    &mutated,
+                );
+                match wire_res {
+                    Err(Error::Integrity(_)) => {
+                        // For Successful invalid shapes, try_from_domain correctly refuses
+                    }
+                    Ok(wire) => {
+                        // For non-Successful dispositions (e.g., FailedRolledBack), wire conversion
+                        // succeeds but the ledger read must still refuse the cross-record mismatch
+                        write_wire_pair(&store, target, &LedgerIntentWire::from(intent), &wire);
+                        assert_consumers_refuse_with_integrity(
+                            &store,
+                            &config,
+                            target,
+                            "deploy-pair",
+                            &why,
+                        );
+                    }
+                    Err(e) => panic!(
+                        "{why}: try_from_domain should return Integrity for invalid shape, got: {e:?}"
+                    ),
                 }
+                // Also verify the wire-level mutation is refused at read time:
+                // build a valid wire then apply a single-leg mutation to its
+                // public memberships/rollback and assert `into_domain` returns Integrity.
+                let valid_wire = LedgerTerminalWire::try_from_domain(
+                    &intent.deployment_id,
+                    &TargetName::parse(target).expect("target name is a safe segment"),
+                    &terminal,
+                )
+                .unwrap();
+                assert!(valid_wire.clone().into_domain().is_ok());
+                let mut bad_wire = valid_wire.clone();
+                bad_wire
+                    .selected_membership
+                    .push(crate::identity::SlotId::new("ghost-wire".to_string()));
+                assert!(matches!(
+                    bad_wire.clone().into_domain(),
+                    Err(Error::Integrity(_))
+                ));
+                write_wire_pair(&store, target, &LedgerIntentWire::from(intent), &bad_wire);
+                assert_consumers_refuse_with_integrity(
+                    &store,
+                    &config,
+                    target,
+                    "deploy-pair",
+                    &why,
+                );
             }
         }
     }
@@ -2774,14 +2804,20 @@ mod tests {
         assert_wire_terminal_refused(&tmp, target, &intent, &bad, "c");
         // (d) EXACT BINDING KEYS: a generation without its binding.
         let mut bad = terminal.clone();
-        let TerminalDisposition::Successful { rollback, .. } = &mut bad.disposition else {
-            unreachable!("the fixture terminal is Successful");
+        let first = match &bad.disposition {
+            TerminalDisposition::Successful(st) => st.rollback().keys().next().cloned().unwrap(),
+            _ => unreachable!("the fixture terminal is Successful"),
         };
-        let first = rollback.keys().next().cloned().unwrap();
-        {
-            let mut entries = rollback.clone().into_entries();
+        if let TerminalDisposition::Successful(st) = &mut bad.disposition {
+            let mut entries = st.rollback().clone().into_entries();
             entries.remove(&first);
-            *rollback = crate::ledger::records::LedgerRollback::from_entries(entries);
+            let new_rollback = crate::ledger::records::LedgerRollback::from_entries(entries);
+            let new_st = crate::ledger::SuccessfulTerminal::new_unchecked(
+                new_rollback,
+                st.activated().clone(),
+                st.full_membership().clone(),
+            );
+            *st = new_st;
         }
         assert_terminal_refused(&tmp, target, &intent, &bad, "d");
         // (e) OUTCOME KEY SET == membership: an outcome for a non-member
@@ -2794,17 +2830,11 @@ mod tests {
         // name a member slot).
         let mut bad = terminal.clone();
         let extra = SlotId::new("extra-slot".to_string());
-        let TerminalDisposition::Successful {
-            rollback,
-            activated,
-            full_membership,
-        } = &mut bad.disposition
-        else {
-            unreachable!("the fixture terminal is Successful");
-        };
-        activated.insert(extra.clone());
-        {
-            let mut entries = rollback.clone().into_entries();
+        if let TerminalDisposition::Successful(st) = &mut bad.disposition {
+            let mut act_set = st.activated().as_set().clone();
+            act_set.insert(extra.clone());
+            let new_activated = crate::identity::NonEmptySlotSet::try_new(act_set).unwrap();
+            let mut entries = st.rollback().clone().into_entries();
             let gr = gen_ref(&extra);
             entries.insert(
                 extra.clone(),
@@ -2814,9 +2844,16 @@ mod tests {
                     binding_for(&extra),
                 ),
             );
-            *rollback = crate::ledger::records::LedgerRollback::from_entries(entries);
+            let new_rollback = crate::ledger::records::LedgerRollback::from_entries(entries);
+            let mut new_full = st.full_membership().clone();
+            new_full.insert(extra.clone());
+            let new_st = crate::ledger::SuccessfulTerminal::new_unchecked(
+                new_rollback,
+                new_activated,
+                new_full,
+            );
+            *st = new_st;
         }
-        full_membership.insert(extra);
         assert_terminal_refused(&tmp, target, &intent, &bad, "e");
         // (f) OUTCOME KEY RENAMED: the domain value carries no slot (the
         // table key owns identity), so an own-key violation is
@@ -2836,25 +2873,26 @@ mod tests {
             .cloned()
             .unwrap();
         let renamed = SlotId::new("renamed-outcome".to_string());
-        let TerminalDisposition::Successful {
-            rollback,
-            activated,
-            full_membership,
-        } = &mut bad.disposition
-        else {
-            unreachable!("the fixture terminal is Successful");
-        };
-        activated.remove(&first);
-        activated.insert(renamed.clone());
-        {
-            let mut entries = rollback.clone().into_entries();
+        if let TerminalDisposition::Successful(st) = &mut bad.disposition {
+            let mut act_set = st.activated().as_set().clone();
+            act_set.remove(&first);
+            act_set.insert(renamed.clone());
+            let new_activated = crate::identity::NonEmptySlotSet::try_new(act_set).unwrap();
+            let mut entries = st.rollback().clone().into_entries();
             if let Some(e) = entries.remove(&first) {
                 entries.insert(renamed.clone(), e);
             }
-            *rollback = crate::ledger::records::LedgerRollback::from_entries(entries);
+            let new_rollback = crate::ledger::records::LedgerRollback::from_entries(entries);
+            let mut new_full = st.full_membership().clone();
+            new_full.remove(&first);
+            new_full.insert(renamed.clone());
+            let new_st2 = crate::ledger::SuccessfulTerminal::new_unchecked(
+                new_rollback,
+                new_activated,
+                new_full,
+            );
+            *st = new_st2;
         }
-        full_membership.remove(&first);
-        full_membership.insert(renamed);
         assert_terminal_refused(&tmp, target, &intent, &bad, "f");
         // (g) TARGET EQUALITY, intent leg: the intent names a different
         // target than the path.
@@ -2897,29 +2935,29 @@ mod tests {
         );
         // THE READER STILL REFUSES a directly-written copy of the same
         // divergent pair (the read path's refusal is independent of the
-        // writer). For terminals where `activated` is not subset of `rollback`
-        // (the single-map shape), `from_domain` would panic when deriving
-        // `outcomes` — that panic is the expected refusal of the inconsistent
-        // shape, so we catch it and consider the direct-write also refused.
-        let wire_result = std::panic::catch_unwind(|| {
-            LedgerTerminalWire::from_domain(
-                &intent.deployment_id,
-                &TargetName::parse(target).expect("target name is a safe segment"),
-                mutated,
-            )
-        });
-        if let Ok(wire) = wire_result {
-            write_wire_pair(&store, target, &LedgerIntentWire::from(intent), &wire);
-            let err = store.read_ledger(target).unwrap_err();
-            assert!(
-                matches!(err, Error::Integrity(_)),
-                "a terminal violating the invariants must be refused with an integrity error, got: {err}"
-            );
-        } else {
-            // `from_domain` panicked due to `activated` not subset of `rollback`
-            // — this is the expected refusal for the single-map shape (the
-            // domain terminal is structurally inconsistent and cannot be
-            // serialized).
+        // writer). Invalid domain data is now unconstructible via `try_new`;
+        // wire conversion returns `Error::Integrity` — no panic is involved.
+        let wire_res = LedgerTerminalWire::try_from_domain(
+            &intent.deployment_id,
+            &TargetName::parse(target).expect("target name is a safe segment"),
+            mutated,
+        );
+        match wire_res {
+            Ok(wire) => {
+                write_wire_pair(&store, target, &LedgerIntentWire::from(intent), &wire);
+                let err = store.read_ledger(target).unwrap_err();
+                assert!(
+                    matches!(err, Error::Integrity(_)),
+                    "a terminal violating the invariants must be refused with an integrity error, got: {err}"
+                );
+            }
+            Err(Error::Integrity(_)) => {
+                // try_from_domain correctly refused the structurally inconsistent shape
+                // (e.g., activated ⊄ rollback) — this is the expected Integrity rejection.
+            }
+            Err(e) => {
+                panic!("try_from_domain should return Integrity for invalid shape, got: {e:?}")
+            }
         }
     }
 

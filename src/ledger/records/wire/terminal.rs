@@ -9,7 +9,7 @@
 //! [`crate::ledger::finalize`].
 
 use crate::error::{Error, Result};
-use crate::identity::{DeploymentId, SlotId, TargetName, Timestamp};
+use crate::identity::{DeploymentId, NonEmptySlotSet, SlotId, TargetName, Timestamp};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -72,53 +72,98 @@ use super::outcomes::{SlotOutcome, SlotOutcomeKind, SlotResult, SlotTransition};
 /// non-Known observation, a mismatched generation, an operation error, or a
 /// compensated slot — an `InProgress`/`PendingCommit` terminal — all are
 /// conversion errors, fail closed).
+/// The VALIDATED successful terminal payload: the complete rollback
+/// (`rollback` — the full snapshot), the ACTIVATED slot-id set
+/// (`activated` — non-empty by TYPE via [`NonEmptySlotSet`]), and the
+/// FULL membership (`full_membership` — the complete target membership at
+/// terminal time). INVARIANTS enforced by CONSTRUCTION via
+/// [`SuccessfulTerminal::try_new`]: `activated` is non-empty by TYPE
+/// (`NonEmptySlotSet`), `activated ⊆ full_membership` by CONSTRUCTION,
+/// `full_membership == rollback.keys()` by CONSTRUCTION. Wire conversion
+/// calls `try_new`; any violation returns `Error::Integrity`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SuccessfulTerminal {
+    rollback: CompleteRollback,
+    activated: NonEmptySlotSet,
+    full_membership: BTreeSet<SlotId>,
+}
+
+impl SuccessfulTerminal {
+    pub fn try_new(
+        rollback: CompleteRollback,
+        activated: NonEmptySlotSet,
+        full_membership: BTreeSet<SlotId>,
+    ) -> Result<Self> {
+        let rollback_slots: BTreeSet<SlotId> = rollback.keys().cloned().collect();
+        if full_membership != rollback_slots {
+            return Err(Error::integrity(format!(
+                "SuccessfulTerminal: full_membership must EXACTLY equal the rollback's slots (full {full_membership:?} vs rollback slots {rollback_slots:?})"
+            )));
+        }
+        if !activated.is_subset_of(&full_membership) {
+            return Err(Error::integrity(format!(
+                "SuccessfulTerminal: activated must be a SUBSET (possibly equal) of full_membership (activated {activated:?} ⊄ full {full_membership:?})"
+            )));
+        }
+        Ok(Self {
+            rollback,
+            activated,
+            full_membership,
+        })
+    }
+    pub fn rollback(&self) -> &CompleteRollback {
+        &self.rollback
+    }
+    pub fn activated(&self) -> &NonEmptySlotSet {
+        &self.activated
+    }
+    pub fn full_membership(&self) -> &BTreeSet<SlotId> {
+        &self.full_membership
+    }
+    #[cfg(test)]
+    pub fn new_unchecked(
+        rollback: CompleteRollback,
+        activated: NonEmptySlotSet,
+        full_membership: BTreeSet<SlotId>,
+    ) -> Self {
+        Self {
+            rollback,
+            activated,
+            full_membership,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerminalDisposition {
     /// The deployment succeeded: the complete rollback payload (the full
     /// snapshot: per-slot generations + physical bindings — THE single
     /// source of truth for each slot's generation/artifact facts), THE
     /// ACTIVATED SLOT-ID SET (the non-empty set of slots the push
-    /// activated — the per-slot generation/artifact facts are NOT stored
-    /// again; every consumer derives them from the rollback via
+    /// activated — `NonEmptySlotSet` by TYPE, so emptiness is
+    /// unrepresentable — the per-slot generation/artifact facts are NOT
+    /// stored again; every consumer derives them from the rollback via
     /// [`LedgerTerminal::outcomes`]), and the TWO PERSISTED MEMBERSHIPS
     /// that PROVE the membership equations: `activated` (the slots the push
     /// actually deployed — EQUAL to the wire's `selected_membership`,
     /// enforced by the conversion) and `full_membership` (the COMPLETE
     /// target membership at terminal time — EQUAL to the rollback's slots,
-    /// enforced by the conversion). `activated ⊆ full_membership` is
-    /// enforced by the conversion; the FULL-push equality `activated ==
-    /// full_membership` is enforced where the terminal merges into its
-    /// entry (the mode — group vs full — lives in the intent's `group`).
-    /// The rollback is the COMPLETE resulting target snapshot: for a GROUP
-    /// push the base-overlay carries the unselected slots forward, so the
-    /// rollback's slots ⊇ the activated set (the outcomes cover the
-    /// SELECTED slots; the full-push EQUALITY activated == full applies
-    /// only to a FULL push, enforced where the terminal merges into its
-    /// entry (the mode lives in the intent's `group`).
-    Successful {
-        rollback: CompleteRollback,
-        /// THE ACTIVATED SLOTS — the NON-EMPTY set of slot ids this push
-        /// activated (the outcomes' keys; a group push's group slots; a
-        /// full push's every target slot). THE SUCCESS REPRESENTATION: the
-        /// per-slot GENERATION/ARTIFACT facts are NOT stored here — they
-        /// are DERIVED from the rollback (the single source of truth,
-        /// [`LedgerTerminal::outcomes`]): the wire → domain conversion
-        /// enforces the COMPLETE EQUALITY PREDICATE per activated slot
-        /// (Known(g), g == the rollback's generation, error == None,
-        /// compensated == false) and then DISCARDS the wire's per-slot
-        /// claims. EQUAL to the wire's `selected_membership` by
-        /// construction — the conversion refuses a disagreement, so the
-        /// record PROVES which slots were selected (every selected slot was
-        /// activated).
-        activated: BTreeSet<SlotId>,
-        /// The FULL membership: the COMPLETE target membership at terminal
-        /// time — the rollback's key set (the intent's FROZEN full
-        /// membership the terminal REPRODUCES). EQUAL to the rollback's
-        /// slots by construction — the conversion refuses a disagreement,
-        /// so the record PROVES the complete membership the rollback
-        /// snapshot covers.
-        full_membership: BTreeSet<SlotId>,
-    },
+    /// enforced by the conversion). `activated ⊆ full_membership` by
+    /// CONSTRUCTION via [`SuccessfulTerminal::try_new`];
+    /// `full_membership == rollback.keys()` by CONSTRUCTION;
+    /// `activated` non-empty by TYPE (`NonEmptySlotSet`); the FULL-push
+    /// equality `activated == full_membership` is enforced where the
+    /// terminal merges into its entry (the mode — group vs full — lives in
+    /// the intent's `group`). The rollback is the COMPLETE resulting target
+    /// snapshot: for a GROUP push the base-overlay carries the unselected
+    /// slots forward, so the rollback's slots ⊇ the activated set (the
+    /// outcomes cover the SELECTED slots; for a FULL push the terminal's own
+    /// memberships satisfy selected == full — enforced where the terminal
+    /// merges into its entry, via the intent's `group`). The validated
+    /// payload is constructed ONLY via [`SuccessfulTerminal::try_new`], so
+    /// an inconsistent shape (e.g. activated ⊄ full, full ≠ rollback
+    /// slots) is UNCONSTRUCTIBLE.
+    Successful(SuccessfulTerminal),
     /// The attempt failed before any slot mutation: no payload (no
     /// rollback — and the conversion also refuses outcomes, since a
     /// pre-mutation failure touched no slot).
@@ -146,7 +191,7 @@ impl TerminalDisposition {
     /// from its disposition; the two are never stored side by side).
     pub fn status(&self) -> DeploymentStatus {
         match self {
-            TerminalDisposition::Successful { .. } => DeploymentStatus::Successful,
+            TerminalDisposition::Successful(_) => DeploymentStatus::Successful,
             TerminalDisposition::FailedPreflight => DeploymentStatus::FailedPreflight,
             TerminalDisposition::FailedRolledBack { .. } => DeploymentStatus::FailedRolledBack,
             TerminalDisposition::Degraded { .. } => DeploymentStatus::Degraded,
@@ -154,7 +199,7 @@ impl TerminalDisposition {
     }
 
     pub fn is_successful(&self) -> bool {
-        matches!(self, TerminalDisposition::Successful { .. })
+        matches!(self, TerminalDisposition::Successful(_))
     }
 }
 
@@ -223,22 +268,17 @@ impl LedgerTerminal {
     /// Known(rollback generation) / error None / compensated false.
     pub fn outcomes(&self) -> SlotTable<SlotOutcome> {
         match &self.disposition {
-            TerminalDisposition::Successful {
-                rollback,
-                activated,
-                ..
-            } => {
+            TerminalDisposition::Successful(st) => {
                 // THE DERIVED VIEW: every activated slot's per-slot outcome
                 // facts ARE the rollback's authoritative generation — never
                 // stored/trusted separately. Every activated slot is a
-                // rollback slot (the conversion enforced activated ==
-                // selected ⊆ full == the rollback's slots).
-                let map: BTreeMap<SlotId, SlotOutcome> = activated
+                // rollback slot (the constructor enforces activated ⊆ full ==
+                // rollback slots, so the lookup is infallible).
+                let map: BTreeMap<SlotId, SlotOutcome> = st
+                    .activated()
                     .iter()
                     .map(|sid| {
-                        let rb = rollback.get(sid).expect(
-                            "a Successful terminal's activated slots are always covered by its rollback — the conversion enforces activated ⊆ rollback == full",
-                        );
+                        let rb = st.rollback().get(sid).unwrap();
                         (
                             sid.clone(),
                             SlotOutcome {
@@ -273,7 +313,7 @@ impl LedgerTerminal {
     /// proves a membership).
     pub fn selected_membership(&self) -> Option<&BTreeSet<SlotId>> {
         match &self.disposition {
-            TerminalDisposition::Successful { activated, .. } => Some(activated),
+            TerminalDisposition::Successful(st) => Some(st.activated().as_set()),
             _ => None,
         }
     }
@@ -288,9 +328,7 @@ impl LedgerTerminal {
     /// non-Successful disposition.
     pub fn full_membership(&self) -> Option<&BTreeSet<SlotId>> {
         match &self.disposition {
-            TerminalDisposition::Successful {
-                full_membership, ..
-            } => Some(full_membership),
+            TerminalDisposition::Successful(st) => Some(st.full_membership()),
             _ => None,
         }
     }
@@ -574,11 +612,18 @@ impl LedgerTerminalWire {
                 // per-slot wire claims have been validated against the
                 // rollback and DISCARDED — the domain keeps the activated
                 // set + the rollback (the facts source) + the memberships.
-                TerminalDisposition::Successful {
-                    rollback,
-                    activated: outcome_keys,
-                    full_membership,
-                }
+                // FINAL BACKSTOP: construct through the validated
+                // `SuccessfulTerminal::try_new` (non-empty by TYPE,
+                // activated ⊆ full, full == rollback.keys).
+                let activated_set = NonEmptySlotSet::try_new(outcome_keys.clone()).ok_or_else(|| {
+                    Error::integrity(format!(
+                        "terminal {}: activated must be non-empty (SuccessfulTerminal requires NonEmptySlotSet)",
+                        self.deployment_id
+                    ))
+                })?;
+                let st =
+                    SuccessfulTerminal::try_new(rollback, activated_set, full_membership.clone())?;
+                TerminalDisposition::Successful(st)
             }
             (DeploymentStatus::Successful, None) => {
                 return Err(Error::integrity(format!(
@@ -673,23 +718,42 @@ impl LedgerTerminalWire {
     /// separately), reproducing the exact consistent shape the engine
     /// writes; the next read's complete equality predicate accepts it
     /// unchanged.
+    pub fn try_from_domain(
+        deployment_id: &DeploymentId,
+        target: &TargetName,
+        t: &LedgerTerminal,
+    ) -> Result<Self> {
+        // VALIDATE the domain's memberships BEFORE materializing `outcomes`
+        // — on the invalid shape return `Error::integrity`, NO panic path.
+        if let TerminalDisposition::Successful(st) = &t.disposition {
+            let activated = NonEmptySlotSet::try_new(st.activated().iter().cloned()).ok_or_else(|| {
+                Error::integrity(format!(
+                    "terminal {}: activated must be non-empty (SuccessfulTerminal requires NonEmptySlotSet)",
+                    deployment_id
+                ))
+            })?;
+            SuccessfulTerminal::try_new(
+                st.rollback().clone(),
+                activated,
+                st.full_membership().clone(),
+            )?;
+        }
+        Ok(Self::from_domain(deployment_id, target, t))
+    }
+
     pub fn from_domain(
         deployment_id: &DeploymentId,
         target: &TargetName,
         t: &LedgerTerminal,
     ) -> Self {
         let rollback = match &t.disposition {
-            TerminalDisposition::Successful { rollback, .. } => Some(rollback.clone()),
+            TerminalDisposition::Successful(st) => Some(st.rollback().clone()),
             _ => None,
         };
         let (selected_membership, full_membership) = match &t.disposition {
-            TerminalDisposition::Successful {
-                activated,
-                full_membership,
-                ..
-            } => (
-                activated.iter().cloned().collect(),
-                full_membership.iter().cloned().collect(),
+            TerminalDisposition::Successful(st) => (
+                st.activated().iter().cloned().collect(),
+                st.full_membership().iter().cloned().collect(),
             ),
             _ => (Vec::new(), Vec::new()),
         };
@@ -712,5 +776,176 @@ impl LedgerTerminalWire {
             full_membership,
             reason: t.reason.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_terminal {
+    use super::*;
+    use crate::identity::ServerId;
+    use crate::identity::{
+        DeploymentId, SlotId, TargetName, test_generation_id, test_release_id, test_tree_digest,
+    };
+    use crate::ledger::records::{LedgerRollback, PhysicalBinding, RollbackEntry};
+    use proptest::prelude::*;
+    use proptest::test_runner::RngSeed;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn slot(i: u32) -> SlotId {
+        SlotId::new(format!("slot-{i}"))
+    }
+
+    fn arb_slot_set() -> impl Strategy<Value = BTreeSet<SlotId>> {
+        prop::collection::btree_set((0u32..4).prop_map(slot), 0..=4)
+    }
+
+    fn arb_rollback() -> impl Strategy<Value = LedgerRollback> {
+        prop::collection::btree_set((0u32..4).prop_map(slot), 0..=4).prop_map(|slots| {
+            let mut entries = BTreeMap::new();
+            for sid in slots {
+                let generation = test_generation_id(sid.as_str());
+                let artifact = crate::identity::ArtifactRef {
+                    release: test_release_id(sid.as_str()),
+                    variant: crate::identity::VariantName::new("standard".to_string()),
+                    tree: test_tree_digest(sid.as_str()),
+                };
+                let binding = PhysicalBinding {
+                    server: ServerId::new("s1".to_string()),
+                    deploy_dir: format!("/srv/deploy/{}", sid.as_str()),
+                };
+                entries.insert(
+                    sid.clone(),
+                    RollbackEntry::new(generation, artifact, binding),
+                );
+            }
+            LedgerRollback::from_entries(entries)
+        })
+    }
+
+    proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: crate::testutil::proptest_cases(64),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..Default::default()
+        })]
+        #[test]
+        fn successful_terminal_protected_constructor(
+            rollback in arb_rollback(),
+            activated_raw in arb_slot_set(),
+            full_raw in arb_slot_set(),
+        ) {
+            let rollback_keys: BTreeSet<SlotId> = rollback.keys().cloned().collect();
+            let activated_opt = crate::identity::NonEmptySlotSet::try_new(activated_raw.clone());
+            let should_succeed = !activated_raw.is_empty()
+                && activated_raw.is_subset(&full_raw)
+                && full_raw == rollback_keys;
+            match activated_opt {
+                None => {
+                    prop_assert!(!should_succeed, "empty activated should not succeed");
+                }
+                Some(activated) => {
+                    let res = SuccessfulTerminal::try_new(rollback.clone(), activated.clone(), full_raw.clone());
+                    if should_succeed {
+                        prop_assert!(res.is_ok(), "try_new should succeed for valid shape, got {res:?}");
+                        let st = res.unwrap();
+                        // For every Ok, call outcomes() and serialization directly — any panic fails the property
+                        let term = LedgerTerminal {
+                            recorded_at: "2026-01-01T00:00:00Z".to_string(),
+                            disposition: TerminalDisposition::Successful(st),
+                            reason: None,
+                        };
+                        let _outcomes = term.outcomes();
+                        let wire_res = LedgerTerminalWire::try_from_domain(
+                            &DeploymentId::new("deploy-00000000-0000-7000-8000-000000000001".to_string()),
+                            &TargetName::new("t1".to_string()),
+                            &term,
+                        );
+                        prop_assert!(wire_res.is_ok(), "try_from_domain should succeed for valid terminal");
+                    } else {
+                        prop_assert!(res.is_err(), "try_new should fail for invalid shape");
+                        prop_assert!(matches!(res.unwrap_err(), crate::error::Error::Integrity(_)));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn successful_terminal_deterministic_cases() {
+        let mk_rollback = |slots: Vec<SlotId>| {
+            let mut entries = BTreeMap::new();
+            for sid in slots.clone() {
+                let generation = test_generation_id(sid.as_str());
+                let artifact = crate::identity::ArtifactRef {
+                    release: test_release_id(sid.as_str()),
+                    variant: crate::identity::VariantName::new("standard".to_string()),
+                    tree: test_tree_digest(sid.as_str()),
+                };
+                let binding = PhysicalBinding {
+                    server: ServerId::new("s1".to_string()),
+                    deploy_dir: format!("/srv/deploy/{}", sid.as_str()),
+                };
+                entries.insert(sid, RollbackEntry::new(generation, artifact, binding));
+            }
+            LedgerRollback::from_entries(entries)
+        };
+        let s1 = slot(1);
+        let s2 = slot(2);
+        // Case 1: empty activated -> None -> try_new cannot be called, should be considered Err
+        let _rb = mk_rollback(vec![s1.clone()]);
+        let activated_empty: BTreeSet<SlotId> = BTreeSet::new();
+        assert!(crate::identity::NonEmptySlotSet::try_new(activated_empty).is_none());
+        // Case 2: activated ⊄ full -> Err
+        let rb2 = mk_rollback(vec![s1.clone()]);
+        let activated =
+            crate::identity::NonEmptySlotSet::try_new(vec![s1.clone(), s2.clone()]).unwrap();
+        let full = BTreeSet::from([s1.clone()]);
+        assert!(matches!(
+            SuccessfulTerminal::try_new(rb2, activated, full),
+            Err(crate::error::Error::Integrity(_))
+        ));
+        // Case 3: full != rollback keys -> Err
+        let rb3 = mk_rollback(vec![s1.clone()]);
+        let activated3 = crate::identity::NonEmptySlotSet::try_new(vec![s1.clone()]).unwrap();
+        let full3 = BTreeSet::from([s1.clone(), s2.clone()]);
+        assert!(matches!(
+            SuccessfulTerminal::try_new(rb3, activated3, full3),
+            Err(crate::error::Error::Integrity(_))
+        ));
+        // Case 4: valid combos -> Ok and outcomes/serialization succeed without panic
+        let rb4 = mk_rollback(vec![s1.clone(), s2.clone()]);
+        let activated4 = crate::identity::NonEmptySlotSet::try_new(vec![s1.clone()]).unwrap();
+        let full4 = BTreeSet::from([s1.clone(), s2.clone()]);
+        let st = SuccessfulTerminal::try_new(rb4.clone(), activated4, full4).unwrap();
+        let term = LedgerTerminal {
+            recorded_at: "2026-01-01T00:00:00Z".to_string(),
+            disposition: TerminalDisposition::Successful(st),
+            reason: None,
+        };
+        let _ = term.outcomes();
+        let _ = LedgerTerminalWire::try_from_domain(
+            &DeploymentId::new("deploy-00000000-0000-7000-8000-000000000001".to_string()),
+            &TargetName::new("t1".to_string()),
+            &term,
+        )
+        .unwrap();
+        // Case 5: activated == full == rollback keys -> Ok
+        let rb5 = mk_rollback(vec![s1.clone()]);
+        let activated5 = crate::identity::NonEmptySlotSet::try_new(vec![s1.clone()]).unwrap();
+        let full5 = BTreeSet::from([s1.clone()]);
+        let st5 = SuccessfulTerminal::try_new(rb5, activated5, full5).unwrap();
+        let term5 = LedgerTerminal {
+            recorded_at: "2026-01-01T00:00:00Z".to_string(),
+            disposition: TerminalDisposition::Successful(st5),
+            reason: None,
+        };
+        let _ = term5.outcomes();
+        let _ = LedgerTerminalWire::try_from_domain(
+            &DeploymentId::new("deploy-00000000-0000-7000-8000-000000000001".to_string()),
+            &TargetName::new("t1".to_string()),
+            &term5,
+        )
+        .unwrap();
     }
 }

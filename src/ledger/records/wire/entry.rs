@@ -342,11 +342,9 @@ mod tests_entry {
                 // proper subset (the ⊆ is already enforced by the
                 // conversion).
                 let (selected, full) = match &terminal.disposition {
-                    TerminalDisposition::Successful {
-                        activated,
-                        full_membership,
-                        ..
-                    } => (activated, full_membership),
+                    TerminalDisposition::Successful(st) => {
+                        (st.activated().as_set(), st.full_membership())
+                    }
                     _ => {
                         unreachable!(
                             "a Successful terminal carries its rollback + activated set + memberships"
@@ -449,21 +447,14 @@ mod tests_entry {
             // its per-slot data.
         }
         match (&terminal.disposition, status_idx) {
-            (
-                TerminalDisposition::Successful {
-                    rollback,
-                    activated,
-                    ..
-                },
-                0,
-            ) => {
+            (TerminalDisposition::Successful(st), 0) => {
                 assert_eq!(
-                    rollback.len(),
+                    st.rollback().len(),
                     keys.len(),
                     "the complete rollback covers every member slot"
                 );
                 assert_eq!(
-                    rollback.len(),
+                    st.rollback().len(),
                     keys.len(),
                     "every slotted generation carries its physical binding"
                 );
@@ -471,7 +462,11 @@ mod tests_entry {
                 // accessor MATERIALIZES the DERIVED VIEW over the rollback
                 // (every activated slot's facts ARE the rollback's
                 // generation — never stored/trusted separately).
-                assert_eq!(activated.len(), keys.len(), "one activated slot per member");
+                assert_eq!(
+                    st.activated().as_set().len(),
+                    keys.len(),
+                    "one activated slot per member"
+                );
                 let outcomes = terminal.outcomes();
                 assert_eq!(
                     outcomes.len(),
@@ -488,7 +483,7 @@ mod tests_entry {
                     assert_eq!(
                         outcomes[key].observation,
                         Observation::Known(ObservedGeneration {
-                            generation: rollback.get(key).unwrap().generation().clone(),
+                            generation: st.rollback().get(key).unwrap().generation().clone(),
                         }),
                         "the derived view's generation EQUALS the rollback's authoritative generation"
                     );

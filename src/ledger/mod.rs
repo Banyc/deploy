@@ -92,8 +92,8 @@ pub use records::{
     ObservedAssignment, ObservedGeneration, ObservedGenerationWire, ObservedSlot, ObservedTarget,
     PhysicalBinding, Pins, PlanOrigin, PlanSource, PreviousGeneration, RebindingPlan,
     RollbackEntry, ServerState, SlotAttemptState, SlotAttemptStateWire, SlotOutcome,
-    SlotOutcomeKind, SlotPlan, SlotResult, SlotTable, SlotTransition, TerminalDisposition,
-    VerifiedReleaseRebinding,
+    SlotOutcomeKind, SlotPlan, SlotResult, SlotTable, SlotTransition, SuccessfulTerminal,
+    TerminalDisposition, VerifiedReleaseRebinding,
 };
 pub use refs::{
     PushRef, attempt_slot_ids, deployment_index, ref_name, resolve_deployment,
