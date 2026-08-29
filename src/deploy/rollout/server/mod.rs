@@ -69,7 +69,7 @@ pub(crate) struct ServerProc {
 // documents the deliberate choice.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn process_server(
-    store: &LocalStore,
+    _store: &LocalStore,
     remote: &dyn Remote,
     helper: &RemoteHelper,
     op_id: &OperationId,
@@ -81,7 +81,7 @@ pub(crate) fn process_server(
     behavior: &BehaviorContract,
     behavior_sha256: &str,
     template_vars: &crate::remote::canonical::TemplateVars,
-    config: &ProjectConfig,
+    _config: &ProjectConfig,
 ) -> Result<ServerProc> {
     // Acquire the slot's mutation lock via an RAII guard so every return path
     // (including errors) releases it. Held in a named binding so in-process
@@ -277,18 +277,14 @@ pub(crate) fn process_server(
         &behavior.activation,
         template_vars,
     ) {
-        let comp = compensate_server_locked(
-            &held,
-            store,
-            remote,
-            helper,
-            op_id,
-            deployment_id,
-            expected_gen,
-            new_gen,
-            config,
-            template_vars,
-        );
+        let request = CompensationRequest {
+            op_id: op_id.clone(),
+            deployment_id: deployment_id.clone(),
+            prior_gen: expected_gen.cloned(),
+            advanced_gen: new_gen.clone(),
+            template_vars: template_vars.clone(),
+        };
+        let comp = compensate_server_locked(&held, &request);
         let _ = held.transaction_record(op_id.as_str(), "compensated");
         let did_comp = matches!(comp, Ok(true));
         let generation = if did_comp {
@@ -312,18 +308,14 @@ pub(crate) fn process_server(
 
     // Verification adapter. On failure, compensate (borrow held lock).
     if let Err(e) = run_verification(remote, &behavior.verification, template_vars) {
-        let comp = compensate_server_locked(
-            &held,
-            store,
-            remote,
-            helper,
-            op_id,
-            deployment_id,
-            expected_gen,
-            new_gen,
-            config,
-            template_vars,
-        );
+        let request = CompensationRequest {
+            op_id: op_id.clone(),
+            deployment_id: deployment_id.clone(),
+            prior_gen: expected_gen.cloned(),
+            advanced_gen: new_gen.clone(),
+            template_vars: template_vars.clone(),
+        };
+        let comp = compensate_server_locked(&held, &request);
         let _ = held.transaction_record(op_id.as_str(), "compensated");
         let did_comp = matches!(comp, Ok(true));
         let generation = if did_comp {

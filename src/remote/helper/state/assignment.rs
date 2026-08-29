@@ -7,7 +7,7 @@ use crate::remote::layout;
 use crate::remote::transport::{CreateNewVerdict, VerifiedExisting};
 use serde::{Deserialize, Serialize};
 
-use super::super::RemoteHelper;
+use super::super::{HeldSlotLock, RemoteHelper};
 
 /// The remote generation record (`generations/<gen>/assignment.json`). The
 /// artifact relationship is expressed via the canonical [`ArtifactRef`]; the
@@ -37,22 +37,21 @@ impl<'a> RemoteHelper<'a> {
         let data = self.remote.read(&p)?;
         serde_json::from_slice(&data).map_err(|e| Error::remote(format!("parse assignment: {e}")))
     }
+}
 
+impl<'a> HeldSlotLock<'a> {
     /// Create a generation record and its `root` symlink. Does not move
-    /// `current`. Requires the slot-mutation capability — only callable via
-    /// `HeldSlotLock::create_generation` (the receiver is the guard; the helper
-    /// is the guard's own — a guard can only mutate the slot it was acquired
-    /// from; there is no API parameter through which a guard from server A can
-    /// authorize a mutation on server B).
+    /// `current`. Requires the slot-mutation capability — the receiver is the
+    /// guard; the helper is the guard's own.
     ///
     /// The assignment record is immutable and installed with create-or-compare
     /// semantics: a generation ID colliding with different content fails
     /// integrity instead of silently rewriting history. Generation IDs are
     /// fresh UUIDv7 values minted while holding the slot lock, so this can
     /// only fire on corruption or retry-after-crash with divergent state.
-    pub(crate) fn create_generation_locked(&self, assignment: &GenerationAssignment) -> Result<()> {
+    pub fn create_generation(&self, assignment: &GenerationAssignment) -> Result<()> {
         let gen_dir = layout::generation(assignment.generation_id.as_str());
-        self.remote.create_dir_all(&gen_dir)?;
+        self.helper.remote.create_dir_all(&gen_dir)?;
         let json = serde_json::to_vec_pretty(assignment)
             .map_err(|e| Error::remote(format!("serialize assignment: {e}")))?;
         let assignment_path = gen_dir.join("assignment.json");
@@ -62,7 +61,7 @@ impl<'a> RemoteHelper<'a> {
         // directory/symlink where the record should be, a mode mismatch, an
         // unreadable entry) is a REAL conflict, never accepted as "already
         // present, fine".
-        match self.remote.try_write_new(&assignment_path, &json)? {
+        match self.helper.remote.try_write_new(&assignment_path, &json)? {
             CreateNewVerdict::Created | CreateNewVerdict::AlreadyPresent => {}
             CreateNewVerdict::Conflict(reason) => match reason {
                 VerifiedExisting::ContentMismatch => {
@@ -105,9 +104,9 @@ impl<'a> RemoteHelper<'a> {
         // deterministically from the (now-verified) assignment, so recreating
         // it after a crash is safe.
         let root_link_path = gen_dir.join("root");
-        if self.remote.metadata_opt(&root_link_path)?.is_none() {
+        if self.helper.remote.metadata_opt(&root_link_path)?.is_none() {
             let root_link = layout::generation_root_link(assignment.artifact.tree.as_str());
-            self.remote.symlink(&root_link, &root_link_path)?;
+            self.helper.remote.symlink(&root_link, &root_link_path)?;
         }
         Ok(())
     }

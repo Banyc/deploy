@@ -225,29 +225,14 @@ impl<'a> RemoteHelper<'a> {
     }
 
     // ---- swap / CAS ----
-    /// Atomically move `current` to the given generation. `expected` is the
-    /// compare-and-swap precondition (the planned pre-push generation). When
-    /// `expected` is `None` there is no precondition (first deployment).
-    ///
-    /// A PRESENT-but-malformed `current` link is NEVER overwritten: it is
-    /// parsed exactly like [`Self::status`], and any deviation from the exact
-    /// canonical `generations/<gen-id>/root` target fails with an integrity
-    /// error — even with `expected = None` (the first-deployment path). Only
-    /// genuine absence (no `current` entry at all) or an exact canonical
-    /// target passes this gate; a canonical target then follows the CAS
-    /// precondition below.
-    ///
-    /// Lock discipline: the CAS precondition alone is necessary but NOT
-    /// sufficient — every caller MUST hold this server's mutation lock
-    /// ([`Self::acquire_lock_guard`]) for the whole read-decide-swap window.
-    /// The same rule governs [`Self::remove_current_if`]. A swap performed
-    /// without the flock can race a concurrent activation between its status
-    /// read and the rename. Requires the slot-mutation capability — only
-    /// callable via `HeldSlotLock::swap_current` (the receiver is the guard;
-    /// the helper is the guard's own — a guard can only mutate the slot it was
-    /// acquired from; there is no API parameter through which a guard from
-    /// server A can authorize a mutation on server B).
-    pub(crate) fn swap_current_locked(
+}
+
+impl<'a> crate::remote::helper::HeldSlotLock<'a> {
+    /// Atomically move `current` to the given generation. Requires the
+    /// slot-mutation capability — the receiver is the guard; the helper is the
+    /// guard's own. See [`crate::remote::helper::RemoteHelper::status`] for
+    /// the canonical-target gate.
+    pub fn swap_current(
         &self,
         expected: &ExpectedCurrent,
         gen_id: &str,
@@ -258,7 +243,7 @@ impl<'a> RemoteHelper<'a> {
         // Then require EXACT equality with the typed expectation — there is
         // NO wildcard state, so a first deployment (`ExpectedCurrent::Absent`)
         // can never overwrite a concurrently-swapped present link.
-        let actual = self.resolve_current()?;
+        let actual = self.helper.resolve_current()?;
         match (expected, &actual) {
             (ExpectedCurrent::Absent, CurrentState::Absent) => {}
             (ExpectedCurrent::Generation(exp), CurrentState::Generation(act)) if exp == act => {}
@@ -282,34 +267,26 @@ impl<'a> RemoteHelper<'a> {
         let tmp_name = format!(".current.tmp.{op_id}");
         let tmp = Path::new(&tmp_name);
         // Remove any stale temp link.
-        self.remote.remove_file(tmp)?;
-        self.remote.symlink(new_target.as_path(), tmp)?;
-        self.remote.rename(tmp, layout::current())?;
-        self.remote.remove_file(tmp).ok();
+        self.helper.remote.remove_file(tmp)?;
+        self.helper.remote.symlink(new_target.as_path(), tmp)?;
+        self.helper.remote.rename(tmp, layout::current())?;
+        self.helper.remote.remove_file(tmp).ok();
         Ok(())
     }
 
-    /// Remove the top-level `current` symlink (used for first-deploy
-    /// compensation). Requires the slot-mutation capability — only callable via
-    /// `HeldSlotLock::remove_current_if` (the receiver is the guard; the helper
-    /// is the guard's own — a guard can only mutate the slot it was acquired from;
-    /// there is no API parameter through which a guard from server A can authorize
-    /// a mutation on server B).
-    /// `expected` makes the removal a compare-and-swap: the link is removed
-    /// only if it currently points at `expected`, so a concurrent activation
-    /// cannot be clobbered.
-    /// Remove `current` only if it currently points at `expected`. Returns true
-    /// if it was removed, false if `current` pointed elsewhere (or did not exist).
-    pub(crate) fn remove_current_if_locked(&self, expected: &ExpectedCurrent) -> Result<bool> {
+    /// Remove `current` only if it currently points at `expected`. Requires the
+    /// slot-mutation capability — the receiver is the guard. `expected` makes
+    /// the removal a compare-and-swap.
+    pub fn remove_current_if(&self, expected: &ExpectedCurrent) -> Result<bool> {
         // Same exact-equality gate as the swap: resolve the actual state once
         // (malformed/transport errors propagate, link byte-identical) and
         // remove ONLY on an exact generation match. `Absent` expectation with
         // genuine absence removes nothing (`Ok(false)`); any disagreement is
         // an error — a removal can never clobber an unexpected state.
-        let actual = self.resolve_current()?;
+        let actual = self.helper.resolve_current()?;
         match (expected, &actual) {
             (ExpectedCurrent::Generation(exp), CurrentState::Generation(act)) if exp == act => {
-                self.remote.remove_file(layout::current())?;
+                self.helper.remote.remove_file(layout::current())?;
                 Ok(true)
             }
             (ExpectedCurrent::Absent, CurrentState::Absent) => Ok(false),

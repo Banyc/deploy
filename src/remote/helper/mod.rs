@@ -66,8 +66,12 @@
 //! the slot-mutation functions (`create_generation`, `swap_current`,
 //! `transaction_record`, `write_commit_marker`, `remove_current_if`,
 //! `publish_from_incoming`). A mutation never consults the on-disk lock;
-//! mutual exclusion comes from acquire-exclusivity plus the caller holding
-//! the capability by convention.
+//! mutual exclusion comes from acquire-exclusivity plus structural enforcement:
+//! the six slot-mutation operations ARE methods on the [`HeldSlotLock`] guard —
+//! there is no `RemoteHelper::*_locked` entry point and no state-changing helper
+//! method that mutates a slot without a guard. Cross-slot mutation is structurally
+//! unrepresentable. The single documented non-guard state change is
+//! `write_inventory` (inventory bookkeeping, not a slot mutation).
 //!
 //! What the protocol GUARANTEES (under the dead-only-recovery precondition):
 //!
@@ -495,6 +499,10 @@ pub struct HeldSlotLock<'a> {
     active: bool,
 }
 impl<'a> HeldSlotLock<'a> {
+    pub(crate) fn helper(&self) -> &'a RemoteHelper<'a> {
+        self.helper
+    }
+
     /// Release the lock now, surfacing the outcome: `Ok` when the lock was
     /// removed (or was already gone — idempotent), `Err` when the release
     /// FAILED — a stale release whose record no longer matches the on-disk
@@ -535,46 +543,6 @@ impl<'a> Drop for HeldSlotLock<'a> {
             // [`HeldSlotLock::release`].
             let _ = self.helper.release_lock(&self.record);
         }
-    }
-}
-
-impl HeldSlotLock<'_> {
-    /// Atomically move `current` to the given generation (guard-bound).
-    pub fn swap_current(
-        &self,
-        expected: &ExpectedCurrent,
-        gen_id: &str,
-        op_id: &str,
-    ) -> Result<()> {
-        self.helper.swap_current_locked(expected, gen_id, op_id)
-    }
-    /// Remove `current` only if it points at `expected` (guard-bound).
-    pub fn remove_current_if(&self, expected: &ExpectedCurrent) -> Result<bool> {
-        self.helper.remove_current_if_locked(expected)
-    }
-    /// Publish a staged incoming tree into the object store (guard-bound).
-    pub fn publish_from_incoming(&self, deployment_id: &str, digest: &str) -> Result<()> {
-        self.helper
-            .publish_from_incoming_locked(deployment_id, digest)
-    }
-    /// Persist a transaction record (guard-bound).
-    pub fn transaction_record(&self, op_id: &str, state: &str) -> Result<()> {
-        self.helper.transaction_record_locked(op_id, state)
-    }
-    /// Write a commit marker (guard-bound).
-    pub fn write_commit_marker(
-        &self,
-        deployment_id: &str,
-        generation: &str,
-        slot_ids: &[String],
-        target: Option<&str>,
-    ) -> Result<()> {
-        self.helper
-            .write_commit_marker_locked(deployment_id, generation, slot_ids, target)
-    }
-    /// Create a generation record and its `root` symlink (guard-bound).
-    pub fn create_generation(&self, assignment: &GenerationAssignment) -> Result<()> {
-        self.helper.create_generation_locked(assignment)
     }
 }
 

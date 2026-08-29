@@ -5,14 +5,14 @@ use crate::error::{Error, Result};
 use crate::remote::layout;
 use crate::remote::transport::{CreateNewVerdict, VerifiedExisting};
 
+use super::super::HeldSlotLock;
+#[allow(unused_imports)]
 use super::super::RemoteHelper;
 
-impl<'a> RemoteHelper<'a> {
+impl<'a> HeldSlotLock<'a> {
     /// Write a commit marker for a deployment under this server. Requires the
-    /// slot-mutation capability — only callable via `HeldSlotLock::write_commit_marker`
-    /// (the receiver is the guard; the helper is the guard's own — a guard can only
-    /// mutate the slot it was acquired from; there is no API parameter through which
-    /// a guard from server A can authorize a mutation on server B). The marker records the generation
+    /// slot-mutation capability — the receiver is the guard; the helper is the
+    /// guard's own. The marker records the generation
     /// this slot committed, the full set of placement slot IDs that
     /// participate in the commit (so a partial marker can never masquerade as
     /// a complete commit), and the originating target of the push. `target`
@@ -23,7 +23,7 @@ impl<'a> RemoteHelper<'a> {
     /// and an existing record must match byte-for-byte (deterministic payload
     /// for the same deployment) or the rewrite fails integrity. A concurrent or
     /// retried commit therefore never corrupts a recorded fact.
-    pub(crate) fn write_commit_marker_locked(
+    pub fn write_commit_marker(
         &self,
         deployment_id: &str,
         generation: &str,
@@ -52,7 +52,7 @@ impl<'a> RemoteHelper<'a> {
         // conflict — a directory/symlink where the marker should be, a mode
         // mismatch, an unreadable entry — is a real marker-integrity
         // conflict, never silently accepted as "already present, fine".
-        match self.remote.try_write_new(&p, &bytes)? {
+        match self.helper.remote.try_write_new(&p, &bytes)? {
             CreateNewVerdict::Created | CreateNewVerdict::AlreadyPresent => Ok(()),
             CreateNewVerdict::Conflict(reason) => Err(Error::integrity(match reason {
                 VerifiedExisting::ContentMismatch => format!(

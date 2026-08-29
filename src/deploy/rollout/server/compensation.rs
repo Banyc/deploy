@@ -1,17 +1,13 @@
 //! Per-slot prior-generation restore: [`compensate_server`] re-installs the
 //! previous generation on a slot whose swap/activate failed.
 
-use crate::config::ProjectConfig;
 use crate::error::Error;
 use crate::error::Result;
 use crate::identity::DeploymentId;
 use crate::identity::GenerationId;
 use crate::identity::OperationId;
 use crate::remote::helper::HeldSlotLock;
-use crate::remote::helper::RemoteHelper;
 use crate::remote::layout;
-use crate::remote::transport::Remote;
-use crate::store::local::LocalStore;
 use crate::verify::command::run_verification;
 use crate::verify::systemd::run_activation;
 
@@ -23,6 +19,18 @@ use crate::verify::systemd::run_activation;
 // process ([`process_server`]) and by the
 // failure-policy pass (failure section).
 
+/// Pure input data for compensation. The helper, transport and remote root
+/// are derived from the held guard — never passed independently.
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub(crate) struct CompensationRequest {
+    pub op_id: OperationId,
+    pub deployment_id: DeploymentId,
+    pub prior_gen: Option<GenerationId>,
+    pub advanced_gen: GenerationId,
+    pub template_vars: crate::remote::canonical::TemplateVars,
+}
+
 /// Restore the prior generation (or remove `current` on first deploy). Uses the
 /// prior generation's stored behavior contract rather than the caller's current
 /// configuration. `advanced_gen` is the generation this slot was just advanced
@@ -31,23 +39,13 @@ use crate::verify::systemd::run_activation;
 /// slot context (deploy_dir, application, ...); the VARIANT is overridden with
 /// the prior assignment's variant, because compensation re-runs the PRIOR
 /// generation's contract. Returns true if compensation restored prior state.
-// 11 parameters mirror `process_server` (same rationale: a settings-struct
-// consolidation of the trailing config/vars args is a dedicated refactor;
-// the allow documents the deliberate choice).
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn compensate_server_locked(
     held: &HeldSlotLock<'_>,
-    _store: &LocalStore,
-    remote: &dyn Remote,
-    helper: &RemoteHelper,
-    op_id: &OperationId,
-    _deployment_id: &DeploymentId,
-    prior_gen: Option<&GenerationId>,
-    advanced_gen: &GenerationId,
-    _config: &ProjectConfig,
-    template_vars: &crate::remote::canonical::TemplateVars,
+    request: &CompensationRequest,
 ) -> Result<bool> {
-    match prior_gen {
+    let helper = held.helper();
+    let remote = helper.remote();
+    match &request.prior_gen {
         Some(prior) => {
             // Load the prior generation's behavior contract from the remote.
             let prior_assignment = match helper.read_assignment(prior.as_str()) {
@@ -71,9 +69,11 @@ pub(crate) fn compensate_server_locked(
             // it and we must not clobber their state.
             if held
                 .swap_current(
-                    &crate::remote::helper::ExpectedCurrent::Generation(advanced_gen.clone()),
+                    &crate::remote::helper::ExpectedCurrent::Generation(
+                        request.advanced_gen.clone(),
+                    ),
                     prior.as_str(),
-                    op_id.as_str(),
+                    request.op_id.as_str(),
                 )
                 .is_err()
             {
@@ -92,7 +92,7 @@ pub(crate) fn compensate_server_locked(
             // via `with_assignment`, so a restored slot never renders a torn
             // combination (e.g. the prior variant with the desired release, or
             // the prior artifact with the failed generation's deployment id).
-            let prior_vars = template_vars.with_assignment(&prior_assignment);
+            let prior_vars = request.template_vars.with_assignment(&prior_assignment);
             run_activation(remote, &root, &prior_behavior.activation, &prior_vars)
                 .map_err(|e| Error::remote(format!("compensation activation failed: {e}")))?;
             run_verification(remote, &prior_behavior.verification, &prior_vars)
@@ -104,7 +104,7 @@ pub(crate) fn compensate_server_locked(
             // generation we advanced (compare-and-swap style).
             Ok(held
                 .remove_current_if(&crate::remote::helper::ExpectedCurrent::Generation(
-                    advanced_gen.clone(),
+                    request.advanced_gen.clone(),
                 ))
                 .unwrap_or(false))
         }
@@ -114,34 +114,15 @@ pub(crate) fn compensate_server_locked(
 /// External wrapper: acquires the slot mutation lock ONCE, calls
 /// `compensate_server_locked`, and drops the guard at the end. An acquire
 /// failure is swallowed as `Ok(false)` (slot stays advanced → attempt Degraded).
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn compensate_server(
-    store: &LocalStore,
-    remote: &dyn Remote,
-    helper: &RemoteHelper,
-    op_id: &OperationId,
-    deployment_id: &DeploymentId,
-    prior_gen: Option<&GenerationId>,
-    advanced_gen: &GenerationId,
-    config: &ProjectConfig,
-    template_vars: &crate::remote::canonical::TemplateVars,
+    helper: &crate::remote::helper::RemoteHelper,
+    request: &CompensationRequest,
 ) -> Result<bool> {
-    let guard = match helper.acquire_lock_guard(op_id) {
+    let guard = match helper.acquire_lock_guard(&request.op_id) {
         Ok(g) => g,
         Err(_) => return Ok(false),
     };
-    compensate_server_locked(
-        &guard,
-        store,
-        remote,
-        helper,
-        op_id,
-        deployment_id,
-        prior_gen,
-        advanced_gen,
-        config,
-        template_vars,
-    )
+    compensate_server_locked(&guard, request)
 }
 
 #[cfg(test)]
@@ -265,18 +246,14 @@ mod compensation_tests {
                     &serde_json::to_string(&behaviors).unwrap(),
                 )
                 .unwrap();
-            let ok = compensate_server(
-                &h.store,
-                &h.remote,
-                &helper,
-                &op_id,
-                &failed_deployment_id,
-                Some(&first.generation),
-                &first.generation, // current still points at the first generation
-                &h.config,
-                &desired_vars,
-            )
-            .map_err(|e| e.to_string())?;
+            let request = CompensationRequest {
+                op_id: op_id.clone(),
+                deployment_id: failed_deployment_id.clone(),
+                prior_gen: Some(first.generation.clone()),
+                advanced_gen: first.generation.clone(),
+                template_vars: desired_vars,
+            };
+            let ok = compensate_server(&helper, &request).map_err(|e| e.to_string())?;
             assert!(ok, "compensation must restore the prior generation");
 
             // The installed unit was re-rendered with the PRIOR assignment:
@@ -440,18 +417,14 @@ mod compensation_tests {
             Some(&GenerationId::generate()),
             Some(&h.tree),
         );
-        let ok = compensate_server(
-            &h.store,
-            &h.remote,
-            &helper,
-            &OperationId::generate(),
-            &DeploymentId::generate(),
-            Some(&first.generation),
-            &g2,
-            &h.config,
-            &vars,
-        )
-        .unwrap();
+        let request = CompensationRequest {
+            op_id: OperationId::generate(),
+            deployment_id: DeploymentId::generate(),
+            prior_gen: Some(first.generation.clone()),
+            advanced_gen: g2.clone(),
+            template_vars: vars,
+        };
+        let ok = compensate_server(&helper, &request).unwrap();
         assert!(
             !ok,
             "compensation must refuse when current no longer names the advanced generation"

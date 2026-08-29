@@ -55,8 +55,8 @@ pub(crate) fn apply_failure_policy(
     members: &[(&SlotConfig, &ServerDef)],
     config: &ProjectConfig,
     target_name: &str,
-    store: &LocalStore,
-    remotes: &HashMap<SlotId, Box<dyn Remote>>,
+    _store: &LocalStore,
+    _remotes: &HashMap<SlotId, Box<dyn Remote>>,
     helpers: &HashMap<SlotId, RemoteHelper>,
     op_id: &OperationId,
     deployment_id: &DeploymentId,
@@ -94,18 +94,14 @@ pub(crate) fn apply_failure_policy(
                         Some(deployment_id),
                         Some(&new_gen[sid]),
                     )?;
-                    let ok = compensate_server(
-                        store,
-                        remotes[sid].as_ref(),
-                        &helpers[sid],
-                        op_id,
-                        deployment_id,
-                        prior,
-                        &new_gen[sid],
-                        config,
-                        &vars,
-                    )
-                    .unwrap_or_default();
+                    let request = crate::deploy::rollout::server::CompensationRequest {
+                        op_id: op_id.clone(),
+                        deployment_id: deployment_id.clone(),
+                        prior_gen: prior.cloned(),
+                        advanced_gen: new_gen[sid].clone(),
+                        template_vars: vars.clone(),
+                    };
+                    let ok = compensate_server(&helpers[sid], &request).unwrap_or_default();
                     if ok {
                         compensated.push(sid.clone());
                         if let Some(r) = results.get_mut(sid) {

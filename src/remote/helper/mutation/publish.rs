@@ -187,28 +187,25 @@ impl<'a> RemoteHelper<'a> {
         let dest = layout::staged_tree(deployment_id, digest);
         copy_host_tree_to_remote(host_src, &dest, self.remote)
     }
+}
 
+impl<'a> crate::remote::helper::HeldSlotLock<'a> {
     /// Publish a previously staged incoming tree into the object store. Requires
-    /// the slot-mutation capability — only callable via `HeldSlotLock::publish_from_incoming`
-    /// (the receiver is the guard; the helper is the guard's own — a guard can only
-    /// mutate the slot it was acquired from; there is no API parameter through which
-    /// a guard from server A can authorize a mutation on server B). Reuses an existing, verified
-    /// object.
-    pub(crate) fn publish_from_incoming_locked(
-        &self,
-        deployment_id: &str,
-        digest: &str,
-    ) -> Result<()> {
-        if self.tree_exists(digest)? {
+    /// the slot-mutation capability — the receiver is the guard; the helper is the
+    /// guard's own. Reuses an existing, verified object.
+    pub fn publish_from_incoming(&self, deployment_id: &str, digest: &str) -> Result<()> {
+        if self.helper.tree_exists(digest)? {
             return Ok(());
         }
         let from = layout::staged_tree(deployment_id, digest);
         let to = layout::tree_root(digest);
-        self.remote.create_dir_all(to.parent().unwrap())?;
-        self.remote.rename(&from, &to)?;
+        self.helper.remote.create_dir_all(to.parent().unwrap())?;
+        self.helper.remote.rename(&from, &to)?;
         Ok(())
     }
+}
 
+impl<'a> RemoteHelper<'a> {
     /// Publish a tree object from a host-local path (used when no prior
     /// incoming staging occurred).
     pub fn publish_tree_from_host(&self, digest: &str, host_src: &Path) -> Result<()> {
