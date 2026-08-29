@@ -77,6 +77,40 @@ pub const SSH_TWRITE_CONFLICT_EXIT: i32 = 17;
 /// happened" from "the destination already existed".
 pub const SSH_TWRITE_PREINSTALL_EXIT: i32 = 1;
 
+/// How long the SSH sidecar flock waits before giving up — mirrors
+/// `crate::remote::transport::SIDECAR_WAIT_TIMEOUT` (2s) with a 5ms retry interval
+/// (`crate::remote::transport::SIDECAR_RETRY_INTERVAL`). The Perl sidecars use a
+/// monotonic deadline (`clock_gettime(CLOCK_MONOTONIC)`) so the wait is bounded
+/// even if the system clock jumps.
+const SIDECAR_FLOCK_DEADLINE_SECS: f64 = 2.0;
+const SIDECAR_FLOCK_INTERVAL_SECS: f64 = 0.005;
+
+/// ONE shared Perl prelude for the sidecar `flock` — the SSH mirror of
+/// `crate::remote::transport::wait_for_sidecar_flock`'s policy: `EWOULDBLOCK`/`EAGAIN`
+/// → wait `interval.min(remaining)`; `EINTR` → retry immediately; any other
+/// errno → `die "sidecar flock failed: $!"`; contended past the deadline →
+/// `die "sidecar contended"`. The prelude reads `$fh` already opened by the
+/// caller and keeps the flock held through file fsync and parent-directory sync
+/// (the same perl process does the fsyncs while still holding the descriptor).
+fn sidecar_flock_prelude(deadline_secs: f64, interval_secs: f64) -> String {
+    format!(
+        "use Fcntl qw(:flock);\n\
+use Errno qw(EINTR EAGAIN EWOULDBLOCK);\n\
+use Time::HiRes qw(clock_gettime usleep CLOCK_MONOTONIC);\n\
+my $deadline = clock_gettime(CLOCK_MONOTONIC) + {deadline:?};\n\
+while (!flock($fh, LOCK_EX | LOCK_NB)) {{{{\n\
+    my $errno = 0 + $!;\n\
+    next if $errno == EINTR;\n\
+    die \"sidecar flock failed: $!\" unless $errno == EAGAIN || $errno == EWOULDBLOCK;\n\
+    my $remaining = $deadline - clock_gettime(CLOCK_MONOTONIC);\n\
+    die \"sidecar contended\" if $remaining <= 0;\n\
+    usleep(int(1_000_000 * ($remaining < {interval:?} ? $remaining : {interval:?})));\n\
+}}}}",
+        deadline = deadline_secs,
+        interval = interval_secs
+    )
+}
+
 /// A transport that drives a real remote host over SSH.
 pub struct SshTransport {
     /// `user@address` passed to `ssh` as the connection target.
@@ -468,12 +502,12 @@ fn remove_file_if_sidecar_cmd(root: &Path, expected: &[u8]) -> String {
     let sidecar_parent_q = shell_quote(&sidecar_parent);
     let lock_q = shell_quote(&lock);
     let expected_q = shell_quote(&String::from_utf8_lossy(expected));
+    let prelude = sidecar_flock_prelude(SIDECAR_FLOCK_DEADLINE_SECS, SIDECAR_FLOCK_INTERVAL_SECS);
     format!(
         "mkdir -p {sidecar_parent} && touch {sidecar} && chmod 644 {sidecar} && perl -e '
 use Fcntl qw(:flock);
 open my $fh, \"+<\", $ARGV[0] or die \"open sidecar: $!\";
-my $locked=0; for (1..32) {{ if (flock($fh, LOCK_EX|LOCK_NB)) {{ $locked=1; last; }} select(undef,undef,undef,0.005); }}
-die \"sidecar contended\" unless $locked;
+{prelude}
 my $lock=$ARGV[1]; my $exp=$ARGV[2];
 if (! -e $lock && ! -l $lock) {{ print \"A\"; exit 0; }}
 open my $lf, \"<\", $lock or do {{ print \"M\"; exit 0; }};
@@ -484,6 +518,7 @@ if ($content eq $exp) {{ unlink $lock or die \"unlink: $!\"; print \"R\"; }} els
         sidecar = sidecar_q,
         lock = lock_q,
         exp = expected_q,
+        prelude = prelude,
     )
 }
 
@@ -516,12 +551,12 @@ fn recover_sidecar_cmd(root: &Path, observed: &[u8], new_data: &[u8]) -> String 
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| ".".to_string());
     let sidecar_parent_q = shell_quote(&sidecar_parent);
+    let prelude = sidecar_flock_prelude(SIDECAR_FLOCK_DEADLINE_SECS, SIDECAR_FLOCK_INTERVAL_SECS);
     format!(
         "mkdir -p {parent} && mkdir -p {sidecar_parent} && touch {sidecar} && chmod 644 {sidecar} && perl -e '
 use Fcntl qw(:flock);
 open my $fh, \"+<\", $ARGV[0] or die \"open sidecar: $!\";
-my $locked=0; for (1..32) {{ if (flock($fh, LOCK_EX|LOCK_NB)) {{ $locked=1; last; }} select(undef,undef,undef,0.005); }}
-die \"sidecar contended\" unless $locked;
+{prelude}
 my $lock=$ARGV[1]; my $obs=$ARGV[2]; my $new=$ARGV[3];
 if (! -e $lock && ! -l $lock) {{ print \"ABSENT\\n\"; exit 0; }}
 open my $lf, \"<\", $lock or do {{ print \"MISMATCH\\n\"; exit 0; }};
@@ -546,6 +581,7 @@ print \"OK\\n\";
         lock = lock_q,
         obs = observed_q,
         new = new_q,
+        prelude = prelude,
     )
 }
 
@@ -681,12 +717,16 @@ impl SshTransport {
     /// the ENTIRE seven-step durable create is performed inside the SAME Perl
     /// process that owns the sidecar `flock`. The sidecar is created durably
     /// (`mkdir -p`, `touch`, `chmod 644`) and never removed; the perl helper
-    /// acquires an exclusive `LOCK_EX|LOCK_NB` with the bounded retry budget
-    /// (32 attempts, ~5ms sleep) mirroring `SIDECAR_RETRY_ATTEMPTS`. The lock
-    /// is held via the open file description until the perl process exits — no
-    /// `exec` is ever performed, so the descriptor is never closed with
-    /// `FD_CLOEXEC` before the mutation. Perl is used because it ships on
-    /// every Linux/macOS remote and provides portable `flock`.
+    /// acquires an exclusive `LOCK_EX|LOCK_NB` with a 2-second monotonic deadline
+    /// and 5ms retry interval (mirroring `SIDECAR_WAIT_TIMEOUT` /
+    /// `SIDECAR_RETRY_INTERVAL`): `EWOULDBLOCK`/`EAGAIN` waits
+    /// `interval.min(remaining)`, `EINTR` retries immediately, any other errno
+    /// fails with `sidecar flock failed`, contended past the deadline dies with
+    /// `sidecar contended`. The lock is held via the open file description until
+    /// the perl process exits — no `exec` is ever performed, so the descriptor is
+    /// never closed with `FD_CLOEXEC` before the mutation, and the flock stays
+    /// held through file fsync and parent-directory sync. Perl is used because it
+    /// ships on every Linux/macOS remote and provides portable `flock`.
     ///
     /// The parent-directory fsync (step 7) is performed INSIDE the Perl process
     /// before exit by opening the directory and calling `IO::Handle->sync` on
@@ -709,14 +749,17 @@ impl SshTransport {
         let lock_q = shell_quote(&lock);
         let mode_str = format!("{:o}", mode & 0o7777);
         let mode_q = shell_quote(&mode_str);
+        let prelude =
+            sidecar_flock_prelude(SIDECAR_FLOCK_DEADLINE_SECS, SIDECAR_FLOCK_INTERVAL_SECS);
         format!(
-            "mkdir -p {parent} && touch {sidecar} && chmod 644 {sidecar} && perl -e 'use Fcntl qw(:flock O_WRONLY O_CREAT O_EXCL); use IO::Handle; open my $fh, \"+<\", $ARGV[0] or die \"open sidecar $ARGV[0]: $!\"; my $locked=0; for (1..32) {{ if (flock($fh, LOCK_EX|LOCK_NB)) {{ $locked=1; last; }} select(undef,undef,undef,0.005); }} die \"sidecar contended\" unless $locked; binmode STDIN; my $data = do {{ local $/; <STDIN> }}; my $lock=$ARGV[1]; my $mode=$ARGV[2]; my $dir=$lock; $dir=~s{{/[^/]+$}}{{}}; $dir=\".\" if $dir eq \"\"; my $base=$lock; $base=~s{{.*/}}{{}}; my $tmp; my $tfh; for (1..32) {{ my $uniq=\"$$.\".time.\".\".int(rand(1000000)); $tmp=\"$dir/.$base.tmp.$uniq\"; if (sysopen($tfh, $tmp, O_WRONLY|O_CREAT|O_EXCL)) {{ last; }} $tmp=undef; if (($!+0)!=17) {{ exit {preinst}; }} }} if (!defined $tmp || !defined $tfh) {{ exit {preinst}; }} binmode $tfh; print $tfh $data or do {{ close $tfh; unlink $tmp; exit {preinst}; }}; close $tfh or do {{ unlink $tmp; exit {preinst}; }}; chmod oct($mode), $tmp or do {{ unlink $tmp; exit {preinst}; }}; open my $sfh, \"+<\", $tmp or do {{ unlink $tmp; exit {preinst}; }}; $sfh->sync or do {{ unlink $tmp; exit {preinst}; }}; close $sfh; if (link($tmp, $lock)) {{ unlink $tmp; open my $dfh, \"<\", $dir or exit {preinst}; $dfh->sync or exit {preinst}; close $dfh; exit 0; }} else {{ my $e=$!+0; unlink $tmp; if ($e==17) {{ exit {conflict}; }} else {{ exit {preinst}; }} }}' -- {sidecar} {lock} {mode}",
+            "mkdir -p {parent} && touch {sidecar} && chmod 644 {sidecar} && perl -e 'use Fcntl qw(:flock O_WRONLY O_CREAT O_EXCL); use IO::Handle; open my $fh, \"+<\", $ARGV[0] or die \"open sidecar $ARGV[0]: $!\"; {prelude} binmode STDIN; my $data = do {{ local $/; <STDIN> }}; my $lock=$ARGV[1]; my $mode=$ARGV[2]; my $dir=$lock; $dir=~s{{/[^/]+$}}{{}}; $dir=\".\" if $dir eq \"\"; my $base=$lock; $base=~s{{.*/}}{{}}; my $tmp; my $tfh; for (1..32) {{ my $uniq=\"$$.\".time.\".\".int(rand(1000000)); $tmp=\"$dir/.$base.tmp.$uniq\"; if (sysopen($tfh, $tmp, O_WRONLY|O_CREAT|O_EXCL)) {{ last; }} $tmp=undef; if (($!+0)!=17) {{ exit {preinst}; }} }} if (!defined $tmp || !defined $tfh) {{ exit {preinst}; }} binmode $tfh; print $tfh $data or do {{ close $tfh; unlink $tmp; exit {preinst}; }}; close $tfh or do {{ unlink $tmp; exit {preinst}; }}; chmod oct($mode), $tmp or do {{ unlink $tmp; exit {preinst}; }}; open my $sfh, \"+<\", $tmp or do {{ unlink $tmp; exit {preinst}; }}; $sfh->sync or do {{ unlink $tmp; exit {preinst}; }}; close $sfh; if (link($tmp, $lock)) {{ unlink $tmp; open my $dfh, \"<\", $dir or exit {preinst}; $dfh->sync or exit {preinst}; close $dfh; exit 0; }} else {{ my $e=$!+0; unlink $tmp; if ($e==17) {{ exit {conflict}; }} else {{ exit {preinst}; }} }}' -- {sidecar} {lock} {mode}",
             parent = parent_q,
             sidecar = sidecar_q,
             lock = lock_q,
             mode = mode_q,
             conflict = SSH_TWRITE_CONFLICT_EXIT,
             preinst = SSH_TWRITE_PREINSTALL_EXIT,
+            prelude = prelude,
         )
     }
 
@@ -1889,6 +1932,199 @@ mod tests_ssh {
             ordinary.contains("mktemp"),
             "ordinary writes retain mktemp-based shell implementation, got: {ordinary}"
         );
+        // New deadline policy: shared prelude uses monotonic deadline, EINTR retry,
+        // and distinguishes contention from other errno.
+        assert!(
+            cmd.contains("while (!flock($fh"),
+            "sidecar flock must use deadline while loop, got: {cmd}"
+        );
+        assert!(
+            cmd.contains("clock_gettime(CLOCK_MONOTONIC)"),
+            "sidecar flock must use monotonic clock, got: {cmd}"
+        );
+        assert!(
+            cmd.contains("usleep"),
+            "sidecar flock must use usleep with bounded interval, got: {cmd}"
+        );
+        assert!(
+            cmd.contains("EINTR"),
+            "sidecar flock must handle EINTR, got: {cmd}"
+        );
+    }
+
+    #[test]
+    fn sidecar_flock_prelude_contains_expected_branches() {
+        let prelude =
+            sidecar_flock_prelude(SIDECAR_FLOCK_DEADLINE_SECS, SIDECAR_FLOCK_INTERVAL_SECS);
+        assert!(prelude.contains("use Fcntl qw(:flock)"), "missing Fcntl");
+        assert!(
+            prelude.contains("use Errno qw(EINTR EAGAIN EWOULDBLOCK)"),
+            "missing Errno"
+        );
+        assert!(
+            prelude.contains("use Time::HiRes qw(clock_gettime usleep CLOCK_MONOTONIC)"),
+            "missing Time::HiRes"
+        );
+        assert!(
+            prelude.contains("clock_gettime(CLOCK_MONOTONIC)"),
+            "missing deadline"
+        );
+        assert!(
+            prelude.contains("while (!flock($fh, LOCK_EX | LOCK_NB))"),
+            "missing while flock"
+        );
+        assert!(
+            prelude.contains("next if $errno == EINTR"),
+            "missing EINTR retry"
+        );
+        assert!(
+            prelude.contains("sidecar flock failed"),
+            "missing non-contention die"
+        );
+        assert!(
+            prelude.contains("EAGAIN") && prelude.contains("EWOULDBLOCK"),
+            "missing contention check"
+        );
+        assert!(
+            prelude.contains("sidecar contended"),
+            "missing contended die"
+        );
+        assert!(prelude.contains("usleep"), "missing usleep");
+        // production constants
+        assert!(
+            prelude.contains("2"),
+            "deadline 2.0 missing, got: {prelude}"
+        );
+        assert!(
+            prelude.contains("0.005"),
+            "interval 0.005 missing, got: {prelude}"
+        );
+        // parameterized variant
+        let short = sidecar_flock_prelude(0.05, 0.005);
+        assert!(
+            short.contains("0.05"),
+            "short deadline not embedded, got: {short}"
+        );
+    }
+
+    #[test]
+    fn sidecar_flock_prelude_all_builders_share_deadline_policy() {
+        let remove = remove_file_if_sidecar_cmd(Path::new("/srv/app"), b"exp");
+        let recover = recover_sidecar_cmd(Path::new("/srv/app"), b"obs", b"new");
+        let tr = transport();
+        let create = tr.try_write_new_sidecar_cmd(
+            &crate::remote::layout::operation_lock(),
+            IMMUTABLE_RECORD_MODE,
+        );
+        for (name, cmd) in [
+            ("remove", remove),
+            ("recover", recover),
+            ("create-new", create),
+        ] {
+            assert!(
+                cmd.contains("while (!flock($fh"),
+                "{name} missing while loop"
+            );
+            assert!(
+                cmd.contains("clock_gettime(CLOCK_MONOTONIC)"),
+                "{name} missing monotonic clock"
+            );
+            assert!(cmd.contains("EINTR"), "{name} missing EINTR");
+            assert!(
+                cmd.contains("EAGAIN") && cmd.contains("EWOULDBLOCK"),
+                "{name} missing EAGAIN/EWOULDBLOCK"
+            );
+            assert!(
+                cmd.contains("sidecar flock failed"),
+                "{name} missing flock failed"
+            );
+            assert!(
+                cmd.contains("sidecar contended"),
+                "{name} missing contended"
+            );
+            assert!(cmd.contains("usleep"), "{name} missing usleep");
+            // the old bounded-retry loop is gone (flock part); the create-new tmp-name
+            // allocation loop is a different O_EXCL concern and is intentionally kept.
+            // So we don't assert absence of "for (1..32)" globally.
+        }
+        // The tmp-name O_EXCL allocation loop in create-new is still present.
+        let tr2 = transport();
+        let create2 = tr2.try_write_new_sidecar_cmd(
+            &crate::remote::layout::operation_lock(),
+            IMMUTABLE_RECORD_MODE,
+        );
+        assert!(
+            create2.contains("sysopen($tfh"),
+            "create-new must retain tmp sysopen loop"
+        );
+        assert!(
+            create2.contains("O_EXCL"),
+            "create-new must retain O_EXCL tmp allocation"
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: crate::testutil::proptest_cases(16),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+        #[test]
+        fn sidecar_flock_prelude_runtime_with_short_deadline(hold_ms in prop_oneof![Just(0u64), Just(10u64), Just(20u64), Just(70u64), Just(90u64)]) {
+            use std::os::unix::io::AsRawFd;
+            let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+            let sidecar = dir.path().join("sidecar");
+            std::fs::write(&sidecar, b"").unwrap();
+            let deadline = 0.05f64;
+            let interval = 0.005f64;
+            let prelude = sidecar_flock_prelude(deadline, interval);
+            let script = format!("open my $fh, \"+<\", $ARGV[0] or die \"open sidecar: $!\"; {prelude} print \"OK\\n\";");
+            let sidecar_str = sidecar.to_string_lossy().into_owned();
+            if hold_ms == 0 {
+                let out = std::process::Command::new("perl")
+                    .arg("-e")
+                    .arg(&script)
+                    .arg("--")
+                    .arg(&sidecar_str)
+                    .output()
+                    .expect("run perl");
+                prop_assert!(out.status.success(), "no contention should succeed: stderr={}", String::from_utf8_lossy(&out.stderr));
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                prop_assert_eq!(stdout.trim(), "OK");
+            } else {
+                let hold = std::time::Duration::from_millis(hold_ms);
+                let deadline_dur = std::time::Duration::from_millis((deadline * 1000.0) as u64);
+                let (tx, rx) = std::sync::mpsc::channel();
+                let sc = sidecar.clone();
+                let handle = std::thread::spawn(move || {
+                    let f = std::fs::OpenOptions::new().read(true).write(true).open(&sc).unwrap();
+                    let fd = f.as_raw_fd();
+                    unsafe { libc::flock(fd, libc::LOCK_EX); }
+                    tx.send(()).unwrap();
+                    std::thread::sleep(hold);
+                    unsafe { libc::flock(fd, libc::LOCK_UN); }
+                });
+                rx.recv().unwrap();
+                let out = std::process::Command::new("perl")
+                    .arg("-e")
+                    .arg(&script)
+                    .arg("--")
+                    .arg(&sidecar_str)
+                    .output()
+                    .expect("run perl");
+                handle.join().unwrap();
+                if hold < deadline_dur {
+                    prop_assert!(out.status.success(), "hold {hold:?} < deadline {deadline_dur:?} should succeed: stderr={}", String::from_utf8_lossy(&out.stderr));
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    prop_assert_eq!(stdout.trim(), "OK");
+                } else {
+                    prop_assert!(!out.status.success(), "hold {hold:?} >= deadline {deadline_dur:?} should be contended");
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    prop_assert!(stderr.contains("sidecar contended"), "contended stderr missing: {stderr}");
+                }
+            }
+        }
     }
 
     /// Execute `sh -c "$command"` with `stdin` piped to the shell — the
