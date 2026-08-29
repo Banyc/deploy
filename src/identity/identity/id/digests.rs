@@ -42,6 +42,7 @@ impl ReleaseDigest {
 }
 
 /// A deterministic 64-lowercase-hex sha256 digest derived from a tag.
+#[cfg(test)]
 pub(crate) fn test_sha256_hex(tag: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -53,10 +54,12 @@ pub(crate) fn test_sha256_hex(tag: &str) -> String {
     format!("{r:016x}{r2:016x}{r:016x}{r2:016x}")
 }
 
+#[cfg(test)]
 pub(crate) fn test_tree_digest(tag: &str) -> TreeDigest {
     TreeDigest::parse(&test_sha256_hex(tag)).expect("canonical test digest")
 }
 
+#[cfg(test)]
 mod tests {
     use super::*;
 

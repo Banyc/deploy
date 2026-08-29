@@ -17,7 +17,6 @@ use crate::ledger::DeploymentStatus;
 use crate::ledger::LedgerIntentReport;
 use crate::ledger::LedgerTerminal;
 use crate::ledger::SlotOutcome;
-use crate::ledger::SlotResult;
 use crate::ledger::SlotTable;
 use crate::remote::helper::RemoteHelper;
 use std::collections::BTreeMap;
@@ -53,75 +52,109 @@ pub(crate) fn run_commit(
     // 16 & 17. Record outcomes, finalize, history, retention. The ledger's
     // intent line (persisted BEFORE the mutation loop) keeps only the
     // immutable intent; the ACTUAL per-slot outcomes and the terminal status
-    // are appended as the deployment's TERMINAL EVENT (the ledger's
-    // `{"kind":"terminal"}` line) — the outcomes feed the non-successful
-    // dispositions (Degraded / FailedRolledBack). The REPORT's attempt
-    // ([`LedgerIntentReport`]) also carries the actuals (for display); the
-    // persisted intent does not — outcomes are never part of the verified
-    // intent object.
+    // are appended as the deployment's TERMINAL EVENT — the ENGINE GATHERS
+    // EVIDENCE and the KERNEL DECIDES every disposition
+    // ([`crate::kernel::transition::decide_terminal`] owns the complete
+    // truth table). The REPORT's attempt ([`LedgerIntentReport`]) also
+    // carries the actuals (for display); the persisted intent does not —
+    // outcomes are never part of the verified intent object.
     let mut attempt = LedgerIntentReport::from_intent(attempt_intent)?;
     attempt.slots = execution.actual_servers.clone();
-    let outcomes_map: BTreeMap<SlotId, SlotResult> = execution.results.clone();
 
-    // Finalize the attempt's terminal event. A SUCCESSFUL attempt goes
-    // through the SAME shared finalizer as recovery
-    // ([`ledger::finalize_successful_locked`]): ONE atomic terminal append
-    // carrying the `Successful` status, the ACTIVATED slot-id set, and the
-    // ROLLBACK STATE (built EXCLUSIVELY from the VERIFIED LIVE
-    // `GenerationRef`s the lock-verified re-observation returns — the
-    // values read under the locks, never the engine's observation records,
-    // which a concurrent controller can make stale). A non-successful
-    // final status (`Degraded` / `FailedRolledBack`) is a plain terminal
-    // append carrying the status and outcomes, no rollback. A demoted
-    // `PendingCommit` status (the commit markers are not all durable) is NOT
-    // terminal at all: the entry stays intent-only — the recoverable pending
-    // state a later push reconciles before its own no-op check.
-    let mut message = format!("push status: {:?}", execution.commit_status);
-    if execution.commit_status == DeploymentStatus::Successful {
-        // The rollback state records each slot's COMPLETE physical binding
-        // (`{server, deploy_dir}`) so an exact rollback can verify a slot
-        // still lives at the exact on-host location it was deployed onto (a
-        // rebound slot OR a slot whose deploy_dir moved must refuse rather
-        // than deploy to the wrong host/location). The bindings come from
-        // the INTENT'S FROZEN per-slot values (schema v6) — the plan-time
-        // `{server, deploy_dir}` the attempt was planned against, NEVER a
-        // re-read of the current configuration: the frozen bindings are the
-        // HISTORICAL fact an exact rollback must verify against, and the
-        // finalize and recovery paths must stamp the SAME values into the
-        // rollback (recovery degrades an attempt whose live binding drifted
-        // instead of recording the live value as history).
+    let message;
+    let status;
+    if execution.had_failure {
+        // THE FAILURE PATH: the engine gathered the per-slot outcome
+        // evidence (and whether every attempted mutation was restored or
+        // never advanced); the KERNEL decides `FailedRolledBack` /
+        // `Degraded` and validates the payload through the constructors.
+        let outcomes: SlotTable<SlotOutcome> = SlotTable::from_map(
+            execution
+                .results
+                .iter()
+                .map(|(key, result)| Ok((key.clone(), SlotOutcome::from_wire(result.clone())?)))
+                .collect::<Result<BTreeMap<SlotId, SlotOutcome>>>()?,
+        );
+        let disposition = crate::kernel::transition::decide_terminal(
+            attempt_intent,
+            crate::kernel::transition::ExecutionReport {
+                preflight_failed: false,
+                verified: false,
+                all_restored: execution.everything_restored,
+                outcomes,
+            },
+        )
+        .map_err(|e| {
+            crate::error::Error::integrity(format!(
+                "push {deployment_id}: the kernel refused the failure disposition: {e}"
+            ))
+        })?;
+        status = disposition.status();
+        store.append_terminal(
+            target_name,
+            deployment_id,
+            &LedgerTerminal::new(
+                crate::remote::helper::now_rfc3339_ts(),
+                crate::kernel::terminal::intent_digest(attempt_intent),
+                disposition,
+                Some("push failed after mutation".to_string()),
+            ),
+        )?;
+        message = format!("push status: {status:?}");
+    } else {
+        // THE SUCCESS PATH — a successful yield goes through the SAME shared
+        // lock-verified finalizer as recovery
+        // ([`crate::ledger::finalize::finalize_successful_locked`]): acquire
+        // every selected-slot mutation lock (sorted-slot-id order), gather
+        // the verification evidence (each selected slot's LIVE generation +
+        // assignment artifact EQUAL the intent's planned result), write the
+        // commit markers, re-verify, check the ONE-PARENT rule (the intent's
+        // parent must still be the target's successful head), then append
+        // the PAYLOAD-FREE `Successful` terminal (bound by the canonical
+        // intent digest). A slot whose live state diverged REFUSES: the
+        // attempt ends `Degraded`. A transient failure leaves the attempt
+        // intent-only (the PENDING state a later push reconciles).
 
-        // The terminal's FULL MEMBERSHIP is the INTENT'S FROZEN value — the
-        // finalizer reads `attempt.full_membership()` (the complete target
-        // membership resolved AT PLAN TIME, when the immutable intent was
-        // written), never recomputed from the current configuration. The
-        // rollback is the COMPLETE resulting target state (the base-overlay
-        // semantics): the SELECTED slots' VERIFIED LIVE assignments overlaid
-        // on the latest successful base, unselected slots carried forward —
-        // so the rollback's slots are the frozen FULL membership, never just
-        // the selected slots. The terminal PERSISTS both memberships
-        // (selected = the intent's selected slots = the activated set, full
-        // = the frozen value) and the read path enforces the equations:
-        // outcomes == selected, rollback == full, selected ⊆ full, the
-        // INTENT-BINDING legs (the terminal must REPRODUCE the intent's
-        // frozen selected/full), and — for a FULL push (no group,
-        // distinguished by the intent's `group`) — selected == full.
-        // THE ONE LOCK-VERIFIED FINALIZER — the SAME shared operation as
-        // recovery ([`ledger::finalize_successful_locked`]): acquire ALL
-        // selected-slot mutation locks (deterministic sorted-slot-id order),
-        // re-observe EVERY selected slot's LIVE `GenerationRef` (generation
-        // AND artifact) under the locks and require it to EXACTLY equal the
-        // selected slot's entry in the intent's FROZEN
-        // `resulting_snapshot` (the single frozen source),
-        // write the commit markers, append the `Successful` terminal (ONE
-        // atomic line append) with the rollback being EXACTLY that frozen
-        // `resulting_snapshot` (never from `execution.actual_servers` /
-        // `outcomes_map` — the engine's
-        // observation records, which a concurrent controller can make stale
-        // between this push's observation and the finalize), and release the
-        // locks. A slot whose live state diverged (a concurrent controller
-        // swapped `current`) REFUSES the finalization: the attempt ends
-        // `Degraded` — never `Successful`, no rollback payload.
+        // "ACTIVE BUT NOT DURABLY BOOKKEPT" DEMOTION (the status enum no
+        // longer carries `PendingCommit` — the pending state IS the
+        // intent-only entry): a slot whose committed-transaction record
+        // write failed is still ACTIVE (its `current` advanced) but the
+        // attempt cannot be durably marked committed. The attempt must NOT
+        // finalize `Successful` — it stays intent-only (the recoverable
+        // PENDING state a later push reconciles before its own no-op
+        // check).
+        if execution.results.values().any(|r| {
+            use crate::ledger::records::SlotOutcomeKind as K;
+            r.outcome == K::Activated && r.error.is_some()
+        }) {
+            let (_observed, observed_warnings) =
+                crate::deploy::maintenance::refresh_observed_from_live(
+                    store,
+                    target_name,
+                    members,
+                    helpers,
+                );
+            let mut maintenance: Vec<String> = Vec::new();
+            maintenance.extend(observed_warnings);
+            maintenance.extend(crate::deploy::maintenance::retry_deferred_retentions(
+                store,
+                config,
+                target_name,
+                helpers,
+                op_id,
+                deployment_id,
+            ));
+            return Ok(PushReport {
+                status: None,
+                attempt: Some(attempt),
+                message: format!(
+                    "push pending: a slot is active but not durably bookkept (its committed-transaction record write failed) — deployment {deployment_id} stays intent-only; a later push reconciles it"
+                ),
+                warning: (!maintenance.is_empty()).then_some(maintenance.join("; ")),
+                dry_run: false,
+            });
+        }
+
         match ledger::finalize_successful_locked(
             store,
             attempt_intent,
@@ -129,12 +162,17 @@ pub(crate) fn run_commit(
             &ledger::FinalizeSettings {
                 reason: "push completed",
                 op_id,
+                // A NEW plan must still be the head's child at finalize
+                // time (the one-parent rule gates new plans — a drifted
+                // head is refused, never reconciled implicitly).
+                enforce_parent: true,
             },
         )? {
             ledger::FinalizeOutcome::Finalized => {
                 // The new successful deployment is keyed by its deployment id
                 // (the public grammar is deployment-keyed — successful
                 // positions are derived internally, never exposed as sN).
+                status = DeploymentStatus::Successful;
                 message = format!(
                     "push successful; rollback payload keyed by deployment {deployment_id} of target {target_name}"
                 );
@@ -143,77 +181,86 @@ pub(crate) fn run_commit(
                 // A TRANSIENT failure (a slot lock held elsewhere, a live
                 // status/assignment read failure, a marker transport write
                 // failure): the terminal is NOT appended — the attempt stays
-                // intent-only (the recoverable pending state a later push
-                // reconciles before its own no-op check). Abort the push so
-                // the incomplete finalization is visible — the attempt is
-                // never reported `Successful` without its durable terminal.
-                return Err(crate::error::Error::remote(format!(
-                    "push {deployment_id}: finalization could not verify the selected-slot locks / live state (transient) — the attempt stays pending for a later push to reconcile"
-                )));
+                // intent-only (the recoverable PENDING state a later push
+                // reconciles before its own no-op check). REFRESH THE
+                // OBSERVED PROJECTIONS REGARDLESS: the servers already
+                // advanced to the attempt's generation, and the observed
+                // projection must reflect the remote assignment after ANY
+                // mutation attempt — a crash-window push that aborted after
+                // the remote advanced but before the observed refresh would
+                // otherwise leave the slot's physical record stale (the
+                // pending attempt itself is the visible recoverable state).
+                let (_observed, observed_warnings) =
+                    crate::deploy::maintenance::refresh_observed_from_live(
+                        store,
+                        target_name,
+                        members,
+                        helpers,
+                    );
+                let mut maintenance: Vec<String> = Vec::new();
+                maintenance.extend(observed_warnings);
+                maintenance.extend(crate::deploy::maintenance::retry_deferred_retentions(
+                    store,
+                    config,
+                    target_name,
+                    helpers,
+                    op_id,
+                    deployment_id,
+                ));
+                return Ok(PushReport {
+                    status: None,
+                    attempt: Some(attempt),
+                    message: format!(
+                        "push pending: the finalization could not verify the selected-slot state or write the commit markers (transient) — deployment {deployment_id} stays intent-only; a later push reconciles it"
+                    ),
+                    warning: (!maintenance.is_empty()).then_some(maintenance.join("; ")),
+                    dry_run: false,
+                });
             }
             ledger::FinalizeOutcome::Refused { reason, .. } => {
-                // The shared finalizer REFUSED: a selected slot's live
-                // `GenerationRef` diverged from the frozen desired assignment
-                // ("state diverged") or a conflicting commit marker exists
-                // ("marker integrity conflict"). Append a `Degraded`
-                // terminal — NEVER `Successful`, no rollback payload.
+                // The shared finalizer REFUSED: a selected slot's live state
+                // diverged from the planned result ("state diverged"), the
+                // parent head drifted ("stale plan"), or a conflicting commit
+                // marker exists ("marker integrity conflict"). Append a
+                // `Degraded` terminal — NEVER `Successful`. The kernel
+                // decides the disposition from the failure evidence.
                 let outcomes: SlotTable<SlotOutcome> = SlotTable::from_map(
-                    outcomes_map
-                        .into_iter()
-                        .map(|(key, result)| Ok((key, SlotOutcome::from_wire(result)?)))
+                    execution
+                        .results
+                        .iter()
+                        .map(|(key, result)| {
+                            Ok((key.clone(), SlotOutcome::from_wire(result.clone())?))
+                        })
                         .collect::<Result<BTreeMap<SlotId, SlotOutcome>>>()?,
                 );
-                let disposition =
-                    crate::deploy::rollout::disposition_for(&DeploymentStatus::Degraded, outcomes)?;
+                let disposition = crate::kernel::transition::decide_terminal(
+                    attempt_intent,
+                    crate::kernel::transition::ExecutionReport {
+                        preflight_failed: false,
+                        verified: false,
+                        all_restored: false,
+                        outcomes,
+                    },
+                )
+                .map_err(|e| {
+                    crate::error::Error::integrity(format!(
+                        "push {deployment_id}: the kernel refused the degraded disposition: {e}"
+                    ))
+                })?;
                 store.append_terminal(
                     target_name,
                     deployment_id,
-                    &LedgerTerminal {
-                        recorded_at: crate::remote::helper::now_rfc3339(),
+                    &LedgerTerminal::new(
+                        crate::remote::helper::now_rfc3339_ts(),
+                        crate::kernel::terminal::intent_digest(attempt_intent),
                         disposition,
-                        reason: Some(reason.to_string()),
-                    },
+                        Some(reason.to_string()),
+                    ),
                 )?;
+                status = DeploymentStatus::Degraded;
                 message = format!("push degraded: {reason}");
             }
         }
-    } else if execution.commit_status != DeploymentStatus::PendingCommit {
-        // A demoted `PendingCommit` status is NOT terminal: the entry stays
-        // intent-only (the recoverable pending state a later push reconciles
-        // before its own no-op check) — appending a PendingCommit terminal
-        // would strand the attempt forever (reconciliation only picks up
-        // entries WITHOUT a terminal).
-        // The wire outcomes are converted to the DOMAIN outcomes, deriving
-        // each slot's TRANSITION STATE from the wire's status/outcome fields
-        // and DROPPING the wire outcome's redundant `slot_id` into the key
-        // (the domain value carries no slot — the table key owns identity);
-        // the STATUS → DISPOSITION mapping lives in
-        // [`crate::deploy::rollout::disposition_for`] (the structural domain
-        // truth table: FailedPreflight carries nothing, FailedRolledBack owns
-        // the outcomes as its compensation report, Degraded owns the outcomes
-        // its remaining changes are derived from — and refuses an
-        // all-restored Degraded wire).
-        // WIRE → DOMAIN (fail closed): each wire outcome converts through
-        // [`SlotOutcome::from_wire`] — deriving the per-slot TRANSITION
-        // STATE and converting the strict wire observation to the domain
-        // observation — and the redundant `slot_id` is DROPPED into the key.
-        let outcomes: SlotTable<SlotOutcome> = SlotTable::from_map(
-            outcomes_map
-                .into_iter()
-                .map(|(key, result)| Ok((key, SlotOutcome::from_wire(result)?)))
-                .collect::<Result<BTreeMap<SlotId, SlotOutcome>>>()?,
-        );
-        let disposition =
-            crate::deploy::rollout::disposition_for(&execution.commit_status, outcomes)?;
-        store.append_terminal(
-            target_name,
-            deployment_id,
-            &LedgerTerminal {
-                recorded_at: crate::remote::helper::now_rfc3339(),
-                disposition,
-                reason: execution.commit_reason.map(str::to_string),
-            },
-        )?;
     }
 
     let (_observed, observed_warnings) = crate::deploy::maintenance::refresh_observed_from_live(
@@ -224,16 +271,7 @@ pub(crate) fn run_commit(
     );
 
     let mut maintenance: Vec<String> = Vec::new();
-    // Observed-refresh deferrals (post-commit projection lag) ride the same
-    // warning channel as retention; unlike retention there is no debt marker to
-    // retry — the next real push re-projects from durable facts.
     maintenance.extend(observed_warnings);
-    // Retry any debt left by earlier pushes FIRST (before this push's own
-    // retention), so a marker that succeeds here is cleared without re-rotating
-    // the same slot immediately after a fresh step-17 failure. The retry is
-    // NON-FALLIBLE (post-commit maintenance): every debt read/write failure is
-    // a warning entry in the returned vec, never an `Err` — a debt-file fault
-    // must not change the outcome of a deployment that already committed.
     maintenance.extend(crate::deploy::maintenance::retry_deferred_retentions(
         store,
         config,
@@ -242,21 +280,11 @@ pub(crate) fn run_commit(
         op_id,
         deployment_id,
     ));
-    // The store-global PENDING SWEEP (deferred by an earlier checkpoint
-    // whose sweep did not complete) is likewise POST-COMMIT MAINTENANCE:
-    // retry it on this push — recomputing reachability fresh, no persisted
-    // worklist — and clear the marker once it completes. NON-FALLIBLE: every
-    // debt read/write failure is a warning entry in the returned vec, never
-    // an `Err` — a debt-file fault must not change the outcome of a
-    // deployment that already committed.
     maintenance.extend(crate::deploy::maintenance::retry_pending_sweep(
         store,
         config,
         deployment_id.as_str(),
     ));
-    // Step 17: per-slot retention — post-commit maintenance, never a push
-    // failure (the contract is structural in
-    // [`crate::deploy::maintenance::retain_slot_post_commit`]).
     crate::deploy::maintenance::run_step17_retention(
         store,
         config,
@@ -268,7 +296,7 @@ pub(crate) fn run_commit(
         &mut maintenance,
     );
     Ok(PushReport {
-        status: Some(execution.commit_status.clone()),
+        status: Some(status),
         attempt: Some(attempt),
         message,
         warning: crate::deploy::maintenance::maintenance_warning(&maintenance),
@@ -287,7 +315,6 @@ pub(crate) mod commit_tests {
 
     use crate::deploy::testsupport::*;
     use crate::identity::{OperationId, ServerId, test_deployment_id};
-    use crate::ledger::SlotOutcomeKind;
     use crate::ledger::recovery::reconcile_pending_commits;
     use crate::remote::helper::{ExpectedCurrent, GenerationAssignment, RemoteHelper};
     use crate::remote::layout;
@@ -300,6 +327,41 @@ pub(crate) mod commit_tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+
+    /// A crafted ONE-SLOT (p1) FULL-push intent for the harness target,
+    /// built through the kernel's validated constructor (the domain types
+    /// cannot be struct-literal-constructed; the constructor is the ONE
+    /// validator). `binding` must match the harness slot's deploy_dir for
+    /// the recovery binding check to pass.
+    fn crafted_intent(
+        dep: &crate::identity::DeploymentId,
+        generation: &crate::identity::GenerationId,
+        artifact: &crate::identity::ArtifactRef,
+        binding: crate::ledger::PhysicalBinding,
+        behavior: &crate::identity::BehaviorDigest,
+    ) -> DeploymentIntent {
+        use crate::kernel::intent::{PlanInput, PlannedDeploy};
+        use crate::kernel::snapshot::SnapshotSlot;
+        use crate::ledger::Observation;
+        let p1 = SlotId::new("p1".to_string());
+        crate::kernel::intent::plan(PlanInput {
+            deployment_id: dep.clone(),
+            target: TargetName::parse("t1").unwrap(),
+            parent: None,
+            parent_snapshot: None,
+            group: None,
+            selection: vec![p1.clone()],
+            planned: vec![PlannedDeploy {
+                slot: p1,
+                result: SnapshotSlot::new(generation.clone(), artifact.clone(), binding),
+                pre_push: Observation::KnownAbsent,
+            }],
+            behavior_digest: behavior.clone(),
+            attempted_at: crate::identity::Timestamp::parse(&crate::remote::helper::now_rfc3339())
+                .unwrap(),
+        })
+        .expect("a crafted test intent plans")
+    }
 
     /// The TERMINAL EVENT append (the deployment's ONE atomic finalize write)
     /// fails once on the replaying push: `Err`, no rollback state exists
@@ -331,8 +393,8 @@ pub(crate) mod commit_tests {
         assert!(h.store.read_last_successful("t1").is_none());
         assert_eq!(
             latest_status(&h, attempt.deployment_id.as_str()),
-            DeploymentStatus::PendingCommit,
-            "the intent-only entry stays recoverable-pending"
+            None,
+            "the intent-only entry stays recoverable-pending (an intent without a terminal IS pending)"
         );
 
         // Push 3: a clean push replays and completes finalization exactly once.
@@ -364,8 +426,8 @@ pub(crate) mod commit_tests {
         assert!(h.store.read_last_successful("t1").is_none());
         assert_eq!(
             latest_status(&h, id.as_str()),
-            DeploymentStatus::PendingCommit,
-            "crash window must leave the attempt PendingCommit, not Successful"
+            None,
+            "the crash window must leave the attempt PENDING (intent-only), never Successful"
         );
 
         // Push 2: a clean push reconciles the pending attempt (servers are
@@ -563,7 +625,10 @@ pub(crate) mod commit_tests {
             },
         )
         .unwrap();
-        assert_eq!(r2.status, Some(DeploymentStatus::PendingCommit));
+        assert_eq!(
+            r2.status, None,
+            "the marker-faulted push leaves the attempt pending (intent-only)"
+        );
         let attempt = r2.attempt.expect("attempt recorded");
         let dep2 = attempt.deployment_id.clone();
         let gen_v2 = attempt.desired[&SlotId::new("p1")].generation.clone();
@@ -601,13 +666,13 @@ pub(crate) mod commit_tests {
         assert_eq!(r3.message, "Everything up to date");
         assert_eq!(
             latest_status(&h, dep2.as_str()),
-            DeploymentStatus::Degraded,
+            Some(DeploymentStatus::Degraded),
             "a conflicting marker must NEVER finalize the attempt Successful"
         );
         let transitions = h.store.read_transitions(dep2.as_str()).unwrap();
         let last = transitions.last().expect("transition stream non-empty");
         assert_eq!(
-            last.reason.as_deref(),
+            last.reason(),
             Some("marker integrity conflict"),
             "the degradation must be explained"
         );
@@ -690,8 +755,8 @@ pub(crate) mod commit_tests {
         // report, never in the persisted intent). The ONE slot table carries
         // the planned (desired) + observed (pre_push) entries per member.
         assert!(
-            intent.intent.selected.contains_key(&SlotId::new("p1")),
-            "the intent's one selected table carries the planned slots"
+            intent.intent.slots().contains_key(&SlotId::new("p1")),
+            "the intent's one full slot table carries the planned slots"
         );
         assert!(
             h.store.read_results(id.as_str()).is_err(),
@@ -699,7 +764,7 @@ pub(crate) mod commit_tests {
         );
         assert_eq!(
             latest_status(&h, id.as_str()),
-            DeploymentStatus::PendingCommit,
+            None,
             "the crash window leaves the entry intent-only (recoverable-pending)"
         );
         assert!(h.store.read_snapshots("t1").unwrap().is_empty());
@@ -723,7 +788,8 @@ pub(crate) mod commit_tests {
         assert_finalized(&h, &intent);
         let snap = h.store.read_snapshots("t1").unwrap();
         assert_eq!(snap.len(), 1);
-        let g = rollback_of(&snap[0]).get(&SlotId::new("p1")).unwrap();
+        let rb = rollback_of(&snap[0]);
+        let g = rb.get(&SlotId::new("p1")).unwrap();
         let desired = &intent.desired[&SlotId::new("p1")];
         assert_eq!(
             g.generation().as_str(),
@@ -763,8 +829,8 @@ pub(crate) mod commit_tests {
         );
         assert_eq!(
             latest_status(&h, id.as_str()),
-            DeploymentStatus::PendingCommit,
-            "crash window must leave the attempt PendingCommit (intent-only), never Successful"
+            None,
+            "crash window must leave the attempt pending (intent-only), never Successful"
         );
         assert!(h.store.read_snapshots("t1").unwrap().is_empty());
         assert!(h.store.read_last_successful("t1").is_none());
@@ -782,7 +848,10 @@ pub(crate) mod commit_tests {
             1,
             "the replay must not record a new attempt"
         );
-        assert_eq!(latest_status(&h, id.as_str()), DeploymentStatus::Successful);
+        assert_eq!(
+            latest_status(&h, id.as_str()),
+            Some(DeploymentStatus::Successful)
+        );
         assert_eq!(h.store.read_snapshots("t1").unwrap().len(), 1);
     }
 
@@ -819,34 +888,20 @@ pub(crate) mod commit_tests {
         let id_a = test_deployment_id("deploy-inprogress-diverged");
         let desired_ref = baseline.desired[&SlotId::new("p1")].clone();
 
-        let intent = DeploymentIntent {
-            deployment_id: id_a.clone(),
-            target: TargetName::parse("t1").unwrap(),
-            group: None,
-            resulting_snapshot: TargetSnapshot::from_entries(BTreeMap::from([(
-                SlotId::parse("p1").unwrap(),
-                SnapshotEntry::new(
-                    target_a,
-                    desired_ref.assignment.artifact.clone(),
-                    crate::ledger::PhysicalBinding {
-                        server: ServerId::parse("s1").unwrap(),
-                        deploy_dir: "/srv/eng".to_string(),
-                    },
-                ),
-            )])),
-            selected: NonEmptySlotTable::build(BTreeMap::from([(
-                SlotId::parse("p1").unwrap(),
-                SelectedSlotIntent { pre_push: None },
-            )]))
-            .expect("one member slot"),
-            behavior_sha256: baseline.behavior_sha256.clone(),
-            attempted_at: crate::identity::Timestamp::parse(&crate::remote::helper::now_rfc3339())
-                .unwrap(),
-        };
+        let intent = crafted_intent(
+            &id_a,
+            &target_a,
+            &desired_ref.assignment.artifact,
+            crate::ledger::PhysicalBinding {
+                server: ServerId::parse("s1").unwrap(),
+                deploy_dir: "/srv/eng".to_string(),
+            },
+            &baseline.behavior_sha256,
+        );
         h.store.append_attempt("t1", &intent).unwrap();
         assert_eq!(
             latest_status(&h, id_a.as_str()),
-            DeploymentStatus::PendingCommit,
+            None,
             "the intent-only entry is the recoverable pending state"
         );
 
@@ -859,7 +914,7 @@ pub(crate) mod commit_tests {
         assert_eq!(r2.message, "Everything up to date");
         assert_eq!(
             latest_status(&h, id_a.as_str()),
-            DeploymentStatus::Degraded,
+            Some(DeploymentStatus::Degraded),
             "the diverged attempt must finalize Degraded"
         );
         let snapshots = h.store.read_snapshots("t1").unwrap();
@@ -899,34 +954,20 @@ pub(crate) mod commit_tests {
         let id_a = test_deployment_id("deploy-no-status");
         let desired_ref = baseline.desired[&SlotId::new("p1")].clone();
 
-        let intent = DeploymentIntent {
-            deployment_id: id_a.clone(),
-            target: TargetName::parse("t1").unwrap(),
-            group: None,
-            resulting_snapshot: TargetSnapshot::from_entries(BTreeMap::from([(
-                SlotId::parse("p1").unwrap(),
-                SnapshotEntry::new(
-                    desired_ref.generation.clone(),
-                    desired_ref.assignment.artifact.clone(),
-                    crate::ledger::PhysicalBinding {
-                        server: ServerId::parse("s1").unwrap(),
-                        deploy_dir: "/srv/eng".to_string(),
-                    },
-                ),
-            )])),
-            selected: NonEmptySlotTable::build(BTreeMap::from([(
-                SlotId::parse("p1").unwrap(),
-                SelectedSlotIntent { pre_push: None },
-            )]))
-            .expect("one member slot"),
-            behavior_sha256: baseline.behavior_sha256.clone(),
-            attempted_at: crate::identity::Timestamp::parse(&crate::remote::helper::now_rfc3339())
-                .unwrap(),
-        };
+        let intent = crafted_intent(
+            &id_a,
+            &desired_ref.generation.clone(),
+            &desired_ref.assignment.artifact,
+            crate::ledger::PhysicalBinding {
+                server: ServerId::parse("s1").unwrap(),
+                deploy_dir: "/srv/eng".to_string(),
+            },
+            &baseline.behavior_sha256.clone(),
+        );
         h.store.append_attempt("t1", &intent).unwrap();
         assert_eq!(
             h.store.latest_status(id_a.as_str()).unwrap(),
-            Some(DeploymentStatus::PendingCommit),
+            None,
             "an intent-only entry is the recoverable pending state"
         );
 
@@ -937,7 +978,7 @@ pub(crate) mod commit_tests {
         assert_eq!(r2.message, "Everything up to date");
         assert_eq!(
             latest_status(&h, id_a.as_str()),
-            DeploymentStatus::Successful
+            Some(DeploymentStatus::Successful)
         );
         let snapshots = h.store.read_snapshots("t1").unwrap();
         assert_eq!(snapshots.len(), 2, "baseline + reconciled attempt");
@@ -973,29 +1014,17 @@ pub(crate) mod commit_tests {
         let baseline = r1.attempt.as_ref().expect("attempt recorded");
         let desired_ref = baseline.desired[&SlotId::new("p1")].clone();
 
-        let mk = |id: &str| DeploymentIntent {
-            deployment_id: test_deployment_id(id),
-            target: TargetName::parse("t1").unwrap(),
-            group: None,
-            resulting_snapshot: TargetSnapshot::from_entries(BTreeMap::from([(
-                SlotId::parse("p1").unwrap(),
-                SnapshotEntry::new(
-                    desired_ref.generation.clone(),
-                    desired_ref.assignment.artifact.clone(),
-                    crate::ledger::PhysicalBinding {
-                        server: ServerId::parse("s1").unwrap(),
-                        deploy_dir: "/srv/eng".to_string(),
-                    },
-                ),
-            )])),
-            selected: NonEmptySlotTable::build(BTreeMap::from([(
-                SlotId::parse("p1").unwrap(),
-                SelectedSlotIntent { pre_push: None },
-            )]))
-            .expect("one member slot"),
-            behavior_sha256: baseline.behavior_sha256.clone(),
-            attempted_at: crate::identity::Timestamp::parse(&crate::remote::helper::now_rfc3339())
-                .unwrap(),
+        let mk = |id: &str| {
+            crafted_intent(
+                &test_deployment_id(id),
+                &desired_ref.generation,
+                &desired_ref.assignment.artifact,
+                crate::ledger::PhysicalBinding {
+                    server: ServerId::parse("s1").unwrap(),
+                    deploy_dir: "/srv/eng".to_string(),
+                },
+                &baseline.behavior_sha256,
+            )
         };
         let a = mk("deploy-multi-a");
         let b = mk("deploy-multi-b");
@@ -1008,35 +1037,35 @@ pub(crate) mod commit_tests {
         assert_eq!(r2.message, "Everything up to date");
         let snapshots = h.store.read_snapshots("t1").unwrap();
         assert_eq!(snapshots.len(), 3);
-        assert_eq!(snapshots[1].deployment_id, a.deployment_id);
-        assert_eq!(snapshots[2].deployment_id, b.deployment_id);
+        assert_eq!(snapshots[1].deployment_id, *a.deployment_id());
+        assert_eq!(snapshots[2].deployment_id, *b.deployment_id());
         assert_eq!(
-            ledger::successful_index(&h.store, "t1", &a.deployment_id)
+            ledger::successful_index(&h.store, "t1", a.deployment_id())
                 .unwrap()
                 .unwrap(),
             1,
             "successful-chain positions stay monotonic"
         );
         assert_eq!(
-            ledger::successful_index(&h.store, "t1", &b.deployment_id)
+            ledger::successful_index(&h.store, "t1", b.deployment_id())
                 .unwrap()
                 .unwrap(),
             2
         );
         assert_eq!(
-            latest_status(&h, a.deployment_id.as_str()),
-            DeploymentStatus::Successful
+            latest_status(&h, a.deployment_id().as_str()),
+            Some(DeploymentStatus::Successful)
         );
         assert_eq!(
-            latest_status(&h, b.deployment_id.as_str()),
-            DeploymentStatus::Successful
+            latest_status(&h, b.deployment_id().as_str()),
+            Some(DeploymentStatus::Successful)
         );
         assert_eq!(
             h.store.read_last_successful("t1").as_deref(),
-            Some(b.deployment_id.as_str())
+            Some(b.deployment_id().as_str())
         );
         assert_eq!(h.store.read_attempts("t1").unwrap().len(), 3);
-        for id in [a.deployment_id.as_str(), b.deployment_id.as_str()] {
+        for id in [a.deployment_id().as_str(), b.deployment_id().as_str()] {
             let marker = h
                 .remotes_base
                 .join("s1")
@@ -1467,24 +1496,19 @@ pub(crate) mod commit_tests {
         // membership.
         let entries = h.store.read_ledger("t1").unwrap();
         let terminal = entries[1].terminal.as_ref().unwrap();
+        assert!(
+            terminal.outcomes().is_empty(),
+            "a Successful terminal is PAYLOAD-FREE — no outcome claims to drift from the intent"
+        );
         assert_eq!(
-            terminal.outcomes().keys().cloned().collect::<BTreeSet<_>>(),
+            entries[1].intent.selected_membership(),
             BTreeSet::from([slot_a.clone()]),
-            "the outcomes cover the selected group slot only"
+            "the SELECTED membership = the group's slot, DERIVED from the intent's slot actions"
         );
         assert_eq!(
-            terminal.selected_membership(),
-            Some(BTreeSet::from([slot_a.clone()])),
-            "the terminal PERSISTS the selected membership (== the outcomes' keys == the group's slot)"
-        );
-        assert_eq!(
-            terminal.full_membership(),
-            Some(full_membership.clone()),
-            "the terminal PERSISTS the full membership (== the complete target membership == the rollback's slots)"
-        );
-        assert_eq!(
-            terminal.outcomes()[&slot_a].outcome,
-            SlotOutcomeKind::Activated
+            entries[1].intent.full_membership(),
+            full_membership.clone(),
+            "the FULL membership = the complete target membership, DERIVED from the intent's slot table"
         );
     }
 
@@ -1559,43 +1583,34 @@ pub(crate) mod commit_tests {
         let entries = h.store.read_ledger("t1").unwrap();
         let entry = &entries[0];
         assert_eq!(
-            entry
-                .intent
-                .selected
-                .keys()
-                .cloned()
-                .collect::<BTreeSet<_>>(),
-            full_membership,
-            "the full push's intent membership is the full target"
+            entry.intent.selected_membership(),
+            full_membership.clone(),
+            "a full push's SELECTED membership (the Deploy slots) is the full target"
+        );
+        assert_eq!(
+            entry.intent.full_membership(),
+            full_membership.clone(),
+            "a full push's FULL membership is the full target"
         );
         let terminal = entry.terminal.as_ref().unwrap();
+        assert!(
+            terminal.disposition().is_successful(),
+            "the full push is Successful"
+        );
+        assert!(
+            terminal.outcomes().is_empty(),
+            "a Successful terminal is PAYLOAD-FREE — one stored fact"
+        );
+        let resolved = crate::kernel::snapshot::resolve_snapshot(entry).unwrap();
         assert_eq!(
-            terminal.outcomes().keys().cloned().collect::<BTreeSet<_>>(),
+            resolved.keys().cloned().collect::<BTreeSet<_>>(),
             full_membership,
-            "the full push's outcomes equal the membership"
+            "the resolved snapshot's slots equal the membership"
         );
         assert_eq!(
-            terminal.selected_membership(),
-            Some(full_membership.clone()),
-            "the terminal PERSISTS the selected membership == the full membership (a full push selects every target slot)"
-        );
-        assert_eq!(
-            terminal.full_membership(),
-            Some(full_membership.clone()),
-            "the terminal PERSISTS the full membership == the complete target membership"
-        );
-        let TerminalDisposition::Successful(st) = &terminal.disposition else {
-            panic!("the full push is Successful");
-        };
-        assert_eq!(
-            st.rollback().keys().cloned().collect::<BTreeSet<_>>(),
-            full_membership,
-            "the full push's rollback slots equal the membership"
-        );
-        assert_eq!(
-            st.rollback().keys().cloned().collect::<BTreeSet<_>>(),
-            full_membership,
-            "the full push's rollback bindings equal the membership"
+            resolved,
+            entry.intent.resulting_snapshot(),
+            "the resolved snapshot IS the intent's planned result — no parallel payload"
         );
     }
 
@@ -1756,22 +1771,17 @@ pub(crate) mod commit_tests {
             // THE SUCCESS-PERMITTED PREDICATE: the live state EXACTLY
             // matches the frozen intent (selected bindings equal, selected
             // membership covered, live generations equal the desired ones).
+            let intent_snapshot = intent.resulting_snapshot();
             let membership_ok = intent
-                .selected
-                .keys()
+                .full_membership()
+                .iter()
                 .all(|sid| live_bindings.contains_key(sid));
-            let bindings_equal = intent.selected.keys().all(|sid| {
+            let bindings_equal = intent.full_membership().iter().all(|sid| {
                 live_bindings.get(sid)
-                    == intent
-                        .resulting_snapshot
-                        .get(sid)
-                        .map(|e| e.binding())
+                    == intent_snapshot.get(sid).map(|e| e.binding())
             });
-            let gens_match = intent.selected.keys().all(|sid| {
-                let desired_gen = intent
-                    .resulting_snapshot
-                    .get(sid)
-                    .map(|e| e.generation());
+            let gens_match = intent.full_membership().iter().all(|sid| {
+                let desired_gen = intent_snapshot.get(sid).map(|e| e.generation());
                 helpers
                     .get(sid)
                     .and_then(|helper| helper.status().ok())
@@ -1789,7 +1799,10 @@ pub(crate) mod commit_tests {
                 .store
                 .latest_status(pending.deployment_id.as_str())
                 .unwrap()
-                .expect("the recovered attempt has a status");
+                .ok_or_else(|| {
+                    crate::error::Error::store("the recovered attempt must have a terminal status")
+                })
+                .unwrap();
             match status {
                 DeploymentStatus::Successful => {
                     // SUCCESS IS PERMITTED ONLY when bindings + membership +
@@ -1803,17 +1816,18 @@ pub(crate) mod commit_tests {
                     // (never the live config re-read at recovery time).
                     let snapshots = h.store.read_snapshots("t1").unwrap();
                     assert_eq!(snapshots.len(), 1, "exactly one successful snapshot");
-                    assert_eq!(snapshots[0].deployment_id, intent.deployment_id);
+                    assert_eq!(snapshots[0].deployment_id, *intent.deployment_id());
                     let rb = rollback_of(&snapshots[0]);
-                    for sid in intent.selected.keys() {
-                        let entry = intent.resulting_snapshot.get(sid).expect("selected in snapshot");
+                    let intent_snapshot = intent.resulting_snapshot();
+                    for sid in intent.full_membership() {
+                        let entry = intent_snapshot.get(&sid).expect("selected in snapshot");
                         assert_eq!(
-                            rb.get(sid).map(|e| e.binding()),
+                            rb.get(&sid).map(|e| e.binding()),
                             Some(entry.binding()),
                             "the rollback binding for {sid} must come from the FROZEN intent, not the live config"
                         );
                         assert_eq!(
-                            rb.get(sid).map(|e| e.generation()),
+                            rb.get(&sid).map(|e| e.generation()),
                             Some(entry.generation()),
                             "the rollback generation for {sid} must equal the frozen desired generation"
                         );
@@ -1993,22 +2007,46 @@ pub(crate) mod commit_tests {
             // live config's, so the degrade is the injected swap's
             // divergence, never binding drift).
             let bindings = h.config.target_slot_bindings("t1").unwrap();
-            let intent = DeploymentIntent {
-                deployment_id: deployment_id.clone(),
-                target: TargetName::parse("t1").unwrap(),
-                group: None,
-                behavior_sha256: crate::identity::BehaviorDigest::parse("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855").unwrap(),
-                attempted_at: crate::identity::Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
-                resulting_snapshot: TargetSnapshot::from_entries(BTreeMap::from([
-                    (p1.clone(), SnapshotEntry::new(gen_p1.clone(), art_p1.clone(), bindings.get(&p1).cloned().expect("p1 is a target slot"))),
-                    (p2.clone(), SnapshotEntry::new(gen_p2.clone(), art_p2.clone(), bindings.get(&p2).cloned().expect("p2 is a target slot"))),
-                ])),
-                selected: NonEmptySlotTable::build(BTreeMap::from([
-                    (p1.clone(), SelectedSlotIntent { pre_push: None }),
-                    (p2.clone(), SelectedSlotIntent { pre_push: None }),
-                ]))
-                .expect("two selected slots"),
-        };
+            let intent = {
+                use crate::kernel::intent::{PlanInput, PlannedDeploy};
+                use crate::kernel::snapshot::SnapshotSlot;
+                use crate::ledger::Observation;
+                crate::kernel::intent::plan(PlanInput {
+                    deployment_id: deployment_id.clone(),
+                    target: TargetName::parse("t1").unwrap(),
+                    parent: None,
+                    parent_snapshot: None,
+                    group: None,
+                    selection: vec![p1.clone(), p2.clone()],
+                    planned: vec![
+                        PlannedDeploy {
+                            slot: p1.clone(),
+                            result: SnapshotSlot::new(
+                                gen_p1.clone(),
+                                art_p1.clone(),
+                                bindings.get(&p1).cloned().expect("p1 is a target slot"),
+                            ),
+                            pre_push: Observation::KnownAbsent,
+                        },
+                        PlannedDeploy {
+                            slot: p2.clone(),
+                            result: SnapshotSlot::new(
+                                gen_p2.clone(),
+                                art_p2.clone(),
+                                bindings.get(&p2).cloned().expect("p2 is a target slot"),
+                            ),
+                            pre_push: Observation::KnownAbsent,
+                        },
+                    ],
+                    behavior_digest: crate::identity::BehaviorDigest::parse(
+                        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                    )
+                    .unwrap(),
+                    attempted_at: crate::identity::Timestamp::parse("2026-01-01T00:00:00Z")
+                        .unwrap(),
+                })
+                .expect("the swap-prop pending intent plans")
+            };
             h.store.append_attempt("t1", &intent).unwrap();
 
             // The per-slot helpers: the injected swap rides the FIRST slot's
@@ -2069,10 +2107,11 @@ pub(crate) mod commit_tests {
                     assert_eq!(snapshots.len(), 1, "exactly one successful snapshot");
                     assert_eq!(snapshots[0].deployment_id, deployment_id);
                     let rb = rollback_of(&snapshots[0]);
-                    for sid in intent.selected.keys() {
-                        let entry = intent.resulting_snapshot.get(sid).expect("selected in snapshot");
+                    let intent_snapshot = intent.resulting_snapshot();
+                    for sid in intent.full_membership() {
+                        let entry = intent_snapshot.get(&sid).expect("selected in snapshot");
                         let rbs = rb
-                            .get(sid)
+                            .get(&sid)
                             .expect("the rollback covers every selected slot");
                         assert_eq!(
                             rbs.generation().clone(), entry.generation().clone(),
@@ -2194,22 +2233,46 @@ pub(crate) mod commit_tests {
             // The PENDING intent: durable, no terminal, the frozen desired
             // assignments + the plan-time physical bindings.
             let bindings = h.config.target_slot_bindings("t1").unwrap();
-            let intent = DeploymentIntent {
-                deployment_id: deployment_id.clone(),
-                target: TargetName::parse("t1").unwrap(),
-                group: None,
-                behavior_sha256: crate::identity::BehaviorDigest::parse("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855").unwrap(),
-                attempted_at: crate::identity::Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
-                resulting_snapshot: TargetSnapshot::from_entries(BTreeMap::from([
-                    (p1.clone(), SnapshotEntry::new(gen_p1.clone(), art_p1.clone(), bindings.get(&p1).cloned().expect("p1 is a target slot"))),
-                    (p2.clone(), SnapshotEntry::new(gen_p2.clone(), art_p2.clone(), bindings.get(&p2).cloned().expect("p2 is a target slot"))),
-                ])),
-                selected: NonEmptySlotTable::build(BTreeMap::from([
-                    (p1.clone(), SelectedSlotIntent { pre_push: None }),
-                    (p2.clone(), SelectedSlotIntent { pre_push: None }),
-                ]))
-                .expect("two selected slots"),
-        };
+            let intent = {
+                use crate::kernel::intent::{PlanInput, PlannedDeploy};
+                use crate::kernel::snapshot::SnapshotSlot;
+                use crate::ledger::Observation;
+                crate::kernel::intent::plan(PlanInput {
+                    deployment_id: deployment_id.clone(),
+                    target: TargetName::parse("t1").unwrap(),
+                    parent: None,
+                    parent_snapshot: None,
+                    group: None,
+                    selection: vec![p1.clone(), p2.clone()],
+                    planned: vec![
+                        PlannedDeploy {
+                            slot: p1.clone(),
+                            result: SnapshotSlot::new(
+                                gen_p1.clone(),
+                                art_p1.clone(),
+                                bindings.get(&p1).cloned().expect("p1 is a target slot"),
+                            ),
+                            pre_push: Observation::KnownAbsent,
+                        },
+                        PlannedDeploy {
+                            slot: p2.clone(),
+                            result: SnapshotSlot::new(
+                                gen_p2.clone(),
+                                art_p2.clone(),
+                                bindings.get(&p2).cloned().expect("p2 is a target slot"),
+                            ),
+                            pre_push: Observation::KnownAbsent,
+                        },
+                    ],
+                    behavior_digest: crate::identity::BehaviorDigest::parse(
+                        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                    )
+                    .unwrap(),
+                    attempted_at: crate::identity::Timestamp::parse("2026-01-01T00:00:00Z")
+                        .unwrap(),
+                })
+                .expect("the swap-prop pending intent plans")
+            };
             h.store.append_attempt("t1", &intent).unwrap();
 
             // THE STALE OBSERVED VALUES the engine could have recorded for
@@ -2217,18 +2280,19 @@ pub(crate) mod commit_tests {
             // the (generation, artifact) the OLD code would have persisted
             // into the rollback. Per the strategy, the generation leg, the
             // artifact leg, or both diverge from the frozen desired.
+            let intent_snapshot = intent.resulting_snapshot();
             let stale_of = |sid: &SlotId| -> (GenerationId, ArtifactRef) {
                 let generation = match stale {
                     StaleDivergence::Generation | StaleDivergence::Both => test_generation_id(
                         &format!("gen-stale-{}", sid.as_str()),
                     ),
                     StaleDivergence::Artifact => {
-                        intent.resulting_snapshot.get(sid).expect("a selected slot").generation().clone()
+                        intent_snapshot.get(sid).expect("a selected slot").generation().clone()
                     }
                 };
                 let artifact = match stale {
                     StaleDivergence::Generation => {
-                        intent.resulting_snapshot.get(sid).expect("a selected slot").artifact().clone()
+                        intent_snapshot.get(sid).expect("a selected slot").artifact().clone()
                     }
                     StaleDivergence::Artifact | StaleDivergence::Both => ArtifactRef {
                         release: crate::identity::test_release_id("rel-stale"),
@@ -2240,9 +2304,9 @@ pub(crate) mod commit_tests {
             };
             // The stale fixture genuinely diverges (the bug scenario): at
             // least one leg differs from the frozen desired per slot.
-            for sid in intent.selected.keys() {
-                let (g, a) = stale_of(sid);
-                let desired = &intent.resulting_snapshot.get(sid).expect("a selected slot");
+            for sid in intent.full_membership() {
+                let (g, a) = stale_of(&sid);
+                let desired = &intent_snapshot.get(&sid).expect("a selected slot");
                 assert!(
                     g != *desired.generation() || a != *desired.artifact(),
                     "the stale fixture must diverge from the frozen desired"
@@ -2271,6 +2335,7 @@ pub(crate) mod commit_tests {
                 &ledger::FinalizeSettings {
                     reason: "push completed",
                     op_id: &op_id,
+                    enforce_parent: true,
                 },
             )
             .unwrap();
@@ -2288,10 +2353,11 @@ pub(crate) mod commit_tests {
             assert_eq!(snapshots.len(), 1, "exactly one successful snapshot");
             assert_eq!(snapshots[0].deployment_id, deployment_id);
             let rb = rollback_of(&snapshots[0]);
-            for sid in intent.selected.keys() {
-                let entry = intent.resulting_snapshot.get(sid).expect("selected in snapshot");
+            let intent_snapshot2 = intent.resulting_snapshot();
+            for sid in intent.full_membership() {
+                let entry = intent_snapshot2.get(&sid).expect("selected in snapshot");
                 let rbs = rb
-                    .get(sid)
+                    .get(&sid)
                     .expect("the rollback covers every selected slot");
                 assert_eq!(
                     rbs.generation().clone(), entry.generation().clone(),
@@ -2301,7 +2367,7 @@ pub(crate) mod commit_tests {
                     rbs.artifact().clone(), entry.artifact().clone(),
                     "the rollback artifact for {sid} equals the frozen desired (the verified live value), never the stale observation (stale {stale:?})"
                 );
-                let (stale_gen, stale_art) = stale_of(sid);
+                let (stale_gen, stale_art) = stale_of(&sid);
                 match stale {
                     StaleDivergence::Generation | StaleDivergence::Both => assert_ne!(rbs.generation().clone(), stale_gen,
                         "the stale generation for {sid} must never leak into the rollback payload (stale {stale:?})"
@@ -2334,8 +2400,8 @@ pub(crate) mod commit_tests {
     // (`SlotId -> BoundGeneration { generation, binding }`) — the
     // construction has NO parallel maps to drift — the merge REFUSES a
     // missing / extra / renamed binding (an integrity `Err` propagated up:
-    // the finalization never appends a broken terminal), `build_rollback`
-    // is FALLIBLE, and `append_terminal` validates the intent/terminal
+    // the finalization never appends a broken terminal), and
+    // `append_terminal` validates the intent/terminal
     // pair against the strict reader's own legs BEFORE writing.
 
     /// The DIVERGENCE MUTATIONS applied to the LIVE STATE the lock-verified
@@ -2461,22 +2527,46 @@ pub(crate) mod commit_tests {
             // resulting snapshot (each SELECTED slot's minted generation +
             // artifact + the plan-time physical binding).
             let bindings = h.config.target_slot_bindings("t1").unwrap();
-            let intent = DeploymentIntent {
-                deployment_id: deployment_id.clone(),
-                target: TargetName::parse("t1").unwrap(),
-                group: None,
-                behavior_sha256: crate::identity::BehaviorDigest::parse("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855").unwrap(),
-                attempted_at: crate::identity::Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
-                resulting_snapshot: TargetSnapshot::from_entries(BTreeMap::from([
-                    (p1.clone(), SnapshotEntry::new(gen_p1.clone(), art_p1.clone(), bindings.get(&p1).cloned().expect("p1 is a target slot"))),
-                    (p2.clone(), SnapshotEntry::new(gen_p2.clone(), art_p2.clone(), bindings.get(&p2).cloned().expect("p2 is a target slot"))),
-                ])),
-                selected: NonEmptySlotTable::build(BTreeMap::from([
-                    (p1.clone(), SelectedSlotIntent { pre_push: None }),
-                    (p2.clone(), SelectedSlotIntent { pre_push: None }),
-                ]))
-                .expect("two selected slots"),
-        };
+            let intent = {
+                use crate::kernel::intent::{PlanInput, PlannedDeploy};
+                use crate::kernel::snapshot::SnapshotSlot;
+                use crate::ledger::Observation;
+                crate::kernel::intent::plan(PlanInput {
+                    deployment_id: deployment_id.clone(),
+                    target: TargetName::parse("t1").unwrap(),
+                    parent: None,
+                    parent_snapshot: None,
+                    group: None,
+                    selection: vec![p1.clone(), p2.clone()],
+                    planned: vec![
+                        PlannedDeploy {
+                            slot: p1.clone(),
+                            result: SnapshotSlot::new(
+                                gen_p1.clone(),
+                                art_p1.clone(),
+                                bindings.get(&p1).cloned().expect("p1 is a target slot"),
+                            ),
+                            pre_push: Observation::KnownAbsent,
+                        },
+                        PlannedDeploy {
+                            slot: p2.clone(),
+                            result: SnapshotSlot::new(
+                                gen_p2.clone(),
+                                art_p2.clone(),
+                                bindings.get(&p2).cloned().expect("p2 is a target slot"),
+                            ),
+                            pre_push: Observation::KnownAbsent,
+                        },
+                    ],
+                    behavior_digest: crate::identity::BehaviorDigest::parse(
+                        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                    )
+                    .unwrap(),
+                    attempted_at: crate::identity::Timestamp::parse("2026-01-01T00:00:00Z")
+                        .unwrap(),
+                })
+                .expect("the swap-prop pending intent plans")
+            };
             h.store.append_attempt("t1", &intent).unwrap();
 
             // The per-slot live helpers (the lock-verified finalizer
@@ -2504,6 +2594,7 @@ pub(crate) mod commit_tests {
                 &ledger::FinalizeSettings {
                     reason: "push completed",
                     op_id: &op_id,
+                    enforce_parent: true,
                 },
             ) {
                 // ANY SUCCESSFUL APPEND IS IMMEDIATELY READABLE: the
@@ -2525,18 +2616,24 @@ pub(crate) mod commit_tests {
                         .terminal
                         .as_ref()
                         .expect("the successful finalization appended its terminal");
-                    let ledger::TerminalDisposition::Successful(st) = &terminal.disposition else {
-                        panic!("a successful finalization appends a Successful terminal");
-                    };
+                    assert!(
+                        terminal.disposition().is_successful(),
+                        "a successful finalization appends a Successful terminal"
+                    );
+                    assert!(
+                        terminal.outcomes().is_empty(),
+                        "a Successful terminal is PAYLOAD-FREE — the snapshot resolves from the intent"
+                    );
+                    let resolved = crate::kernel::snapshot::resolve_snapshot(&entries[0]).unwrap();
                     assert_eq!(
-                        st.rollback(),
-                        &intent.resulting_snapshot,
-                        "the appended rollback EXACTLY equals the intent's frozen resulting_snapshot (one validated snapshot — no parallel maps to drift)"
+                        resolved,
+                        intent.resulting_snapshot(),
+                        "the resolved snapshot EXACTLY equals the intent's planned result (one stored fact — no parallel payload to drift)"
                     );
                     assert_eq!(
-                        st.activated().as_set().iter().cloned().collect::<BTreeSet<_>>(),
+                        entries[0].intent.selected_membership(),
                         intent.selected_membership(),
-                        "the appended terminal's ACTIVATED set EXACTLY equals the intent's frozen SELECTED keys — the record the strict reader accepts"
+                        "the successful terminal promises the intent's planned result — the selected membership is derived from the slot table"
                     );
                 }
                 // REJECTED INPUTS LEAVE THE LEDGER BYTES UNCHANGED: the

@@ -2,16 +2,15 @@
 //! RECOVERY / RECONCILIATION of intent-only ledger entries).
 
 use crate::config::ProjectConfig;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::identity::{OperationId, SlotId};
+use crate::kernel;
 use crate::ledger::finalize::{FinalizeOutcome, FinalizeSettings, finalize_successful_locked};
-use crate::ledger::records::DegradedTerminal;
-use crate::ledger::records::DeploymentIntent;
-use crate::ledger::records::NonEmptySlotTable;
-use crate::ledger::records::SlotTable;
-use crate::ledger::records::{LedgerTerminal, TerminalDisposition};
-use crate::ledger::records::{Observation, ObservedGeneration};
-use crate::ledger::records::{SlotOutcome, SlotOutcomeKind, SlotTransition};
+use crate::ledger::records::{
+    DegradedTerminal, DeploymentIntent, LedgerTerminal, NonEmptySlotTable, Observation,
+    ObservedGeneration, SlotOutcome, SlotOutcomeKind, SlotTable, SlotTransition,
+    TerminalDisposition,
+};
 use crate::remote::helper::RemoteHelper;
 use crate::store::local::LocalStore;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -42,8 +41,8 @@ pub(crate) fn reconcile_pending_commits(
 
     for attempt in pending {
         let membership_ok = attempt
-            .selected
-            .keys()
+            .selected_membership()
+            .iter()
             .all(|sid| members.contains(sid.as_str()));
         if !membership_ok {
             append_degraded(store, target_name, &attempt, "membership mismatch")?;
@@ -51,13 +50,10 @@ pub(crate) fn reconcile_pending_commits(
         }
 
         let mut bindings_equal = true;
-        for sid in attempt.selected.keys() {
-            let frozen_binding = attempt
-                .resulting_snapshot
-                .get(sid)
-                .expect("selected in snapshot")
-                .binding();
-            let equal = live_bindings.get(sid) == Some(frozen_binding);
+        let snapshot = attempt.resulting_snapshot();
+        for sid in attempt.selected_membership() {
+            let frozen_binding = snapshot.get(&sid).expect("selected in snapshot").binding();
+            let equal = live_bindings.get(&sid) == Some(frozen_binding);
             bindings_equal &= equal;
         }
         if !bindings_equal {
@@ -65,6 +61,12 @@ pub(crate) fn reconcile_pending_commits(
             continue;
         }
 
+        // RECOVERY COMPLETES THE RECORDED ATTEMPT: the plan was validated
+        // at plan time and durably recorded before mutation, and the
+        // recovery contract (requirement.md step 15) finalizes it
+        // `Successful` once the LIVE state still matches — so the
+        // finalize-time one-parent rule is SKIPPED here (a head that later
+        // landed is never a reason to strand a verified attempt).
         match finalize_successful_locked(
             store,
             &attempt,
@@ -72,6 +74,7 @@ pub(crate) fn reconcile_pending_commits(
             &FinalizeSettings {
                 reason: "recovery finalized",
                 op_id,
+                enforce_parent: false,
             },
         )? {
             FinalizeOutcome::Finalized => {}
@@ -92,14 +95,11 @@ fn append_degraded(
     attempt: &DeploymentIntent,
     reason: &str,
 ) -> Result<()> {
+    let snapshot = attempt.resulting_snapshot();
     let outcomes: BTreeMap<SlotId, SlotOutcome> = attempt
-        .selected
-        .keys()
-        .map(|sid| {
-            let entry = attempt
-                .resulting_snapshot
-                .get(sid)
-                .expect("selected in snapshot");
+        .selected()
+        .map(|(sid, _)| {
+            let entry = snapshot.get(&sid).expect("selected in snapshot");
             (
                 sid.clone(),
                 SlotOutcome {
@@ -115,15 +115,15 @@ fn append_degraded(
         })
         .collect();
     let outcomes: SlotTable<SlotOutcome> = SlotTable::from_map(outcomes);
-    let non_empty = NonEmptySlotTable::build(outcomes.iter().map(|(k, v)| (k.clone(), v.clone())))?;
-    let dt = DegradedTerminal::try_new(non_empty)?;
-    store.append_terminal(
-        target_name,
-        &attempt.deployment_id,
-        &LedgerTerminal {
-            recorded_at: crate::remote::helper::now_rfc3339(),
-            disposition: TerminalDisposition::Degraded(dt),
-            reason: Some(reason.to_string()),
-        },
-    )
+    let non_empty = NonEmptySlotTable::build(outcomes.iter().map(|(k, v)| (k.clone(), v.clone())))
+        .map_err(|e| Error::integrity(format!("recovery degraded outcomes: {e}")))?;
+    let dt = DegradedTerminal::try_new(non_empty)
+        .map_err(|e| Error::integrity(format!("recovery degraded terminal: {e}")))?;
+    let terminal = LedgerTerminal::new(
+        crate::remote::helper::now_rfc3339_ts(),
+        kernel::terminal::intent_digest(attempt),
+        TerminalDisposition::Degraded(dt),
+        Some(reason.to_string()),
+    );
+    store.append_terminal(target_name, attempt.deployment_id(), &terminal)
 }

@@ -37,7 +37,7 @@
 /// current one is REJECTED on read (no compatibility fallback), so a
 /// record is interpreted only under exactly the schema that wrote it:
 ///
-/// * version 8 (CURRENT): the INTENT record FREEZES the COMPLETE resulting
+/// * version 9 (CURRENT): the INTENT record FREEZES the COMPLETE resulting
 ///   snapshot (`resulting_snapshot: TargetSnapshotWire` — every target slot's
 ///   generation+artifact+binding, keys = full membership) plus the selected
 ///   slots' pre-push states (`selected` table); the intent wire DROPS the
@@ -103,7 +103,7 @@
 /// frozen bindings are REQUIRED, no serde default). A hypothetical
 /// pre-rekeying shape that keyed these maps by server ID with flat
 /// artifact fields is NOT the current schema and never loads.
-pub(crate) const LEDGER_SCHEMA_VERSION: u32 = 8;
+pub(crate) const LEDGER_SCHEMA_VERSION: u32 = 9;
 
 /// The `pins.json` record format version (`Pins.schema_version`). Pins are
 /// durable, store-global retention anchors for artifact CONTENT ONLY (see

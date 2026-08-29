@@ -26,18 +26,13 @@ fn successful_entries(store: &LocalStore, target: &str) -> Result<Vec<LedgerEntr
         .collect())
 }
 
-/// The rollback payload of a successful entry (the old snapshot fields:
-/// `slots`, `bindings`, `behavior_sha256`, `release`).
-fn rollback_of(e: &LedgerEntry) -> &TargetSnapshot {
-    match &e
-        .terminal
-        .as_ref()
-        .expect("a successful entry has a terminal")
-        .disposition
-    {
-        deploy::ledger::TerminalDisposition::Successful(st) => st.rollback(),
-        _ => panic!("a successful entry carries a rollback state"),
-    }
+/// THE SNAPSHOT of a successful entry, RESOLVED from its intent (the
+/// successful terminal is payload-free; the old `slots`/`bindings`/
+/// `behavior_sha256`/`release` fields all resolve from the one stored
+/// fact).
+fn rollback_of(e: &LedgerEntry) -> TargetSnapshot {
+    deploy::kernel::snapshot::resolve_snapshot(e)
+        .expect("a successful entry resolves its snapshot from the intent")
 }
 
 /// The KNOWN artifact of a report actual ([`deploy::ledger::SlotAttemptState`]):
@@ -2916,11 +2911,12 @@ fn committed_txn_write_failure_pends_commit() -> Result<()> {
     );
 
     // The service is active (current was advanced) but the bookkeeping write
-    // failed, so the attempt must NOT be `Successful`.
+    // failed, so the attempt must NOT be `Successful`: the push reports the
+    // PENDING state (an intent without a terminal IS pending — no terminal
+    // status on the enum), and the next push's finalizer completes it.
     assert_eq!(
-        r.status,
-        Some(DeploymentStatus::PendingCommit),
-        "failed committed-transaction write must yield PendingCommit, got {:?}",
+        r.status, None,
+        "failed committed-transaction write must leave the attempt pending, got {:?}",
         r.status
     );
 
@@ -2975,9 +2971,8 @@ fn commit_marker_write_failure_pends_commit() -> Result<()> {
     // All servers activated and the committed-transaction write succeeded, but
     // the commit marker write failed: do not report `Successful`.
     assert_eq!(
-        r.status,
-        Some(DeploymentStatus::PendingCommit),
-        "failed commit-marker write must yield PendingCommit, got {:?}",
+        r.status, None,
+        "failed commit-marker write must leave the attempt pending, got {:?}",
         r.status
     );
 
@@ -3030,9 +3025,8 @@ fn pending_commit_attempt_reconciled_on_next_push() -> Result<()> {
         },
     )?;
     assert_eq!(
-        r1.status,
-        Some(DeploymentStatus::PendingCommit),
-        "failed marker write must yield PendingCommit"
+        r1.status, None,
+        "failed marker write must leave the attempt pending (intent-only)"
     );
     let attempt1 = r1.attempt.expect("attempt recorded");
 
@@ -3199,7 +3193,10 @@ fn pending_commit_diverged_generation_is_degraded_not_successful() -> Result<()>
             group: None,
         },
     )?;
-    assert_eq!(r1.status, Some(DeploymentStatus::PendingCommit));
+    assert_eq!(
+        r1.status, None,
+        "failed marker write leaves the attempt pending"
+    );
     let attempt1 = r1.attempt.expect("attempt recorded");
     let marker = remotes_base
         .join("server-01/state/commits")
@@ -3434,9 +3431,8 @@ fn pending_commit_conflicting_marker_is_degraded_not_pending_forever() -> Result
         },
     )?;
     assert_eq!(
-        r1.status,
-        Some(DeploymentStatus::PendingCommit),
-        "failed marker write must yield PendingCommit"
+        r1.status, None,
+        "failed marker write must leave the attempt pending (intent-only)"
     );
     let attempt1 = r1.attempt.expect("attempt recorded");
     let marker = remotes_base

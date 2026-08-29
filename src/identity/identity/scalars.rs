@@ -34,6 +34,7 @@ use crate::error::{Error, Result};
 
 /// A valid 64-lowercase-hex sha256 digest, shared by test fixtures that need
 /// a well-formed behavior digest.
+#[cfg(test)]
 pub(crate) const DIGEST_TEST_HEX_1: &str =
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 

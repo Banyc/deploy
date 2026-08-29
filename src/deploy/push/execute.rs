@@ -11,7 +11,6 @@ use crate::deploy::push::PushContext;
 use crate::deploy::rollout::BatchRun;
 use crate::error::Result;
 use crate::identity::SlotId;
-use crate::ledger::DeploymentStatus;
 use crate::ledger::SlotAttemptState;
 use crate::ledger::SlotResult;
 use crate::remote::helper::RemoteHelper;
@@ -28,20 +27,21 @@ use std::collections::HashMap;
 // the terminal event is finalized; a pre-swap failure records the ACTUAL
 // observed post-state via [`record_never_advanced_outcomes`].
 
-/// The outcome of the mutation phases: the per-slot results (with the
-/// never-advanced fix-up applied), the final status / commit decision, and
-/// the post-mutation ACTUAL observation the terminal event is built from.
+/// The outcome of the mutation phases: the gathered EVIDENCE only — the
+/// engine never decides the status (the kernel's
+/// [`crate::kernel::transition::decide_terminal`] owns the complete truth
+/// table). The successful path's verification evidence is gathered by the
+/// shared lock-verified finalizer at commit time.
 pub(crate) struct ExecutionOutcome {
     /// The per-slot results (every SELECTED slot; never-advanced outcomes
     /// carry the ACTUAL observed post-state).
     pub results: BTreeMap<SlotId, SlotResult>,
-    /// The attempt status after failure-policy compensation + commit-marker
-    /// demotion (`Successful` / `PendingCommit` / `Degraded` /
-    /// `FailedRolledBack`).
-    pub commit_status: DeploymentStatus,
-    /// The commit demotion reason (the `PendingCommit`/`Degraded` terminal
-    /// reason, e.g. "recoverable metadata failure").
-    pub commit_reason: Option<&'static str>,
+    /// Whether any slot failed during the mutation loop (the failure-path
+    /// evidence; a successful yield feeds the finalizer's verification).
+    pub had_failure: bool,
+    /// THE FAILURE EVIDENCE: whether every attempted mutation was restored
+    /// or never advanced (the kernel decides what that means).
+    pub everything_restored: bool,
     /// The per-slot ACTUAL final state (read from the live remote generation).
     pub actual_servers: BTreeMap<SlotId, SlotAttemptState>,
     /// The deployment-order slot list (step 17's per-slot retention runs in
@@ -119,9 +119,14 @@ pub(crate) fn run_execution(
 
     // 13 & 14. The FAILURE-POLICY PASS lives in [`crate::deploy::rollout`]:
     // the step-13 compensation of still-advanced servers (RollbackChanged)
-    // and the step-14 attempt-status derivation — both EXHAUSTIVE matches on
-    // the typed policy (no `_ =>` fallback, no string compare).
-    let status = crate::deploy::rollout::apply_failure_policy(
+    // and the GATHERED FAILURE EVIDENCE (whether every attempted mutation was
+    // restored or never advanced) — the STATUS DECISION IS THE KERNEL'S
+    // ([`crate::kernel::transition::decide_terminal`]); the engine gathers
+    // evidence only. The commit-marker step for an otherwise-successful
+    // attempt lives in the shared lock-verified finalizer
+    // ([`crate::ledger::finalize::finalize_successful_locked`]) at commit
+    // time.
+    let everything_restored = crate::deploy::rollout::apply_failure_policy(
         had_failure,
         failure_policy,
         &outcome.assignments,
@@ -139,23 +144,6 @@ pub(crate) fn run_execution(
         &mut compensated,
         &mut results,
     )?;
-
-    // 15. Commit markers (only for otherwise-successful attempts) and the
-    // resulting status/disposition decision live in [`crate::deploy::rollout`]:
-    // [`status::decide_commit_status`] runs the per-slot marker step and
-    // demotes to `PendingCommit` / `Degraded` with the recorded reason (e.g.
-    // "recoverable metadata failure", "commit diverged", "marker integrity
-    // conflict") so `deploy log` can explain why an attempt ended up there.
-    let (commit_status, commit_reason) = crate::deploy::rollout::decide_commit_status(
-        &status,
-        &results,
-        helpers,
-        &servers_order,
-        &outcome.new_gen,
-        deployment_id,
-        target_name,
-        op_id,
-    );
 
     // 16 & 17. Record attempt, history, retention.
     //
@@ -184,8 +172,8 @@ pub(crate) fn run_execution(
 
     Ok(ExecutionOutcome {
         results,
-        commit_status,
-        commit_reason,
+        had_failure,
+        everything_restored,
         actual_servers,
         servers_order,
     })
@@ -261,7 +249,7 @@ pub(crate) mod execute_tests {
         assert_eq!(attempts.len(), 1, "intent must be recorded before mutation");
         assert_eq!(
             latest_status(&h, id.as_str()),
-            DeploymentStatus::FailedRolledBack
+            Some(DeploymentStatus::FailedRolledBack)
         );
         let results = h.store.read_results(id.as_str()).unwrap();
         assert_eq!(results[&SlotId::new("p1")].outcome, SlotOutcomeKind::Failed);
@@ -513,7 +501,7 @@ pub(crate) mod execute_tests {
         // snapshot, and the s0 snapshot/ref are untouched.
         assert_eq!(
             latest_status(&h, id2.as_str()),
-            DeploymentStatus::FailedRolledBack
+            Some(DeploymentStatus::FailedRolledBack)
         );
         let snapshots = h.store.read_snapshots("t1").unwrap();
         assert_eq!(snapshots.len(), 1);

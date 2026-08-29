@@ -477,34 +477,6 @@ pub(crate) mod test_faults {
             self.arm(FaultKind::AppendDirSync, deployment_id);
         }
 
-        /// Arm the FIRST append's durable dir-creation SYNC of the new target
-        /// dir's entry (the fsync of `targets/`) to fail once for `target`.
-        /// The arm fires only when the append actually CREATED the target
-        /// directory: the dirs are created and their entries synced by the
-        /// durable helper, the append reports `Err`, and crash recovery finds
-        /// the prior state (the target dir, no ledger).
-        pub(crate) fn arm_sync_new_target_dir(&self, target: &str) {
-            self.arm(FaultKind::SyncNewTargetDir, target);
-        }
-
-        /// Arm the FIRST append's durable dir-creation: the sync of the
-        /// `targets/` directory's OWN entry (the fsync of the store base) to
-        /// fail once for `target`. Same conditioning and outcome contract as
-        /// [`FaultRegistry::arm_sync_new_target_dir`].
-        pub(crate) fn arm_sync_targets_dir(&self, target: &str) {
-            self.arm(FaultKind::SyncTargetsDir, target);
-        }
-
-        /// Arm the LOCK-PATH target-dir creation (the durable pre-creation
-        /// the engine/checkpoint run before the target lock) to fail once for
-        /// `target`. Fires BEFORE the durable helper creates anything — a
-        /// crash at the mkdir step — so recovery finds the prior state with
-        /// NO target directory (a first target) and no ledger, and a retry
-        /// re-appends cleanly.
-        pub(crate) fn arm_lock_mkdir(&self, target: &str) {
-            self.arm(FaultKind::LockMkdir, target);
-        }
-
         /// Arm the next `write_server` call that records `deployment_id`
         /// (its `last_observed.last_deployment`) under `target` (its
         /// `last_seen_target`) to fail once. This is the post-commit
@@ -1784,5 +1756,245 @@ mod step17_hook_property_tests {
                 );
             }
         }
+    }
+}
+
+/// TEST FIXTURES for the semantic-kernel record shapes: shared builders the
+/// record-model and engine test modules use to construct VALID intents and
+/// terminals through the KERNEL's validated constructors (the old direct
+/// struct literals are gone — the domain types are private-fielded and the
+/// constructors are the ONE validator). Tests that need INVALID values
+/// mutate the WIRE objects, never the domain.
+pub(crate) mod fixtures {
+    use crate::identity::{
+        ArtifactRef, BehaviorDigest, DeploymentId, RolloutGroupName, SlotId, TargetName, Timestamp,
+        VariantName, test_deployment_id, test_generation_id, test_release_id, test_tree_digest,
+    };
+    use crate::kernel;
+    use crate::kernel::intent::{PlanInput, PlannedDeploy};
+    use crate::kernel::snapshot::{PreviousGeneration, SnapshotSlot};
+    use crate::ledger::TargetSnapshot;
+    use crate::ledger::records::{
+        DegradedTerminal, LedgerTerminal, NonEmptySlotTable, Observation, PhysicalBinding,
+        SlotOutcome, SlotOutcomeKind, SlotTable, SlotTransition, TerminalDisposition,
+    };
+    use std::collections::BTreeMap;
+
+    /// The canonical test binding for a slot.
+    pub(crate) fn binding(sid: &SlotId) -> PhysicalBinding {
+        PhysicalBinding {
+            server: crate::identity::ServerId::parse("s1").unwrap(),
+            deploy_dir: format!("/srv/deploy/{}", sid.as_str()),
+        }
+    }
+
+    /// A plan-minted result for a slot, derived deterministically from the
+    /// slot id (generation/artifact by tag).
+    pub(crate) fn snapshot_slot(sid: &SlotId) -> SnapshotSlot {
+        SnapshotSlot::new(
+            test_generation_id(sid.as_str()),
+            ArtifactRef {
+                release: test_release_id(sid.as_str()),
+                variant: VariantName::parse("standard").unwrap(),
+                tree: test_tree_digest(sid.as_str()),
+            },
+            binding(sid),
+        )
+    }
+
+    /// The canonical behavior digest fixture.
+    pub(crate) fn behavior_digest() -> BehaviorDigest {
+        BehaviorDigest::parse(crate::identity::DIGEST_TEST_HEX_1).unwrap()
+    }
+
+    /// Build a FULL-push intent (group None, parent None) over `slots`, all
+    /// deployed (rule: group None requires every slot Deploy), with the
+    /// given pre-push observations (default `KnownAbsent`).
+    pub(crate) fn full_intent(
+        dep: &str,
+        target: &str,
+        slots: &[SlotId],
+        pre_push: &[(SlotId, Observation<PreviousGeneration>)],
+    ) -> crate::kernel::intent::DeploymentIntent {
+        let target_name = TargetName::parse(target).unwrap();
+        let planned: Vec<PlannedDeploy> = slots
+            .iter()
+            .map(|sid| PlannedDeploy {
+                slot: sid.clone(),
+                result: snapshot_slot(sid),
+                pre_push: pre_push
+                    .iter()
+                    .find(|(k, _)| k == sid)
+                    .map(|(_, o)| o.clone())
+                    .unwrap_or(Observation::KnownAbsent),
+            })
+            .collect();
+        kernel::intent::plan(PlanInput {
+            deployment_id: test_deployment_id(dep),
+            target: target_name,
+            parent: None,
+            parent_snapshot: None,
+            group: None,
+            selection: slots.to_vec(),
+            planned,
+            behavior_digest: behavior_digest(),
+            attempted_at: Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
+        })
+        .expect("a valid test intent plans")
+    }
+
+    /// [`full_intent`] with an explicit attempted_at (log-rendering tests).
+    pub(crate) fn full_intent_at(
+        dep: &str,
+        target: &str,
+        slots: &[SlotId],
+        attempted_at: &str,
+    ) -> crate::kernel::intent::DeploymentIntent {
+        let mut i = full_intent(dep, target, slots, &[]);
+        i = crate::kernel::intent::from_wire(
+            i.deployment_id().clone(),
+            i.target().clone(),
+            i.parent().cloned(),
+            i.group().cloned(),
+            i.slots().clone(),
+            i.behavior_digest().clone(),
+            Timestamp::parse(attempted_at).unwrap(),
+        )
+        .expect("the fixture intent stays valid under a new timestamp");
+        i
+    }
+
+    /// Build a GROUP intent: a subset of slots deployed, the rest inherited
+    /// from `base` (the parent snapshot). `base` must cover every slot in
+    /// `slots`.
+    pub(crate) fn group_intent(
+        dep: &str,
+        target: &str,
+        group: &str,
+        parent: &DeploymentId,
+        base: &TargetSnapshot,
+        slots: &[SlotId],
+        group_slots: &[SlotId],
+    ) -> crate::kernel::intent::DeploymentIntent {
+        let target_name = TargetName::parse(target).unwrap();
+        let planned: Vec<PlannedDeploy> = group_slots
+            .iter()
+            .map(|sid| PlannedDeploy {
+                slot: sid.clone(),
+                result: snapshot_slot(sid),
+                pre_push: Observation::KnownAbsent,
+            })
+            .collect();
+        kernel::intent::plan(PlanInput {
+            deployment_id: test_deployment_id(dep),
+            target: target_name,
+            parent: Some(parent.clone()),
+            parent_snapshot: Some(base.clone()),
+            group: Some(RolloutGroupName::parse(group).unwrap()),
+            selection: slots.to_vec(),
+            planned,
+            behavior_digest: behavior_digest(),
+            attempted_at: Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
+        })
+        .expect("a valid test group intent plans")
+    }
+
+    /// A Successful TERMINAL for an intent: PAYLOAD-FREE, bound by the
+    /// canonical intent digest.
+    pub(crate) fn successful_terminal(
+        intent: &crate::kernel::intent::DeploymentIntent,
+    ) -> LedgerTerminal {
+        LedgerTerminal::new(
+            Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
+            kernel::terminal::intent_digest(intent),
+            TerminalDisposition::Successful,
+            Some("test seeds a successful deployment".to_string()),
+        )
+    }
+
+    /// A FailedPreflight TERMINAL for an intent.
+    pub(crate) fn failed_preflight_terminal(
+        intent: &crate::kernel::intent::DeploymentIntent,
+    ) -> LedgerTerminal {
+        LedgerTerminal::new(
+            Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
+            kernel::terminal::intent_digest(intent),
+            TerminalDisposition::FailedPreflight,
+            Some("test: preflight failed".to_string()),
+        )
+    }
+
+    /// A FAILED-ROLLED-BACK terminal whose outcomes cover exactly `slots`
+    /// (all Restored — the rolled-back class).
+    pub(crate) fn rolled_back_terminal(
+        intent: &crate::kernel::intent::DeploymentIntent,
+        slots: &[SlotId],
+    ) -> LedgerTerminal {
+        let outcomes = SlotTable::from_map(
+            slots
+                .iter()
+                .map(|sid| {
+                    (
+                        sid.clone(),
+                        SlotOutcome {
+                            outcome: SlotOutcomeKind::Restored,
+                            observation: Observation::Known(
+                                crate::ledger::records::ObservedGeneration {
+                                    generation: test_generation_id(sid.as_str()),
+                                },
+                            ),
+                            compensated: true,
+                            error: None,
+                            transition: SlotTransition::Restored,
+                        },
+                    )
+                })
+                .collect(),
+        );
+        let payload = crate::kernel::terminal::FailedRolledBackTerminal::try_new(outcomes)
+            .expect("a rolled-back payload is valid");
+        LedgerTerminal::new(
+            Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
+            kernel::terminal::intent_digest(intent),
+            TerminalDisposition::FailedRolledBack(payload),
+            Some("test: rolled back".to_string()),
+        )
+    }
+
+    /// A DEGRADED terminal whose outcomes cover exactly `slots` (all
+    /// Failed/Advanced — the remaining-changes class).
+    pub(crate) fn degraded_terminal(
+        intent: &crate::kernel::intent::DeploymentIntent,
+        slots: &[SlotId],
+    ) -> LedgerTerminal {
+        let outcomes: BTreeMap<SlotId, SlotOutcome> = slots
+            .iter()
+            .map(|sid| {
+                (
+                    sid.clone(),
+                    SlotOutcome {
+                        outcome: SlotOutcomeKind::Failed,
+                        observation: Observation::Known(
+                            crate::ledger::records::ObservedGeneration {
+                                generation: test_generation_id(sid.as_str()),
+                            },
+                        ),
+                        compensated: false,
+                        error: Some("test failure".to_string()),
+                        transition: SlotTransition::AdvanceUnknown,
+                    },
+                )
+            })
+            .collect();
+        let non_empty =
+            NonEmptySlotTable::build(outcomes.iter().map(|(k, v)| (k.clone(), v.clone())))
+                .expect("a degraded fixture outcome set is non-empty");
+        let payload = DegradedTerminal::try_new(non_empty).expect("a degraded payload is valid");
+        LedgerTerminal::new(
+            Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
+            kernel::terminal::intent_digest(intent),
+            TerminalDisposition::Degraded(payload),
+            Some("test: degraded".to_string()),
+        )
     }
 }

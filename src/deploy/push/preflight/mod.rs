@@ -1315,7 +1315,7 @@ pub(crate) mod preflight_tests {
         );
         assert_eq!(
             latest_status(&h, id.as_str()),
-            DeploymentStatus::FailedPreflight,
+            Some(DeploymentStatus::FailedPreflight),
             "a preflight failure after intent must end FailedPreflight"
         );
         let transitions = h.store.read_transitions(id.as_str()).unwrap();
@@ -1418,7 +1418,7 @@ pub(crate) mod preflight_tests {
         assert_eq!(attempts.len(), 1, "intent must be persisted before staging");
         assert_eq!(
             latest_status(&h, id.as_str()),
-            DeploymentStatus::FailedPreflight,
+            Some(DeploymentStatus::FailedPreflight),
             "a staging failure after intent must end FailedPreflight"
         );
         let transitions = h.store.read_transitions(id.as_str()).unwrap();
@@ -2136,7 +2136,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 group: None},
             )
             .unwrap();
-            assert_eq!(rp.status, Some(DeploymentStatus::PendingCommit));
+            assert_eq!(rp.status, None, "the failed-marker push leaves the attempt pending (intent-only)");
             let pending = rp.attempt.as_ref().expect("the pending push records an attempt");
             let pending_id = pending.deployment_id.clone();
             let pending_artifact = known_artifact(&pending.slots[&slot]).clone();

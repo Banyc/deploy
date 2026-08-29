@@ -11,13 +11,13 @@
 //!   [`crate::ledger::records`] itself; the LEDGER LINE + ENTRY facets
 //!   (intent, terminal, outcomes, the merged entry) live in
 //!   `crate::ledger::records::wire`; the RECORD-VALIDATION facets
-//!   (rollback payload builder, rebinding proof, membership equations,
-//!   schema versions) live in `crate::ledger::records::validation`; the
+//!   (rebinding proof, schema versions) live in
+//!   `crate::ledger::records::validation`; the
 //!   foundational three-state observation lives in
 //!   `crate::ledger::records::observation`. The record names are all
-//!   re-exported at [`crate::ledger::records`]: the rollback records
-//!   ([`TargetSnapshot`] /
-//!   [`PhysicalBinding`] / [`CompleteRollback`]), the plan/report records
+//!   re-exported at [`crate::ledger::records`]: the shared core
+//!   ([`SlotAttemptState`] / [`DeploymentStatus`] / [`TargetSnapshot`] /
+//!   [`SnapshotEntry`] / [`PhysicalBinding`]), the plan/report records
 //!   ([`DeploymentPlanWire`] / [`DeploymentPlan`] / [`PlanSource`] /
 //!   [`PlanOrigin`] / [`BehaviorIndex`] / [`SlotPlan`]), the pins/server
 //!   records ([`Pins`] / [`ServerState`]), the intent facet
@@ -26,11 +26,10 @@
 //!   [`TerminalDisposition`]), the per-slot outcomes ([`SlotOutcome`] /
 //!   [`SlotOutcomeKind`] / [`SlotTransition`] / [`SlotResult`]), the
 //!   three-state observations ([`Observation`] and friends), the merged
-//!   entry ([`LedgerEntry`]), the rollback payload builder
-//!   ([`crate::ledger::records::build_rollback`]), the rebinding proof ([`RebindingPlan`] /
-//!   [`VerifiedReleaseRebinding`] / [`FrozenSlotTopology`]), the successful
-//!   membership-equation enforcement
-//!   (`records::verify_successful_membership_equations`), and the
+//!   entry ([`LedgerEntry`]), the rebinding proof ([`RebindingPlan`] /
+//!   [`VerifiedReleaseRebinding`] / [`FrozenSlotTopology`]), the
+//!   SEMANTIC KERNEL re-exports ([`crate::kernel::intent::DeploymentIntent`]
+//!   / [`crate::kernel::terminal`]'s terminal records), and the
 //!   schema-version constants (`LEDGER_SCHEMA_VERSION` /
 //!   `PINS_SCHEMA_VERSION`).
 //! * [`tables`] — the per-slot ordered TABLES ([`SlotTable`] /
@@ -80,20 +79,21 @@ pub mod recovery;
 pub mod refs;
 pub mod tables;
 
+pub use crate::kernel::intent::{PlannedSlot, SlotAction};
+pub use crate::kernel::snapshot::PreviousGeneration;
 pub use finalize::{
     FinalizeOutcome, FinalizeSettings, LedgerEntry, LedgerLine, finalize_successful_locked,
 };
 pub use log::render_log;
 pub use records::{
-    ArtifactRefWire, BehaviorIndex, CompensationReport, CompleteRollback, DegradedTerminal,
-    DeploymentIntent, DeploymentPlan, DeploymentPlanWire, DeploymentStatus, FrozenSlotTopology,
+    ArtifactRefWire, BehaviorIndex, CheckpointWire, DegradedTerminal, DeploymentIntent,
+    DeploymentPlan, DeploymentPlanWire, DeploymentStatus, FrozenSlotTopology, LedgerEventWire,
     LedgerIntentReport, LedgerIntentWire, LedgerTerminal, LedgerTerminalWire, NonEmptySlotTable,
     Observation, ObservationError, ObservationWire, ObservedAssignment, ObservedGeneration,
     ObservedGenerationWire, ObservedSlot, ObservedTarget, PhysicalBinding, Pins, PlanOrigin,
-    PlanSource, RebindingPlan, SelectedSlotIntent, ServerState, SlotAttemptState,
-    SlotAttemptStateWire, SlotOutcome, SlotOutcomeKind, SlotPlan, SlotResult, SlotTable,
-    SlotTransition, SnapshotEntry, SuccessfulTerminal, TargetSnapshot, TargetSnapshotWire,
-    TerminalDisposition, VerifiedReleaseRebinding,
+    PlanSource, RebindingPlan, ServerState, SlotAttemptState, SlotOutcome, SlotOutcomeKind,
+    SlotPlan, SlotResult, SlotTable, SlotTransition, SnapshotEntry, SnapshotSlotWire,
+    TargetSnapshot, TerminalDisposition, VerifiedReleaseRebinding,
 };
 pub use refs::{
     PushRef, attempt_slot_ids, deployment_index, ref_name, resolve_deployment,

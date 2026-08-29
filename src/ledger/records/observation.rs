@@ -20,8 +20,8 @@
 //!
 //! The single CONCERN of this module is the observed assignment itself;
 //! every other facet consumes it (the shared core's pre-push assignments,
-//! the intent's [`crate::ledger::records::SelectedSlotIntent`], the per-slot
-//! outcomes, the rollback payload builder).
+//! the intent's slot table, the per-slot outcomes, the derived resulting
+//! snapshot).
 
 use crate::error::{Error, Result};
 use crate::identity::{

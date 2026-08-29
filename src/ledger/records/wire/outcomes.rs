@@ -13,12 +13,11 @@
 use crate::error::Result;
 use crate::identity::SlotId;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
+use super::super::SlotTable;
 use super::super::observation::{
     Observation, ObservationWire, ObservedGeneration, ObservedGenerationWire,
 };
-use super::super::{DeploymentIntent, LedgerTerminal, SlotTable, TerminalDisposition};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SlotOutcomeKind {
@@ -201,104 +200,6 @@ impl SlotResult {
 /// ([`LedgerTerminal::compensation`]) — never a stored duplicate that could
 /// disagree with the outcomes.
 pub type CompensationReport = SlotTable<SlotOutcome>;
-
-impl LedgerTerminal {
-    /// The REMAINING CHANGES of a [`TerminalDisposition::Degraded`] terminal
-    /// — DERIVED from the disposition's OWN per-slot outcomes (the slots
-    /// whose FINAL OBSERVED STATE differs from their pre_push state, each
-    /// mapped to its THREE-STATE OBSERVATION), never stored. `None` for any
-    /// non-Degraded disposition. For a Degraded terminal the set may be
-    /// EMPTY (a `leave_changed` failure that advanced nothing — e.g. a
-    /// pre-swap failure with every slot skipped — is Degraded with no
-    /// remaining change); the conversion refuses only a Degraded wire whose
-    /// outcomes are ALL restored (a fully-compensated attempt must be
-    /// `FailedRolledBack`, never Degraded).
-    ///
-    /// THE DERIVATION IS THE TRANSITION STATE, NOT THE OUTCOME'S GENERATION
-    /// FIELD: each slot's [`SlotTransition`] classifies it — a
-    /// `NeverAdvanced` slot (skipped) and a `Restored` slot (compensated
-    /// back) are back at their pre_push state (never remaining changes); an
-    /// `Advanced` slot is at the desired state (always a remaining change);
-    /// an `AdvanceUnknown` slot (a pre-swap failure — the advance outcome is
-    /// unknown) is a remaining change iff its OBSERVED state (the outcome's
-    /// observation, which the engine records as the actual post-state, never
-    /// the desired one) differs from pre_push. The intent's `pre_push` per
-    /// slot is the comparison baseline.
-    ///
-    /// THE THREE-STATE OBSERVATION IS THE COMPARISON, NEVER A `None`
-    /// COLLAPSED INTO "UNCHANGED": an `Unknown` observation (the post-mutation
-    /// status read failed) is UNCERTAIN — the slot may or may not have
-    /// changed — so it is NEVER classified as unchanged: it IS a remaining
-    /// change, mapped to its `Unknown(error)` observation. A `KnownAbsent`
-    /// observation (the read succeeded showing no state) is a remaining
-    /// change only when the slot HAD a pre_push generation that is now gone.
-    pub fn remaining_changes(
-        &self,
-        intent: &DeploymentIntent,
-    ) -> Option<SlotTable<Observation<ObservedGeneration>>> {
-        // The derivation reads the Degraded disposition's OWN outcome table
-        // directly (never the materialized [`LedgerTerminal::outcomes`]
-        // accessor — a Degraded terminal stores its table).
-        let TerminalDisposition::Degraded(dt) = &self.disposition else {
-            return None;
-        };
-        let remaining: BTreeMap<SlotId, Observation<ObservedGeneration>> = dt
-            .outcomes()
-            .iter()
-            .filter(|(sid, r)| match r.transition {
-                SlotTransition::NeverAdvanced | SlotTransition::Restored => false,
-                SlotTransition::Advanced => true,
-                SlotTransition::AdvanceUnknown => {
-                    // The advance outcome is unknown (a pre-swap failure):
-                    // the slot is a remaining change iff its OBSERVED state
-                    // differs from pre_push. An `Unknown` observation (the
-                    // post-mutation status read failed) is NOT evidence of
-                    // no change — the slot may have changed; it is UNCERTAIN
-                    // and therefore a remaining change.
-                    let pre = intent
-                        .selected
-                        .get(sid)
-                        .and_then(|s| s.pre_push.as_ref())
-                        .map(|p| p.generation.clone());
-                    match &r.observation {
-                        Observation::Known(og) => {
-                            let obs = og.generation.clone();
-                            match (Some(obs), pre) {
-                                (Some(obs), Some(pre_gen)) => obs != pre_gen,
-                                (Some(_), None) => true,
-                                _ => false,
-                            }
-                        }
-                        // The read succeeded showing no state: a change only
-                        // when the slot HAD a pre_push generation that is now
-                        // gone.
-                        Observation::KnownAbsent => pre.is_some(),
-                        // The read FAILED: uncertain — never unchanged.
-                        Observation::Unknown(_) => true,
-                    }
-                }
-            })
-            .map(|(k, r)| (k.clone(), r.observation.clone()))
-            .collect();
-        Some(SlotTable::from_map(remaining))
-    }
-
-    /// The COMPENSATION REPORT of a [`TerminalDisposition::FailedRolledBack`]
-    /// terminal — the disposition's OWN per-slot outcomes table itself (the
-    /// record of what the compensation pass did to each slot: which slots
-    /// were restored and which compensation failed), never a stored
-    /// duplicate. `None` for any other disposition.
-    pub fn compensation(&self) -> Option<&CompensationReport> {
-        // The report IS the FailedRolledBack disposition's OWN outcome
-        // table — read directly (never the materialized
-        // [`LedgerTerminal::outcomes`] accessor — a FailedRolledBack
-        // terminal stores its table).
-        match &self.disposition {
-            TerminalDisposition::FailedRolledBack { outcomes } => Some(outcomes),
-            _ => None,
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests_outcomes {

@@ -1,11 +1,11 @@
 //! The per-attempt outcome derivation: [`failure`] (failure policies +
-//! never-advanced outcome fix-up), [`results`] (result-table shaping),
-//! [`status`] (the post-mutation status / disposition decision).
+//! never-advanced outcome fix-up) and [`results`] (result-table shaping).
+//! The STATUS / DISPOSITION DECISION is the SEMANTIC KERNEL's
+//! ([`crate::kernel::transition::decide_terminal`]); the engine gathers
+//! evidence only.
 
 mod failure;
 mod results;
-mod status;
 
 pub(crate) use failure::*;
 pub(crate) use results::*;
-pub(crate) use status::*;

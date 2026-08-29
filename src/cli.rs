@@ -650,157 +650,54 @@ fn print_report(report: &PushReport) {
 mod tests {
     use super::*;
     use crate::identity::{
-        ArtifactRef, GenerationRef, PlacementSlotAssignment, ReleaseId, ServerId, SlotId,
-        TargetName, VariantName, test_deployment_id, test_generation_id, test_release_id,
+        ReleaseId, SlotId, VariantName, test_deployment_id, test_generation_id, test_release_id,
         test_tree_digest,
     };
     use crate::ledger::{
-        DeploymentIntent, DeploymentStatus, LedgerTerminal, NonEmptySlotTable, ObservedSlot,
-        TargetSnapshot, TerminalDisposition,
+        DeploymentIntent, DeploymentStatus, LedgerTerminal, ObservedSlot, TerminalDisposition,
     };
-    use std::collections::BTreeMap;
-    use std::collections::BTreeSet;
 
+    /// A valid full-push intent for the ONE-slot (p1) `production` fixture
+    /// target, built through the kernel's validated constructor.
     fn pending_attempt(id: &str) -> DeploymentIntent {
-        let p1 = SlotId::parse("p1").unwrap();
-        let artifact = ArtifactRef {
-            release: test_release_id("rel-1"),
-            variant: VariantName::parse("standard").unwrap(),
-            tree: test_tree_digest("tree-1"),
-        };
-        let binding = crate::ledger::PhysicalBinding {
-            server: ServerId::parse("s1").unwrap(),
-            deploy_dir: "/srv/deploy/p1".to_string(),
-        };
-        let entries = BTreeMap::from([(
-            p1.clone(),
-            crate::ledger::SnapshotEntry::new(
-                test_generation_id("gen-1"),
-                artifact.clone(),
-                binding,
-            ),
-        )]);
-        let snapshot = TargetSnapshot::from_entries(entries);
-        DeploymentIntent {
-            deployment_id: test_deployment_id(id),
-            target: TargetName::parse("production").unwrap(),
-            group: None,
-            resulting_snapshot: snapshot,
-            selected: NonEmptySlotTable::build(BTreeMap::from([(
-                p1.clone(),
-                crate::ledger::SelectedSlotIntent {
-                    pre_push: None,
-                    ..Default::default()
-                },
-            )]))
-            .expect("fixture"),
-            behavior_sha256: crate::identity::BehaviorDigest::parse(
-                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-            )
-            .unwrap(),
-            attempted_at: crate::identity::Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
-        }
+        crate::testutil::fixtures::full_intent(
+            id,
+            "production",
+            &[SlotId::parse("p1").unwrap()],
+            &[],
+        )
     }
 
-    /// Seed the ledger with a successful deployment (intent + `Successful`
-    /// terminal carrying a rollback state, so `sN`/log prefixes apply). The
-    /// terminal is the EXACT-EQUAL shape: one Activated outcome per slotted
-    /// generation, and a rollback whose slots/bindings key the same
-    /// membership (the membership equations (outcomes == selected == full == rollback slots) are enforced by the conversion).
+    /// Seed the ledger with a successful deployment (intent + its
+    /// PAYLOAD-FREE `Successful` terminal, bound by the canonical digest —
+    /// the snapshot resolves from the intent).
     fn seed_successful(store: &LocalStore, id: &str, attempted_at: &str) {
-        let mut it = pending_attempt(id);
-        it.attempted_at = crate::identity::Timestamp::parse(attempted_at).unwrap();
+        let it = crate::testutil::fixtures::full_intent_at(
+            id,
+            "production",
+            &[SlotId::parse("p1").unwrap()],
+            attempted_at,
+        );
         store.append_intent("production", &it).unwrap();
         store
             .append_terminal(
                 "production",
-                &test_deployment_id(id),
-                &successful_terminal(attempted_at, "deployed"),
+                it.deployment_id(),
+                &successful_terminal(&it, "deployed"),
             )
             .unwrap();
     }
 
-    /// A `Successful` terminal in the EXACT-EQUAL shape for the one-slot
-    /// fixture intent (membership `p1`): one Activated outcome, and a
-    /// rollback whose slots and bindings key exactly `p1`.
-    fn successful_terminal(recorded_at: &str, reason: &str) -> LedgerTerminal {
-        let p1 = SlotId::parse("p1").unwrap();
-        LedgerTerminal {
-            recorded_at: recorded_at.to_string(),
-            disposition: TerminalDisposition::Successful(
-                crate::ledger::SuccessfulTerminal::try_new(
-                    {
-                        let __slots: BTreeMap<
-                            crate::identity::SlotId,
-                            crate::identity::GenerationRef,
-                        > = BTreeMap::from([(
-                            p1.clone(),
-                            GenerationRef {
-                                generation: test_generation_id("gen-1"),
-                                assignment: PlacementSlotAssignment {
-                                    placement_slot: p1.clone(),
-                                    artifact: ArtifactRef {
-                                        release: test_release_id("rel-1"),
-                                        variant: VariantName::parse("standard").unwrap(),
-                                        tree: test_tree_digest("tree-1"),
-                                    },
-                                },
-                            },
-                        )]);
-                        let __bindings: BTreeMap<
-                            crate::identity::SlotId,
-                            crate::ledger::records::PhysicalBinding,
-                        > = BTreeMap::from([(
-                            p1.clone(),
-                            crate::ledger::PhysicalBinding {
-                                server: ServerId::parse("s1").unwrap(),
-                                deploy_dir: "/srv/deploy/p1".to_string(),
-                            },
-                        )]);
-                        let mut __entries: BTreeMap<
-                            crate::identity::SlotId,
-                            crate::ledger::records::SnapshotEntry,
-                        > = BTreeMap::new();
-                        for (k, v) in __slots.clone() {
-                            let b = __bindings.get(&k).cloned().unwrap_or(
-                                crate::ledger::records::PhysicalBinding {
-                                    server: crate::identity::ServerId::new("s1"),
-                                    deploy_dir: format!("/srv/deploy/{}", k.as_str()),
-                                },
-                            );
-                            __entries.insert(
-                                k.clone(),
-                                crate::ledger::records::SnapshotEntry::new(
-                                    v.generation.clone(),
-                                    v.assignment.artifact.clone(),
-                                    b,
-                                ),
-                            );
-                        }
-                        for (k, b) in __bindings.clone() {
-                            __entries.entry(k.clone()).or_insert_with(|| {
-                                crate::ledger::records::SnapshotEntry::new(
-                                    crate::identity::GenerationId::new("gen-missing".to_string()),
-                                    crate::identity::ArtifactRef {
-                                        release: crate::identity::test_release_id("rel-missing"),
-                                        variant: crate::identity::VariantName::new(
-                                            "standard".to_string(),
-                                        ),
-                                        tree: crate::identity::test_tree_digest("missing"),
-                                    },
-                                    b.clone(),
-                                )
-                            });
-                        }
-                        TargetSnapshot::from_entries(__entries)
-                    },
-                    crate::identity::NonEmptySlotSet::try_new(BTreeSet::from([p1.clone()]))
-                        .unwrap(),
-                )
-                .unwrap(),
-            ),
-            reason: Some(reason.to_string()),
-        }
+    /// A `Successful` terminal BOUND to the given intent, with the given
+    /// reason (payload-free — the disposition only says the intent's planned
+    /// result was achieved).
+    fn successful_terminal(intent: &DeploymentIntent, reason: &str) -> LedgerTerminal {
+        LedgerTerminal::new(
+            crate::identity::Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
+            crate::kernel::terminal::intent_digest(intent),
+            TerminalDisposition::Successful,
+            Some(reason.to_string()),
+        )
     }
 
     #[test]
@@ -815,26 +712,24 @@ mod tests {
         let entries = store.read_ledger("production").unwrap();
         assert_eq!(
             crate::ledger::log::effective_status(&entries[0]),
-            (DeploymentStatus::PendingCommit, None)
+            (None, None),
+            "an intent-only entry IS the pending state — no pending status on the terminal enum"
         );
 
-        // A terminal event carries the status + reason. The status is
-        // `Successful`, so the terminal must carry its rollback payload (the
-        // STATUS/ROLLBACK TRUTH TABLE refuses a Successful terminal without
-        // one — the status-only `append_transition` helper cannot represent
-        // it, so the terminal is appended directly).
+        // A terminal event carries the status + reason. A `Successful`
+        // terminal is PAYLOAD-FREE (the snapshot resolves from the intent).
         store
             .append_terminal(
                 "production",
-                &a.deployment_id,
-                &successful_terminal("2026-01-01T00:00:00Z", "recovery finalization"),
+                a.deployment_id(),
+                &successful_terminal(&a, "recovery finalization"),
             )
             .unwrap();
         let entries = store.read_ledger("production").unwrap();
         assert_eq!(
             crate::ledger::log::effective_status(&entries[0]),
             (
-                DeploymentStatus::Successful,
+                Some(DeploymentStatus::Successful),
                 Some("recovery finalization".to_string())
             )
         );
@@ -857,18 +752,23 @@ mod tests {
         // Two deployments: the first succeeds (producing rollback ref s0);
         // the second fails in preflight (producing NO rollback state).
         seed_successful(&store, "deploy-log-ok", "2026-01-01T00:00:00Z");
-        let mut a_failed = pending_attempt("deploy-log-failed");
-        a_failed.attempted_at = crate::identity::Timestamp::parse("2026-01-02T00:00:00Z").unwrap();
+        let a_failed = crate::testutil::fixtures::full_intent_at(
+            "deploy-log-failed",
+            "production",
+            &[SlotId::parse("p1").unwrap()],
+            "2026-01-02T00:00:00Z",
+        );
         store.append_intent("production", &a_failed).unwrap();
         store
             .append_terminal(
                 "production",
-                &a_failed.deployment_id,
-                &LedgerTerminal {
-                    recorded_at: "2026-01-02T00:00:00Z".to_string(),
-                    disposition: TerminalDisposition::FailedPreflight,
-                    reason: Some("preflight failed".to_string()),
-                },
+                a_failed.deployment_id(),
+                &LedgerTerminal::new(
+                    crate::identity::Timestamp::parse("2026-01-02T00:00:00Z").unwrap(),
+                    crate::kernel::terminal::intent_digest(&a_failed),
+                    TerminalDisposition::FailedPreflight,
+                    Some("preflight failed".to_string()),
+                ),
             )
             .unwrap();
 

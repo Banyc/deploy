@@ -551,11 +551,12 @@ pub(crate) fn push_inner(
         let _ = store.append_terminal(
             target_name,
             deployment_id,
-            &LedgerTerminal {
-                recorded_at: crate::remote::helper::now_rfc3339(),
-                disposition: TerminalDisposition::FailedPreflight,
-                reason: Some(failure.reason.to_string()),
-            },
+            &LedgerTerminal::new(
+                crate::remote::helper::now_rfc3339_ts(),
+                crate::kernel::terminal::intent_digest(&attempt_intent),
+                TerminalDisposition::FailedPreflight,
+                Some(failure.reason.to_string()),
+            ),
         );
         for a in &preflight.assignments {
             helpers[&a.placement_slot]
@@ -582,12 +583,13 @@ pub(crate) fn push_inner(
 pub(crate) mod push_tests {
     use crate::deploy::testsupport::*;
     use crate::identity::test_deployment_id;
-    use crate::ledger::SlotOutcomeKind;
 
     /// The ORDERING test: a clean successful push appends exactly ONE
     /// terminal event (`Successful`) in the deployment order, with the
-    /// outcomes separation (persisted intent carries none) and the
-    /// snapshot built from the outcomes.
+    /// outcomes separation under the new model — the persisted intent line
+    /// carries NO outcomes AND the Successful terminal is PAYLOAD-FREE (the
+    /// resulting snapshot resolves from the intent's own slot table, never
+    /// from a duplicated outcome payload).
     #[test]
     fn clean_push_transition_sequence_and_outcomes() {
         let h = RecoveryHarness::new();
@@ -602,14 +604,16 @@ pub(crate) mod push_tests {
             vec![DeploymentStatus::Successful],
             "a successful push appends exactly ONE terminal event (Successful)"
         );
-        assert_eq!(transitions[0].reason.as_deref(), Some("push completed"));
+        assert_eq!(transitions[0].reason(), Some("push completed"));
 
-        // Outcomes separation: the terminal event carries the per-slot
-        // outcome and the persisted intent carries NO outcomes.
+        // Outcomes separation: the Successful terminal carries NO per-slot
+        // outcome rows (payload-free — the disposition only says the
+        // planned result was achieved), and the persisted intent line also
+        // keeps none (the report's `slots` actuals stay empty).
         let results = h.store.read_results(id.as_str()).unwrap();
-        assert_eq!(
-            results[&SlotId::new("p1")].outcome,
-            SlotOutcomeKind::Activated
+        assert!(
+            results.is_empty(),
+            "a Successful terminal is payload-free — no per-slot outcome row"
         );
         let attempt = single_attempt(&h);
         assert!(
@@ -617,33 +621,28 @@ pub(crate) mod push_tests {
             "the recovered report carries no outcomes (the ledger intent line keeps them empty)"
         );
 
-        // The snapshot is built from the OUTCOMES: its per-slot generation
-        // equals results.json's outcome generation, and its artifact equals the
-        // report's actual (observed) assignment.
+        // The snapshot IS the intent's planned result (derived on demand,
+        // never stored in any terminal payload): its per-slot generation
+        // equals the report's observed actual generation, and its artifact
+        // equals the observed assignment.
         let snapshots = h.store.read_snapshots("t1").unwrap();
         assert_eq!(snapshots.len(), 1);
         let snap = &snapshots[0];
-        let wire_observation = &results[&SlotId::new("p1")].observation;
-        let wire_generation = match wire_observation {
-            ObservationWire::Known(w) => w.generation.clone(),
-            _ => panic!("a successful outcome records a Known observation"),
-        };
-        assert_eq!(
-            rollback_of(snap)
-                .get(&SlotId::new("p1"))
-                .unwrap()
-                .generation()
-                .clone(),
-            wire_generation.clone()
-        );
         let actual = &r.attempt.as_ref().unwrap().slots[&SlotId::new("p1")];
+        let rollback = rollback_of(snap);
+        let snap_p1 = rollback.get(&SlotId::new("p1")).unwrap();
         assert_eq!(
-            rollback_of(snap)
-                .get(&SlotId::new("p1"))
-                .unwrap()
-                .artifact()
-                .clone(),
-            known_artifact(actual).clone()
+            snap_p1.generation().clone(),
+            actual
+                .generation
+                .clone()
+                .expect("a successful slot records its generation"),
+            "the snapshot's generation equals the observed actual generation"
+        );
+        assert_eq!(
+            snap_p1.artifact().clone(),
+            known_artifact(actual).clone(),
+            "the snapshot's artifact equals the observed assignment"
         );
     }
 }

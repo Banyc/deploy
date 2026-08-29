@@ -10,6 +10,7 @@ pub mod env;
 pub mod error;
 pub mod identity;
 pub mod init;
+pub mod kernel;
 pub mod ledger;
 pub mod remote;
 pub mod retention;

@@ -123,16 +123,20 @@ impl PlannedResolution {
 
 /// The latest successful rollback state of a target (the base for a partial
 /// rollout's complete snapshot), or `None` when the target has no successful
-/// deployment yet.
+/// deployment yet. RESOLVED from the successful entry's intent
+/// ([`crate::kernel::snapshot::resolve_snapshot`]) — the successful
+/// terminal carries no payload.
 pub(crate) fn latest_successful_rollback(
     store: &LocalStore,
     target: &str,
 ) -> Result<Option<TargetSnapshot>> {
     for entry in store.read_ledger(target)?.into_iter().rev() {
-        if let Some(t) = entry.terminal
-            && let crate::ledger::TerminalDisposition::Successful(st) = t.disposition
+        if entry
+            .terminal
+            .as_ref()
+            .is_some_and(|t| t.disposition().is_successful())
         {
-            return Ok(Some(st.rollback().clone()));
+            return Ok(Some(crate::kernel::snapshot::resolve_snapshot(&entry)?));
         }
     }
     Ok(None)
@@ -555,11 +559,7 @@ mod plan_tests {
         Provenance, ReleaseRecord, ServerId, SlotId, TargetName, TreeDigest, VariantName,
         test_deployment_id, test_generation_id, test_tree_digest,
     };
-    use crate::ledger::records::{SelectedSlotIntent, SnapshotEntry};
-    use crate::ledger::{
-        DeploymentIntent, LedgerTerminal, NonEmptySlotTable, PhysicalBinding, TargetSnapshot,
-        TerminalDisposition,
-    };
+    use crate::ledger::PhysicalBinding;
     use crate::verify::release::RELEASE_RECORD_SCHEMA_VERSION;
     #[cfg(test)]
     use proptest::prelude::*;
@@ -721,12 +721,10 @@ interval_seconds = 0
         (dir, config)
     }
 
-    /// Seed a SUCCESSFUL ledger entry for `t1` (intent + `Successful`
-    /// terminal carrying the rollback payload), mirroring the old
-    /// `append_snapshot` test helper. The rollback payload carries the
-    /// snapshot's `slots`/`bindings`; there is NO snapshot-wide release —
-    /// each slot's generation ref carries its OWN artifact (release, variant,
-    /// tree), and a partial snapshot can span several releases.
+    /// Seed a SUCCESSFUL ledger entry for `t1`: an intent carrying the
+    /// slots' plan-minted generations/artifacts/bindings plus its
+    /// PAYLOAD-FREE `Successful` terminal (bound by the canonical digest);
+    /// the snapshot resolves from the intent's slot table.
     fn append_successful_snapshot(
         store: &LocalStore,
         deployment_id: &str,
@@ -734,142 +732,51 @@ interval_seconds = 0
         slots: BTreeMap<SlotId, GenerationRef>,
         bindings: BTreeMap<SlotId, PhysicalBinding>,
     ) {
-        let id = test_deployment_id(deployment_id);
-        let target = TargetName::parse("t1").unwrap();
-        // THE FROZEN RESULTING SNAPSHOT: one entry per slot carrying the
-        // plan-minted generation, artifact and plan-time physical binding
-        // (schema v6) — seed the binding from the same bindings the
-        // terminal's rollback records when the caller binds the slot; a
-        // deliberately UNBOUND seed (a legacy-snapshot test whose terminal's
-        // rollback omits the bindings the conversion must refuse) is given
-        // the canonical fixture binding so the INTENT itself stays a valid
-        // schema-v6 record.
-        let snapshot = TargetSnapshot::from_entries(
-            slots
-                .iter()
-                .map(|(k, g)| {
-                    (
-                        k.clone(),
-                        SnapshotEntry::new(
-                            g.generation.clone(),
-                            g.assignment.artifact.clone(),
-                            bindings.get(k).cloned().unwrap_or(PhysicalBinding {
-                                server: ServerId::parse("s1").unwrap(),
-                                deploy_dir: "/srv/eng".to_string(),
-                            }),
-                        ),
-                    )
-                })
-                .collect(),
-        );
-        store
-            .append_intent(
-                "t1",
-                &DeploymentIntent {
-                    deployment_id: id.clone(),
-                    target: target.clone(),
-                    group: None,
-                    behavior_sha256: crate::identity::BehaviorDigest::parse(
-                        crate::identity::DIGEST_TEST_HEX_1,
-                    )
-                    .unwrap(),
-                    attempted_at: crate::identity::Timestamp::parse("2026-01-01T00:00:00Z")
-                        .unwrap(),
-                    resulting_snapshot: snapshot,
-                    selected: NonEmptySlotTable::build(
-                        slots
-                            .keys()
-                            .map(|k| (k.clone(), SelectedSlotIntent { pre_push: None })),
-                    )
-                    .expect("a seeded snapshot always has at least one slot"),
-                },
-            )
-            .unwrap();
-        store
-            .append_terminal(
-                "t1",
-                &id,
-                &LedgerTerminal {
-                    recorded_at: "2026-01-01T00:00:00Z".to_string(),
-                    // THE EXACT-EQUAL shape: every slotted generation is
-                    // ACTIVATED (the memberships PROVE the equations —
-                    // activated == full == the rollback's slots — and the
-                    // per-slot generation/artifact facts are DERIVED from
-                    // the rollback, the single source of truth; a seeded
-                    // Successful terminal must carry one activated slot per
-                    // slotted generation).
-                    disposition: TerminalDisposition::Successful(
-                        crate::ledger::SuccessfulTerminal::try_new(
-                            {
-                                let __slots: BTreeMap<
-                                    crate::identity::SlotId,
-                                    crate::identity::GenerationRef,
-                                > = slots.clone();
-                                let __bindings: BTreeMap<
-                                    crate::identity::SlotId,
-                                    crate::ledger::records::PhysicalBinding,
-                                > = bindings;
-                                let mut __entries: BTreeMap<
-                                    crate::identity::SlotId,
-                                    crate::ledger::records::SnapshotEntry,
-                                > = BTreeMap::new();
-                                for (k, v) in __slots.clone() {
-                                    let b = __bindings.get(&k).cloned().unwrap_or(
-                                        crate::ledger::records::PhysicalBinding {
-                                            server: crate::identity::ServerId::new("s1"),
-                                            deploy_dir: format!("/srv/deploy/{}", k.as_str()),
-                                        },
-                                    );
-                                    __entries.insert(
-                                        k.clone(),
-                                        crate::ledger::records::SnapshotEntry::new(
-                                            v.generation.clone(),
-                                            v.assignment.artifact.clone(),
-                                            b,
-                                        ),
-                                    );
-                                }
-                                for (k, b) in __bindings.clone() {
-                                    __entries.entry(k.clone()).or_insert_with(|| {
-                                        crate::ledger::records::SnapshotEntry::new(
-                                            crate::identity::GenerationId::new(
-                                                "gen-missing".to_string(),
-                                            ),
-                                            crate::identity::ArtifactRef {
-                                                release: crate::identity::test_release_id(
-                                                    "rel-missing",
-                                                ),
-                                                variant: crate::identity::VariantName::new(
-                                                    "standard".to_string(),
-                                                ),
-                                                tree: crate::identity::test_tree_digest("missing"),
-                                            },
-                                            b.clone(),
-                                        )
-                                    });
-                                }
-                                TargetSnapshot::from_entries(__entries)
-                            },
-                            crate::identity::NonEmptySlotSet::try_new(slots.keys().cloned())
-                                .unwrap(),
-                        )
-                        .unwrap(),
+        let slot_ids: Vec<SlotId> = slots.keys().cloned().collect();
+        use crate::identity::test_deployment_id as tdi;
+        use crate::kernel::intent::{PlanInput, PlannedDeploy};
+        use crate::kernel::snapshot::SnapshotSlot;
+        use crate::ledger::Observation;
+        let planned: Vec<PlannedDeploy> = slot_ids
+            .iter()
+            .map(|k| {
+                let g = &slots[k];
+                PlannedDeploy {
+                    slot: k.clone(),
+                    result: SnapshotSlot::new(
+                        g.generation.clone(),
+                        g.assignment.artifact.clone(),
+                        bindings.get(k).cloned().unwrap_or(PhysicalBinding {
+                            server: ServerId::parse("s1").unwrap(),
+                            deploy_dir: "/srv/eng".to_string(),
+                        }),
                     ),
-                    reason: None,
-                },
+                    pre_push: Observation::KnownAbsent,
+                }
+            })
+            .collect();
+        let intent = crate::kernel::intent::plan(PlanInput {
+            deployment_id: tdi(deployment_id),
+            target: TargetName::parse("t1").unwrap(),
+            parent: None,
+            parent_snapshot: None,
+            group: None,
+            selection: slot_ids.clone(),
+            planned,
+            behavior_digest: crate::identity::BehaviorDigest::parse(
+                crate::identity::DIGEST_TEST_HEX_1,
             )
+            .unwrap(),
+            attempted_at: crate::identity::Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
+        })
+        .expect("a seeded plan intent is valid");
+        store.append_intent("t1", &intent).unwrap();
+        let terminal = crate::testutil::fixtures::successful_terminal(&intent);
+        store
+            .append_terminal("t1", &tdi(deployment_id), &terminal)
             .unwrap();
     }
 
-    /// A release record in the pre-snapshot SHAPE: an EMPTY `slots` map (the
-    /// shape written before the slots-into-identity refactor, and what
-    /// `#[serde(default)]` yields for records without a `slots` member). The
-    /// store now REJECTS empty slot snapshots at write and read (an empty
-    /// snapshot cannot be verified from content), so fixtures that need a
-    /// WRITABLE record must fill `slots` and recompute the identity with
-    /// [`consistent`]. The bare empty-snapshot record is used directly only
-    /// when a test needs the on-disk legacy shape. It still carries the
-    /// per-variant tree bindings.
     fn legacy_record(id: &str, tree: &str) -> ReleaseRecord {
         ReleaseRecord {
             release_schema_version: RELEASE_RECORD_SCHEMA_VERSION,
@@ -1498,11 +1405,13 @@ interval_seconds = 0
     /// makes exact rollback unverifiable: `plan_assignments` must REFUSE the
     /// deployment ref with a rollback error naming the slot, rather than guessing
     /// the host/location. The integration tests cover binding MISMATCH
-    /// (`rollback_refuses_rebound_slot` / `rollback_refuses_moved_deploy_dir`);
-    /// this pins the MISSING-binding refusal (the `#[serde(default)]` empty
-    /// map path).
+    /// A ROLLBACK REF CANNOT RESOLVE A TAMPERED SOURCE: the strict reader
+    /// refuses a successful terminal whose `intent_digest` does not bind its
+    /// canonical intent (the digest equality is the ONE binding — there is
+    /// no separate rollback payload to drift), so a corrupt success claim is
+    /// refused before any plan can resolve it.
     #[test]
-    fn snapshot_ref_without_recorded_bindings_refuses_rollback() {
+    fn tampered_success_claim_refuses_rollback_resolution() {
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
@@ -1511,173 +1420,54 @@ interval_seconds = 0
         std::fs::write(release_dir.join("standard.toml"), VARIANT_TOML).unwrap();
         let cfg_path = project.join("deploy.toml");
         std::fs::write(&cfg_path, DEPLOY_TOML).unwrap();
-        let config = ProjectConfig::load(&cfg_path).unwrap();
+        let _config = ProjectConfig::load(&cfg_path).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
-
-        // A snapshot whose `slots` record the generation but whose `bindings`
-        // map is EMPTY (legacy pre-feature line). The exact-binding-keys
-        // invariant now refuses such a payload TWICE OVER: the PRE-WRITE
-        // VALIDATION refuses it at the store APPEND (fail closed — the
-        // rejected pair never writes; the ledger bytes stay UNCHANGED), and
-        // a DIRECTLY-WRITTEN legacy line is still refused at the STORE READ
-        // (the wire → domain conversion): the missing binding is caught at
-        // conversion time, BEFORE `plan_assignments` can resolve the
-        // rollback, and the refusal propagates out of the plan as an
-        // integrity error naming the missing binding.
-        let id = test_deployment_id("deploy-legacy-snapshot");
-        let target = TargetName::parse("t1").unwrap();
         let slot_p1 = SlotId::parse("p1").unwrap();
-        let legacy_slot = GenerationRef {
-            generation: test_generation_id("gen-legacy"),
-            assignment: PlacementSlotAssignment {
-                placement_slot: slot_p1.clone(),
-                artifact: ArtifactRef {
-                    release: crate::identity::test_release_id("rel-sha256-legacy"),
-                    variant: VariantName::parse("standard").unwrap(),
-                    tree: test_tree_digest("tree-legacy"),
-                },
-            },
-        };
-        // THE VALID intent (schema v6: it freezes a physical binding) + the
-        // LEGACY terminal whose rollback omits the bindings map.
-        let intent = DeploymentIntent {
-            deployment_id: id.clone(),
-            target: target.clone(),
-            group: None,
-            behavior_sha256: crate::identity::BehaviorDigest::parse(
-                crate::identity::DIGEST_TEST_HEX_1,
-            )
-            .unwrap(),
-            attempted_at: crate::identity::Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
-            resulting_snapshot: TargetSnapshot::from_entries(BTreeMap::from([(
-                slot_p1.clone(),
-                SnapshotEntry::new(
-                    legacy_slot.generation.clone(),
-                    legacy_slot.assignment.artifact.clone(),
-                    PhysicalBinding {
-                        server: ServerId::parse("s1").unwrap(),
-                        deploy_dir: "/srv/eng".to_string(),
-                    },
-                ),
-            )])),
-            selected: NonEmptySlotTable::build(BTreeMap::from([(
-                slot_p1.clone(),
-                SelectedSlotIntent { pre_push: None },
-            )]))
-            .expect("a seeded snapshot always has at least one slot"),
-        };
-        let legacy_terminal = LedgerTerminal {
-            recorded_at: "2026-01-01T00:00:00Z".to_string(),
-            disposition: TerminalDisposition::Successful(
-                crate::ledger::SuccessfulTerminal::new_unchecked(
-                    crate::ledger::records::TargetSnapshot::from_entries(BTreeMap::new()),
-                    crate::identity::NonEmptySlotSet::try_new(BTreeSet::from([slot_p1.clone()]))
-                        .unwrap(),
-                ),
-            ),
-            reason: None,
-        };
-        // THE WRITER REFUSES the missing-binding pair (the hard guarantee):
-        // a terminal the strict reader would reject is never written — the
-        // ledger bytes stay unchanged.
+
+        // A valid successful deployment resolves.
+        let intent = crate::testutil::fixtures::full_intent("deploy-good", "t1", &[slot_p1], &[]);
         store.append_intent("t1", &intent).unwrap();
-        let before = std::fs::read(store.ledger_path("t1")).unwrap();
-        let err = store
-            .append_terminal("t1", &id, &legacy_terminal)
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("p1")
-                || err.to_string().contains("rollback")
-                || err.to_string().contains("selected_membership")
-                || err.to_string().contains("full_membership"),
-            "the writer must name the unverifiable slot, rollback or membership, got: {err}"
+        store
+            .append_terminal(
+                "t1",
+                intent.deployment_id(),
+                &crate::testutil::fixtures::successful_terminal(&intent),
+            )
+            .unwrap();
+        let entry = store.read_ledger("t1").unwrap().remove(0);
+        let snapshot = crate::kernel::snapshot::resolve_snapshot(&entry)
+            .expect("the successful snapshot resolves from the intent");
+        assert_eq!(snapshot.len(), 1);
+
+        // A TAMPERED SUCCESS CLAIM: the same intent + a terminal whose
+        // digest was flipped is refused by the strict reader BEFORE any plan
+        // resolves it (the digest is the ONE binding — no payload to drift).
+        let terminal_wire = crate::ledger::LedgerTerminalWire::to_wire(
+            intent.deployment_id(),
+            intent.target(),
+            &crate::testutil::fixtures::successful_terminal(&intent),
         );
-        assert!(
-            err.to_string().contains("full")
-                || err.to_string().contains("rollback")
-                || err.to_string().contains("membership")
-                || err.to_string().contains("NON-EMPTY"),
-            "the writer must explain the rollback vs membership verification failure, got: {err}"
-        );
-        let after = std::fs::read(store.ledger_path("t1")).unwrap();
-        assert_eq!(
-            before, after,
-            "a rejected terminal never writes — the ledger bytes are unchanged"
-        );
-        // THE READ STILL REFUSES a DIRECTLY-WRITTEN legacy line (the
-        // reader's refusal is independent of the writer): the resolution
-        // path propagates the same integrity error naming the missing
-        // binding.
+        let mut tampered = terminal_wire.clone();
+        let bytes = tampered.intent_digest.clone().into_bytes();
+        let flipped = if bytes[0] == b'0' { b'1' } else { b'0' };
+        let mut s_bytes = tampered.intent_digest.clone().into_bytes();
+        s_bytes[0] = flipped;
+        tampered.intent_digest = String::from_utf8(s_bytes).unwrap();
+        assert_ne!(tampered.intent_digest, terminal_wire.intent_digest);
         let p = store.ledger_path("t1");
         let line1 = serde_json::to_string(&crate::ledger::LedgerLine::Intent(
             crate::ledger::LedgerIntentWire::from(&intent),
         ))
         .unwrap();
-        let line2 = serde_json::to_string(&crate::ledger::LedgerLine::Terminal(
-            crate::ledger::LedgerTerminalWire {
-                deployment_id: id.clone(),
-                target: target.clone(),
-                status: crate::ledger::DeploymentStatus::Successful,
-                recorded_at: "2026-01-01T00:00:00Z".to_string(),
-                outcomes: {
-                    let mut m = std::collections::BTreeMap::new();
-                    m.insert(
-                        slot_p1.clone(),
-                        crate::ledger::SlotResult {
-                            slot_id: slot_p1.clone(),
-                            outcome: crate::ledger::SlotOutcomeKind::Activated,
-                            observation: crate::ledger::ObservationWire::Known(
-                                crate::ledger::ObservedGenerationWire {
-                                    generation: legacy_slot.generation.clone(),
-                                },
-                            ),
-                            compensated: false,
-                            error: None,
-                        },
-                    );
-                    m
-                },
-                rollback: Some(crate::ledger::records::TargetSnapshot::from_entries(
-                    std::collections::BTreeMap::new(),
-                )),
-                selected_membership: vec![slot_p1.clone()],
-                full_membership: vec![slot_p1.clone()],
-                reason: None,
-            },
-        ))
-        .unwrap();
+        let line2 = serde_json::to_string(&crate::ledger::LedgerLine::Terminal(tampered)).unwrap();
         std::fs::write(&p, format!("{line1}\n{line2}\n")).unwrap();
-
-        let err = plan_assignments(
-            &SlotSelection::normalize(&config, "t1", None).unwrap(),
-            &PushRef::Deployment {
-                target: TargetName::parse("t1").unwrap(),
-                deployment_id: test_deployment_id("deploy-legacy-snapshot"),
-            },
-            &crate::identity::test_release_id("unused"),
-            &BTreeMap::new(),
-            &store,
-            &config,
-        )
-        .expect_err("a deployment ref whose snapshot recorded no physical binding must refuse");
-        let msg = err.to_string();
+        let err = store.read_ledger("t1").unwrap_err();
         assert!(
-            msg.contains("p1") || msg.contains("rollback"),
-            "error must name the unverifiable slot or rollback, got: {msg}"
-        );
-        assert!(
-            msg.contains("rollback")
-                || msg.contains("full")
-                || msg.contains("membership")
-                || msg.contains("EXACTLY"),
-            "error must explain the rollback vs membership verification failure, got: {msg}"
+            err.to_string().contains("digest"),
+            "a tampered success claim must be refused by the reader, got: {err}"
         );
     }
 
-    // ---------------------------------------------------------------------
-    // DIRECT-RELEASE PROPERTY: `release:<id>` plans where a snapshot ref
-    // cannot — changed physical bindings, or a destination with no snapshot
-    // history — while snapshot refs RETAIN their exact-binding checks.
     // ---------------------------------------------------------------------
 
     /// A generated change to a slot's physical binding between the source
@@ -2211,8 +2001,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // base snapshot carrying every unselected slot); every later push is
         // a PARTIAL push of one group (its slots receive a fresh release with
         // its own distinct contract). The per-slot state overlay mirrors
-        // `build_rollback`: selected slots are replaced, unselected slots are
-        // carried forward.
+        // the resulting-snapshot overlay: selected slots are replaced,
+        // unselected slots are carried forward.
         let mut expected_digests: BTreeMap<ReleaseId, String> = BTreeMap::new();
         let mut state: BTreeMap<SlotId, ArtifactRef> = BTreeMap::new();
         let mut chain: Vec<(DeploymentId, BTreeMap<SlotId, GenerationRef>)> = Vec::new();

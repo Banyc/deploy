@@ -1,20 +1,23 @@
-//! Intent persistence: [`persist_intent`] writes the plan + the attempt
-//! INTENT record (the plan/record half of steps 5-9) — the intent freezes
-//! the COMPLETE resulting snapshot at plan time.
+//! Intent persistence: [`persist_intent`] builds the attempt INTENT through
+//! the KERNEL's validated constructor ([`crate::kernel::intent::plan`]) and
+//! writes it (the plan/record half of steps 5-9) — the intent FREEZES the
+//! COMPLETE RESULT in ONE full slot table at plan time.
 
 use super::PreflightOutcome;
 use crate::deploy::push::PushContext;
 use crate::error::Result;
-use crate::identity::{GenerationRef, PlacementSlotAssignment, SlotId, TargetName};
-use crate::ledger::DeploymentIntent;
-use crate::ledger::NonEmptySlotTable;
-use crate::ledger::records::SelectedSlotIntent;
-use crate::ledger::records::{BoundGeneration, build_rollback};
+use crate::identity::{DeploymentId, RolloutGroupName, SlotId, TargetName};
+use crate::kernel;
+use crate::kernel::intent::{PlanInput, PlannedDeploy};
+use crate::kernel::snapshot::{PreviousGeneration, SnapshotSlot};
+use crate::ledger::Observation;
+use crate::ledger::TargetSnapshot;
 
+/// The intent built by [`persist_intent`] before the append.
 pub(crate) fn persist_intent(
     ctx: &PushContext,
     outcome: &PreflightOutcome,
-) -> Result<DeploymentIntent> {
+) -> Result<kernel::intent::DeploymentIntent> {
     let store = ctx.store;
     let target_name = ctx.target_name;
     let selection = ctx.selection;
@@ -24,9 +27,27 @@ pub(crate) fn persist_intent(
         crate::verify::release::behavior_index_digest(&outcome.behavior_index);
     let slot_bindings = ctx.config.target_slot_bindings(target_name)?;
 
-    // Build verified map for selected slots
-    let mut verified: std::collections::BTreeMap<SlotId, BoundGeneration> =
-        std::collections::BTreeMap::new();
+    // The parent snapshot: the target's current successful head's resulting
+    // snapshot (the overlay base for a group push's Inherit slots) + the
+    // head's deployment id (the one parent).
+    let (parent, parent_snapshot): (Option<DeploymentId>, Option<TargetSnapshot>) =
+        match crate::deploy::plan::latest_successful_rollback(store, target_name)? {
+            Some(snapshot) => (
+                store
+                    .read_last_successful(target_name)
+                    .and_then(|h| DeploymentId::parse(&h).ok()),
+                Some(snapshot),
+            ),
+            None => (None, None),
+        };
+    if parent.is_some() != parent_snapshot.is_some() {
+        return Err(crate::error::Error::integrity(
+            "intent planning: the successful head's id and snapshot must be coherent",
+        ));
+    }
+
+    // Every SELECTED slot's plan-minted result + observed pre-push state.
+    let mut planned: Vec<PlannedDeploy> = Vec::with_capacity(outcome.assignments.len());
     for a in &outcome.assignments {
         let binding = slot_bindings
             .get(&a.placement_slot)
@@ -38,89 +59,26 @@ pub(crate) fn persist_intent(
                 ))
             })?;
         let generation = outcome.new_gen[&a.placement_slot].clone();
-        verified.insert(
-            a.placement_slot.clone(),
-            BoundGeneration {
-                generation: GenerationRef {
-                    generation,
-                    assignment: PlacementSlotAssignment {
-                        placement_slot: a.placement_slot.clone(),
-                        artifact: a.artifact.clone(),
-                    },
-                },
-                binding,
-            },
-        );
+        let result = SnapshotSlot::new(generation, a.artifact.clone(), binding);
+        let pre_push = pre_push_observation(&a.placement_slot, &outcome.pre_push);
+        planned.push(PlannedDeploy {
+            slot: a.placement_slot.clone(),
+            result,
+            pre_push,
+        });
     }
 
-    let base = crate::deploy::plan::latest_successful_rollback(store, target_name)?;
-    let current_slot_ids: Vec<SlotId> = ctx
+    // The target's COMPLETE current slot set, in configuration order (the
+    // deployment order — every slot the new intent covers must be a member).
+    let selection_slots: Vec<SlotId> = ctx
         .config
         .target_slots(target_name)?
         .into_iter()
         .map(|(slot, _)| SlotId::parse(slot.id.as_str()).expect("validated slot id"))
         .collect();
 
-    let resulting_snapshot = build_rollback(&verified, base.as_ref(), &current_slot_ids)?;
-    // Assert snapshot keys == full membership
-    let snapshot_keys: std::collections::BTreeSet<SlotId> =
-        resulting_snapshot.keys().cloned().collect();
-    let full_set: std::collections::BTreeSet<SlotId> = current_slot_ids.iter().cloned().collect();
-    if snapshot_keys != full_set {
-        return Err(crate::error::Error::integrity(format!(
-            "intent {}: resulting_snapshot keys {snapshot_keys:?} != full membership {full_set:?}",
-            deployment_id
-        )));
-    }
-
-    // Build selected table with pre_push conversion, fail closed on unreadable
-    let mut selected_entries: Vec<(SlotId, SelectedSlotIntent)> = Vec::new();
-    for a in &outcome.assignments {
-        let sid = a.placement_slot.clone();
-        let pre = outcome.pre_push.get(&sid).and_then(|p| p.clone());
-        let pre_push = match pre {
-            None => None,
-            Some(p) => match p.artifact {
-                crate::ledger::Observation::Known(ref artifact) => {
-                    let generation_val = p.generation.clone().ok_or_else(|| {
-                            crate::error::Error::integrity(format!(
-                                "intent {}: pre_push for slot '{sid}' has Known artifact but missing generation — unrepresentable",
-                                deployment_id
-                            ))
-                        })?;
-                    Some(GenerationRef {
-                        generation: generation_val,
-                        assignment: PlacementSlotAssignment {
-                            placement_slot: sid.clone(),
-                            artifact: artifact.clone(),
-                        },
-                    })
-                }
-                crate::ledger::Observation::KnownAbsent => {
-                    return Err(crate::error::Error::integrity(format!(
-                        "intent {}: pre_push for slot '{sid}' is KnownAbsent — unrepresentable (unreadable pre-push cannot be frozen)",
-                        deployment_id
-                    )));
-                }
-                crate::ledger::Observation::Unknown(_) => {
-                    return Err(crate::error::Error::integrity(format!(
-                        "intent {}: pre_push for slot '{sid}' is Unknown — unrepresentable (unreadable pre-push cannot be frozen)",
-                        deployment_id
-                    )));
-                }
-            },
-        };
-        selected_entries.push((
-            sid,
-            SelectedSlotIntent {
-                pre_push,
-                ..Default::default()
-            },
-        ));
-    }
-
     let group = match &selection.group {
-        Some(g) => Some(crate::identity::RolloutGroupName::parse(g).map_err(|_| {
+        Some(g) => Some(RolloutGroupName::parse(g).map_err(|_| {
             crate::error::Error::integrity(format!(
                 "intent {}: rollout group {g:?} is not a valid group name",
                 deployment_id
@@ -129,13 +87,15 @@ pub(crate) fn persist_intent(
         None => None,
     };
 
-    let attempt_intent = DeploymentIntent {
+    let attempt_intent = kernel::intent::plan(PlanInput {
         deployment_id: deployment_id.clone(),
         target: TargetName::parse(target_name).expect("target name is a safe segment"),
+        parent,
+        parent_snapshot,
         group,
-        resulting_snapshot,
-        selected: NonEmptySlotTable::build(selected_entries)?,
-        behavior_sha256: crate::identity::BehaviorDigest::parse(&desired_behavior_sha).map_err(
+        selection: selection_slots,
+        planned,
+        behavior_digest: crate::identity::BehaviorDigest::parse(&desired_behavior_sha).map_err(
             |_| {
                 crate::error::Error::integrity(format!(
                     "intent {}: behavior_sha256 is not a valid digest",
@@ -150,8 +110,46 @@ pub(crate) fn persist_intent(
                     deployment_id
                 ))
             })?,
-        ..Default::default()
-    };
+    })
+    .map_err(|e| crate::error::Error::integrity(format!("intent {deployment_id}: {e}")))?;
+
+    // THE ONE-PARENT RULE (before mutation): the intent's parent must be the
+    // target's current successful head AT THE MOMENT OF MUTATION — a drifted
+    // head is a stale plan (refused, never reconciled implicitly). The
+    // ledger is a SINGLE-WRITER authority under the target lock, so this is
+    // the defensive cross-process check.
+    let head = store
+        .read_last_successful(target_name)
+        .and_then(|h| DeploymentId::parse(&h).ok());
+    kernel::terminal::assert_parent_is_head(&attempt_intent, head.as_ref()).map_err(|e| {
+        crate::error::Error::conflict(format!(
+            "push for target '{target_name}' refused before mutation: {e}"
+        ))
+    })?;
+
     store.append_intent(target_name, &attempt_intent)?;
     Ok(attempt_intent)
+}
+
+/// The observed pre-push state of one selected slot, as the kernel's
+/// three-state [`Observation<PreviousGeneration>`]: `Known` prior
+/// generation (with its artifact), `KnownAbsent` (never deployed), or
+/// `Unknown(error)` (the read failed).
+fn pre_push_observation(
+    sid: &SlotId,
+    pre_push: &std::collections::BTreeMap<SlotId, Option<crate::ledger::SlotAttemptState>>,
+) -> Observation<PreviousGeneration> {
+    match pre_push.get(sid).and_then(|p| p.clone()) {
+        None => Observation::KnownAbsent,
+        Some(state) => match (state.artifact, state.generation) {
+            (Observation::Known(artifact), Some(generation)) => {
+                Observation::Known(PreviousGeneration {
+                    generation,
+                    artifact,
+                })
+            }
+            (Observation::KnownAbsent, _) | (_, None) => Observation::KnownAbsent,
+            (Observation::Unknown(e), _) => Observation::Unknown(e),
+        },
+    }
 }

@@ -37,15 +37,10 @@ use crate::config::ProjectConfig;
 use crate::deploy::{PushOptions, push, retry_pending_sweep};
 use crate::error::Result;
 use crate::identity::{
-    ArtifactRef, DeploymentId, PlacementSlotAssignment, ReleaseId, ServerId, SlotId, TargetName,
-    TreeDigest, VariantName, test_deployment_id, test_generation_id, test_tree_digest,
+    ArtifactRef, DeploymentId, ReleaseId, ServerId, SlotId, TargetName, TreeDigest, VariantName,
+    test_deployment_id, test_generation_id, test_tree_digest,
 };
-use crate::ledger::records::{SelectedSlotIntent, SnapshotEntry};
-use crate::ledger::{
-    DeploymentIntent, DeploymentStatus, LedgerTerminal, NonEmptySlotTable, ObservationWire,
-    ObservedGenerationWire, SlotOutcome, SlotOutcomeKind, SlotResult, SlotTable, TargetSnapshot,
-    TerminalDisposition,
-};
+use crate::ledger::{DeploymentIntent, DeploymentStatus, LedgerTerminal};
 use crate::remote::helper::{GenerationAssignment, RemoteHelper};
 use crate::remote::layout;
 use crate::remote::transport::{LocalTransport, Remote};
@@ -58,7 +53,7 @@ use crate::testutil::test_remotes::FailOnceInventoryRemote;
 use proptest::prelude::*;
 #[cfg(test)]
 use proptest::test_runner::RngSeed;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -208,41 +203,45 @@ fn list_generations(helper: &RemoteHelper) -> Vec<String> {
 // ---- pusher (checkpoint) fixture helpers -----------------------------------
 
 fn intent(id: &str, target: &str) -> DeploymentIntent {
+    crate::testutil::fixtures::full_intent(id, target, &[SlotId::parse("p1").unwrap()], &[])
+}
+
+/// A FULL-push intent with the given release + tree baked into its ONE slot
+/// table (the complete result stored once; the successful terminal is
+/// payload-free and bound by digest).
+fn success_intent(id: &str, target: &str, release: &str, tree: &str) -> DeploymentIntent {
+    use crate::kernel::intent::{PlanInput, PlannedDeploy};
+    use crate::kernel::snapshot::SnapshotSlot;
+    use crate::ledger::Observation;
     let p1 = SlotId::parse("p1").unwrap();
-    // THE FROZEN RESULTING SNAPSHOT: the single slot's plan-minted
-    // generation/artifact and plan-time physical binding (schema v6) — the
-    // snapshot's key set IS the frozen membership.
-    let snapshot = TargetSnapshot::from_entries(BTreeMap::from([(
-        p1.clone(),
-        SnapshotEntry::new(
-            test_generation_id("gen-1"),
-            ArtifactRef {
-                release: crate::identity::test_release_id("rel-1"),
-                variant: VariantName::parse("standard").unwrap(),
-                tree: test_tree_digest("tree-1"),
-            },
-            // The FROZEN plan-time physical binding (schema v6): the
-            // fixture's single slot is bound to server s1 at /srv/deploy/p1.
-            crate::ledger::PhysicalBinding {
-                server: ServerId::parse("s1").unwrap(),
-                deploy_dir: "/srv/deploy/p1".to_string(),
-            },
-        ),
-    )]));
-    DeploymentIntent {
+    crate::kernel::intent::plan(PlanInput {
         deployment_id: test_deployment_id(id),
         target: TargetName::new(target.to_string()),
+        parent: None,
+        parent_snapshot: None,
         group: None,
-        resulting_snapshot: snapshot,
-        selected: NonEmptySlotTable::build(BTreeMap::from([(
-            p1,
-            SelectedSlotIntent { pre_push: None },
-        )]))
-        .expect("fixture always has a slot"),
-        behavior_sha256: crate::identity::BehaviorDigest::parse(crate::identity::DIGEST_TEST_HEX_1)
+        selection: vec![p1.clone()],
+        planned: vec![PlannedDeploy {
+            slot: p1.clone(),
+            result: SnapshotSlot::new(
+                test_generation_id("gen-1"),
+                ArtifactRef {
+                    release: crate::identity::ReleaseId::new(release.to_string()),
+                    variant: VariantName::parse("standard").unwrap(),
+                    tree: test_tree_digest(tree),
+                },
+                crate::ledger::PhysicalBinding {
+                    server: ServerId::parse("s1").unwrap(),
+                    deploy_dir: "/srv/deploy/p1".to_string(),
+                },
+            ),
+            pre_push: Observation::KnownAbsent,
+        }],
+        behavior_digest: crate::identity::BehaviorDigest::parse(crate::identity::DIGEST_TEST_HEX_1)
             .unwrap(),
         attempted_at: crate::identity::Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
-    }
+    })
+    .expect("the sweep-tests success intent plans")
 }
 
 /// A SUCCESSFUL terminal whose rollback references `release` and `tree` —
@@ -250,110 +249,17 @@ fn intent(id: &str, target: &str) -> DeploymentIntent {
 /// EXACT-EQUAL shape: one Activated outcome per slotted generation (the
 /// membership equations — outcomes == selected == full == rollback slots —
 /// are enforced by the conversion).
-fn terminal_for(release: &str, tree: &str) -> LedgerTerminal {
-    LedgerTerminal {
-        recorded_at: "2026-01-01T00:00:00Z".to_string(),
-        // The EXACT-EQUAL shape: one Activated outcome per slotted
-        // generation (the membership equations (outcomes == selected == full == rollback slots) are enforced by the conversion).
-        disposition: TerminalDisposition::Successful(
-            crate::ledger::SuccessfulTerminal::try_new(
-                {
-                    let __slots: BTreeMap<crate::identity::SlotId, crate::identity::GenerationRef> =
-                        BTreeMap::from([(
-                            SlotId::parse("p1").unwrap(),
-                            crate::identity::GenerationRef {
-                                generation: test_generation_id("gen-1"),
-                                assignment: PlacementSlotAssignment {
-                                    placement_slot: SlotId::parse("p1").unwrap(),
-                                    artifact: ArtifactRef {
-                                        release: ReleaseId::new(release.to_string()),
-                                        variant: VariantName::parse("standard").unwrap(),
-                                        tree: test_tree_digest(tree),
-                                    },
-                                },
-                            },
-                        )]);
-                    let __bindings: BTreeMap<
-                        crate::identity::SlotId,
-                        crate::ledger::records::PhysicalBinding,
-                    > = BTreeMap::from([(
-                        SlotId::parse("p1").unwrap(),
-                        crate::ledger::PhysicalBinding {
-                            server: ServerId::parse("s1").unwrap(),
-                            deploy_dir: "/srv/deploy/p1".to_string(),
-                        },
-                    )]);
-                    let mut __entries: BTreeMap<
-                        crate::identity::SlotId,
-                        crate::ledger::records::SnapshotEntry,
-                    > = BTreeMap::new();
-                    for (k, v) in __slots.clone() {
-                        let b = __bindings.get(&k).cloned().unwrap_or(
-                            crate::ledger::records::PhysicalBinding {
-                                server: crate::identity::ServerId::new("s1"),
-                                deploy_dir: format!("/srv/deploy/{}", k.as_str()),
-                            },
-                        );
-                        __entries.insert(
-                            k.clone(),
-                            crate::ledger::records::SnapshotEntry::new(
-                                v.generation.clone(),
-                                v.assignment.artifact.clone(),
-                                b,
-                            ),
-                        );
-                    }
-                    for (k, b) in __bindings.clone() {
-                        __entries.entry(k.clone()).or_insert_with(|| {
-                            crate::ledger::records::SnapshotEntry::new(
-                                crate::identity::GenerationId::new("gen-missing".to_string()),
-                                crate::identity::ArtifactRef {
-                                    release: crate::identity::test_release_id("rel-missing"),
-                                    variant: crate::identity::VariantName::new(
-                                        "standard".to_string(),
-                                    ),
-                                    tree: crate::identity::test_tree_digest("missing"),
-                                },
-                                b.clone(),
-                            )
-                        });
-                    }
-                    TargetSnapshot::from_entries(__entries)
-                },
-                crate::identity::NonEmptySlotSet::try_new(BTreeSet::from([SlotId::new(
-                    "p1".to_string(),
-                )]))
-                .unwrap(),
-            )
-            .unwrap(),
-        ),
-        reason: None,
-    }
+/// A SUCCESSFUL terminal BOUND to the given intent (payload-free; the
+/// snapshot resolves from the intent's slot table).
+fn terminal_for(intent: &DeploymentIntent) -> LedgerTerminal {
+    crate::testutil::fixtures::successful_terminal(intent)
 }
 
-fn failed_terminal() -> LedgerTerminal {
-    LedgerTerminal {
-        recorded_at: "2026-01-01T00:00:00Z".to_string(),
-        // The FailedRolledBack compensation report IS the outcome table — it
-        // must EXACTLY cover the membership (the status-specific outcome
-        // rule).
-        disposition: TerminalDisposition::FailedRolledBack {
-            outcomes: SlotTable::from_map(BTreeMap::from([(
-                SlotId::parse("p1").unwrap(),
-                SlotOutcome::from_wire(SlotResult {
-                    slot_id: SlotId::parse("p1").unwrap(),
-                    outcome: SlotOutcomeKind::Restored,
-                    observation: ObservationWire::Known(ObservedGenerationWire {
-                        generation: test_generation_id("gen-1"),
-                    }),
-                    compensated: true,
-                    error: None,
-                })
-                .unwrap(),
-            )])),
-        },
-        reason: None,
-    }
+fn failed_terminal(intent: &DeploymentIntent) -> LedgerTerminal {
+    crate::testutil::fixtures::rolled_back_terminal(
+        intent,
+        &intent.full_membership().into_iter().collect::<Vec<_>>(),
+    )
 }
 
 /// Seed a target's ledger with `history[i]`-shaped entries: `true` =
@@ -368,49 +274,21 @@ fn seed_history(store: &LocalStore, target: &str, prefix: &str, history: &[bool]
         if *ok {
             let rel = crate::identity::test_release_id(&id).as_str().to_string();
             let tree = format!("tree-{id}");
-            // Build a matching intent whose frozen snapshot
-            // generation/artifact/binding equals the rollback.
-            let p1 = SlotId::parse("p1").unwrap();
-            let snapshot = TargetSnapshot::from_entries(BTreeMap::from([(
-                p1.clone(),
-                SnapshotEntry::new(
-                    test_generation_id("gen-1"),
-                    ArtifactRef {
-                        release: crate::identity::ReleaseId::new(rel.clone()),
-                        variant: VariantName::parse("standard").unwrap(),
-                        tree: test_tree_digest(&tree),
-                    },
-                    crate::ledger::PhysicalBinding {
-                        server: ServerId::parse("s1").unwrap(),
-                        deploy_dir: "/srv/deploy/p1".to_string(),
-                    },
-                ),
-            )]));
-            let matching_intent = DeploymentIntent {
-                deployment_id: canonical.clone(),
-                target: TargetName::new(target.to_string()),
-                group: None,
-                resulting_snapshot: snapshot,
-                selected: NonEmptySlotTable::build(BTreeMap::from([(
-                    p1,
-                    SelectedSlotIntent { pre_push: None },
-                )]))
-                .expect("fixture always has a slot"),
-                behavior_sha256: crate::identity::BehaviorDigest::parse(
-                    crate::identity::DIGEST_TEST_HEX_1,
-                )
-                .unwrap(),
-                attempted_at: crate::identity::Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
-            };
+            let matching_intent = success_intent(&id, target, &rel, &tree);
             store.append_intent(target, &matching_intent).unwrap();
             store
-                .append_terminal(target, &canonical, &terminal_for(&rel, &tree))
+                .append_terminal(
+                    target,
+                    matching_intent.deployment_id(),
+                    &terminal_for(&matching_intent),
+                )
                 .unwrap();
             successful.push(canonical.as_str().to_string());
         } else {
-            store.append_intent(target, &intent(&id, target)).unwrap();
+            let it = intent(&id, target);
+            store.append_intent(target, &it).unwrap();
             store
-                .append_terminal(target, &canonical, &failed_terminal())
+                .append_terminal(target, it.deployment_id(), &failed_terminal(&it))
                 .unwrap();
         }
     }

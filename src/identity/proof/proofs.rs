@@ -39,6 +39,9 @@ impl SlotSet {
         self.0.is_empty()
     }
 
+    /// The number of distinct slot ids (test-facing: the proof legs that
+    /// used the count in production were removed with the rollback payload).
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.0.len()
     }
@@ -58,9 +61,9 @@ impl SlotSet {
 /// targets without slots), so the invariant holds by construction. This is
 /// the SET form; the sibling records-shape work carries the companion
 /// [`NonEmptySlotTable`]-shaped (map-keyed) non-empty tables the records
-/// use. Shared by the identity proofs and the ledger's SuccessfulTerminal
-/// — the non-empty invariant is the same structural guarantee (activated
-/// ⊆ full ∧ full == rollback.keys, with activated non-empty by TYPE).
+/// use. Shared by the identity proofs and the ledger's successful-chain
+/// membership — the non-empty invariant is the same structural guarantee
+/// (the activated set is non-empty by TYPE).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NonEmptySlotSet(BTreeSet<SlotId>);
 
@@ -72,7 +75,9 @@ impl NonEmptySlotSet {
         (!ids.is_empty()).then_some(NonEmptySlotSet(ids))
     }
 
-    /// The number of distinct slot ids.
+    /// The number of distinct slot ids (test-facing today: the resolved
+    /// memberships' counts are asserted by the planner property tests).
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.0.len()
     }
@@ -86,11 +91,6 @@ impl NonEmptySlotSet {
     #[allow(dead_code)]
     pub(crate) fn contains(&self, id: &SlotId) -> bool {
         self.0.contains(id)
-    }
-
-    /// Whether this set is a subset of `full` (activated ⊆ full).
-    pub(crate) fn is_subset_of(&self, full: &BTreeSet<SlotId>) -> bool {
-        self.0.is_subset(full)
     }
 
     /// The backing set as a read-only view (composes with the sibling

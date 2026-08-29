@@ -315,13 +315,7 @@ impl<T> Index<&SlotId> for NonEmptySlotTable<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::{
-        ArtifactRef, GenerationRef, PlacementSlotAssignment, ServerId, TargetName, VariantName,
-        test_deployment_id, test_generation_id, test_release_id, test_tree_digest,
-    };
     use crate::ledger::records::LedgerIntentWire;
-    use crate::ledger::records::{PhysicalBinding, SlotAttemptStateWire};
-    use crate::ledger::{TargetSnapshot, TargetSnapshotWire};
     #[cfg(test)]
     use proptest::prelude::*;
     #[cfg(test)]
@@ -334,67 +328,16 @@ mod tests {
     }
 
     /// The agreeing intent's frozen per-slot physical binding (schema v6):
-    /// server `s1` at the canonical deploy dir for the slot.
-    fn binding(sid: &SlotId) -> PhysicalBinding {
-        PhysicalBinding {
-            server: ServerId::parse("s1").unwrap(),
-            deploy_dir: format!("/srv/deploy/{}", sid.as_str()),
-        }
-    }
-
     fn slot_strategy() -> impl Strategy<Value = SlotId> {
         (0u32..6).prop_map(slot)
     }
 
-    /// A generation ref whose assignment names its own key (the agreeing
-    /// form); the artifact's release is derived from the slot id.
-    fn gen_ref_for(key: &SlotId) -> GenerationRef {
-        GenerationRef {
-            generation: test_generation_id(key.as_str()),
-            assignment: PlacementSlotAssignment {
-                placement_slot: key.clone(),
-                artifact: ArtifactRef {
-                    release: test_release_id(key.as_str()),
-                    variant: VariantName::parse("standard").unwrap(),
-                    tree: test_tree_digest(key.as_str()),
-                },
-            },
-        }
-    }
-
     /// A valid base intent wire over the given membership (the ordering
-    /// property needs an AGREEING wire whose `slot_ids` is the authoritative
-    /// deployment order).
+    /// property's agreeing base — the wire's slot table carries the full
+    /// result once).
     fn agreeing_intent(keys: &[SlotId]) -> LedgerIntentWire {
-        let snapshot = TargetSnapshot::from_entries(
-            keys.iter()
-                .map(|k| {
-                    let g = gen_ref_for(k);
-                    (
-                        k.clone(),
-                        crate::ledger::SnapshotEntry::new(
-                            g.generation.clone(),
-                            g.assignment.artifact.clone(),
-                            binding(k),
-                        ),
-                    )
-                })
-                .collect(),
-        );
-        let pre_push: BTreeMap<SlotId, Option<SlotAttemptStateWire>> =
-            keys.iter().map(|k| (k.clone(), None)).collect();
-        LedgerIntentWire {
-            deployment_schema_version: crate::ledger::LEDGER_SCHEMA_VERSION,
-            deployment_id: test_deployment_id("deploy-w"),
-            target: TargetName::parse("t1").unwrap(),
-            group: None,
-            slot_ids: keys.to_vec(),
-            behavior_sha256: crate::identity::DIGEST_TEST_HEX_1.to_string(),
-            attempted_at: "2026-01-01T00:00:00Z".to_string(),
-            resulting_snapshot: TargetSnapshotWire::from(&snapshot),
-            pre_push,
-            slots: BTreeMap::new(),
-        }
+        let domain = crate::testutil::fixtures::full_intent("deploy-w", "t1", keys, &[]);
+        LedgerIntentWire::from(&domain)
     }
 
     /// UNIQUE slot ids in an ARBITRARY PERMUTATION: a shuffled non-empty
@@ -505,30 +448,29 @@ mod tests {
         })]
 
         #[test]
-        fn wire_slot_ids_sequence_round_trips_exactly(keys in slot_ids_permutation()) {
+        fn wire_slot_table_round_trips_exactly(keys in slot_ids_permutation()) {
             let wire = agreeing_intent(&keys);
             let domain = wire
                 .clone()
                 .into_domain()
                 .expect("the agreeing intent converts");
-            // The DOMAIN table iterates in the wire's sequence order.
-            assert_eq!(
-                domain.membership(),
-                keys,
-                "the domain table must preserve the wire's slot_ids sequence (deployment order), not sort by id"
-            );
-            // The domain → wire re-expansion emits the SAME sequence.
+            // The DOMAIN derives the exact memberships from the table.
+            let expected: std::collections::BTreeSet<SlotId> = keys.iter().cloned().collect();
+            assert_eq!(domain.full_membership(), expected);
+            assert_eq!(domain.selected_membership(), expected);
+            // The domain → wire re-expansion emits the SAME full slot table
+            // (the complete result is stored once; the map round-trips).
             let wire2 = LedgerIntentWire::from(&domain);
-            assert_eq!(
-                wire2.slot_ids, keys,
-                "the domain → wire re-expansion must reproduce the exact slot_ids sequence"
-            );
-            // The full JSON round trip (serialize → deserialize) too.
-            let json = serde_json::to_string(&domain).unwrap();
+            assert_eq!(wire2.slots, wire.slots);
+            // The full WIRE JSON round trip (serialize → deserialize) too.
+            let json = serde_json::to_string(&wire2).unwrap();
             let wire3: LedgerIntentWire = serde_json::from_str(&json).unwrap();
+            assert_eq!(wire3.slots, wire.slots);
+            // The derived resulting snapshot covers exactly the membership.
+            let snapshot = domain.resulting_snapshot();
             assert_eq!(
-                wire3.slot_ids, keys,
-                "the JSON round trip must preserve the exact slot_ids sequence"
+                snapshot.keys().cloned().collect::<std::collections::BTreeSet<_>>(),
+                expected
             );
         }
     }

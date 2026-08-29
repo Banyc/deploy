@@ -472,19 +472,18 @@ mod tests {
     use super::*;
     use crate::config::SlotConfig;
     use crate::identity::{
-        ArtifactRef, GenerationRef, PlacementSlotAssignment, ServerId, SlotId, TargetName,
-        TreeDigest, VariantName, test_deployment_id, test_generation_id, test_tree_digest,
+        ArtifactRef, ServerId, SlotId, TargetName, TreeDigest, VariantName, test_deployment_id,
+        test_generation_id, test_tree_digest,
     };
-    use crate::ledger::records::{SelectedSlotIntent, SnapshotEntry};
     use crate::ledger::{
-        DeploymentIntent, LedgerTerminal, NonEmptySlotTable, Observation, ObservationError,
-        ObservedAssignment, ObservedSlot, Pins, TargetSnapshot, TerminalDisposition,
+        DeploymentIntent, LedgerTerminal, Observation, ObservationError, ObservedAssignment,
+        ObservedSlot, Pins, PreviousGeneration,
     };
     #[cfg(test)]
     use proptest::prelude::*;
     #[cfg(test)]
     use proptest::test_runner::RngSeed;
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
 
     const TARGET: &str = "t1";
@@ -582,7 +581,13 @@ interval_seconds = 0
     /// key-set equality (`slot_ids == desired == pre_push`).
     #[allow(dead_code)]
     fn intent(id: &str) -> DeploymentIntent {
-        intent_full(id, "rel-1", "tree-1", "/srv/deploy/p1", None)
+        intent_full(
+            id,
+            "rel-1",
+            "tree-1",
+            "/srv/deploy/p1",
+            crate::ledger::Observation::KnownAbsent,
+        )
     }
 
     /// A single-slot (`p1`) VALID intent: the frozen snapshot entry
@@ -595,45 +600,41 @@ interval_seconds = 0
         release: &str,
         tree: &str,
         deploy_dir: &str,
-        pre_push: Option<GenerationRef>,
+        pre_push: crate::ledger::Observation<PreviousGeneration>,
     ) -> DeploymentIntent {
+        use crate::kernel::intent::{PlanInput, PlannedDeploy};
+        use crate::kernel::snapshot::SnapshotSlot;
         let p1 = SlotId::new(SLOT.to_string());
-        // THE FROZEN RESULTING SNAPSHOT: the single slot's plan-minted
-        // generation/artifact and plan-time physical binding.
-        let snapshot = TargetSnapshot::from_entries(BTreeMap::from([(
-            p1.clone(),
-            SnapshotEntry::new(
-                test_generation_id("gen-1"),
-                ArtifactRef {
-                    release: crate::identity::test_release_id(release),
-                    variant: VariantName::parse("standard").unwrap(),
-                    tree: test_tree_digest(tree),
-                },
-                // The FROZEN plan-time physical binding (schema v6): the
-                // fixture's single slot is bound to server s1 at the given
-                // deploy dir.
-                crate::ledger::PhysicalBinding {
-                    server: ServerId::parse("s1").unwrap(),
-                    deploy_dir: deploy_dir.to_string(),
-                },
-            ),
-        )]));
-        DeploymentIntent {
+        crate::kernel::intent::plan(PlanInput {
             deployment_id: test_deployment_id(id),
             target: TargetName::new(TARGET.to_string()),
+            parent: None,
+            parent_snapshot: None,
             group: None,
-            resulting_snapshot: snapshot,
-            selected: NonEmptySlotTable::build(BTreeMap::from([(
-                p1,
-                SelectedSlotIntent { pre_push },
-            )]))
-            .expect("fixture always has a slot"),
-            behavior_sha256: crate::identity::BehaviorDigest::parse(
+            selection: vec![p1.clone()],
+            planned: vec![PlannedDeploy {
+                slot: p1.clone(),
+                result: SnapshotSlot::new(
+                    test_generation_id("gen-1"),
+                    ArtifactRef {
+                        release: crate::identity::test_release_id(release),
+                        variant: VariantName::parse("standard").unwrap(),
+                        tree: test_tree_digest(tree),
+                    },
+                    crate::ledger::PhysicalBinding {
+                        server: ServerId::parse("s1").unwrap(),
+                        deploy_dir: deploy_dir.to_string(),
+                    },
+                ),
+                pre_push,
+            }],
+            behavior_digest: crate::identity::BehaviorDigest::parse(
                 crate::identity::DIGEST_TEST_HEX_1,
             )
             .unwrap(),
             attempted_at: crate::identity::Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
-        }
+        })
+        .expect("fixture intent always plans")
     }
 
     /// An ARBITRARY but VALID artifact: canonical `rel-sha256-<64hex>`
@@ -665,23 +666,22 @@ interval_seconds = 0
     }
 
     #[allow(dead_code)]
-    fn arbitrary_pre_push() -> impl Strategy<Value = Option<GenerationRef>> {
+    fn arbitrary_pre_push() -> impl Strategy<Value = crate::ledger::Observation<PreviousGeneration>>
+    {
+        use crate::kernel::snapshot::PreviousGeneration;
         arbitrary_assignment_observation().prop_map(|obs| match obs {
-            Observation::Known(a) => Some(GenerationRef {
+            Observation::Known(a) => crate::ledger::Observation::Known(PreviousGeneration {
                 generation: test_generation_id("gen-pre"),
-                assignment: PlacementSlotAssignment {
-                    placement_slot: SlotId::new(SLOT.to_string()),
-                    artifact: a,
-                },
+                artifact: a,
             }),
-            // The domain pre-push carries ONLY a known prior state or None:
-            // an unreadable assignment is refused at the wire boundary, so
-            // the reachability strategy maps it to the no-prior-state case
-            // (which contributes nothing beyond the desired artifact).
-            Observation::Unknown(_) | Observation::KnownAbsent => None,
+            Observation::Unknown(e) => crate::ledger::Observation::Unknown(e),
+            Observation::KnownAbsent => crate::ledger::Observation::KnownAbsent,
         })
     }
-    fn intent_with_pre_push(pre_push: Option<GenerationRef>) -> DeploymentIntent {
+
+    fn intent_with_pre_push(
+        pre_push: crate::ledger::Observation<PreviousGeneration>,
+    ) -> DeploymentIntent {
         intent_full(
             "deploy-prop-unknown",
             "desired-rel",
@@ -691,95 +691,12 @@ interval_seconds = 0
         )
     }
 
-    fn terminal_for(release: &str, tree: &str) -> LedgerTerminal {
-        LedgerTerminal {
-            recorded_at: "2026-01-01T00:00:00Z".to_string(),
-            // The EXACT-EQUAL shape: one Activated outcome per slotted
-            // generation (the membership equations — outcomes == selected ==
-            // full == rollback slots — are enforced by the conversion).
-            disposition: TerminalDisposition::Successful(
-                crate::ledger::SuccessfulTerminal::try_new(
-                    {
-                        let __slots: BTreeMap<
-                            crate::identity::SlotId,
-                            crate::identity::GenerationRef,
-                        > = BTreeMap::from([(
-                            SlotId::new(SLOT.to_string()),
-                            GenerationRef {
-                                generation: test_generation_id("gen-1"),
-                                assignment: PlacementSlotAssignment {
-                                    placement_slot: SlotId::new(SLOT.to_string()),
-                                    artifact: ArtifactRef {
-                                        release: ReleaseId::new(release.to_string()),
-                                        variant: VariantName::parse("standard").unwrap(),
-                                        tree: test_tree_digest(tree),
-                                    },
-                                },
-                            },
-                        )]);
-                        let __bindings: BTreeMap<
-                            crate::identity::SlotId,
-                            crate::ledger::records::PhysicalBinding,
-                        > = BTreeMap::from([(
-                            SlotId::new(SLOT.to_string()),
-                            crate::ledger::PhysicalBinding {
-                                server: crate::identity::ServerId::parse("s1").unwrap(),
-                                deploy_dir: "/srv/eng".to_string(),
-                            },
-                        )]);
-                        let mut __entries: BTreeMap<
-                            crate::identity::SlotId,
-                            crate::ledger::records::SnapshotEntry,
-                        > = BTreeMap::new();
-                        for (k, v) in __slots.clone() {
-                            let b = __bindings.get(&k).cloned().unwrap_or(
-                                crate::ledger::records::PhysicalBinding {
-                                    server: crate::identity::ServerId::new("s1"),
-                                    deploy_dir: format!("/srv/deploy/{}", k.as_str()),
-                                },
-                            );
-                            __entries.insert(
-                                k.clone(),
-                                crate::ledger::records::SnapshotEntry::new(
-                                    v.generation.clone(),
-                                    v.assignment.artifact.clone(),
-                                    b,
-                                ),
-                            );
-                        }
-                        for (k, b) in __bindings.clone() {
-                            __entries.entry(k.clone()).or_insert_with(|| {
-                                crate::ledger::records::SnapshotEntry::new(
-                                    crate::identity::GenerationId::new("gen-missing".to_string()),
-                                    crate::identity::ArtifactRef {
-                                        release: crate::identity::test_release_id("rel-missing"),
-                                        variant: crate::identity::VariantName::new(
-                                            "standard".to_string(),
-                                        ),
-                                        tree: crate::identity::test_tree_digest("missing"),
-                                    },
-                                    b.clone(),
-                                )
-                            });
-                        }
-                        TargetSnapshot::from_entries(__entries)
-                    },
-                    crate::identity::NonEmptySlotSet::try_new(BTreeSet::from([SlotId::new(
-                        SLOT.to_string(),
-                    )]))
-                    .unwrap(),
-                )
-                .unwrap(),
-            ),
-            reason: None,
-        }
+    /// A SUCCESSFUL terminal BOUND to the given intent (payload-free; the
+    /// snapshot resolves from the intent's slot table).
+    fn terminal_for(intent: &DeploymentIntent) -> LedgerTerminal {
+        crate::testutil::fixtures::successful_terminal(intent)
     }
 
-    /// Create a release directory under the given NAME with junk content —
-    /// the sweep keeps or sweeps it by NAME (only PINNED releases are read).
-    /// The dir is created under the EXACT name given: callers pass the
-    /// canonical `rel-sha256-<64hex>` form the ledgers/observations/pins
-    /// reference (or a raw junk name for a pure-garbage candidate).
     fn seed_named_release(store: &LocalStore, name: &str) {
         let dir = store.release_dir(&ReleaseId::new(name.to_string()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -867,18 +784,11 @@ interval_seconds = 0
                 &format!("ret-{i}"),
                 &format!("tree-ret-{i}"),
                 "/srv/eng",
-                None,
+                crate::ledger::Observation::KnownAbsent,
             );
             store.append_intent(TARGET, &matching_intent).unwrap();
             store
-                .append_terminal(
-                    TARGET,
-                    &canonical,
-                    &terminal_for(
-                        crate::identity::test_release_id(&format!("ret-{i}")).as_str(),
-                        &format!("tree-ret-{i}"),
-                    ),
-                )
+                .append_terminal(TARGET, &canonical, &terminal_for(&matching_intent))
                 .unwrap();
             retained_deployments.push(canonical.as_str().to_string());
         }
@@ -1217,6 +1127,7 @@ interval_seconds = 0
     }
 
     // ---- THE USER'S PROPERTY: an assignment-read failure is a distinct
+    // ---- THE USER'S PROPERTY: an assignment-read failure is a distinct
     // value, never an artifact, and never a reachability anchor -------------
 
     /// Run ONE generated pre-push assignment observation through the REAL
@@ -1225,32 +1136,33 @@ interval_seconds = 0
     /// (append_intent → read_ledger → into_domain) and collects the
     /// reachability entries. This is the production code path the sweep and
     /// the checkpoint preview share — not a copy of its logic.
-    fn run_assignment_observation_case(pre_push: Option<GenerationRef>) {
+    fn run_assignment_observation_case(pre_push: crate::ledger::Observation<PreviousGeneration>) {
         let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let config = config_with_pin(tmp.path(), None);
         let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
         let intent = intent_with_pre_push(pre_push.clone());
         store.append_intent(TARGET, &intent).unwrap();
 
-        // ---- 1. The pre-push state round-trips EXACTLY through the wire
-        // (None stays None; an unreadable assignment can NEVER be re-read as
-        // a fabricated/known `GenerationRef` — the wire → domain conversion
-        // refuses Unknown/KnownAbsent values outright, see
-        // `unreadable_pre_push_wire_fails_closed`).
+        // ---- 1. The pre-push state round-trips EXACTLY through the wire —
+        // the observation is the frozen fact (Known prior state,
+        // KnownAbsent, or the preserved Unknown read failure).
         let entries = store.read_ledger(TARGET).unwrap();
-        let read_back = &entries[0].intent.selected[&SlotId::new(SLOT.to_string())].pre_push;
+        let read_back = entries[0].intent.pre_push(&SlotId::new(SLOT.to_string()));
         assert_eq!(
-            read_back, &pre_push,
+            read_back,
+            Some(&pre_push),
             "the pre-push state must round-trip the wire EXACTLY — \
              no prior state contributes nothing, a known state never changes"
         );
 
         // ---- 2. The reachability effect, through the REAL collection logic:
-        // `None` (no prior state) contributes NOTHING beyond the desired
-        // artifact; a `Some(gr)` KNOWN pre-push DOES contribute its release
-        // + tree (the positive control).
+        // `KnownAbsent` (no prior state) contributes NOTHING beyond the
+        // desired artifact; a KNOWN pre-push DOES contribute its release +
+        // tree; an UNKNOWN pre-push (the read failed) FAILS the sweep
+        // closed (the sweep cannot verify what the slot ran before the
+        // attempt, so reachability would be incomplete).
         match &pre_push {
-            None => {
+            crate::ledger::Observation::KnownAbsent => {
                 let retained = store.reachable_set(&config, None).unwrap();
                 assert_eq!(
                     retained.releases.len(),
@@ -1273,54 +1185,47 @@ interval_seconds = 0
                         .contains(test_tree_digest("tree-desired").as_str())
                 );
             }
-            Some(gr) => {
+            crate::ledger::Observation::Known(prev) => {
                 let retained = store.reachable_set(&config, None).unwrap();
                 assert!(
-                    retained
-                        .releases
-                        .contains(gr.assignment.artifact.release.as_str()),
+                    retained.releases.contains(prev.artifact.release.as_str()),
                     "a Known pre-push artifact retains its release, got {retained:?}"
                 );
                 assert!(
-                    retained
-                        .trees
-                        .contains(gr.assignment.artifact.tree.as_str()),
+                    retained.trees.contains(prev.artifact.tree.as_str()),
                     "a Known pre-push artifact retains its tree, got {retained:?}"
+                );
+            }
+            crate::ledger::Observation::Unknown(_) => {
+                let err = store.reachable_set(&config, None).unwrap_err();
+                assert!(
+                    err.to_string().contains("pre-push"),
+                    "an Unknown pre-push MUST fail the reachability sweep closed, got: {err}"
                 );
             }
         }
 
         // ---- 3. NO domain value simultaneously means "unknown" and "known
         // artifact": the only carrier of an `ArtifactRef` is the `Known`
-        // variant — `Unknown` holds ONLY an `ObservationError` (matched
-        // structurally above: no artifact is ever bound from it) and
+        // variant — `Unknown` holds ONLY an `ObservationError` and
         // `KnownAbsent` holds nothing, so neither can ever be mistaken for a
-        // known artifact. The `unknown_artifact()` SENTINEL API is REMOVED
-        // from [`crate::identity`] (any residual reference would not compile):
-        // an `ArtifactRef` in the system always means a known artifact. An
-        // `ArtifactRef` born from the domain pre-push is real and known.
-        if let Some(gr) = &pre_push {
-            assert!(
-                gr.assignment
-                    .artifact
-                    .release
-                    .as_str()
-                    .starts_with("rel-sha256-")
-            );
-            assert!(gr.assignment.artifact.tree.as_str().len() == 64);
+        // known artifact. An `ArtifactRef` born from the domain pre-push is
+        // real and known.
+        if let crate::ledger::Observation::Known(prev) = &pre_push {
+            assert!(prev.artifact.release.as_str().starts_with("rel-sha256-"));
+            assert!(prev.artifact.tree.as_str().len() == 64);
         }
     }
 
     proptest! {
-        // THE USER'S PROPERTY: GENERATED pre-push states (no prior state /
-        // arbitrary KNOWN artifacts, generated from the full
-        // Unknown/KnownAbsent/Known observation space but clamped to the
-        // domain's known-or-None carrier) must round-trip EXACTLY through
-        // the real wire and never leak an invented artifact into
-        // reachability. Runs through the REAL store + the REAL reachable_set
-        // scan (the production collection logic). Bounded
-        // `proptest_cases(16)` (full 16 with `DEPLOY_FULL_TESTS=1`, fast
-        // default), fixed seed 0x5EED_5EED (house style), no persistence.
+        // THE USER'S PROPERTY: GENERATED pre-push observations (no prior
+        // state / arbitrary KNOWN artifacts / preserved read failures) must
+        // round-trip EXACTLY through the real wire and never leak an
+        // invented artifact into reachability (a `Known` prior state reaches
+        // what it names; `KnownAbsent` contributes nothing; an `Unknown`
+        // pre-push fails the sweep closed). Bounded
+        // `proptest_cases(16)` (full 16 with `DEPLOY_FULL_TESTS=1`), fixed
+        // seed 0x5EED_5EED (house style), no persistence.
         #![proptest_config(ProptestConfig {
             cases: crate::testutil::proptest_cases(16),
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
@@ -1336,39 +1241,40 @@ interval_seconds = 0
         }
     }
 
-    /// The DETERMINISTIC companion: an UNREADABLE pre-push wire value
-    /// (Unknown / KnownAbsent / missing generation) can never be read as a
-    /// domain intent — the wire → domain conversion refuses it fail-closed
-    /// ("an unreadable pre-push cannot be frozen"), so the sweep can never
-    /// derive a release/tree reachability entry from a FAILED assignment
-    /// read: the record cannot even be read.
+    /// The DETERMINISTIC companion: the pre-push observation FREEZES the
+    /// preserved read failure as an `Unknown` (a distinct value that never
+    /// looks like an artifact) — a successful read showing no state is
+    /// `KnownAbsent` (never deployed) — and neither can ever be re-read as
+    /// a known `GenerationRef`: the only carrier of an `ArtifactRef` is the
+    /// `Known` variant, and the reachability sweep fails closed on the
+    /// `Unknown` (see part 2 above).
     #[test]
     fn unreadable_pre_push_wire_fails_closed() {
-        let intent = intent_with_pre_push(Some(GenerationRef {
-            generation: test_generation_id("gen-pre"),
-            assignment: PlacementSlotAssignment {
-                placement_slot: SlotId::new(SLOT.to_string()),
-                artifact: ArtifactRef {
-                    release: crate::identity::test_release_id("pre-rel"),
-                    variant: VariantName::parse("standard").unwrap(),
-                    tree: test_tree_digest("tree-pre"),
-                },
-            },
+        let intent = intent_with_pre_push(crate::ledger::Observation::Unknown(ObservationError {
+            message: "assignment read failed: fixture corruption".to_string(),
         }));
-        let mut wire = crate::ledger::LedgerIntentWire::from(&intent);
-        wire.pre_push.insert(
-            SlotId::new(SLOT.to_string()),
-            Some(crate::ledger::records::SlotAttemptStateWire {
-                artifact: crate::ledger::ObservationWire::Unknown(ObservationError {
-                    message: "assignment read failed: fixture corruption".to_string(),
-                }),
-                generation: Some(test_generation_id("gen-pre")),
-            }),
-        );
-        let err = crate::ledger::LedgerIntentWire::into_domain(wire).unwrap_err();
+        store_round_trip_keeps_unknown(intent);
+    }
+
+    /// Round-trip helper: the unknown pre-push observation survives the wire
+    /// EXACTLY (it is a frozen fact, never a fabricated known artifact) and
+    /// the sweep refuses it (fail closed — an unreadable pre-push means the
+    /// sweep cannot verify reachability).
+    fn store_round_trip_keeps_unknown(intent: DeploymentIntent) {
+        let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let config = config_with_pin(tmp.path(), None);
+        let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
+        store.append_intent(TARGET, &intent).unwrap();
+        let entries = store.read_ledger(TARGET).unwrap();
+        let read_back = entries[0].intent.pre_push(&SlotId::new(SLOT.to_string()));
         assert!(
-            err.to_string().contains("pre_push"),
-            "the conversion must refuse the unreadable pre-push wire value, got: {err}"
+            matches!(read_back, Some(crate::ledger::Observation::Unknown(_))),
+            "the unknown pre-push must survive the wire as Unknown, got: {read_back:?}"
+        );
+        let err = store.reachable_set(&config, None).unwrap_err();
+        assert!(
+            err.to_string().contains("pre-push"),
+            "an Unknown pre-push MUST fail the reachability sweep closed, got: {err}"
         );
     }
 

@@ -550,6 +550,13 @@ pub fn now_rfc3339() -> String {
     jiff::Timestamp::now().to_string()
 }
 
+/// The current wall-clock time as the domain [`crate::identity::Timestamp`]
+/// (RFC 3339) — the recorded-time value the terminal domain carries.
+pub fn now_rfc3339_ts() -> crate::identity::Timestamp {
+    crate::identity::Timestamp::parse(&now_rfc3339())
+        .expect("the current time is always a timestamp")
+}
+
 /// The on-server mutation-lock record: owner identity plus a UNIQUE
 /// ACQUISITION ID (uuid-v7, freshly minted per acquisition). The record IS
 /// the lock's content — the compare-and-delete primitive

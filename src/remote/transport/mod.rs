@@ -413,7 +413,6 @@ pub(crate) fn with_operation_lock_sidecar<R>(
     use std::os::unix::io::AsRawFd;
     let fd = file.as_raw_fd();
     wait_for_sidecar_flock(
-        fd,
         &p,
         SIDECAR_WAIT_TIMEOUT,
         SIDECAR_RETRY_INTERVAL,
@@ -441,7 +440,6 @@ pub(crate) fn with_operation_lock_sidecar<R>(
 /// immediately, any other errno fails immediately; a holder that is still
 /// contended when the deadline passes fails with the timeout error.
 pub(crate) fn wait_for_sidecar_flock(
-    fd: std::os::unix::io::RawFd,
     path: &std::path::Path,
     timeout: Duration,
     interval: Duration,
@@ -450,7 +448,6 @@ pub(crate) fn wait_for_sidecar_flock(
     mut now: impl FnMut() -> Instant,
     mut sleep: impl FnMut(Duration),
 ) -> Result<()> {
-    let _ = fd;
     let deadline = now() + timeout;
     loop {
         if try_flock() == 0 {
@@ -2686,9 +2683,7 @@ mod tests {
             let try_count = std::cell::Cell::new(0usize);
             let last_now = std::cell::Cell::new(None::<Instant>);
             let path = Path::new("/tmp/sidecar.test");
-            let fd: std::os::unix::io::RawFd = 42;
             let res = wait_for_sidecar_flock(
-                fd,
                 path,
                 timeout,
                 interval,
@@ -2740,9 +2735,7 @@ mod tests {
         let try_count = std::cell::Cell::new(0usize);
         let sleeps = std::cell::RefCell::new(Vec::<Duration>::new());
         let path = Path::new("/tmp/sidecar.test");
-        let fd: std::os::unix::io::RawFd = 42;
         let res = wait_for_sidecar_flock(
-            fd,
             path,
             timeout,
             interval,
@@ -2780,9 +2773,7 @@ mod tests {
         let sleeps = std::cell::RefCell::new(Vec::<Duration>::new());
         let calls = std::cell::Cell::new(0usize);
         let path = Path::new("/tmp/sidecar.test");
-        let fd: std::os::unix::io::RawFd = 42;
         let res = wait_for_sidecar_flock(
-            fd,
             path,
             timeout,
             interval,

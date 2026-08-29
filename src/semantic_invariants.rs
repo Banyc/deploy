@@ -795,20 +795,22 @@ fn classify_outcome(
                 let boundary = ReturnBoundary::Ok;
                 let disposition = match report.status {
                     None => {
-                        assert_eq!(
-                            report.message, "Everything up to date",
-                            "the only statusless report the fixture produces is the no-op"
-                        );
-                        Disposition::NoAttempt
+                        if report.message.starts_with("push pending") {
+                            // An intent-only (pending) attempt: the entry has
+                            // no terminal — the pending OPERATIONAL state.
+                            Disposition::Pending
+                        } else {
+                            assert_eq!(
+                                report.message, "Everything up to date",
+                                "the only statusless report the fixture produces is the no-op (or a pending attempt)"
+                            );
+                            Disposition::NoAttempt
+                        }
                     }
                     Some(DeploymentStatus::Successful) => Disposition::Successful,
-                    Some(DeploymentStatus::PendingCommit) => Disposition::Pending,
                     Some(DeploymentStatus::FailedPreflight) => Disposition::FailedPreflight,
                     Some(DeploymentStatus::Degraded) => Disposition::Degraded,
                     Some(DeploymentStatus::FailedRolledBack) => Disposition::FailedRolledBack,
-                    Some(DeploymentStatus::InProgress) => {
-                        panic!("a final push report must never carry InProgress")
-                    }
                 };
                 OutcomeClass::Push {
                     boundary,
@@ -1425,14 +1427,13 @@ impl Fixture {
             return Disposition::NoAttempt;
         }
         match self.store.latest_status(id).ok().flatten() {
-            Some(DeploymentStatus::PendingCommit) | Some(DeploymentStatus::InProgress) => {
-                Disposition::Pending
-            }
+            // An intent WITHOUT a terminal IS the pending state (the
+            // terminal status enum carries no pending status).
+            None => Disposition::Pending,
             Some(DeploymentStatus::FailedPreflight) => Disposition::FailedPreflight,
             Some(DeploymentStatus::Degraded) => Disposition::Degraded,
             Some(DeploymentStatus::FailedRolledBack) => Disposition::FailedRolledBack,
             Some(DeploymentStatus::Successful) => Disposition::Successful,
-            None => Disposition::NoAttempt,
         }
     }
 
@@ -2052,12 +2053,11 @@ impl Fixture {
                 let latest = self
                     .store
                     .latest_status(attempt.deployment_id.as_str())
-                    .expect("transition stream readable")
-                    .expect("every recorded attempt has a transition");
+                    .expect("status readable");
                 let id = attempt.deployment_id.as_str();
                 let snapshot_exists = snapshots.iter().any(|s| s.deployment_id.as_str() == id);
                 match latest {
-                    DeploymentStatus::Successful => {
+                    Some(DeploymentStatus::Successful) => {
                         assert!(
                             snapshot_exists,
                             "Successful attempt {id} must have a snapshot entry"
@@ -2071,22 +2071,30 @@ impl Fixture {
                             );
                         }
                     }
-                    DeploymentStatus::PendingCommit => {
+                    Some(DeploymentStatus::FailedPreflight)
+                    | Some(DeploymentStatus::Degraded)
+                    | Some(DeploymentStatus::FailedRolledBack) => {
                         assert!(
                             !snapshot_exists,
-                            "PendingCommit attempt {id} must NOT have a rollback state yet"
-                        );
-                        // The intent-only entry is the recoverable pending
-                        // state: no terminal event exists (the ledger's ONE
-                        // atomic finalize write never landed), so recovery
-                        // rebuilds the outcomes from the VERIFIED DESIRED
-                        // state — never from a durable outcomes file.
-                        assert!(
-                            self.store.read_transitions(id).unwrap().is_empty(),
-                            "PendingCommit attempt {id} must be intent-only (no terminal event)"
+                            "a failed attempt {id} must NOT have a snapshot entry"
                         );
                     }
-                    _ => {}
+                    None => {
+                        // The PENDING state: an intent WITHOUT a terminal IS
+                        // pending (the terminal status enum carries no
+                        // pending status; the ledger's ONE atomic finalize
+                        // write never landed), so recovery rebuilds the
+                        // outcomes from the VERIFIED DESIRED state — never
+                        // from a durable outcomes file.
+                        assert!(
+                            self.store.read_transitions(id).unwrap().is_empty(),
+                            "a pending attempt {id} must be intent-only (no terminal event)"
+                        );
+                        assert!(
+                            !snapshot_exists,
+                            "a pending attempt {id} must not have a snapshot entry"
+                        );
+                    }
                 }
             }
             // `read_last_successful` is DERIVED from the ledger (the newest
@@ -2535,9 +2543,8 @@ fn state_machine_lifecycle_pending_commit_recovery_no_duplicate_history() {
     };
     let r1 = res.expect("marker-write failure is reported, not fatal");
     assert_eq!(
-        r1.status,
-        Some(DeploymentStatus::PendingCommit),
-        "the failed commit must be reported PendingCommit"
+        r1.status, None,
+        "the failed commit leaves the attempt PENDING (intent-only, no terminal)"
     );
     let attempt = r1.attempt.expect("the attempt is recorded");
     let id = attempt.deployment_id.clone();
@@ -2552,7 +2559,8 @@ fn state_machine_lifecycle_pending_commit_recovery_no_duplicate_history() {
     );
     assert_eq!(
         f.store.latest_status(id.as_str()).unwrap(),
-        Some(DeploymentStatus::PendingCommit)
+        None,
+        "the pending attempt has no terminal status (an intent without a terminal IS pending)"
     );
     // Recoverable: the intent is durable and the entry is intent-only (the
     // ONE terminal event never landed — recovery rebuilds the outcomes from
@@ -3038,7 +3046,10 @@ fn observed_scope_interleaved_push_fail_retry_rollback_sequence() {
         panic!("expected a push outcome");
     };
     let report = res.expect("the pending-commit push succeeds");
-    assert_eq!(report.status, Some(DeploymentStatus::PendingCommit));
+    assert_eq!(
+        report.status, None,
+        "the attempt stays pending until finalization"
+    );
     f.assert_observed_scope_property();
     let r = f.apply(Action::Retry("t2"));
     let Outcome::Push(res) = r else {
@@ -3448,11 +3459,10 @@ fn run_remaining_changes_case(policy: FailurePolicy, position: usize) {
                 }
                 _ => None,
             });
-            let pre_gen = intent
-                .selected
-                .get(sid)
-                .and_then(|s| s.pre_push.as_ref())
-                .map(|p| p.generation.clone());
+            let pre_gen = match intent.pre_push(sid) {
+                Some(crate::ledger::Observation::Known(prev)) => Some(prev.generation.clone()),
+                _ => None,
+            };
             observed_gen != pre_gen
         })
         .collect();
@@ -3824,11 +3834,10 @@ fn lifecycle_store_fault_matrix_recovers_without_duplicate_history() {
         // the later finalization steps the snapshot / last-successful may
         // already be durable — the attempt is still not terminal.)
         assert!(
-            matches!(
-                f.store.latest_status(id.as_str()).unwrap(),
-                Some(DeploymentStatus::PendingCommit) | Some(DeploymentStatus::InProgress)
-            ),
-            "{step:?}: the crash window must leave the attempt recoverable, never Successful"
+            // An intent WITHOUT a terminal IS the pending state — the
+            // terminal status enum carries no pending status.
+            f.store.latest_status(id.as_str()).unwrap().is_none(),
+            "{step:?}: the crash window must leave the attempt recoverable (pending), never Successful"
         );
 
         // Clean retry converges to exactly one final state.
@@ -4624,13 +4633,12 @@ fn integrity_incoming_record_field_deletion_fails_closed() {
     // The INTENT line: every required field rejected individually.
     let intent_line = lines[0].clone();
     for field in [
+        "deployment_schema_version",
         "deployment_id",
         "target",
-        "slot_ids",
+        "slots",
         "behavior_sha256",
         "attempted_at",
-        "resulting_snapshot",
-        "pre_push",
     ] {
         let mut v: serde_json::Value = serde_json::from_str(intent_line.trim()).unwrap();
         v.as_object_mut().unwrap().remove(field);
@@ -4642,14 +4650,16 @@ fn integrity_incoming_record_field_deletion_fails_closed() {
             "deleting intent field '{field}' must fail deserialization"
         );
     }
-    // The TERMINAL line: every required field rejected individually.
+    // The TERMINAL line: every required field rejected individually. The
+    // optional members (`outcomes` on a Successful terminal, `reason`)
+    // carry serde defaults — deleting them stays valid.
     let terminal_line = lines[1].clone();
     for field in [
         "deployment_id",
         "target",
         "status",
         "recorded_at",
-        "outcomes",
+        "intent_digest",
     ] {
         let mut v: serde_json::Value = serde_json::from_str(terminal_line.trim()).unwrap();
         v.as_object_mut().unwrap().remove(field);
@@ -5864,14 +5874,13 @@ fn system_has_pending(system: &Fixture, t: &str) -> bool {
         .unwrap_or_default()
         .iter()
         .any(|a| {
-            matches!(
-                system
-                    .store
-                    .latest_status(a.deployment_id.as_str())
-                    .ok()
-                    .flatten(),
-                Some(DeploymentStatus::PendingCommit) | Some(DeploymentStatus::InProgress)
-            )
+            // The pending state: an intent without a terminal.
+            system
+                .store
+                .latest_status(a.deployment_id.as_str())
+                .ok()
+                .flatten()
+                .is_none()
         })
 }
 
@@ -5973,10 +5982,16 @@ fn assert_semantic_invariants(model: &Model, system: &Fixture) {
                 "{ctx}: snapshot deployment id at position {wi} for {t} — the SAME position \
                  must never resolve to a different deployment (no duplicate, no re-append)"
             );
-            let rollback = match &ss.terminal.as_ref().expect("terminal").disposition {
-                crate::ledger::TerminalDisposition::Successful(st) => st.rollback(),
-                _ => panic!("a successful entry carries a rollback state"),
-            };
+            assert!(
+                ss.terminal
+                    .as_ref()
+                    .expect("terminal")
+                    .disposition()
+                    .is_successful(),
+                "a successful entry carries a snapshot"
+            );
+            let rollback = crate::kernel::snapshot::resolve_snapshot(ss)
+                .expect("the successful snapshot resolves from the intent");
             // The snapshot's OWN first slot (a slot has exactly one owning
             // target, so a t1 snapshot carries p1/p2 and a t2 snapshot p3).
             let pid = Model::target_slots(t)[0].clone();
@@ -6009,7 +6024,7 @@ fn assert_semantic_invariants(model: &Model, system: &Fixture) {
             let pid = Model::target_slots(t)[0].clone();
             let art = sa
                 .intent
-                .resulting_snapshot
+                .resulting_snapshot()
                 .get(&pid)
                 .unwrap()
                 .artifact()

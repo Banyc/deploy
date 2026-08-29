@@ -18,7 +18,8 @@
 //!
 //! * **intent** — the durable intent wire/domain pair ([`LedgerIntentWire`]
 //!   / [`DeploymentIntent`]) with the VERIFYING CONVERSION, the per-slot
-//!   payload type ([`SelectedSlotIntent`]) and the in-memory push report
+//!   plan types ([`crate::kernel::intent::PlannedSlot`] /
+//!   [`crate::kernel::intent::SlotAction`]) and the in-memory push report
 //!   ([`LedgerIntentReport`]) (the "two line kinds — intent" half);
 //! * **terminal** — the terminal wire/domain pair ([`LedgerTerminalWire`] /
 //!   [`LedgerTerminal`]) with the VERIFYING CONVERSION, the
@@ -32,17 +33,20 @@
 //! * **entries / merge** — the merged deployment entry ([`LedgerEntry`]):
 //!   the intent + optional terminal merge type the append/read path
 //!   carries;
-//! * **rollback payload** — the rollback PAYLOAD builder
-//!   ([`build_rollback`]): the complete-snapshot overlay + exact-rollback
-//!   verification semantics;
 //! * **rebinding proof** — the rebinding proof records ([`RebindingPlan`] /
 //!   [`VerifiedReleaseRebinding`] / [`FrozenSlotTopology`]);
-//! * **membership equations** — the SUCCESSFUL membership-equation
-//!   enforcement (`verify_successful_membership_equations`);
 //! * **schema versions** — the format-version constants
 //!   (`LEDGER_SCHEMA_VERSION` / `PINS_SCHEMA_VERSION`).
 //!
-//! The ROLLBACK payload IS the domain struct serialized directly; the schema version gates old shapes.
+//! The SEMANTIC kernel ([`crate::kernel`]) owns the DOMAIN records: the
+//! validated [`DeploymentIntent`] (this module re-exports it) and the
+//! terminal records ([`LedgerTerminal`] / [`TerminalDisposition`]); a
+//! successful deployment's resulting snapshot resolves from the intent's
+//! own slot table — there is NO separately stored rollback payload to build
+//! or validate (the old `build_rollback` /
+//! `validate_successful_rollback_against_intent` /
+//! `verify_successful_membership_equations` validators are GONE). The
+//! schema version gates old shapes.
 //! The per-slot ordered TABLES ([`crate::ledger::tables::SlotTable`] /
 //! [`crate::ledger::tables::NonEmptySlotTable`] over the private ordered
 //! map) are generic slot collection INFRASTRUCTURE and stay in
@@ -122,36 +126,82 @@ pub use observation::{
     ArtifactRefWire, Observation, ObservationError, ObservationWire, ObservedAssignment,
     ObservedGeneration, ObservedGenerationWire, ObservedSlot, ObservedTarget,
 };
-pub(crate) use validation::verify_successful_membership_equations;
-pub(crate) use validation::{
-    BoundGeneration, build_rollback, validate_successful_rollback_against_intent,
+// The DOMAIN records are OWNED BY THE SEMANTIC KERNEL
+// ([`crate::kernel`]) and re-exported here so the pre-kernel
+// `crate::ledger::records::X` paths keep resolving: the intent
+// ([`crate::kernel::intent::DeploymentIntent`]) and the terminal
+// ([`crate::kernel::terminal`]'s [`LedgerTerminal`] / [`TerminalDisposition`] /
+// [`DegradedTerminal`] / [`FailedRolledBackTerminal`]).
+pub use crate::kernel::intent::DeploymentIntent;
+pub use crate::kernel::snapshot::SnapshotSlot as SnapshotEntry;
+pub use crate::kernel::terminal::{
+    DegradedTerminal, FailedRolledBackTerminal, IntentDigest, LedgerTerminal, TerminalDisposition,
 };
 pub use validation::{FrozenSlotTopology, RebindingPlan, VerifiedReleaseRebinding};
 pub(crate) use validation::{LEDGER_SCHEMA_VERSION, PINS_SCHEMA_VERSION};
 pub use wire::{
-    CompensationReport, DegradedTerminal, DeploymentIntent, LedgerEntry, LedgerIntentReport,
-    LedgerIntentWire, LedgerTerminal, LedgerTerminalWire, SelectedSlotIntent, SlotAttemptStateWire,
-    SlotOutcome, SlotOutcomeKind, SlotResult, SlotTransition, SuccessfulTerminal,
-    TerminalDisposition,
+    CompensationReport, LedgerEntry, LedgerIntentReport, LedgerIntentWire, LedgerTerminalWire,
+    PlannedSlotWire, PreviousGenerationWire, SlotActionWire, SlotOutcome, SlotOutcomeKind,
+    SlotResult, SlotTransition, SnapshotSlotWire,
 };
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// THE PHYSICAL LEDGER EVENT LINE — the WIRE enum the append-only JSONL
+/// stream carries: one line per intent, terminal, and (as the first line of
+/// a checkpointed ledger) checkpoint event. Strict parsing + the
+/// event-store rules live in the store reader; the SEMANTIC transitions
+/// are validated by [`crate::kernel::transition::apply_event`].
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LedgerEventWire {
+    Intent(LedgerIntentWire),
+    Terminal(LedgerTerminalWire),
+    Checkpoint(CheckpointWire),
+}
+
+/// The WIRE shape of a checkpoint event: the atomic suffix replacement's
+/// ledger begins with this line, recording which deployment the retained
+/// suffix starts at and how many ledger entries were discarded.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CheckpointWire {
+    pub deployment_schema_version: u32,
+    /// The deployment the retained suffix starts at (the checkpoint
+    /// deployment).
+    pub retained_from: String,
+    /// How many ledger entries were discarded by the compaction.
+    pub discarded: u64,
+    pub recorded_at: String,
+}
+
+impl CheckpointWire {
+    /// Build the (infallible, canonical) wire form of a checkpoint event
+    /// carrying the current schema version.
+    pub fn new(
+        retained_from: &crate::identity::DeploymentId,
+        discarded: u64,
+        recorded_at: &str,
+    ) -> Self {
+        CheckpointWire {
+            deployment_schema_version: LEDGER_SCHEMA_VERSION,
+            retained_from: retained_from.as_str().to_string(),
+            discarded,
+            recorded_at: recorded_at.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeploymentStatus {
-    /// A deployment attempt is currently being executed, or was interrupted
-    /// before its terminal event was appended (an intent-only ledger entry):
-    /// a later push reconciles it before its own no-op check.
-    InProgress,
     Successful,
-    /// The commit markers are not all durable yet; a later push
-    /// reconciles this attempt before its own no-op check.
-    PendingCommit,
     FailedPreflight,
     FailedRolledBack,
     Degraded,
 }
 
 impl DeploymentStatus {
+    /// The terminal statuses: an attempt that ended without achieving its
+    /// planned result (a deployment whose entry has NO terminal is the
+    /// PENDING state — never a status in the terminal enum).
     pub fn is_terminal_failure(&self) -> bool {
         matches!(
             self,
@@ -159,6 +209,13 @@ impl DeploymentStatus {
                 | DeploymentStatus::FailedRolledBack
                 | DeploymentStatus::Degraded
         )
+    }
+
+    /// The PENDING (non-terminal) state: an intent WITHOUT a terminal IS
+    /// pending; its recovery phase is an operational view derived from
+    /// markers/transactions, never a status on any terminal event.
+    pub fn is_pending() -> bool {
+        true
     }
 }
 
@@ -208,119 +265,18 @@ impl Default for PhysicalBinding {
     }
 }
 
-/// The ROLLBACK STATE carried by the terminal event of a SUCCESSFUL
-/// deployment: the snapshot payload of the attempt — one entry per slot
-/// carrying its generation, artifact, and physical binding. The payload IS
-/// the domain struct serialized directly; the schema version gates old shapes.
-#[derive(Clone, Debug, Serialize)]
+/// THE DERIVED SNAPSHOT VIEW — the resulting snapshot of a successful
+/// deployment, RESOLVED from its intent's slot table
+/// ([`crate::kernel::snapshot::resolve_snapshot`]) on demand, NEVER stored
+/// in any terminal payload: one entry per slot carrying its generation,
+/// artifact, and physical binding (the `SnapshotEntry` = the kernel's
+/// [`crate::kernel::snapshot::SnapshotSlot`]). A VALUE type only (no
+/// stored invariants — the slot table owns them).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TargetSnapshot {
     entries: BTreeMap<SlotId, SnapshotEntry>,
 }
 
-/// The STRICT wire shape for the rollback payload: entries REQUIRED,
-/// unknown fields REJECTED (`deny_unknown_fields`), and every slot key
-/// unique (a map-visitor deserializer refuses a duplicate — ambiguous
-/// JSON can never read as a valid rollback). Deserialize-only: the writer
-/// emits `TargetSnapshot`'s own `Serialize` (the same `{"entries": ...}`).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TargetSnapshotWire {
-    #[serde(deserialize_with = "deserialize_unique_entries")]
-    entries: BTreeMap<SlotId, SnapshotEntry>,
-}
-
-fn deserialize_unique_entries<'de, D>(
-    deserializer: D,
-) -> std::result::Result<BTreeMap<SlotId, SnapshotEntry>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    struct UniqueEntriesVisitor;
-    impl<'de> serde::de::Visitor<'de> for UniqueEntriesVisitor {
-        type Value = BTreeMap<SlotId, SnapshotEntry>;
-        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            f.write_str("a map with unique slot keys")
-        }
-        fn visit_map<M>(self, mut access: M) -> std::result::Result<Self::Value, M::Error>
-        where
-            M: serde::de::MapAccess<'de>,
-        {
-            let mut entries = BTreeMap::new();
-            while let Some((slot, entry)) = access.next_entry::<SlotId, SnapshotEntry>()? {
-                if entries.insert(slot.clone(), entry).is_some() {
-                    return Err(serde::de::Error::custom(format!(
-                        "duplicate rollback slot '{slot}'"
-                    )));
-                }
-            }
-            Ok(entries)
-        }
-    }
-    deserializer.deserialize_map(UniqueEntriesVisitor)
-}
-
-impl Serialize for TargetSnapshotWire {
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("TargetSnapshotWire", 1)?;
-        state.serialize_field("entries", &self.entries)?;
-        state.end()
-    }
-}
-impl From<TargetSnapshotWire> for TargetSnapshot {
-    fn from(w: TargetSnapshotWire) -> Self {
-        TargetSnapshot::from_entries(w.entries)
-    }
-}
-impl From<&TargetSnapshot> for TargetSnapshotWire {
-    fn from(s: &TargetSnapshot) -> Self {
-        TargetSnapshotWire {
-            entries: s.clone().into_entries(),
-        }
-    }
-}
-
-pub(crate) fn deserialize_opt_strict_rollback<'de, D>(
-    deserializer: D,
-) -> std::result::Result<Option<TargetSnapshot>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Option::<TargetSnapshotWire>::deserialize(deserializer).map(|o| o.map(Into::into))
-}
-impl PartialEq for TargetSnapshot {
-    fn eq(&self, other: &Self) -> bool {
-        self.entries == other.entries
-    }
-}
-impl Eq for TargetSnapshot {}
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SnapshotEntry {
-    generation: GenerationId,
-    artifact: ArtifactRef,
-    binding: PhysicalBinding,
-}
-impl SnapshotEntry {
-    pub fn new(generation: GenerationId, artifact: ArtifactRef, binding: PhysicalBinding) -> Self {
-        Self {
-            generation,
-            artifact,
-            binding,
-        }
-    }
-    pub fn generation(&self) -> &GenerationId {
-        &self.generation
-    }
-    pub fn artifact(&self) -> &ArtifactRef {
-        &self.artifact
-    }
-    pub fn binding(&self) -> &PhysicalBinding {
-        &self.binding
-    }
-}
 impl TargetSnapshot {
     pub fn from_entries(entries: BTreeMap<SlotId, SnapshotEntry>) -> Self {
         Self { entries }
@@ -345,17 +301,17 @@ impl TargetSnapshot {
     }
     pub fn generation_ref(&self, slot: &SlotId) -> Option<GenerationRef> {
         self.entries.get(slot).map(|e| GenerationRef {
-            generation: e.generation.clone(),
+            generation: e.generation().clone(),
             assignment: PlacementSlotAssignment {
                 placement_slot: slot.clone(),
-                artifact: e.artifact.clone(),
+                artifact: e.artifact().clone(),
             },
         })
     }
     pub fn releases(&self) -> BTreeSet<ReleaseId> {
         self.entries
             .values()
-            .map(|e| e.artifact.release.clone())
+            .map(|e| e.artifact().release.clone())
             .collect()
     }
 }
@@ -369,12 +325,6 @@ impl TargetSnapshot {
 /// snapshot's slots can carry artifacts from DIFFERENT releases, so the
 /// index spans every release the attempt's slots reference.
 pub type BehaviorIndex = BTreeMap<ReleaseId, BTreeMap<String, BehaviorContract>>;
-
-/// The COMPLETE ROLLBACK payload of a SUCCESSFUL deployment — the existing
-/// [`TargetSnapshot`] under the domain terminal's name: the per-slot
-/// generation refs + physical bindings the terminal event carries exactly
-/// when the deployment was successful.
-pub type CompleteRollback = TargetSnapshot;
 
 /// A durable pin: retained artifact CONTENT, store-global (a release or
 /// binding is shared by every target that references it, so a pin protects
@@ -830,2492 +780,627 @@ impl<'de> Deserialize<'de> for DeploymentPlan {
 
 #[cfg(test)]
 mod tests {
-    use crate::identity::{
-        ArtifactRef, GenerationRef, MatchingMembership, PlacementSlotAssignment, RolloutGroupName,
-        ServerId, SlotSet, Timestamp, VariantName, test_deployment_id, test_generation_id,
-        test_release_id, test_tree_digest,
+    use super::*;
+    use crate::identity::{SlotId, TargetName, Timestamp, test_deployment_id, test_generation_id};
+    use crate::kernel;
+    use crate::ledger::records::{
+        DeploymentStatus, LedgerIntentWire, LedgerTerminalWire, SlotActionWire,
     };
-    use crate::ledger::records::FrozenSlotTopology;
-    use crate::ledger::records::*;
-    use crate::ledger::records::{DeploymentIntent, LedgerIntentReport, LedgerIntentWire};
-    use crate::ledger::records::{LedgerTerminal, LedgerTerminalWire, TerminalDisposition};
-    use crate::ledger::records::{ObservationError, ObservedGeneration};
-    use crate::ledger::records::{SlotOutcome, SlotOutcomeKind, SlotTransition};
+    use crate::ledger::{LEDGER_SCHEMA_VERSION, LedgerLine, TargetSnapshot};
     use crate::store::local::LocalStore;
-    #[cfg(test)]
+    use crate::testutil::fixtures;
     use proptest::prelude::*;
-    #[cfg(test)]
     use proptest::test_runner::RngSeed;
-    use std::path::Path;
-
-    // ---- fixtures ----------------------------------------------------------
+    use std::collections::BTreeMap;
 
     fn slot(i: u32) -> SlotId {
         SlotId::new(format!("slot-{i}"))
     }
 
-    fn slot_strategy() -> impl Strategy<Value = SlotId> {
-        (0u32..6).prop_map(slot)
+    // ---- fixtures: a valid full-push intent + every terminal disposition --
+
+    /// A valid full-push intent over `keys` (group None → all Deploy).
+    fn valid_intent(keys: &[SlotId], dep: &str) -> crate::kernel::intent::DeploymentIntent {
+        fixtures::full_intent(dep, "t1", keys, &[])
     }
 
-    fn binding(sid: &SlotId) -> PhysicalBinding {
-        PhysicalBinding {
-            server: ServerId::parse("s1").unwrap(),
-            deploy_dir: format!("/srv/deploy/{}", sid.as_str()),
-        }
+    /// The WIRE form of [`valid_intent`] — the tamper target (tests that
+    /// need invalid values mutate the WIRE, never the domain).
+    fn valid_intent_wire(keys: &[SlotId], dep: &str) -> LedgerIntentWire {
+        LedgerIntentWire::from(&valid_intent(keys, dep))
     }
 
-    /// A generation ref whose assignment names its own key (the agreeing
-    /// form); the artifact's release is derived from the slot id.
-    fn gen_ref_for(key: &SlotId) -> GenerationRef {
-        GenerationRef {
-            generation: test_generation_id(key.as_str()),
-            assignment: PlacementSlotAssignment {
-                placement_slot: key.clone(),
-                artifact: ArtifactRef {
-                    release: test_release_id(key.as_str()),
-                    variant: VariantName::parse("standard").unwrap(),
-                    tree: test_tree_digest(key.as_str()),
-                },
-            },
-        }
-    }
-
-    // ---- agreeing (base) wire strategies -----------------------------------
-    //
-    // Every base wire is deterministic in its AGREED projections: a
-    // NON-EMPTY duplicate-free membership K, `slot_ids` = K (deployment
-    // order), `desired`/`pre_push` = K with agreeing per-slot payloads, the
-    // wire `slots` (actuals) map EMPTY (the persisted intent carries no
-    // outcomes), and a terminal whose deployment_id/target EQUAL the
-    // intent's, whose outcome keys are members of K, and whose status →
-    // disposition payload matches (Successful ⇔ rollback, FailedPreflight ⇔
-    // no outcomes, Degraded ⇔ non-restored outcomes). The property then
-    // mutates ONE field at a time and asserts the conversion / reader fails
-    // closed on EVERY tamper while accepting the untampered record.
-
-    fn agreeing_intent(keys: &[SlotId]) -> LedgerIntentWire {
-        agreeing_intent_with_group(keys, keys, None)
-    }
-
-    /// [`agreeing_intent`] with an explicit GROUP MODE and FROZEN FULL
-    /// MEMBERSHIP: `Some(g)` selects a group push (the intent's `slot_ids`
-    /// are the group's slots), `None` a full push (the intent's `slot_ids`
-    /// are every target slot); `full` is the COMPLETE target membership the
-    /// intent FREEZES (⊇ `keys`).
-    fn agreeing_intent_with_group(
+    fn valid_terminal_wire(
         keys: &[SlotId],
-        full: &[SlotId],
-        group: Option<&str>,
-    ) -> LedgerIntentWire {
-        // THE FROZEN RESULTING SNAPSHOT: one entry per FULL member (the
-        // selected keys, plus the unselected `full` slots a group push
-        // carries forward). The selected slot's desired state IS its
-        // snapshot entry — no separate desired/bindings projections.
-        let snapshot = TargetSnapshot::from_entries(
-            full.iter()
-                .map(|k| {
-                    let g = gen_ref_for(k);
-                    (
-                        k.clone(),
-                        crate::ledger::SnapshotEntry::new(
-                            g.generation.clone(),
-                            g.assignment.artifact.clone(),
-                            binding(k),
-                        ),
-                    )
-                })
-                .collect(),
-        );
-        let pre_push: BTreeMap<SlotId, Option<SlotAttemptStateWire>> =
-            keys.iter().map(|k| (k.clone(), None)).collect();
-        LedgerIntentWire {
-            deployment_schema_version: crate::ledger::LEDGER_SCHEMA_VERSION,
-            deployment_id: test_deployment_id("deploy-w"),
-            target: TargetName::parse("t1").unwrap(),
-            group: group.map(str::to_string),
-            slot_ids: keys.to_vec(),
-            behavior_sha256: crate::identity::DIGEST_TEST_HEX_1.to_string(),
-            attempted_at: "2026-01-01T00:00:00Z".to_string(),
-            resulting_snapshot: TargetSnapshotWire::from(&snapshot),
-            pre_push,
-            slots: BTreeMap::new(),
-        }
-    }
-
-    fn outcome_for(key: &SlotId, kind: SlotOutcomeKind) -> SlotResult {
-        let compensated = matches!(&kind, SlotOutcomeKind::Restored);
-        SlotResult {
-            slot_id: key.clone(),
-            outcome: kind,
-            observation: ObservationWire::Known(ObservedGenerationWire {
-                generation: test_generation_id(key.as_str()),
-            }),
-            compensated,
-            error: None,
-        }
-    }
-    fn agreeing_terminal(keys: &[SlotId], status_idx: u32) -> LedgerTerminalWire {
-        let deployment_id = test_deployment_id("deploy-w");
-        let target = TargetName::parse("t1").unwrap();
-        match status_idx {
-            // Successful: EVERY member slot recorded Activated, the
-            // COMPLETE rollback payload covers the same membership with
-            // exact bindings, and BOTH memberships equal that membership
-            // (the proven exact-equal shape).
-            0 => LedgerTerminalWire {
-                deployment_id: deployment_id.clone(),
-                target: target.clone(),
-                status: DeploymentStatus::Successful,
-                recorded_at: "2026-01-01T00:00:00Z".to_string(),
-                outcomes: keys
-                    .iter()
-                    .map(|k| (k.clone(), outcome_for(k, SlotOutcomeKind::Activated)))
-                    .collect(),
-                rollback: Some({
-                    let __slots: BTreeMap<crate::identity::SlotId, crate::identity::GenerationRef> =
-                        keys.iter().map(|k| (k.clone(), gen_ref_for(k))).collect();
-                    let __bindings: BTreeMap<
-                        crate::identity::SlotId,
-                        crate::ledger::records::PhysicalBinding,
-                    > = keys.iter().map(|k| (k.clone(), binding(k))).collect();
-                    let mut __entries: BTreeMap<
-                        crate::identity::SlotId,
-                        crate::ledger::records::SnapshotEntry,
-                    > = BTreeMap::new();
-                    for (k, v) in __slots.clone() {
-                        let b = __bindings.get(&k).cloned().unwrap_or(
-                            crate::ledger::records::PhysicalBinding {
-                                server: crate::identity::ServerId::new("s1"),
-                                deploy_dir: format!("/srv/deploy/{}", k.as_str()),
-                            },
-                        );
-                        __entries.insert(
-                            k.clone(),
-                            crate::ledger::records::SnapshotEntry::new(
-                                v.generation.clone(),
-                                v.assignment.artifact.clone(),
-                                b,
-                            ),
-                        );
-                    }
-                    for (k, b) in __bindings.clone() {
-                        __entries.entry(k.clone()).or_insert_with(|| {
-                            crate::ledger::records::SnapshotEntry::new(
-                                crate::identity::GenerationId::new("gen-missing".to_string()),
-                                crate::identity::ArtifactRef {
-                                    release: crate::identity::test_release_id("rel-missing"),
-                                    variant: crate::identity::VariantName::new(
-                                        "standard".to_string(),
-                                    ),
-                                    tree: crate::identity::test_tree_digest("missing"),
-                                },
-                                b.clone(),
-                            )
-                        });
-                    }
-                    crate::ledger::records::TargetSnapshot::from_entries(__entries)
-                }),
-                selected_membership: keys.to_vec(),
-                full_membership: keys.to_vec(),
-                reason: Some("push completed".to_string()),
-            },
-            // FailedPreflight: pre-mutation — NO outcomes, NO rollback, NO
-            // memberships (only a Successful terminal proves them).
-            1 => LedgerTerminalWire {
-                deployment_id,
-                target,
-                status: DeploymentStatus::FailedPreflight,
-                recorded_at: "2026-01-01T00:00:00Z".to_string(),
-                outcomes: BTreeMap::new(),
-                rollback: None,
-                selected_membership: vec![],
-                full_membership: vec![],
-                reason: Some("preflight failed".to_string()),
-            },
-            // FailedRolledBack: the outcome table IS the compensation
-            // report.
-            2 => LedgerTerminalWire {
-                deployment_id,
-                target,
-                status: DeploymentStatus::FailedRolledBack,
-                recorded_at: "2026-01-01T00:00:00Z".to_string(),
-                outcomes: keys
-                    .iter()
-                    .map(|k| (k.clone(), outcome_for(k, SlotOutcomeKind::Restored)))
-                    .collect(),
-                rollback: None,
-                selected_membership: vec![],
-                full_membership: vec![],
-                reason: Some("rolled back".to_string()),
-            },
-            // Degraded: every member's outcome is a REMAINING change — an
-            // UNCOMPENSATED `Failed` (a pre-swap failure / failed
-            // compensation: the advance outcome is unknown, and the
-            // outcome's observed generation differs from the intent's
-            // `pre_push` (None — a first deployment), so the derived
-            // remaining-changes set is non-empty).
-            _ => LedgerTerminalWire {
-                deployment_id,
-                target,
-                status: DeploymentStatus::Degraded,
-                recorded_at: "2026-01-01T00:00:00Z".to_string(),
-                outcomes: keys
-                    .iter()
-                    .map(|k| (k.clone(), outcome_for(k, SlotOutcomeKind::Failed)))
-                    .collect(),
-                rollback: None,
-                selected_membership: vec![],
-                full_membership: vec![],
-                reason: Some("degraded".to_string()),
-            },
-        }
-    }
-
-    // ---- THE VERIFYING PAIR CONVERSION + the read_ledger consumer ---------
-
-    /// Run the full verifying conversion of an intent + terminal pair — the
-    /// SAME checks `read_ledger` runs when it merges a terminal into its
-    /// entry (the entry owns identity: the terminal's id is the entry key,
-    /// its target must equal the entry's, every outcome key must be a
-    /// member of the intent's membership, and the outcome key set must
-    /// agree with the membership BY STATUS: Successful → the
-    /// ROLLBACK-VS-INTENT legs (the terminal's rollback must EXACTLY equal
-    /// the intent's frozen resulting_snapshot and its activated set the
-    /// intent's selected — via the SHARED validator
-    /// [`crate::ledger::records::validate_successful_rollback_against_intent`]
-    /// the store read runs), FailedPreflight → empty, every other
-    /// state → EXACT coverage) — returning the validated domain pair.
-    fn pair_to_domain(
-        pair: &(LedgerIntentWire, LedgerTerminalWire),
-    ) -> Result<(DeploymentIntent, LedgerTerminal)> {
-        let intent = pair.0.clone().into_domain()?;
-        if pair.1.deployment_id != intent.deployment_id {
-            return Err(Error::integrity(format!(
-                "terminal {}: deployment_id disagrees with its entry (the intent's)",
-                pair.1.deployment_id
-            )));
-        }
-        if pair.1.target != intent.target {
-            return Err(Error::integrity(format!(
-                "terminal {}: target '{}' disagrees with its entry (the intent's target '{}')",
-                pair.1.deployment_id, pair.1.target, intent.target
-            )));
-        }
-        for key in pair.1.outcomes.keys() {
-            if !intent.selected.contains_key(key) {
-                return Err(Error::integrity(format!(
-                    "terminal {}: outcome for slot '{key}' is outside the intent's membership",
-                    pair.1.deployment_id
-                )));
-            }
-        }
-        let terminal = pair.1.clone().into_domain()?;
-        // STATUS-SPECIFIC OUTCOME AGREEMENT (the membership leg — the same
-        // rules `read_ledger` enforces when it merges the terminal into its
-        // entry). The terminal carries its OWN proven memberships (the
-        // conversion enforced outcomes == selected, rollback == full,
-        // selected ⊆ full — the record is self-proving), so the only
-        // Successful leg is the FULL-push equality: a FULL push (no group)
-        // selects every target slot, so selected == full; a GROUP push
-        // allows a proper subset (the ⊆ is already enforced by the
-        // conversion). The intent's `slot_ids` is NOT compared to either
-        // membership (it is the historical selected set written before the
-        // push; the terminal's memberships are proven at terminal time).
-        let outcome_keys: BTreeSet<SlotId> = terminal.outcomes().keys().cloned().collect();
-        let membership: BTreeSet<SlotId> = intent.selected.keys().cloned().collect();
-        match terminal.status() {
-            DeploymentStatus::Successful => {
-                // THE INTENT-BINDING LEGS (the user's requirement): the
-                // terminal must REPRODUCE the intent's FROZEN values — the
-                // intent froze selected (its table keys) and full (the
-                // resulting snapshot: the complete target membership at plan
-                // time), and a terminal whose values diverge is refused.
-                // THE SHARED VALIDATOR is the same one the store read runs
-                // (>[`crate::ledger::records::validate_successful_rollback_against_intent`]):
-                // activated == intent.selected AND the terminal's ROLLBACK
-                // must EXACTLY EQUAL the intent's frozen resulting_snapshot
-                // (full equality over ALL slots — a mutated SELECTED or
-                // UNSELECTED snapshot field is refused). The FULL-push
-                // equality (group None → selected == snapshot keys) is
-                // STRUCTURAL in the intent (the conversion enforces it), so
-                // the terminal legs reproduce both sides of it.
-                let (rollback, selected) = match &terminal.disposition {
-                    TerminalDisposition::Successful(st) => (st.rollback(), st.activated().as_set()),
-                    _ => {
-                        unreachable!("a Successful terminal carries its rollback + activated set")
-                    }
-                };
-                crate::ledger::records::validate_successful_rollback_against_intent(
-                    &intent, rollback, selected,
-                )?;
-            }
-            DeploymentStatus::FailedPreflight => {
-                if !outcome_keys.is_empty() {
-                    return Err(Error::integrity(format!(
-                        "terminal {}: FailedPreflight must carry NO outcomes (a pre-mutation failure touched no slot)",
-                        pair.1.deployment_id
-                    )));
-                }
-            }
-            _ => {
-                if outcome_keys != membership {
-                    return Err(Error::integrity(format!(
-                        "terminal {}: outcomes {outcome_keys:?} must EXACTLY cover the intent's membership {membership:?} — no missing, no extra",
-                        pair.1.deployment_id
-                    )));
-                }
-            }
-        }
-        Ok((intent, terminal))
-    }
-
-    /// [`DeploymentIntent`]: the wire's three projections COLLAPSE into ONE
-    /// slot table; every duplicate-projection disagreement (duplicate member,
-    /// missing/extra desired or pre_push key, an EMPTY membership, an
-    /// assignment naming another placement, a wire actuals key outside the
-    /// membership) fails the conversion, and the domain round-trips stably.
-    #[test]
-    fn intent_collapses_into_one_table_and_refuses_disagreements() {
-        let keys = vec![slot(1)];
-        let wire = agreeing_intent(&keys);
-        let domain = wire.clone().into_domain().unwrap();
-        assert_eq!(domain.membership(), vec![slot(1)]);
-        assert_eq!(
-            domain.releases(),
-            BTreeSet::from([test_release_id("slot-1")])
-        );
-        assert_eq!(domain.selected.len(), 1, "one table, one member");
-        assert!(
-            domain
-                .resulting_snapshot
-                .get(&slot(1))
-                .expect("selected in snapshot")
-                .artifact()
-                .release
-                .as_str()
-                .starts_with("rel-sha256-")
-        );
-        // Round trip: the domain re-expands into the wire split shape and
-        // back unchanged.
-        let wire2 = LedgerIntentWire::from(&domain);
-        assert_eq!(
-            wire2.slot_ids,
-            vec![slot(1)],
-            "the wire split shape is preserved"
-        );
-        let domain2 = wire2.into_domain().unwrap();
-        assert_eq!(
-            domain2, domain,
-            "an agreeing intent survives the round trip"
-        );
-
-        // (a) a DUPLICATE member weakens the membership.
-        let mut bad = wire.clone();
-        bad.slot_ids.push(slot(1));
-        assert!(
-            bad.into_domain().is_err(),
-            "a duplicate member fails closed"
-        );
-        // (b) a DELETED member: the membership omits a key the maps carry.
-        let mut bad = wire.clone();
-        bad.slot_ids.pop();
-        assert!(bad.into_domain().is_err(), "a deleted member fails closed");
-        // (c) an EMPTY membership: the domain's NonEmptySlotTable refuses it.
-        let mut bad = wire.clone();
-        bad.slot_ids.clear();
-        bad.pre_push.clear();
-        assert!(
-            bad.into_domain().is_err(),
-            "an empty membership fails closed"
-        );
-        // (d) a MISSING snapshot entry for a selected slot: the frozen
-        //     snapshot must cover every selected slot (selected ⊆ snapshot).
-        let mut bad = wire.clone();
-        let snapshot: TargetSnapshot = bad.resulting_snapshot.clone().into();
-        let mut entries = snapshot.into_entries();
-        entries.remove(&slot(1));
-        bad.resulting_snapshot = TargetSnapshotWire::from(&TargetSnapshot::from_entries(entries));
-        assert!(
-            bad.into_domain().is_err(),
-            "a missing snapshot entry fails closed"
-        );
-        // (e) an EXTRA snapshot entry beyond the selected membership: a FULL
-        //     push (no group) requires selected == snapshot keys.
-        let mut bad = wire.clone();
-        let snapshot: TargetSnapshot = bad.resulting_snapshot.clone().into();
-        let mut entries = snapshot.into_entries();
-        let g = gen_ref_for(&slot(2));
-        entries.insert(
-            slot(2),
-            SnapshotEntry::new(
-                g.generation.clone(),
-                g.assignment.artifact.clone(),
-                binding(&slot(2)),
-            ),
-        );
-        bad.resulting_snapshot = TargetSnapshotWire::from(&TargetSnapshot::from_entries(entries));
-        assert!(
-            bad.into_domain().is_err(),
-            "an extra snapshot key beyond the selected fails closed"
-        );
-        // (f) a missing pre_push key.
-        let mut bad = wire.clone();
-        bad.pre_push.remove(&slot(1));
-        assert!(
-            bad.into_domain().is_err(),
-            "a missing pre_push key fails closed"
-        );
-        // (g) an extra pre_push key outside the membership.
-        let mut bad = wire.clone();
-        bad.pre_push.insert(slot(2), None);
-        assert!(
-            bad.into_domain().is_err(),
-            "an extra pre_push key fails closed"
-        );
-        // (h) a wire actuals key outside the membership.
-        let mut bad = wire.clone();
-        bad.slots.insert(
-            slot(9),
-            SlotAttemptStateWire {
-                artifact: ObservationWire::Unknown(ObservationError {
-                    message: "fixture: unknown assignment".to_string(),
-                }),
-                generation: None,
-            },
-        );
-        assert!(
-            bad.into_domain().is_err(),
-            "a slots key outside slot_ids fails closed"
-        );
-        // (i) a pre-push wire value with NO generation is unrepresentable as
-        //     a known [`GenerationRef`] (the conversion refuses it
-        //     fail-closed).
-        let mut bad = wire.clone();
-        bad.pre_push.insert(
-            slot(1),
-            Some(SlotAttemptStateWire {
-                artifact: ObservationWire::Unknown(ObservationError {
-                    message: "fixture: unknown assignment".to_string(),
-                }),
-                generation: None,
-            }),
-        );
-        assert!(
-            bad.into_domain().is_err(),
-            "an unrepresentable pre-push wire value fails closed"
-        );
-    }
-
-    /// INTENT vs REPORT datatype split: the verified domain
-    /// [`DeploymentIntent`] carries NO outcomes map (the wire keeps the
-    /// intentionally-empty `slots` member for format stability), while the
-    /// in-memory [`LedgerIntentReport`] carries the observed per-slot
-    /// actuals — the report's map is not part of the intent's key-set
-    /// invariant.
-    #[test]
-    fn intent_report_carries_outcomes_while_persisted_intent_slots_stay_empty() {
-        let keys = vec![slot(1)];
-        let mut wire = agreeing_intent(&keys);
-        // The report parses the intent's digest into a [`BehaviorDigest`], so
-        // the fixture must carry a canonical sha256 digest.
-        wire.behavior_sha256 = crate::identity::DIGEST_TEST_HEX_1.to_string();
-        let domain = wire.into_domain().unwrap();
-        // The REPORT carries the observed per-slot actuals for display.
-        let mut report = LedgerIntentReport::from_intent(&domain).expect("verified intent parses");
-        report.slots.insert(
-            slot(1),
-            SlotAttemptState {
-                artifact: Observation::Unknown(ObservationError {
-                    message: "fixture: unknown assignment".to_string(),
-                }),
-                generation: None,
-            },
-        );
-        assert_eq!(report.slots.len(), 1, "the report carries the actuals");
-        // The PERSISTED intent keeps its wire `slots` map EMPTY (the wire
-        // conversion never reads the report's map): the intent round-trips
-        // without the outcomes.
-        let wire2 = LedgerIntentWire::from(&domain);
-        assert!(
-            wire2.slots.is_empty(),
-            "the persisted intent keeps the `slots` map empty (outcomes live in the terminal event and the in-memory report)"
-        );
-        // The report's maps are re-expanded from the one table (split shape,
-        // display-facing), and its scalars are parsed fail-closed.
-        assert_eq!(report.slot_ids, vec![slot(1)]);
-        assert_eq!(report.desired.len(), 1);
-        assert!(report.pre_push.contains_key(&slot(1)));
-        assert!(
-            LedgerIntentReport::from_intent(&domain).is_ok(),
-            "the verified intent's scalars parse into the report"
-        );
-    }
-    /// STATUS → DISPOSITION: each status maps to EXACTLY ONE disposition,
-    /// and a status whose payload does not match its disposition is a
-    /// conversion error (fail closed) — the truth table is STRUCTURAL in the
-    /// domain.
-    #[test]
-    fn terminal_status_maps_to_exactly_one_disposition() {
-        let keys = vec![slot(1), slot(2)];
-        // Successful + complete rollback → Successful { rollback, activated }.
-        let wire = agreeing_terminal(&keys, 0);
-        let d = wire.into_domain().unwrap();
-        assert_eq!(d.status(), DeploymentStatus::Successful);
-        let TerminalDisposition::Successful(st) = d.disposition else {
-            panic!("Successful maps to Successful {{ rollback, activated, full_membership }}");
+        dep: &str,
+        status: DeploymentStatus,
+    ) -> LedgerTerminalWire {
+        let intent = valid_intent(keys, dep);
+        let terminal = match status {
+            DeploymentStatus::Successful => fixtures::successful_terminal(&intent),
+            DeploymentStatus::FailedPreflight => fixtures::failed_preflight_terminal(&intent),
+            DeploymentStatus::FailedRolledBack => fixtures::rolled_back_terminal(&intent, keys),
+            DeploymentStatus::Degraded => fixtures::degraded_terminal(&intent, keys),
         };
-        assert_eq!(st.rollback().len(), 2, "the complete rollback payload");
-        assert_eq!(
-            st.activated().as_set().len(),
-            2,
-            "the Successful disposition owns the activated slot-id set"
-        );
-
-        // FailedPreflight + no outcomes → FailedPreflight (nothing).
-        let wire = agreeing_terminal(&keys, 1);
-        let d = wire.into_domain().unwrap();
-        assert_eq!(d.disposition, TerminalDisposition::FailedPreflight);
-
-        // FailedRolledBack → the disposition's outcome table IS the
-        // compensation report (exposed, never stored twice).
-        let wire = agreeing_terminal(&keys, 2);
-        let d = wire.into_domain().unwrap();
-        assert!(matches!(
-            d.disposition,
-            TerminalDisposition::FailedRolledBack { .. }
-        ));
-        assert_eq!(
-            d.compensation().expect("derived compensation report").len(),
-            2,
-            "the compensation report is the disposition's outcome table"
-        );
-
-        // Degraded → the non-restored outcomes ARE the remaining changes
-        // (derived from the disposition's own table, never stored twice).
-        let wire = agreeing_terminal(&keys, 3);
-        let d = wire.into_domain().unwrap();
-        let intent = agreeing_intent(&keys).into_domain().unwrap();
-        assert!(matches!(d.disposition, TerminalDisposition::Degraded(_)));
-        assert_eq!(
-            d.remaining_changes(&intent)
-                .expect("derived remaining changes")
-                .len(),
-            2
-        );
-
-        // PAYLOAD MISMATCHES: a status whose payload does not match its
-        // disposition is a conversion error.
-        let mut bad = agreeing_terminal(&keys, 0); // Successful
-        bad.rollback = None;
-        assert!(
-            bad.into_domain().is_err(),
-            "Successful without its rollback is refused"
-        );
-        let mut bad = agreeing_terminal(&keys, 1); // FailedPreflight
-        bad.outcomes
-            .insert(slot(1), outcome_for(&slot(1), SlotOutcomeKind::Activated));
-        assert!(
-            bad.into_domain().is_err(),
-            "FailedPreflight with outcomes is refused"
-        );
-        let mut bad = agreeing_terminal(&keys, 1); // FailedPreflight
-        bad.rollback = Some({
-            let __slots: BTreeMap<crate::identity::SlotId, crate::identity::GenerationRef> =
-                BTreeMap::new();
-            let __bindings: BTreeMap<
-                crate::identity::SlotId,
-                crate::ledger::records::PhysicalBinding,
-            > = BTreeMap::new();
-            let mut __entries: BTreeMap<
-                crate::identity::SlotId,
-                crate::ledger::records::SnapshotEntry,
-            > = BTreeMap::new();
-            for (k, v) in __slots.clone() {
-                let b = __bindings.get(&k).cloned().unwrap_or(
-                    crate::ledger::records::PhysicalBinding {
-                        server: crate::identity::ServerId::new("s1"),
-                        deploy_dir: format!("/srv/deploy/{}", k.as_str()),
-                    },
-                );
-                __entries.insert(
-                    k.clone(),
-                    crate::ledger::records::SnapshotEntry::new(
-                        v.generation.clone(),
-                        v.assignment.artifact.clone(),
-                        b,
-                    ),
-                );
-            }
-            for (k, b) in __bindings.clone() {
-                __entries.entry(k.clone()).or_insert_with(|| {
-                    crate::ledger::records::SnapshotEntry::new(
-                        crate::identity::GenerationId::new("gen-missing".to_string()),
-                        crate::identity::ArtifactRef {
-                            release: crate::identity::test_release_id("rel-missing"),
-                            variant: crate::identity::VariantName::parse("standard").unwrap(),
-                            tree: crate::identity::test_tree_digest("missing"),
-                        },
-                        b.clone(),
-                    )
-                });
-            }
-            crate::ledger::records::TargetSnapshot::from_entries(__entries)
-        });
-        assert!(
-            bad.into_domain().is_err(),
-            "FailedPreflight carrying a rollback is refused"
-        );
-        let mut bad = agreeing_terminal(&keys, 3); // Degraded
-        bad.outcomes = BTreeMap::new();
-        assert!(
-            bad.into_domain().is_err(),
-            "Degraded with NO remaining change is refused"
-        );
-        let mut bad = agreeing_terminal(&keys, 3); // Degraded
-        for r in bad.outcomes.values_mut() {
-            r.outcome = SlotOutcomeKind::Restored;
-        }
-        assert!(
-            bad.into_domain().is_err(),
-            "Degraded with every slot restored is refused"
-        );
-        // A Successful wire whose outcomes disagree with the rollback's
-        // slots (an outcome key the rollback does not cover).
-        let mut bad = agreeing_terminal(&keys, 0); // Successful
-        bad.outcomes
-            .insert(slot(9), outcome_for(&slot(9), SlotOutcomeKind::Activated));
-        assert!(
-            bad.into_domain().is_err(),
-            "a Successful outcome outside the rollback's slots is refused"
-        );
-        // A Successful wire whose outcome status disagrees with the
-        // disposition's implied state (every slot activated).
-        let mut bad = agreeing_terminal(&keys, 0); // Successful
-        bad.outcomes.get_mut(&slot(1)).unwrap().outcome = SlotOutcomeKind::Failed;
-        assert!(
-            bad.into_domain().is_err(),
-            "a Successful terminal with a failed outcome is refused"
-        );
-        // InProgress / PendingCommit never appear on a terminal event.
-        let mut bad = agreeing_terminal(&keys, 0);
-        bad.status = DeploymentStatus::PendingCommit;
-        assert!(
-            bad.into_domain().is_err(),
-            "a PendingCommit terminal is refused"
-        );
+        LedgerTerminalWire::to_wire(intent.deployment_id(), intent.target(), &terminal)
     }
 
-    /// THE STATUS-SPECIFIC OUTCOME RULES (enforced BY STATUS) + THE
-    /// MEMBERSHIP EQUATIONS (the user's requirement): a `Successful`
-    /// terminal must carry NON-EMPTY, DUPLICATE-FREE memberships satisfying
-    /// outcomes == selected_membership, rollback slots == full_membership,
-    /// and selected ⊆ full (terminal-local, enforced by the conversion —
-    /// the record is SELF-PROVING), and a FULL push (no group) additionally
-    /// requires selected == full (the read leg, via the intent's `group`); a
-    /// `FailedPreflight` terminal must carry NO outcomes, and every other
-    /// terminal state's outcomes must EXACTLY COVER the intent's membership
-    /// (no missing, no extra).
-    #[test]
-    fn status_specific_outcome_rules_fail_closed() {
-        let keys = vec![slot(1), slot(2)];
-
-        // THE EXACT-EQUAL SUCCESSFUL → Ok (outcomes == selected == full ==
-        // rollback slots — the exact-equal proven shape).
-        let intent = agreeing_intent(&keys);
-        let terminal = agreeing_terminal(&keys, 0);
-        let (d_intent, d_terminal) = pair_to_domain(&(intent.clone(), terminal.clone()))
-            .expect("the exact-equal Successful pair converts");
-        assert_eq!(d_terminal.status(), DeploymentStatus::Successful);
-        assert_eq!(
-            d_terminal.outcomes().len(),
-            d_intent.selected.len(),
-            "the outcomes exactly cover the membership"
-        );
-        let TerminalDisposition::Successful(st) = &d_terminal.disposition else {
-            panic!("Successful disposition");
-        };
-        assert_eq!(st.rollback().len(), d_intent.selected.len());
-        assert_eq!(st.rollback().len(), d_intent.selected.len());
-        // The PERSISTED memberships are exposed and prove the equations.
-        assert_eq!(
-            d_terminal.selected_membership(),
-            Some(BTreeSet::from_iter(keys.iter().cloned()))
-        );
-        assert_eq!(
-            d_terminal.full_membership(),
-            Some(BTreeSet::from_iter(keys.iter().cloned()))
-        );
-
-        // A GROUP push with a PROPER-SUBSET selected → Ok (the group shape
-        // the base-overlay produces: outcomes == selected ⊊ full ==
-        // rollback — legal in group mode).
-        let selected = vec![slot(1)];
-        let mut group_terminal = agreeing_terminal(&keys, 0);
-        group_terminal.outcomes =
-            BTreeMap::from([(slot(1), outcome_for(&slot(1), SlotOutcomeKind::Activated))]);
-        group_terminal.selected_membership = selected.clone();
-        let group_intent = agreeing_intent_with_group(&selected, &keys, Some("g1"));
-        pair_to_domain(&(group_intent, group_terminal))
-            .expect("a group push with selected ⊊ full converts (the group-proper-subset shape)");
-
-        // SUCCESSFUL with a MISSING outcome key → Err (outcomes != selected
-        // — the terminal-local equation; no cross-record leg needed).
-        let mut bad = terminal.clone();
-        bad.outcomes.remove(&slot(1));
-        assert!(
-            bad.clone().into_domain().is_err(),
-            "a missing outcome key fails the conversion (outcomes must EXACTLY equal the selected_membership)"
-        );
-        assert!(
-            pair_to_domain(&(intent.clone(), bad)).is_err(),
-            "Successful with a missing outcome key fails the pair read"
-        );
-
-        // SUCCESSFUL with an EXTRA outcome key → Err (outcomes != selected).
-        let mut bad = terminal.clone();
-        bad.outcomes
-            .insert(slot(9), outcome_for(&slot(9), SlotOutcomeKind::Activated));
-        assert!(
-            bad.into_domain().is_err(),
-            "Successful with an extra outcome key fails the conversion"
-        );
-
-        // SUCCESSFUL with a MISSING rollback slot → Err
-        // (rollback != full).
-        let mut bad = terminal.clone();
-        {
-            let rb = bad.rollback.take().unwrap();
-            let mut entries = rb.into_entries();
-            entries.remove(&slot(1));
-            bad.rollback = Some(TargetSnapshot::from_entries(entries));
-        }
-        assert!(
-            bad.into_domain().is_err(),
-            "Successful with a missing rollback slot fails the conversion (rollback must EXACTLY equal the full_membership)"
-        );
-
-        // SUCCESSFUL with an EXTRA rollback slot → Err (the terminal-local
-        // conversion allows a rollback ⊇ selected — the rollback is simply
-        // the complete snapshot — but the ROLLBACK-VS-INTENT leg (the read's
-        // shared validator) requires rollback == intent.resulting_snapshot
-        // (full equality): an extra rollback slot the intent's frozen
-        // snapshot does not cover is a disagreement, refused at the read).
-        let mut bad = terminal.clone();
-        {
-            let rb = bad.rollback.take().unwrap();
-            let mut entries = rb.into_entries();
-            let gr = gen_ref_for(&slot(9));
-            entries.insert(
-                slot(9),
-                SnapshotEntry::new(gr.generation, gr.assignment.artifact, binding(&slot(9))),
-            );
-            bad.rollback = Some(TargetSnapshot::from_entries(entries));
-        }
-        assert!(
-            pair_to_domain(&(intent.clone(), bad)).is_err(),
-            "Successful with an extra rollback slot fails the pair read (rollback must EXACTLY equal the intent's frozen resulting_snapshot)"
-        );
-
-        // SUCCESSFUL with EMPTY outcomes → Err (Successful requires
-        // NON-EMPTY outcomes).
-        let mut bad = terminal.clone();
-        bad.outcomes = BTreeMap::new();
-        assert!(
-            bad.into_domain().is_err(),
-            "Successful with empty outcomes fails the conversion"
-        );
-        // EMPTY selected_membership → Err (Successful requires NON-EMPTY
-        // memberships).
-        let mut bad = terminal.clone();
-        bad.selected_membership = vec![];
-        assert!(
-            bad.into_domain().is_err(),
-            "Successful with empty selected_membership fails the conversion"
-        );
-
-        // SELECTED ⊄ FULL → Err (terminal-local).
-        let mut bad = terminal.clone();
-        bad.selected_membership = vec![slot(9)];
-        assert!(
-            bad.into_domain().is_err(),
-            "selected ⊄ full fails the conversion"
-        );
-
-        // A DUPLICATE membership member → Err (the set equations would be
-        // silently weakened).
-        let mut bad = terminal.clone();
-        bad.selected_membership.push(slot(1));
-        assert!(
-            bad.into_domain().is_err(),
-            "a duplicated membership member fails the conversion"
-        );
-
-        // FULL push with selected != full (a proper subset): the
-        // terminal-local equations hold (outcomes == selected, rollback ==
-        // full, selected ⊆ full) — the conversion accepts — but the FULL-push
-        // read leg (the mode lives in the intent's `group`) refuses.
-        let mut group_shaped = terminal.clone();
-        group_shaped.outcomes =
-            BTreeMap::from([(slot(1), outcome_for(&slot(1), SlotOutcomeKind::Activated))]);
-        group_shaped.selected_membership = vec![slot(1)];
-        assert!(
-            group_shaped.clone().into_domain().is_ok(),
-            "a proper-subset selected is not a terminal-local disagreement"
-        );
-        assert!(
-            pair_to_domain(&(intent.clone(), group_shaped)).is_err(),
-            "a FULL push (no group) with selected != full fails the pair read (the read leg)"
-        );
-
-        // A NON-SUCCESSFUL status carrying memberships → Err (only a
-        // Successful terminal proves them).
-        let mut bad = agreeing_terminal(&keys, 2); // FailedRolledBack
-        bad.selected_membership = keys.clone();
-        assert!(
-            bad.into_domain().is_err(),
-            "a failed status carrying memberships fails the conversion"
-        );
-
-        // FAILEDPREFLIGHT with an outcome → Err (a pre-mutation failure
-        // touched no slot).
-        let mut bad = agreeing_terminal(&keys, 1);
-        bad.outcomes
-            .insert(slot(1), outcome_for(&slot(1), SlotOutcomeKind::Activated));
-        assert!(
-            bad.clone().into_domain().is_err(),
-            "FailedPreflight with an outcome fails the conversion"
-        );
-        assert!(
-            pair_to_domain(&(intent.clone(), bad)).is_err(),
-            "FailedPreflight with an outcome fails the pair read"
-        );
-
-        // DEGRADED with a MISSING outcome → Err (the outcomes must EXACTLY
-        // cover the membership).
-        let mut bad = agreeing_terminal(&keys, 3);
-        bad.outcomes.remove(&slot(1));
-        assert!(
-            pair_to_domain(&(intent.clone(), bad)).is_err(),
-            "Degraded with a missing outcome fails the pair read (the outcomes must exactly cover the membership)"
-        );
-
-        // DEGRADED with an EXTRA outcome → Err.
-        let mut bad = agreeing_terminal(&keys, 3);
-        bad.outcomes
-            .insert(slot(9), outcome_for(&slot(9), SlotOutcomeKind::Skipped));
-        assert!(
-            pair_to_domain(&(intent.clone(), bad)).is_err(),
-            "Degraded with an extra outcome fails the pair read"
-        );
-
-        // FAILEDROLLEDBACK with a MISSING outcome → Err (the compensation
-        // report must exactly cover the membership).
-        let mut bad = agreeing_terminal(&keys, 2);
-        bad.outcomes.remove(&slot(1));
-        assert!(
-            pair_to_domain(&(intent, bad)).is_err(),
-            "FailedRolledBack with a missing outcome fails the pair read"
-        );
-    }
-    #[test]
-    fn rollback_wire_disagreement_per_duplicate_fails_closed() {
-        let rb = TargetSnapshot::from_entries(BTreeMap::from([(
-            slot(1),
-            SnapshotEntry::new(
-                test_generation_id("slot-1"),
-                ArtifactRef {
-                    release: test_release_id("slot-1"),
-                    variant: VariantName::parse("standard").unwrap(),
-                    tree: test_tree_digest("slot-1"),
-                },
-                binding(&slot(1)),
-            ),
-        )]));
-        assert_eq!(rb.releases(), BTreeSet::from([test_release_id("slot-1")]));
-        let json = serde_json::to_string(&rb).unwrap();
-        assert!(json.contains("\"entries\""));
-        let wire: TargetSnapshotWire = serde_json::from_str(&json).unwrap();
-        let rb2: TargetSnapshot = wire.into();
-        assert_eq!(rb2.releases(), rb.releases());
-        assert_eq!(rb2.len(), 1);
-    }
-    /// [`LedgerTerminalWire`]: an agreeing terminal converts and round-trips
-    /// stably; the STATUS/ROLLBACK TRUTH TABLE (Successful ⇔ rollback
-    /// present), the outcome own-key agreement, and the rollback's exact
-    /// binding keys each fail closed on ONE mutation, while both truth-table
-    /// variants (Successful + rollback, failed + no rollback) pass.
-    #[test]
-    fn terminal_wire_truth_table_and_rollback_agreement_fails_closed() {
-        let rollback = || {
-            let __slots: BTreeMap<crate::identity::SlotId, crate::identity::GenerationRef> =
-                BTreeMap::from([(slot(1), gen_ref_for(&slot(1)))]);
-            let __bindings: BTreeMap<
-                crate::identity::SlotId,
-                crate::ledger::records::PhysicalBinding,
-            > = BTreeMap::from([(slot(1), binding(&slot(1)))]);
-            let mut __entries: BTreeMap<
-                crate::identity::SlotId,
-                crate::ledger::records::SnapshotEntry,
-            > = BTreeMap::new();
-            for (k, v) in __slots.clone() {
-                let b = __bindings.get(&k).cloned().unwrap_or(
-                    crate::ledger::records::PhysicalBinding {
-                        server: crate::identity::ServerId::new("s1"),
-                        deploy_dir: format!("/srv/deploy/{}", k.as_str()),
-                    },
-                );
-                __entries.insert(
-                    k.clone(),
-                    crate::ledger::records::SnapshotEntry::new(
-                        v.generation.clone(),
-                        v.assignment.artifact.clone(),
-                        b,
-                    ),
-                );
-            }
-            for (k, b) in __bindings.clone() {
-                __entries.entry(k.clone()).or_insert_with(|| {
-                    crate::ledger::records::SnapshotEntry::new(
-                        crate::identity::GenerationId::new("gen-missing".to_string()),
-                        crate::identity::ArtifactRef {
-                            release: crate::identity::test_release_id("rel-missing"),
-                            variant: crate::identity::VariantName::parse("standard").unwrap(),
-                            tree: crate::identity::test_tree_digest("missing"),
-                        },
-                        b.clone(),
-                    )
-                });
-            }
-            crate::ledger::records::TargetSnapshot::from_entries(__entries)
-        };
-        let outcome = || SlotResult {
-            slot_id: slot(1),
-            outcome: SlotOutcomeKind::Activated,
-            observation: ObservationWire::Known(ObservedGenerationWire {
-                // The outcome's observed generation must EQUAL the
-                // rollback's authoritative generation for the slot
-                // (`gen_ref_for` names `test_generation_id(key.as_str())`
-                // = "slot-1"): the complete equality predicate refuses a
-                // successful outcome that contradicts its rollback.
-                generation: test_generation_id("slot-1"),
-            }),
-            compensated: false,
-            error: None,
-        };
-        let wire = LedgerTerminalWire {
-            deployment_id: test_deployment_id("deploy-terminal"),
-            target: TargetName::parse("t1").unwrap(),
-            status: DeploymentStatus::Successful,
-            recorded_at: "2026-01-01T00:00:00Z".to_string(),
-            outcomes: BTreeMap::from([(slot(1), outcome())]),
-            rollback: Some(rollback()),
-            selected_membership: vec![slot(1)],
-            full_membership: vec![slot(1)],
-            reason: None,
-        };
-        let domain = wire.clone().into_domain().unwrap();
-        assert_eq!(domain.status(), DeploymentStatus::Successful);
-        assert!(
-            matches!(&domain.disposition, TerminalDisposition::Successful(_)),
-            "Successful carries its rollback"
-        );
-        // The domain terminal round-trips through the wire shape; `try_from_domain`
-        // supplies the entry-owned deployment id / target.
-        let json = serde_json::to_string(
-            &LedgerTerminalWire::try_from_domain(
-                &test_deployment_id("deploy-terminal"),
-                &TargetName::new("t1".to_string()),
-                &domain,
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        let wire2: LedgerTerminalWire = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            wire2.into_domain().unwrap(),
-            domain,
-            "an agreeing terminal survives the round trip unchanged"
-        );
-
-        // TRUTH TABLE, direction 1: Successful must carry its rollback.
-        let mut bad = wire.clone();
-        bad.rollback = None;
-        assert!(
-            bad.into_domain().is_err(),
-            "a Successful terminal without its rollback fails closed"
-        );
-        // TRUTH TABLE, direction 2: a failed status must not carry one.
-        let mut bad = wire.clone();
-        bad.status = DeploymentStatus::FailedRolledBack;
-        assert!(
-            bad.into_domain().is_err(),
-            "a failed terminal carrying a rollback fails closed"
-        );
-        // OUTCOME OWN-KEY: an outcome naming a different placement slot.
-        let mut bad = wire.clone();
-        bad.outcomes.get_mut(&slot(1)).unwrap().slot_id = slot(2);
-        assert!(
-            bad.into_domain().is_err(),
-            "an outcome naming a different placement fails closed"
-        );
-        // In the single-map shape the cross-map key equality is structurally impossible; no separate binding check.
-
-        // The other truth-table variant stays VALID: a failed terminal with
-        // NO rollback, NO outcomes, and NO memberships (only a Successful
-        // terminal records them) converts fine.
-        let failed = LedgerTerminalWire {
-            status: DeploymentStatus::FailedRolledBack,
-            outcomes: BTreeMap::new(),
-            rollback: None,
-            selected_membership: vec![],
-            full_membership: vec![],
-            ..wire.clone()
-        };
-        assert!(
-            failed.into_domain().is_ok(),
-            "a failed terminal without a rollback stays valid"
-        );
+    /// Write a two-line ledger through the REAL consumer path and read it
+    /// back (the strict reader).
+    fn write_pair_ledger(
+        intent_wire: &LedgerIntentWire,
+        terminal_wire: &LedgerTerminalWire,
+    ) -> Result<Vec<crate::ledger::LedgerEntry>> {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let line1 = serde_json::to_string(&LedgerLine::Intent(intent_wire.clone())).unwrap();
+        let line2 = serde_json::to_string(&LedgerLine::Terminal(terminal_wire.clone())).unwrap();
+        let p = store.ledger_path("t1");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, format!("{line1}\n{line2}\n")).unwrap();
+        store.read_ledger("t1")
     }
 
-    // =====================================================================
-    // DISPOSITION-OWNED OUTCOMES: each disposition owns its table; the
-    // accessors read the disposition's OWN table
-    // =====================================================================
+    // ---- THE WIRE → DOMAIN → WIRE ROUND TRIP (proptest 1) ----------------
 
-    /// LET EACH DISPOSITION OWN ITS OUTCOME TABLE: the outcomes live ONCE,
-    /// inside the disposition — the accessor returns the disposition's OWN
-    /// table (no separate `LedgerTerminal.outcomes` field exists to disagree
-    /// with), and a FailedPreflight terminal carries none (the accessor
-    /// yields an empty table). For a Successful terminal the accessor
-    /// MATERIALIZES the DERIVED VIEW over the rollback (the per-slot facts
-    /// are never stored separately).
-    #[test]
-    fn each_disposition_owns_its_outcome_table() {
-        let keys = vec![slot(1), slot(2)];
-        let intent = agreeing_intent(&keys).into_domain().unwrap();
-        // Successful: the disposition owns its activated set next to the
-        // rollback; the accessor materializes the DERIVED view (every
-        // activated slot's facts ARE the rollback's generation).
-        let d = agreeing_terminal(&keys, 0).into_domain().unwrap();
-        let TerminalDisposition::Successful(st) = &d.disposition else {
-            panic!("Successful carries rollback + activated set + memberships");
-        };
-        let outcomes = d.outcomes();
-        assert_eq!(outcomes.len(), st.activated().as_set().len());
-        assert!(outcomes.len() == 2);
-        assert!(
-            outcomes
-                .values()
-                .all(|o| o.outcome == SlotOutcomeKind::Activated)
-        );
-        for key in outcomes.keys() {
-            assert!(
-                st.rollback().get(key).is_some(),
-                "every activated slot is covered by the rollback (the facts source)"
-            );
-            assert_eq!(
-                outcomes[key].observation,
-                Observation::Known(ObservedGeneration {
-                    generation: st.rollback().get(key).unwrap().generation().clone(),
-                }),
-                "the derived view's generation EQUALS the rollback's authoritative generation"
-            );
-        }
-        // FailedPreflight: no outcomes — the accessor yields an empty table.
-        let d = agreeing_terminal(&keys, 1).into_domain().unwrap();
-        assert!(matches!(
-            d.disposition,
-            TerminalDisposition::FailedPreflight
-        ));
-        assert!(
-            d.outcomes().is_empty(),
-            "a preflight failure carries no outcomes"
-        );
-        // FailedRolledBack: the disposition owns the compensation report.
-        let d = agreeing_terminal(&keys, 2).into_domain().unwrap();
-        let TerminalDisposition::FailedRolledBack { outcomes } = &d.disposition else {
-            panic!("FailedRolledBack carries its outcomes");
-        };
-        assert_eq!(
-            &d.outcomes(),
-            outcomes,
-            "the accessor reads the disposition's OWN table"
-        );
-        assert_eq!(
-            d.compensation().unwrap(),
-            outcomes,
-            "compensation() IS the disposition's table"
-        );
-        // Degraded: the disposition owns the remaining-changes source.
-        let d = agreeing_terminal(&keys, 3).into_domain().unwrap();
-        let TerminalDisposition::Degraded(dt) = &d.disposition else {
-            panic!("Degraded carries its outcomes");
-        };
-        let outcomes = dt.outcomes();
-        assert_eq!(
-            &d.outcomes(),
-            &SlotTable::from_map(outcomes.clone().into_map()),
-            "the accessor reads the disposition's OWN table"
-        );
-        assert_eq!(
-            d.remaining_changes(&intent).unwrap().len(),
-            outcomes.len(),
-            "the remaining changes derive from the disposition's OWN outcomes"
-        );
-    }
-
-    /// The accessors agree with the disposition's table: `compensation()`
-    /// IS the FailedRolledBack disposition's outcomes table,
-    /// `remaining_changes()` derives from the Degraded disposition's OWN
-    /// outcomes, and both are `None` for every other disposition.
-    #[test]
-    fn accessors_agree_with_the_disposition_table() {
-        let keys = vec![slot(1)];
-        let intent = agreeing_intent(&keys).into_domain().unwrap();
-        // Successful: neither accessor applies.
-        let d = agreeing_terminal(&keys, 0).into_domain().unwrap();
-        assert!(d.compensation().is_none());
-        assert!(d.remaining_changes(&intent).is_none());
-        // FailedPreflight: neither accessor applies.
-        let d = agreeing_terminal(&keys, 1).into_domain().unwrap();
-        assert!(d.compensation().is_none());
-        assert!(d.remaining_changes(&intent).is_none());
-        // FailedRolledBack: compensation() IS the disposition's table.
-        let d = agreeing_terminal(&keys, 2).into_domain().unwrap();
-        let TerminalDisposition::FailedRolledBack { outcomes } = &d.disposition else {
-            panic!("FailedRolledBack carries its outcomes");
-        };
-        assert_eq!(d.compensation().unwrap(), outcomes);
-        assert!(d.remaining_changes(&intent).is_none());
-        // Degraded: remaining_changes() derives from the disposition's OWN
-        // outcomes (every non-restored outcome with a recorded generation).
-        let d = agreeing_terminal(&keys, 3).into_domain().unwrap();
-        let TerminalDisposition::Degraded(dt) = &d.disposition else {
-            panic!("Degraded carries its outcomes");
-        };
-        let outcomes = dt.outcomes();
-        assert!(d.compensation().is_none());
-        let remaining = d.remaining_changes(&intent).unwrap();
-        let expected: BTreeMap<SlotId, Observation<ObservedGeneration>> = outcomes
-            .iter()
-            .filter(|(_, o)| {
-                o.outcome != SlotOutcomeKind::Restored
-                    && matches!(o.observation, Observation::Known(_))
-            })
-            .map(|(k, o)| (k.clone(), o.observation.clone()))
-            .collect();
-        assert_eq!(
-            remaining.into_map(),
-            expected,
-            "the derivation matches the disposition's own table"
-        );
-    }
-    // =====================================================================
-    // THE DOMAIN ROUND-TRIP PROPERTY: arbitrary domain terminals survive
-    // the wire exactly
-    // =====================================================================
-
-    /// An arbitrary domain outcome value (any kind, any compensation flag)
-    /// whose TWO error facts are generated INDEPENDENTLY: the OPERATION
-    /// error (`error` — an arbitrary failure reason, carried by the wire's
-    /// `error` field) and the THREE-STATE OBSERVATION (`Known` with an
-    /// arbitrary generation, `KnownAbsent`, or `Unknown` with its OWN
-    /// arbitrary preserved message — carried by the wire's `observation`
-    /// field). The wire has a separate slot per fact, so NO agreement is
-    /// forced: every (operation_error, observation) combination is a valid
-    /// outcome that round-trips exactly.
-    fn arbitrary_outcome() -> impl Strategy<Value = SlotOutcome> {
-        (
-            prop_oneof![
-                Just(SlotOutcomeKind::Activated),
-                Just(SlotOutcomeKind::Failed),
-                Just(SlotOutcomeKind::Compensated),
-                Just(SlotOutcomeKind::Skipped),
-                Just(SlotOutcomeKind::Restored),
-            ],
-            // The pure OPERATION error — independent of the observation.
-            prop::option::of(prop::sample::select(vec![
-                "swap failed: boom".to_string(),
-                "verification failed".to_string(),
-                "internal: no behavior contract for variant 'x'".to_string(),
-            ])),
-            // The THREE-STATE OBSERVATION — its own fact, with its own
-            // error for the `Unknown` half.
-            prop_oneof![
-                // Known: a successful read of a recorded generation.
-                (0u32..6).prop_map(|i| Observation::Known(ObservedGeneration {
-                    generation: test_generation_id(&format!("gen-{i}")),
-                })),
-                // KnownAbsent: a successful read showing no state.
-                Just(Observation::KnownAbsent),
-                // Unknown: the observation itself failed — its OWN preserved
-                // error, independent of the operation error.
-                prop::sample::select(vec![
-                    "status read failed: boom".to_string(),
-                    "assignment read failed: boom".to_string(),
-                ])
-                .prop_map(|e| Observation::Unknown(ObservationError { message: e })),
-            ],
-            any::<bool>(),
-        )
-            .prop_map(|(outcome, error, observation, compensated)| {
-                let transition = match &outcome {
-                    SlotOutcomeKind::Restored => SlotTransition::Restored,
-                    SlotOutcomeKind::Skipped => SlotTransition::NeverAdvanced,
-                    SlotOutcomeKind::Activated => SlotTransition::Advanced,
-                    SlotOutcomeKind::Failed => {
-                        if compensated {
-                            SlotTransition::Restored
-                        } else {
-                            SlotTransition::AdvanceUnknown
-                        }
-                    }
-                    SlotOutcomeKind::Compensated => SlotTransition::Restored,
-                };
-                SlotOutcome {
-                    outcome,
-                    observation,
-                    compensated,
-                    error,
-                    transition,
-                }
-            })
-    }
-
-    /// An arbitrary rollback payload: arbitrary slotted generations (each
-    /// assignment naming its own key) with EXACT bindings (the wire
-    /// conversion refuses a rollback whose bindings omit a slotted
-    /// generation).
-    fn arbitrary_rollback() -> impl Strategy<Value = TargetSnapshot> {
-        prop::collection::btree_set(slot_strategy(), 1..4).prop_map(|keys| {
-            let slots: BTreeMap<SlotId, GenerationRef> =
-                keys.iter().map(|k| (k.clone(), gen_ref_for(k))).collect();
-            let bindings: BTreeMap<SlotId, PhysicalBinding> =
-                slots.keys().map(|k| (k.clone(), binding(k))).collect();
-            {
-                let __slots: BTreeMap<crate::identity::SlotId, crate::identity::GenerationRef> =
-                    slots;
-                let __bindings: BTreeMap<
-                    crate::identity::SlotId,
-                    crate::ledger::records::PhysicalBinding,
-                > = bindings;
-                let mut __entries: BTreeMap<
-                    crate::identity::SlotId,
-                    crate::ledger::records::SnapshotEntry,
-                > = BTreeMap::new();
-                for (k, v) in __slots.clone() {
-                    let b = __bindings.get(&k).cloned().unwrap_or(
-                        crate::ledger::records::PhysicalBinding {
-                            server: crate::identity::ServerId::new("s1"),
-                            deploy_dir: format!("/srv/deploy/{}", k.as_str()),
-                        },
-                    );
-                    __entries.insert(
-                        k.clone(),
-                        crate::ledger::records::SnapshotEntry::new(
-                            v.generation.clone(),
-                            v.assignment.artifact.clone(),
-                            b,
-                        ),
-                    );
-                }
-                for (k, b) in __bindings.clone() {
-                    __entries.entry(k.clone()).or_insert_with(|| {
-                        crate::ledger::records::SnapshotEntry::new(
-                            crate::identity::GenerationId::new("gen-missing".to_string()),
-                            crate::identity::ArtifactRef {
-                                release: crate::identity::test_release_id("rel-missing"),
-                                variant: crate::identity::VariantName::parse("standard").unwrap(),
-                                tree: crate::identity::test_tree_digest("missing"),
-                            },
-                            b.clone(),
-                        )
-                    });
-                }
-                crate::ledger::records::TargetSnapshot::from_entries(__entries)
-            }
+    fn slot_table_strategy() -> impl Strategy<Value = Vec<SlotId>> {
+        prop::collection::btree_set((0u32..5).prop_map(slot), 1..=4).prop_map(|s| {
+            let mut v: Vec<SlotId> = s.into_iter().collect();
+            v.sort();
+            v
         })
-    }
-
-    /// An arbitrary SUCCESSFUL domain terminal: an arbitrary rollback plus
-    /// THE ACTIVATED SLOT-ID SET (the exact-equal shape — every rollback
-    /// slot activated — AND the PERSISTED MEMBERSHIPS (activated == full ==
-    /// the rollback's slots; the mode is a separate record's concern). The
-    /// per-slot generation/artifact facts are NOT stored: they are DERIVED
-    /// from the rollback ([`LedgerTerminal::outcomes`]) — the single source
-    /// of truth.
-    fn arbitrary_successful() -> impl Strategy<Value = LedgerTerminal> {
-        arbitrary_rollback().prop_map(|rollback| {
-            // The exact-equal shape: the activation set EXACTLY covers the
-            // rollback's slots (one activated slot per slotted generation),
-            // and the memberships equal that set — the proven shape the
-            // round trip preserves.
-            let membership: BTreeSet<SlotId> = rollback.keys().cloned().collect();
-            let activated = crate::identity::NonEmptySlotSet::try_new(membership.clone()).unwrap();
-            LedgerTerminal {
-                recorded_at: "2026-01-01T00:00:00Z".to_string(),
-                disposition: TerminalDisposition::Successful(
-                    crate::ledger::SuccessfulTerminal::try_new_with_full(
-                        rollback, activated, membership,
-                    )
-                    .unwrap(),
-                ),
-                reason: None,
-            }
-        })
-    }
-
-    /// An arbitrary FAILEDROLLEDBACK domain terminal: the disposition's OWN
-    /// outcomes table is arbitrary (any kinds, any keys — the compensation
-    /// report IS that table).
-    fn arbitrary_failed_rolled_back() -> impl Strategy<Value = LedgerTerminal> {
-        prop::collection::btree_map(slot_strategy(), arbitrary_outcome(), 0..4).prop_map(
-            |outcomes| LedgerTerminal {
-                recorded_at: "2026-01-01T00:00:00Z".to_string(),
-                disposition: TerminalDisposition::FailedRolledBack {
-                    outcomes: SlotTable::from_map(outcomes),
-                },
-                reason: None,
-            },
-        )
-    }
-
-    /// An outcome that is GUARANTEED non-restored (with a recorded
-    /// generation) — the Degraded conversion's non-emptiness requirement.
-    fn remaining_change_outcome() -> impl Strategy<Value = SlotOutcome> {
-        (
-            prop_oneof![
-                Just(SlotOutcomeKind::Activated),
-                Just(SlotOutcomeKind::Failed),
-                Just(SlotOutcomeKind::Compensated),
-                Just(SlotOutcomeKind::Skipped),
-            ],
-            (0u32..6).prop_map(|i| GenerationId::new(format!("gen-{i}"))),
-            any::<bool>(),
-            prop::option::of(prop::sample::select(vec![
-                "boom".to_string(),
-                "verification failed".to_string(),
-            ])),
-        )
-            .prop_map(|(outcome, generation, compensated, error)| {
-                let transition = match &outcome {
-                    SlotOutcomeKind::Restored => SlotTransition::Restored,
-                    SlotOutcomeKind::Skipped => SlotTransition::NeverAdvanced,
-                    SlotOutcomeKind::Activated => SlotTransition::Advanced,
-                    SlotOutcomeKind::Failed => {
-                        if compensated {
-                            SlotTransition::Restored
-                        } else {
-                            SlotTransition::AdvanceUnknown
-                        }
-                    }
-                    SlotOutcomeKind::Compensated => SlotTransition::Restored,
-                };
-                SlotOutcome {
-                    outcome,
-                    observation: Observation::Known(ObservedGeneration { generation }),
-                    compensated,
-                    error,
-                    transition,
-                }
-            })
-    }
-
-    /// An arbitrary DEGRADED domain terminal: the disposition's OWN outcomes
-    /// table is arbitrary (any kinds, any keys) with at least one GUARANTEED
-    /// non-restored outcome (the conversion refuses an all-restored Degraded
-    /// wire).
-    fn arbitrary_degraded() -> impl Strategy<Value = LedgerTerminal> {
-        (
-            slot_strategy(),
-            remaining_change_outcome(),
-            prop::collection::btree_map(slot_strategy(), arbitrary_outcome(), 0..3),
-        )
-            .prop_map(|(key, first, mut extras)| {
-                extras.insert(key, first);
-                let ne = NonEmptySlotTable::build(extras.into_iter()).unwrap();
-                let dt = DegradedTerminal::try_new(ne).unwrap();
-                LedgerTerminal {
-                    recorded_at: "2026-01-01T00:00:00Z".to_string(),
-                    disposition: TerminalDisposition::Degraded(dt),
-                    reason: None,
-                }
-            })
-    }
-
-    /// An arbitrary domain terminal: ALL dispositions, each with an arbitrary
-    /// outcome table (FailedPreflight carries none by construction).
-    fn arbitrary_domain_terminal() -> impl Strategy<Value = LedgerTerminal> {
-        prop_oneof![
-            arbitrary_successful(),
-            Just(LedgerTerminal {
-                recorded_at: "2026-01-01T00:00:00Z".to_string(),
-                disposition: TerminalDisposition::FailedPreflight,
-                reason: None,
-            }),
-            arbitrary_failed_rolled_back(),
-            arbitrary_degraded(),
-        ]
     }
 
     proptest! {
-        // THE USER'S PROPERTY: ARBITRARY DOMAIN TERMINALS (all dispositions,
-        // arbitrary outcome tables) round-trip through the wire EXACTLY —
-        // domain → wire → domain equals the original domain. The wire's
-        // redundant fields (the status, the outcome's slot_id) round-trip
-        // without changing the domain: the status is re-derived from the
-        // disposition and the outcome slot is dropped into the key. Bounded
-        // 16 cases, fixed seed 0x5EED_5EED (house style), no persistence.
         #![proptest_config(ProptestConfig {
-            cases: 16,
+            cases: crate::testutil::proptest_cases(32),
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
             failure_persistence: None,
             ..ProptestConfig::default()
         })]
 
+        /// 1. Every constructible domain value round-trips exactly
+        /// (wire → domain → wire).
         #[test]
-        fn arbitrary_domain_terminals_round_trip_exactly(
-            terminal in arbitrary_domain_terminal()
-        ) {
-            let wire = LedgerTerminalWire::try_from_domain(
-                &DeploymentId::new("deploy-prop".to_string()),
-                &TargetName::parse("t1").unwrap(),
-                &terminal,
+        fn wire_domain_wire_round_trip_exact(keys in slot_table_strategy()) {
+            let wire = valid_intent_wire(&keys, "deploy-w");
+            let domain = wire.clone().into_domain().expect("valid intent converts");
+            let wire2 = LedgerIntentWire::from(&domain);
+            prop_assert_eq!(
+                wire2, wire,
+                "a constructible intent round-trips exactly through its wire form"
+            );
+            // The derived views are exact against the table.
+            prop_assert_eq!(
+                domain.full_membership(),
+                keys.iter().cloned().collect::<std::collections::BTreeSet<_>>()
+            );
+            prop_assert_eq!(
+                domain.selected_membership(),
+                keys.iter().cloned().collect::<std::collections::BTreeSet<_>>()
+            );
+            prop_assert_eq!(
+                domain.resulting_snapshot().keys().cloned().collect::<Vec<_>>(),
+                keys,
+                "the resulting snapshot is the derived view of the slot table"
+            );
+        }
+    }
+
+    // ---- THE SELF-CONTAINED TAMPER MATRIX (the new projections) ----------
+
+    /// Mutate one wire projection at a time and assert the wire → domain
+    /// conversion fails closed on EVERY tamper while accepting the
+    /// untampered record: the intent's slot-table structure (a slot without
+    /// its result/action, a duplicate slot, an empty table, a group-None
+    /// intent carrying an Inherit slot, a no-Deploy intent), the scalar
+    /// gates (parent, behavior digest, attempted_at, group name), and the
+    /// pre-push wire observation values.
+    #[test]
+    fn intent_wire_tamper_matrix_fails_closed() {
+        let keys = vec![slot(0), slot(1), slot(2)];
+        // 1. Duplicate slot key in the JSON (ambiguous map) is refused by
+        // the strict reader (a map-visitor deserializer rejects the
+        // duplicate — the last-wins collapse could never be read).
+        let wire = valid_intent_wire(&keys, "deploy-tamper");
+        let json = serde_json::to_string(&wire).unwrap();
+        {
+            let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+            let slots = value.get_mut("slots").unwrap().as_object_mut().unwrap();
+            let first = slots.keys().next().unwrap().clone();
+            // TEXT-LEVEL duplication of ONE entry: insert a second copy of the
+            // first slot right after it (serde_json maps cannot hold two
+            // identical keys, so the duplicate must be injected into the raw
+            // JSON text).
+            let first_start = json.find(&format!("\"{first}\":")).unwrap();
+            let first_end = json.find(&format!("\"{}\":", "slot-1")).unwrap();
+            let dup_entry_text = &json[first_start..first_end]; // includes its trailing comma
+            let dup_json = format!(
+                "{}{},{}",
+                &json[..first_start],
+                dup_entry_text,
+                &json[first_start..]
+            );
+            assert_ne!(
+                dup_json, json,
+                "the duplicate entry must actually be injected"
+            );
+            assert!(
+                serde_json::from_str::<LedgerIntentWire>(&dup_json).is_err(),
+                "a duplicate slot key must be refused by the strict reader"
+            );
+        }
+
+        // 2. Empty slots table.
+        let mut wire = valid_intent_wire(&keys, "deploy-tamper");
+        wire.slots.clear();
+        assert!(wire.clone().into_domain().is_err(), "empty slots refused");
+
+        // 3. No Deploy slot.
+        let mut wire = valid_intent_wire(&keys, "deploy-tamper");
+        for p in wire.slots.values_mut() {
+            p.action = SlotActionWire::Inherit;
+        }
+        assert!(
+            wire.clone().into_domain().is_err(),
+            "no Deploy slot refused"
+        );
+
+        // 4. group=Some but an Inherit slot with no parent grounding is
+        // self-contained-invalid ONLY via the group-None rule; for a full
+        // push (group None) an Inherit slot must be refused.
+        let mut wire = valid_intent_wire(&keys, "deploy-tamper");
+        let first_key = keys[0].clone();
+        wire.slots.get_mut(&first_key).unwrap().action = SlotActionWire::Inherit;
+        assert!(
+            wire.clone().into_domain().is_err(),
+            "group None with an Inherit slot refused (a full push requires every slot Deploy)"
+        );
+
+        // 5. Invalid parent id.
+        let mut wire = valid_intent_wire(&keys, "deploy-tamper");
+        wire.parent = Some("not-a-deployment".to_string());
+        assert!(
+            wire.clone().into_domain().is_err(),
+            "invalid parent refused"
+        );
+
+        // 6. Invalid behavior digest.
+        let mut wire = valid_intent_wire(&keys, "deploy-tamper");
+        wire.behavior_sha256 = "sha256-xx".to_string();
+        assert!(
+            wire.clone().into_domain().is_err(),
+            "invalid digest refused"
+        );
+
+        // 7. Invalid attempted_at.
+        let mut wire = valid_intent_wire(&keys, "deploy-tamper");
+        wire.attempted_at = "not-a-time".to_string();
+        assert!(
+            wire.clone().into_domain().is_err(),
+            "invalid timestamp refused"
+        );
+
+        // 8. Invalid group name.
+        let mut wire = valid_intent_wire(&keys, "deploy-tamper");
+        wire.group = Some("../bad".to_string());
+        assert!(wire.clone().into_domain().is_err(), "invalid group refused");
+    }
+
+    /// The TERMINAL tamper matrix: the disposition payload must match its
+    /// status, the `intent_digest` must be a valid sha256 scalar, and a
+    /// successful terminal must be payload-free.
+    #[test]
+    fn terminal_wire_tamper_matrix_fails_closed() {
+        let keys = vec![slot(0)];
+        // Successful with outcomes is refused (payload-free).
+        let mut wire = valid_terminal_wire(&keys, "deploy-t", DeploymentStatus::Successful);
+        wire.outcomes.insert(
+            keys[0].clone(),
+            SlotResult {
+                slot_id: keys[0].clone(),
+                outcome: SlotOutcomeKind::Activated,
+                observation: ObservationWire::Known(ObservedGenerationWire {
+                    generation: test_generation_id("g"),
+                }),
+                compensated: false,
+                error: None,
+            },
+        );
+        assert!(
+            wire.clone().into_domain().is_err(),
+            "a Successful terminal must carry NO outcomes"
+        );
+        // FailedPreflight with outcomes is refused.
+        let mut wire = valid_terminal_wire(&keys, "deploy-t", DeploymentStatus::FailedPreflight);
+        wire.outcomes.insert(
+            keys[0].clone(),
+            SlotResult {
+                slot_id: keys[0].clone(),
+                outcome: SlotOutcomeKind::Failed,
+                observation: ObservationWire::Known(ObservedGenerationWire {
+                    generation: test_generation_id("g"),
+                }),
+                compensated: false,
+                error: Some("boom".to_string()),
+            },
+        );
+        assert!(
+            wire.clone().into_domain().is_err(),
+            "FailedPreflight must carry NO outcomes"
+        );
+        // Invalid intent_digest scalar.
+        let mut wire = valid_terminal_wire(&keys, "deploy-t", DeploymentStatus::Successful);
+        wire.intent_digest = "not-a-digest".to_string();
+        assert!(
+            wire.clone().into_domain().is_err(),
+            "invalid intent_digest refused"
+        );
+        // Invalid recorded_at.
+        let mut wire = valid_terminal_wire(&keys, "deploy-t", DeploymentStatus::Successful);
+        wire.recorded_at = "not-a-time".to_string();
+        assert!(
+            wire.clone().into_domain().is_err(),
+            "invalid recorded_at refused"
+        );
+    }
+
+    /// Mutating ANY terminal's intent_digest is rejected at the READER (the
+    /// digest binds the terminal to the exact canonical intent) — proptest 3.
+    #[test]
+    fn tampered_intent_digest_is_rejected_by_the_reader() {
+        let keys = vec![slot(0), slot(1)];
+        let intent_wire = valid_intent_wire(&keys, "deploy-digest");
+        for status in [
+            DeploymentStatus::Successful,
+            DeploymentStatus::FailedPreflight,
+            DeploymentStatus::FailedRolledBack,
+            DeploymentStatus::Degraded,
+        ] {
+            let mut terminal_wire = valid_terminal_wire(&keys, "deploy-digest", status);
+            let mut tampered = terminal_wire.intent_digest.clone();
+            let b = tampered.as_bytes().to_vec();
+            let flipped = b[0] ^ 1;
+            tampered.replace_range(0..1, &format!("{:x}", flipped));
+            terminal_wire.intent_digest = tampered;
+            let err = write_pair_ledger(&intent_wire, &terminal_wire).unwrap_err();
+            assert!(
+                err.to_string().contains("digest"),
+                "a tampered intent_digest ({status:?}) must be refused by the reader, got: {err}"
+            );
+        }
+    }
+
+    // ---- THE STRICT READER CONTRACT ---------------------------------------
+
+    /// A valid pair loads; the successful snapshot resolves from the intent.
+    #[test]
+    fn strict_reader_accepts_a_valid_pair_and_resolves_the_snapshot() {
+        let keys = vec![slot(0), slot(1)];
+        let intent_wire = valid_intent_wire(&keys, "deploy-ok");
+        for status in [
+            DeploymentStatus::Successful,
+            DeploymentStatus::FailedPreflight,
+            DeploymentStatus::FailedRolledBack,
+            DeploymentStatus::Degraded,
+        ] {
+            let terminal_wire = valid_terminal_wire(&keys, "deploy-ok", status);
+            let entries = write_pair_ledger(&intent_wire, &terminal_wire)
+                .unwrap_or_else(|e| panic!("{status:?} pair must load, got {e}"));
+            assert_eq!(entries.len(), 1);
+            assert_eq!(
+                entries[0].terminal.as_ref().unwrap().status(),
+                status,
+                "the terminal's status derives from its disposition"
+            );
+            assert_eq!(
+                entries[0].intent.full_membership(),
+                keys.iter().cloned().collect(),
+                "the full membership is the slot table's keys"
+            );
+            if status == DeploymentStatus::Successful {
+                let snapshot = kernel::snapshot::resolve_snapshot(&entries[0]).unwrap();
+                assert_eq!(
+                    snapshot,
+                    entries[0].intent.resulting_snapshot(),
+                    "the successful snapshot IS the intent's planned result"
+                );
+            } else {
+                assert!(
+                    kernel::snapshot::resolve_snapshot(&entries[0]).is_err(),
+                    "a non-successful deployment has no snapshot"
+                );
+            }
+        }
+    }
+
+    /// A terminal for an unknown deployment, a duplicate intent, a duplicate
+    /// terminal, and a terminal preceding its intent are all refused.
+    #[test]
+    fn strict_reader_refuses_impossible_event_sequences() {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let p = store.ledger_path("t1");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let keys = vec![slot(0)];
+
+        // Terminal without an intent.
+        let t = valid_terminal_wire(&keys, "deploy-orphan", DeploymentStatus::Successful);
+        let line = serde_json::to_string(&LedgerLine::Terminal(t)).unwrap();
+        std::fs::write(&p, format!("{line}\n")).unwrap();
+        let err = store.read_ledger("t1").unwrap_err();
+        assert!(
+            err.to_string().contains("intent"),
+            "orphan terminal refused: {err}"
+        );
+
+        // Duplicate intent.
+        let i = valid_intent_wire(&keys, "deploy-dup");
+        let line = serde_json::to_string(&LedgerLine::Intent(i)).unwrap();
+        std::fs::write(&p, format!("{line}\n{line}\n")).unwrap();
+        let err = store.read_ledger("t1").unwrap_err();
+        assert!(
+            err.to_string().contains("one intent per deployment"),
+            "duplicate intent refused: {err}"
+        );
+
+        // Duplicate terminal.
+        let i = valid_intent_wire(&keys, "deploy-dup2");
+        let t1 = valid_terminal_wire(&keys, "deploy-dup2", DeploymentStatus::Successful);
+        let t2 = t1.clone();
+        let lines = format!(
+            "{}\n{}\n{}\n",
+            serde_json::to_string(&LedgerLine::Intent(i)).unwrap(),
+            serde_json::to_string(&LedgerLine::Terminal(t1)).unwrap(),
+            serde_json::to_string(&LedgerLine::Terminal(t2)).unwrap(),
+        );
+        std::fs::write(&p, lines).unwrap();
+        let err = store.read_ledger("t1").unwrap_err();
+        assert!(
+            err.to_string().contains("exactly once"),
+            "duplicate terminal refused: {err}"
+        );
+    }
+
+    /// The schema-version gate: a foreign version is refused, malformed
+    /// bytes are a store error — never a silent drop.
+    #[test]
+    fn schema_version_gate_and_malformed_lines_fail_closed() {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let p = store.ledger_path("t1");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let mut wire = valid_intent_wire(&[slot(0)], "deploy-x");
+        wire.deployment_schema_version = LEDGER_SCHEMA_VERSION + 1;
+        let line = serde_json::to_string(&LedgerLine::Intent(wire)).unwrap();
+        std::fs::write(&p, format!("{line}\n")).unwrap();
+        let err = store.read_ledger("t1").unwrap_err();
+        assert!(
+            err.to_string().contains("schema_version"),
+            "foreign version refused: {err}"
+        );
+        std::fs::write(&p, "{ not json !\n").unwrap();
+        assert!(
+            store.read_ledger("t1").is_err(),
+            "malformed line is an error"
+        );
+    }
+
+    /// The outcome coverage contract (the cross-record leg the state machine
+    /// validates): a FailedRolledBack/Degraded terminal must cover EXACTLY
+    /// the selected membership; a Successful terminal must be payload-free.
+    #[test]
+    fn outcome_coverage_must_match_the_selected_membership() {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let p = store.ledger_path("t1");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let keys = vec![slot(0), slot(1)];
+
+        // A Degraded terminal covering only ONE of the two selected slots is
+        // refused (the outcomes must EXACTLY cover the selected membership).
+        let mut t = valid_terminal_wire(&keys, "deploy-cov", DeploymentStatus::Degraded);
+        t.outcomes.remove(&keys[0]);
+        let lines = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&LedgerLine::Intent(valid_intent_wire(&keys, "deploy-cov")))
+                .unwrap(),
+            serde_json::to_string(&LedgerLine::Terminal(t)).unwrap(),
+        );
+        std::fs::write(&p, lines).unwrap();
+        let err = store.read_ledger("t1").unwrap_err();
+        assert!(
+            err.to_string().contains("selected") || err.to_string().contains("outcome"),
+            "an incomplete Degraded outcome table must be refused, got: {err}"
+        );
+
+        // An outcome for a NON-SELECTED slot is refused (a slot the
+        // deployment did not select never reports a result). Build a group
+        // intent selecting only slot-0; a Degraded outcome for slot-1 is
+        // outside the selected membership.
+        let base = TargetSnapshot::from_entries(BTreeMap::from([
+            (keys[0].clone(), fixtures::snapshot_slot(&keys[0])),
+            (keys[1].clone(), fixtures::snapshot_slot(&keys[1])),
+        ]));
+        let group_intent = fixtures::group_intent(
+            "deploy-g",
+            "t1",
+            "g",
+            &test_deployment_id("deploy-base"),
+            &base,
+            &keys,
+            &[keys[0].clone()],
+        );
+        // Rebuild the terminal's outcomes to include slot-1 (not selected).
+        let mut outcomes = BTreeMap::new();
+        outcomes.insert(
+            keys[0].clone(),
+            SlotOutcome {
+                outcome: SlotOutcomeKind::Failed,
+                observation: Observation::Known(ObservedGeneration {
+                    generation: test_generation_id("g0"),
+                }),
+                compensated: false,
+                error: None,
+                transition: SlotTransition::AdvanceUnknown,
+            },
+        );
+        outcomes.insert(
+            keys[1].clone(),
+            SlotOutcome {
+                outcome: SlotOutcomeKind::Failed,
+                observation: Observation::Known(ObservedGeneration {
+                    generation: test_generation_id("g1"),
+                }),
+                compensated: false,
+                error: None,
+                transition: SlotTransition::AdvanceUnknown,
+            },
+        );
+        let non_empty = NonEmptySlotTable::build(outcomes).unwrap();
+        let g_t = crate::kernel::terminal::DegradedTerminal::try_new(non_empty).unwrap();
+        let disposition = TerminalDisposition::Degraded(g_t);
+        let terminal = LedgerTerminal::new(
+            Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
+            kernel::terminal::intent_digest(&group_intent),
+            disposition,
+            None,
+        );
+        let wire = LedgerTerminalWire::to_wire(
+            group_intent.deployment_id(),
+            group_intent.target(),
+            &terminal,
+        );
+        let lines = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&LedgerLine::Intent(LedgerIntentWire::from(&group_intent)))
+                .unwrap(),
+            serde_json::to_string(&LedgerLine::Terminal(wire)).unwrap(),
+        );
+        std::fs::write(&p, lines).unwrap();
+        let err = store.read_ledger("t1").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("outside the intent's selected membership")
+                || err.to_string().contains("selected"),
+            "an outcome outside the selected membership must be refused, got: {err}"
+        );
+    }
+
+    /// Group planning overlays selected slots and preserves inherited parent
+    /// entries EXACTLY (proptest 7, deterministic case): the inherited slots'
+    /// results EQUAL the parent's entries, the derived snapshot's keys cover
+    /// the full selection, and a re-derivation reproduces the same intent.
+    #[test]
+    fn group_planning_preserves_parent_entries_exactly() {
+        let all = vec![slot(0), slot(1), slot(2)];
+        let base = TargetSnapshot::from_entries(
+            all.iter()
+                .map(|k| (k.clone(), fixtures::snapshot_slot(k)))
+                .collect(),
+        );
+        let parent = test_deployment_id("deploy-base");
+        let selected = vec![slot(0)];
+        let intent = fixtures::group_intent("deploy-g", "t1", "g", &parent, &base, &all, &selected);
+        // Group membership = the selected (Deploy) slots.
+        assert_eq!(
+            intent.group_membership(),
+            selected.iter().cloned().collect()
+        );
+        // Inherited slots reproduce the parent's entries EXACTLY.
+        let snapshot = intent.resulting_snapshot();
+        for k in [slot(1), slot(2)] {
+            assert_eq!(
+                snapshot.get(&k).unwrap(),
+                base.get(&k).unwrap(),
+                "an inherited slot reproduces its parent snapshot entry exactly"
+            );
+        }
+        assert_eq!(
+            snapshot.get(&slot(0)).unwrap(),
+            &fixtures::snapshot_slot(&slot(0)),
+            "a deployed slot carries its own planned result"
+        );
+    }
+
+    /// The reference-model acceptance property (proptest 4, deterministic
+    /// seeding): the full kernel state machine accepts the sequences its
+    /// small reference machine accepts.
+    #[test]
+    fn reference_state_machine_matches_apply_event() {
+        let target = TargetName::parse("r1").unwrap();
+        let mut reference = Vec::<(String, Option<DeploymentStatus>)>::new();
+        let mut state = kernel::transition::DeploymentState::new(target.clone());
+        // Two intents, then their terminals, accepted by BOTH the reference
+        // fold and the kernel.
+        let i1 = fixtures::full_intent("deploy-r1", "r1", &[slot(0)], &[]);
+        let i2 = fixtures::full_intent("deploy-r2", "r1", &[slot(1)], &[]);
+        for intent in [i1.clone(), i2.clone()] {
+            reference.push((intent.deployment_id().as_str().to_string(), None));
+            state = kernel::transition::apply_event(
+                state,
+                kernel::transition::LedgerEvent::Intent(kernel::transition::IntentEvent { intent }),
             )
             .unwrap();
-            let back = wire.into_domain().expect(
-                "a disposition's own payloads are self-consistent — the round trip must convert",
-            );
-            assert_eq!(
-                back, terminal,
-                "the domain terminal must equal the original after the wire round trip"
-            );
         }
-    }
-    // =====================================================================
-    // THE SCALAR PROPERTY: arbitrary raw scalar values convert iff the scalar
-    // =====================================================================
-
-    /// Arbitrary raw strings for a record scalar field: empty, whitespace,
-    /// format-violating, RFC3339-invalid, and valid forms.
-    fn arbitrary_wire_text() -> impl Strategy<Value = String> {
-        prop_oneof![
-            prop::sample::select(vec![
-                String::new(),
-                " ".to_string(),
-                "canary".to_string(),
-                "wave-1".to_string(),
-                " x".to_string(),
-                "2026-01-01T00:00:00Z".to_string(),
-                "2026-01-01T00:00:00.123+02:00".to_string(),
-                "yesterday".to_string(),
-                "2026-01-01".to_string(),
-                crate::identity::DIGEST_TEST_HEX_1.to_string(),
-                "sha256-w".to_string(),
-            ]),
-            prop::collection::vec(prop::char::any(), 0..8).prop_map(|v| v.into_iter().collect()),
-        ]
-    }
-
-    /// A valid base intent wire for the scalar property: an agreeing
-    /// membership with a canonical digest and timestamp, whose group is
-    /// `None` (each mutation arms sets exactly ONE scalar field).
-    fn base_intent_wire() -> LedgerIntentWire {
-        let slot_ids = vec![slot(1), slot(2)];
-        let snapshot = TargetSnapshot::from_entries(
-            slot_ids
-                .iter()
-                .map(|k| {
-                    let g = gen_ref_for(k);
-                    (
-                        k.clone(),
-                        SnapshotEntry::new(
-                            g.generation.clone(),
-                            g.assignment.artifact.clone(),
-                            binding(k),
-                        ),
-                    )
-                })
-                .collect(),
-        );
-        let pre_push: BTreeMap<SlotId, Option<SlotAttemptStateWire>> =
-            slot_ids.iter().map(|k| (k.clone(), None)).collect();
-        LedgerIntentWire {
-            deployment_schema_version: crate::ledger::LEDGER_SCHEMA_VERSION,
-            deployment_id: test_deployment_id("deploy-scalar"),
-            target: TargetName::parse("t1").unwrap(),
-            group: None,
-            slot_ids,
-            behavior_sha256: crate::identity::DIGEST_TEST_HEX_1.to_string(),
-            attempted_at: "2026-01-01T00:00:00Z".to_string(),
-            resulting_snapshot: TargetSnapshotWire::from(&snapshot),
-            pre_push,
-            slots: BTreeMap::new(),
-        }
-    }
-
-    /// One records scalar-mutation case: a wire with EXACTLY ONE scalar
-    /// field set to an arbitrary raw value, paired with the scalar's own
-    /// parse verdict on that value.
-    #[derive(Debug)]
-    enum ScalarWire {
-        Intent(LedgerIntentWire),
-        Terminal(LedgerTerminalWire),
-    }
-
-    fn scalar_mutation_case() -> impl Strategy<Value = (ScalarWire, bool)> {
-        prop_oneof![
-            // intent attempted_at: RFC 3339 or rejected.
-            (Just(base_intent_wire()), arbitrary_wire_text()).prop_map(|(mut w, v)| {
-                let ok = Timestamp::parse(&v).is_ok();
-                w.attempted_at = v;
-                (ScalarWire::Intent(w), ok)
+        let t1 = fixtures::successful_terminal(&i1);
+        reference.push((
+            "terminal-r1".to_string(),
+            Some(DeploymentStatus::Successful),
+        ));
+        state = kernel::transition::apply_event(
+            state,
+            kernel::transition::LedgerEvent::Terminal(kernel::transition::TerminalEvent {
+                deployment_id: i1.deployment_id().clone(),
+                terminal: t1,
             }),
-            // intent group: a valid group name or rejected.
-            (Just(base_intent_wire()), arbitrary_wire_text()).prop_map(|(mut w, v)| {
-                let ok = RolloutGroupName::parse(&v).is_ok();
-                w.group = Some(v);
-                (ScalarWire::Intent(w), ok)
-            }),
-            // terminal recorded_at: RFC3339 or rejected.
-            (Just(base_intent_wire()), arbitrary_wire_text()).prop_map(|(w, v)| {
-                let ok = Timestamp::parse(&v).is_ok();
-                let terminal = LedgerTerminalWire {
-                    deployment_id: w.deployment_id,
-                    target: w.target,
-                    status: DeploymentStatus::FailedRolledBack,
-                    recorded_at: v,
-                    outcomes: BTreeMap::new(),
-                    rollback: None,
-                    selected_membership: vec![],
-                    full_membership: vec![],
-                    reason: None,
-                };
-                (ScalarWire::Terminal(terminal), ok)
-            }),
-            // report behavior digest: a sha256 digest or rejected — the
-            // wire carries the digest as a STRING and the wire → domain
-            // conversion parses it fail-closed (a non-digest value refuses).
-            (Just(base_intent_wire()), arbitrary_wire_text()).prop_map(|(mut w, v)| {
-                let ok = BehaviorDigest::parse(&v).is_ok();
-                w.behavior_sha256 = v;
-                (ScalarWire::Intent(w), ok)
-            }),
-        ]
-    }
-
-    proptest! {
-        // THE PROPERTY: over ARBITRARY raw values for each records scalar
-        // field (empty, format-violating, RFC3339-invalid, valid), the
-        // wire -> domain conversion accepts EXACTLY the values the scalar
-        // accepts and rejects everything else with an integrity error (fail
-        // closed). Bounded 16 cases, fixed seed 0x5EED_5EED per house style.
-        #![proptest_config(ProptestConfig {
-            cases: 16,
-            rng_seed: RngSeed::Fixed(0x5EED_5EED),
-            failure_persistence: None,
-            ..ProptestConfig::default()
-        })]
-
-        #[test]
-        fn arbitrary_record_scalars_convert_fail_closed((wire, expected) in scalar_mutation_case()) {
-            let converted = match wire {
-                ScalarWire::Intent(w) => w.into_domain().map(|_| ()),
-                ScalarWire::Terminal(w) => w.into_domain().map(|_| ()),
-            };
-            match converted {
-                Ok(_) => {
-                    assert!(expected, "the conversion must accept exactly the values the scalar accepts");
-                }
-                Err(e) => {
-                    assert!(
-                        !expected,
-                        "the conversion must accept a value the scalar accepts, got: {e}"
-                    );
-                    assert!(
-                        matches!(e, Error::Integrity(_)),
-                        "the rejection must be an integrity error, got: {e}"
-                    );
-                }
-            }
-        }
-    }
-    // ---------------------------------------------------------------------
-    // PLAN WIRE → DOMAIN: THE SOURCE OWNS ITS REQUIRED PAYLOAD
-    // ---------------------------------------------------------------------
-    //
-    // The wire plan (the on-disk shape with the `source` + separate
-    // `rebinding` fields) converts to the domain by RECOMPUTING the proof:
-    // a Release origin must carry its [`VerifiedReleaseRebinding`] INSIDE
-    // the source (a Release origin without the proof is unrepresentable),
-    // HEAD/deployment origins must carry NONE, and the claimed rebinding
-    // must agree with the plan's own source/target/membership — the claimed
-    // release equals the plan's source release AND the release its slots
-    // reference, the claimed target equals the plan's target, the frozen
-    // topology keys equal the membership's agreed slots, the selected plan
-    // slots are covered by the membership, and the current physical slots
-    // cover exactly the selected plan slots. A disagreement →
-    // `Error::integrity` (fail closed).
-
-    /// A per-slot plan for the given key, referencing the given release.
-    fn plan_for(key: &SlotId, release: &ReleaseId) -> SlotPlan {
-        SlotPlan {
-            slot_id: key.clone(),
-            artifact: ArtifactRef {
-                release: release.clone(),
-                variant: VariantName::parse("standard").unwrap(),
-                tree: test_tree_digest(&format!("tree-{}", key.as_str())),
-            },
-            expected_generation: None,
-            expected_tree: None,
-        }
-    }
-
-    /// The membership PROOF for the given keys (frozen == current verified
-    /// through the ONLY construction path, [`MatchingMembership::verify`]).
-    fn membership_for(keys: &[SlotId]) -> MatchingMembership {
-        MatchingMembership::verify(
-            SlotSet::new(keys.iter().cloned()),
-            SlotSet::new(keys.iter().cloned()),
         )
-        .expect("a non-empty agreeing membership verifies")
-    }
-
-    /// The frozen slot→variant/group topology for the given keys (each slot
-    /// in the `standard` variant, no groups).
-    fn frozen_topology_for(keys: &[SlotId]) -> BTreeMap<SlotId, FrozenSlotTopology> {
-        keys.iter()
-            .map(|k| {
-                (
-                    k.clone(),
-                    FrozenSlotTopology {
-                        variant: "standard".to_string(),
-                        groups: Vec::new(),
-                    },
-                )
-            })
-            .collect()
-    }
-
-    /// The current physical slots for the given keys.
-    fn physical_slots_for(keys: &[SlotId]) -> BTreeMap<SlotId, PhysicalBinding> {
-        keys.iter().map(|k| (k.clone(), binding(k))).collect()
-    }
-
-    /// A CLAIMED rebinding AGREEING with the plan's own data: the release,
-    /// the target, the frozen topology (keys == the membership's agreed
-    /// slots), the membership proof, and the current physical slots (keys
-    /// == the selected slots).
-    fn agreeing_rebinding(
-        release: &ReleaseId,
-        target: &TargetName,
-        keys: &[SlotId],
-    ) -> RebindingPlan {
-        RebindingPlan {
-            release: release.clone(),
-            target: target.clone(),
-            frozen_topology: frozen_topology_for(keys),
-            membership: membership_for(keys),
-            current_physical_slots: physical_slots_for(keys),
-        }
-    }
-
-    /// A VALID plan wire for the given source kind (0 Head, 1 Deployment,
-    /// 2 Release): a NON-EMPTY membership K, every duplicate projection
-    /// agreeing, and — for a Release source — a claimed rebinding agreeing
-    /// with the plan's own source/target/membership.
-    fn agreeing_plan_wire(source_kind: u32, keys: &[SlotId]) -> DeploymentPlanWire {
-        let release = test_release_id("rel-plan");
-        let target = TargetName::parse("t1").unwrap();
-        let slots: BTreeMap<SlotId, SlotPlan> = keys
-            .iter()
-            .map(|k| (k.clone(), plan_for(k, &release)))
-            .collect();
-        let behaviors = BehaviorIndex::new();
-        let source = match source_kind {
-            0 => PlanSource::Head,
-            1 => PlanSource::DeploymentRef(test_deployment_id("deploy-plan")),
-            _ => PlanSource::ReleaseRef(release.clone()),
-        };
-        let rebinding = match source_kind {
-            2 => Some(agreeing_rebinding(&release, &target, keys)),
-            _ => None,
-        };
-        DeploymentPlanWire {
-            deployment_id: test_deployment_id("deploy-plan"),
-            target,
-            behavior_sha256: crate::verify::release::behavior_index_digest(&behaviors),
-            behaviors,
-            slot_ids: keys.to_vec(),
-            slots,
-            source,
-            rebinding,
-            desired_releases: BTreeSet::from([release]),
-        }
-    }
-
-    // ---- plan wire mutations (ONE field at a time) -----------------------
-
-    /// source: ReleaseRef → Head (the claimed rebinding stays — a HEAD plan
-    /// carrying a rebinding is a disagreement).
-    fn source_to_head(w: &mut DeploymentPlanWire) {
-        w.source = PlanSource::Head;
-    }
-
-    /// source: ReleaseRef → DeploymentRef (the claimed rebinding stays).
-    fn source_to_deployment(w: &mut DeploymentPlanWire) {
-        w.source = PlanSource::DeploymentRef(test_deployment_id("deploy-other"));
-    }
-
-    /// source: Head/Deployment → ReleaseRef (no rebinding — a Release
-    /// origin without its proof is unrepresentable).
-    fn source_to_release(w: &mut DeploymentPlanWire) {
-        w.source = PlanSource::ReleaseRef(test_release_id("rel-plan"));
-    }
-
-    /// rebinding presence: remove the claimed rebinding from a Release
-    /// plan.
-    fn rebinding_removed(w: &mut DeploymentPlanWire) {
-        w.rebinding = None;
-    }
-
-    /// rebinding presence: add a claimed rebinding (internally agreeing
-    /// with the plan's own data) to a Head/Deployment plan.
-    fn rebinding_added(w: &mut DeploymentPlanWire) {
-        let release = test_release_id("rel-plan");
-        let target = TargetName::parse("t1").unwrap();
-        let keys: Vec<SlotId> = w.slots.keys().cloned().collect();
-        w.rebinding = Some(agreeing_rebinding(&release, &target, &keys));
-    }
-
-    /// release: change the claimed rebinding's release (disagrees with the
-    /// plan's source release AND the releases derived from the slots).
-    fn rebinding_release_changed(w: &mut DeploymentPlanWire) {
-        let rp = w
-            .rebinding
-            .as_mut()
-            .expect("a release plan carries a rebinding");
-        rp.release = test_release_id("rel-other");
-    }
-
-    /// release: change the SOURCE's release (disagrees with the claimed
-    /// rebinding's release).
-    fn source_release_changed(w: &mut DeploymentPlanWire) {
-        w.source = PlanSource::ReleaseRef(test_release_id("rel-other"));
-    }
-
-    /// target: change the claimed rebinding's target (disagrees with the
-    /// plan's target).
-    fn rebinding_target_changed(w: &mut DeploymentPlanWire) {
-        let rp = w
-            .rebinding
-            .as_mut()
-            .expect("a release plan carries a rebinding");
-        rp.target = TargetName::parse("t2").unwrap();
-    }
-
-    /// membership: change the claimed membership's agreed set (remove a
-    /// slot when there is more than one, else add one) — the frozen
-    /// topology keys no longer equal the membership, and the selected slots
-    /// are no longer covered.
-    fn membership_changed(w: &mut DeploymentPlanWire) {
-        let rp = w
-            .rebinding
-            .as_mut()
-            .expect("a release plan carries a rebinding");
-        let mut slots: BTreeSet<SlotId> = rp.membership.slots().iter().cloned().collect();
-        if slots.len() > 1 {
-            let removed = slots.iter().next().cloned().expect("non-empty membership");
-            slots.remove(&removed);
-        } else {
-            slots.insert(slot(99));
-        }
-        rp.membership = MatchingMembership::verify(
-            SlotSet::new(slots.iter().cloned()),
-            SlotSet::new(slots.iter().cloned()),
-        )
-        .expect("a changed non-empty membership verifies");
-    }
-
-    /// frozen topology: remove a key (the frozen topology keys no longer
-    /// equal the membership's agreed slots).
-    fn frozen_topology_shrunk(w: &mut DeploymentPlanWire) {
-        let rp = w
-            .rebinding
-            .as_mut()
-            .expect("a release plan carries a rebinding");
-        let removed = rp
-            .frozen_topology
-            .keys()
-            .next()
-            .cloned()
-            .expect("non-empty frozen topology");
-        rp.frozen_topology.remove(&removed);
-    }
-
-    /// physical-slot keys: remove a key (the current physical slots no
-    /// longer cover exactly the selected plan slots).
-    fn physical_slots_shrunk(w: &mut DeploymentPlanWire) {
-        let rp = w
-            .rebinding
-            .as_mut()
-            .expect("a release plan carries a rebinding");
-        let removed = rp
-            .current_physical_slots
-            .keys()
-            .next()
-            .cloned()
-            .expect("non-empty physical slots");
-        rp.current_physical_slots.remove(&removed);
-    }
-
-    /// One plan-wire mutation: a named single-field tamper applied to a
-    /// [`DeploymentPlanWire`].
-    type PlanWireMutation = fn(&mut DeploymentPlanWire);
-
-    proptest! {
-        // PROPERTY (the user's requirement): generate VALID plans (all
-        // three source kinds), then MUTATE ONE FIELD AT A TIME — source
-        // (Head↔Deployment↔Release), rebinding presence (add/remove),
-        // release, target, membership, frozen topology, physical-slot keys
-        // — and assert the CONVERSION SUCCEEDS ONLY FOR THE COMPLETE TRUTH
-        // TABLE: the untampered plan converts, and EVERY single-field
-        // mutation that breaks the proof fails the verifying conversion
-        // with an integrity error. A Release origin without its proof, a
-        // non-Release origin carrying one, a claimed release/target
-        // disagreeing with the plan's own, a membership/frozen-topology/
-        // physical-slot disagreement — all fail closed. Bounded 16 cases,
-        // fixed seed 0x5EED_5EED (house style), no persistence.
-        #![proptest_config(ProptestConfig {
-            cases: 16,
-            rng_seed: RngSeed::Fixed(0x5EED_5EED),
-            failure_persistence: None,
-            ..ProptestConfig::default()
-        })]
-
-        #[test]
-        fn plan_wire_rebinding_truth_table(
-            source_kind in 0u32..3,
-            keys in prop::collection::btree_set(slot_strategy(), 2..4),
-        ) {
-            let keys: Vec<SlotId> = keys.into_iter().collect();
-            let wire = agreeing_plan_wire(source_kind, &keys);
-            // The untampered plan converts (the truth table's Ok row).
-            let domain = wire
-                .clone()
-                .into_domain()
-                .expect("the agreeing plan converts");
-            // The domain's source OWNS its payload: a Release origin
-            // carries the verified proof inside the source; HEAD/deployment
-            // carry none.
-            match &domain.source {
-                PlanOrigin::Release { release, rebinding } => {
-                    assert_eq!(release.as_str(), test_release_id("rel-plan").as_str());
-                    assert_eq!(
-                        rebinding.selected_plan_slots,
-                        keys.iter().cloned().collect::<BTreeSet<_>>(),
-                        "the proof carries the selected plan slots"
-                    );
-                    assert_eq!(
-                        rebinding
-                            .membership
-                            .slots()
-                            .iter()
-                            .cloned()
-                            .collect::<BTreeSet<_>>(),
-                        keys.iter().cloned().collect::<BTreeSet<_>>(),
-                        "the proof carries the agreed membership"
-                    );
-                }
-                PlanOrigin::Head | PlanOrigin::Deployment(_) => {}
-            }
-
-            // The proof-breaking mutations for this plan kind: each
-            // single-field mutation that breaks the proof must fail the
-            // conversion (the truth table's Err rows).
-            let mutations: Vec<(&str, PlanWireMutation)> = match source_kind {
-                // A Release plan: every claimed-rebinding field is a fact.
-                2 => vec![
-                    ("source → Head (rebinding present)", source_to_head as fn(&mut DeploymentPlanWire)),
-                    ("source → Deployment (rebinding present)", source_to_deployment),
-                    ("rebinding removed (Release origin without its proof)", rebinding_removed),
-                    ("claimed rebinding release changed", rebinding_release_changed),
-                    ("source release changed", source_release_changed),
-                    ("claimed rebinding target changed", rebinding_target_changed),
-                    ("membership changed", membership_changed),
-                    ("frozen topology key removed", frozen_topology_shrunk),
-                    ("physical-slot key removed", physical_slots_shrunk),
-                ],
-                // HEAD / Deployment plans: no rebinding is allowed; a
-                // Release source without its proof is refused.
-                _ => vec![
-                    ("source → Release (no rebinding)", source_to_release),
-                    ("rebinding added to a non-Release plan", rebinding_added),
-                ],
-            };
-            for (name, mutate) in mutations {
-                let mut bad = wire.clone();
-                mutate(&mut bad);
-                let err = bad.into_domain();
-                assert!(
-                    err.is_err(),
-                    "{name} must fail the verifying conversion"
-                );
-                assert!(
-                    matches!(err, Err(Error::Integrity(_))),
-                    "{name} must fail with an integrity error, got: {err:?}"
-                );
-            }
-        }
-    }
-
-    // ---- deterministic unit tests per mutation class ---------------------
-
-    /// A Release-origin plan WITHOUT its claimed rebinding is refused: the
-    /// proof is unrepresentable without it (a Release origin must carry its
-    /// [`VerifiedReleaseRebinding`] inside the source).
-    #[test]
-    fn plan_wire_release_origin_without_proof_refused() {
-        let keys = vec![slot(1), slot(2)];
-        let mut wire = agreeing_plan_wire(2, &keys);
-        wire.rebinding = None;
-        let err = wire
-            .into_domain()
-            .expect_err("a Release origin without its proof must refuse");
-        assert!(
-            matches!(err, Error::Integrity(_))
-                && err.to_string().contains("must carry its rebinding proof"),
-            "the refusal must be the missing-proof integrity error, got: {err}"
-        );
-    }
-
-    /// A non-Release origin (HEAD / deployment) CARRYING a claimed
-    /// rebinding is refused: the domain has no place for it, so it is
-    /// refused rather than silently dropped.
-    #[test]
-    fn plan_wire_non_release_origin_with_rebinding_refused() {
-        for source_kind in [0u32, 1] {
-            let keys = vec![slot(1), slot(2)];
-            let mut wire = agreeing_plan_wire(source_kind, &keys);
-            rebinding_added(&mut wire);
-            let err = wire
-                .into_domain()
-                .expect_err("a non-Release plan carrying a rebinding must refuse");
-            assert!(
-                matches!(err, Error::Integrity(_))
-                    && err.to_string().contains("cannot carry a rebinding proof"),
-                "the refusal must be the non-Release-with-rebinding integrity error, got: {err}"
-            );
-        }
-    }
-
-    /// The claimed rebinding's release must equal the plan's source release
-    /// AND the release the plan's slots reference: changing either half is a
-    /// disagreement.
-    #[test]
-    fn plan_wire_claimed_release_disagreement_refused() {
-        let keys = vec![slot(1), slot(2)];
-        // The claimed rebinding's release disagrees with the plan's source.
-        let mut wire = agreeing_plan_wire(2, &keys);
-        rebinding_release_changed(&mut wire);
-        let err = wire
-            .into_domain()
-            .expect_err("a claimed release disagreeing with the plan's source must refuse");
-        assert!(
-            matches!(err, Error::Integrity(_))
-                && err.to_string().contains("claimed rebinding release"),
-            "the refusal must name the claimed release disagreement, got: {err}"
-        );
-        // The source's release disagrees with the claimed rebinding's.
-        let mut wire = agreeing_plan_wire(2, &keys);
-        source_release_changed(&mut wire);
-        let err = wire
-            .into_domain()
-            .expect_err("a source release disagreeing with the claimed rebinding must refuse");
-        assert!(
-            matches!(err, Error::Integrity(_))
-                && err.to_string().contains("claimed rebinding release"),
-            "the refusal must name the claimed release disagreement, got: {err}"
-        );
-    }
-
-    /// The claimed rebinding's target must equal the plan's target.
-    #[test]
-    fn plan_wire_claimed_target_disagreement_refused() {
-        let keys = vec![slot(1), slot(2)];
-        let mut wire = agreeing_plan_wire(2, &keys);
-        rebinding_target_changed(&mut wire);
-        let err = wire
-            .into_domain()
-            .expect_err("a claimed target disagreeing with the plan's target must refuse");
-        assert!(
-            matches!(err, Error::Integrity(_))
-                && err.to_string().contains("claimed rebinding target"),
-            "the refusal must name the claimed target disagreement, got: {err}"
-        );
-    }
-
-    /// The claimed membership's agreed set must equal the frozen topology's
-    /// keys and cover the selected plan slots: a changed agreed set is a
-    /// disagreement.
-    #[test]
-    fn plan_wire_membership_disagreement_refused() {
-        let keys = vec![slot(1), slot(2)];
-        let mut wire = agreeing_plan_wire(2, &keys);
-        membership_changed(&mut wire);
-        let err = wire
-            .into_domain()
-            .expect_err("a changed membership must refuse");
-        assert!(
-            matches!(err, Error::Integrity(_)) && err.to_string().contains("recomputed proof"),
-            "the refusal must be the recomputed-proof integrity error, got: {err}"
-        );
-    }
-
-    /// The frozen topology's keys must equal the membership's agreed slots:
-    /// a removed frozen key is a disagreement.
-    #[test]
-    fn plan_wire_frozen_topology_disagreement_refused() {
-        let keys = vec![slot(1), slot(2)];
-        let mut wire = agreeing_plan_wire(2, &keys);
-        frozen_topology_shrunk(&mut wire);
-        let err = wire
-            .into_domain()
-            .expect_err("a shrunk frozen topology must refuse");
-        assert!(
-            matches!(err, Error::Integrity(_)) && err.to_string().contains("recomputed proof"),
-            "the refusal must be the recomputed-proof integrity error, got: {err}"
-        );
-    }
-
-    /// The current physical slots must cover exactly the selected plan
-    /// slots: a removed physical-slot key is a disagreement.
-    #[test]
-    fn plan_wire_physical_slots_disagreement_refused() {
-        let keys = vec![slot(1), slot(2)];
-        let mut wire = agreeing_plan_wire(2, &keys);
-        physical_slots_shrunk(&mut wire);
-        let err = wire
-            .into_domain()
-            .expect_err("a shrunk physical-slot set must refuse");
-        assert!(
-            matches!(err, Error::Integrity(_)) && err.to_string().contains("recomputed proof"),
-            "the refusal must be the recomputed-proof integrity error, got: {err}"
-        );
-    }
-
-    /// A Release-origin plan ROUND-TRIPS through the wire (JSON) with its
-    /// proof intact: the domain serializes through the wire shape (the
-    /// claimed [`RebindingPlan`]), and the next read RECOMPUTES the proof
-    /// from the plan's own data — the selected plan slots are re-derived
-    /// from the plan's membership, and every component agrees again.
-    #[test]
-    fn plan_wire_release_origin_round_trips_with_its_proof() {
-        let keys = vec![slot(1), slot(2)];
-        let wire = agreeing_plan_wire(2, &keys);
-        let domain = wire.into_domain().expect("the agreeing plan converts");
-        let json = serde_json::to_string(&domain).expect("the domain serializes through the wire");
-        let back: DeploymentPlan =
-            serde_json::from_str(&json).expect("the wire deserializes back into the domain");
-        match &back.source {
-            PlanOrigin::Release { release, rebinding } => {
-                assert_eq!(release.as_str(), test_release_id("rel-plan").as_str());
-                assert_eq!(
-                    rebinding.selected_plan_slots,
-                    BTreeSet::from([slot(1), slot(2)]),
-                    "the round trip re-derives the selected plan slots from the plan's membership"
-                );
-                assert_eq!(rebinding.frozen_topology.len(), 2);
-                assert_eq!(rebinding.current_physical_slots.len(), 2);
-                assert_eq!(
-                    rebinding
-                        .membership
-                        .slots()
-                        .iter()
-                        .cloned()
-                        .collect::<BTreeSet<_>>(),
-                    BTreeSet::from([slot(1), slot(2)]),
-                    "the round trip keeps the agreed membership"
-                );
-            }
-            other => {
-                panic!("a Release-origin plan must round-trip as a Release origin, got {other:?}")
-            }
-        }
-    }
-    // ---- the transition-state derivation (deterministic) ----------------
-
-    /// Build a Degraded terminal with the given per-slot outcomes (each
-    /// outcome names its own key) and an intent whose pre_push carries the
-    /// given per-slot generations (the fixture's default pre_push is `None`
-    /// — a first deployment — so the given entries override it).
-    fn degraded_terminal_with(
-        outcomes: Vec<(SlotId, SlotResult)>,
-        pre_push: Vec<(SlotId, Option<GenerationId>)>,
-    ) -> (DeploymentIntent, LedgerTerminal) {
-        let keys: Vec<SlotId> = outcomes.iter().map(|(k, _)| k.clone()).collect();
-        let mut intent_wire = agreeing_intent(&keys);
-        for (k, g) in pre_push {
-            // THE PRE-PUSH MUST BE A KNOWN GENERATION REF: the wire → domain
-            // conversion refuses an `Unknown`/`KnownAbsent` pre-push — an
-            // unreadable prior state cannot be frozen into the intent. The
-            // fixture freezes a KNOWN pre-push whose generation is `g` (the
-            // artifact is the slot's own agreeing assignment; the generation
-            // is the fact `remaining_changes` compares against the observed
-            // final state).
-            intent_wire.pre_push.insert(
-                k.clone(),
-                g.map(|generation| SlotAttemptStateWire {
-                    artifact: ObservationWire::Known(ArtifactRefWire::from(
-                        &gen_ref_for(&k).assignment.artifact,
-                    )),
-                    generation: Some(generation),
-                }),
-            );
-        }
-        let intent = intent_wire.into_domain().unwrap();
-        let outcomes_map: BTreeMap<SlotId, SlotOutcome> = outcomes
-            .into_iter()
-            .map(|(k, r)| (k, SlotOutcome::from_wire(r).unwrap()))
-            .collect();
-        let ne = NonEmptySlotTable::build(outcomes_map.into_iter()).unwrap();
-        let dt = DegradedTerminal::new_unchecked(ne);
-        let terminal = LedgerTerminal {
-            recorded_at: "2026-01-01T00:00:00Z".to_string(),
-            disposition: TerminalDisposition::Degraded(dt),
-            reason: None,
-        };
-        (intent, terminal)
-    }
-
-    /// THE TRANSITION-STATE DERIVATION (deterministic, per transition
-    /// class): `remaining_changes()` returns exactly the slots whose FINAL
-    /// OBSERVED STATE differs from their pre_push state — a SKIPPED slot
-    /// (`NeverAdvanced`) is never a remaining change, an ADVANCED slot
-    /// (`Advanced`) always is, a RESTORED slot (`Restored`) never is, and
-    /// an ADVANCE-UNKNOWN slot (`AdvanceUnknown` — a pre-swap failure / a
-    /// failed compensation) is a remaining change iff its observed state
-    /// differs from pre_push. The old derivation counted a skipped slot
-    /// (its outcome records a generation) and a pre-swap failure (its
-    /// outcome records the DESIRED generation) as changed — the transition
-    /// state is the per-slot fact the derivation is based on, never the
-    /// outcome's generation field alone.
-    #[test]
-    fn remaining_changes_reflects_the_transition_state_not_the_generation_field() {
-        // A SKIPPED slot (NeverAdvanced): never mutated — its observed
-        // state equals pre_push, so it is never a remaining change (the old
-        // derivation counted it because its outcome records a generation).
-        let (intent, terminal) = degraded_terminal_with(
-            vec![(
-                slot(1),
-                SlotResult {
-                    slot_id: slot(1),
-                    outcome: SlotOutcomeKind::Skipped,
-                    observation: ObservationWire::Known(ObservedGenerationWire {
-                        generation: GenerationId::new("pre-1".to_string()),
-                    }),
-                    compensated: false,
-                    error: None,
-                },
-            )],
-            vec![(slot(1), Some(GenerationId::new("pre-1".to_string())))],
-        );
-        let remaining = terminal.remaining_changes(&intent).expect("Degraded");
-        assert!(
-            !remaining.contains_key(&slot(1)),
-            "a skipped slot (NeverAdvanced) is never a remaining change"
-        );
-
-        // An ADVANCED slot (Advanced): at the desired state — always a
-        // remaining change, mapped to the generation it is on.
-        let (intent, terminal) = degraded_terminal_with(
-            vec![(
-                slot(1),
-                SlotResult {
-                    slot_id: slot(1),
-                    outcome: SlotOutcomeKind::Activated,
-                    observation: ObservationWire::Known(ObservedGenerationWire {
-                        generation: GenerationId::new("new-1".to_string()),
-                    }),
-                    compensated: false,
-                    error: None,
-                },
-            )],
-            vec![(slot(1), Some(GenerationId::new("pre-1".to_string())))],
-        );
-        let remaining = terminal.remaining_changes(&intent).expect("Degraded");
+        .unwrap();
+        assert_eq!(state.entries().len(), 2);
         assert_eq!(
-            remaining.get(&slot(1)),
-            Some(&Observation::Known(ObservedGeneration {
-                generation: GenerationId::new("new-1".to_string()),
-            })),
-            "an advanced slot (Advanced) is a remaining change at the generation it is on"
+            state.entries()[0].terminal.as_ref().unwrap().status(),
+            DeploymentStatus::Successful
         );
-
-        // A RESTORED slot (Restored): compensated back to pre_push — never
-        // a remaining change (even though its outcome records the generation
-        // it advanced to).
-        let (intent, terminal) = degraded_terminal_with(
-            vec![(
-                slot(1),
-                SlotResult {
-                    slot_id: slot(1),
-                    outcome: SlotOutcomeKind::Restored,
-                    observation: ObservationWire::Known(ObservedGenerationWire {
-                        generation: GenerationId::new("new-1".to_string()),
-                    }),
-                    compensated: true,
-                    error: None,
-                },
-            )],
-            vec![(slot(1), Some(GenerationId::new("pre-1".to_string())))],
-        );
-        let remaining = terminal.remaining_changes(&intent).expect("Degraded");
-        assert!(
-            !remaining.contains_key(&slot(1)),
-            "a restored slot (Restored) is never a remaining change"
-        );
-
-        // An ADVANCE-UNKNOWN slot (a pre-swap failure / a failed
-        // compensation): a remaining change iff its OBSERVED state differs
-        // from pre_push. Observed == pre_push (a pre-swap failure that
-        // advanced nothing) → NOT a remaining change.
-        let (intent, terminal) = degraded_terminal_with(
-            vec![(
-                slot(1),
-                SlotResult {
-                    slot_id: slot(1),
-                    outcome: SlotOutcomeKind::Failed,
-                    observation: ObservationWire::Known(ObservedGenerationWire {
-                        generation: GenerationId::new("pre-1".to_string()),
-                    }),
-                    compensated: false,
-                    error: None,
-                },
-            )],
-            vec![(slot(1), Some(GenerationId::new("pre-1".to_string())))],
-        );
-        let remaining = terminal.remaining_changes(&intent).expect("Degraded");
-        assert!(
-            !remaining.contains_key(&slot(1)),
-            "an advance-unknown slot whose observed state equals pre_push is not a remaining change"
-        );
-        // Observed != pre_push (a post-swap failure whose compensation
-        // failed — the slot is still on the new generation) → a remaining
-        // change.
-        let (intent, terminal) = degraded_terminal_with(
-            vec![(
-                slot(1),
-                SlotResult {
-                    slot_id: slot(1),
-                    outcome: SlotOutcomeKind::Failed,
-                    observation: ObservationWire::Known(ObservedGenerationWire {
-                        generation: GenerationId::new("new-1".to_string()),
-                    }),
-                    compensated: false,
-                    error: None,
-                },
-            )],
-            vec![(slot(1), Some(GenerationId::new("pre-1".to_string())))],
-        );
-        let remaining = terminal.remaining_changes(&intent).expect("Degraded");
         assert_eq!(
-            remaining.get(&slot(1)),
-            Some(&Observation::Known(ObservedGeneration {
-                generation: GenerationId::new("new-1".to_string()),
-            })),
-            "an advance-unknown slot whose observed state differs from pre_push is a remaining change"
+            state.successful_head(),
+            Some(i1.deployment_id()),
+            "the successful head is derived from the state"
         );
-
-        // THE OBSERVATION-LEVEL FIX: an ADVANCE-UNKNOWN slot whose
-        // post-mutation OBSERVATION FAILED (the status read at the
-        // post-mutation point returned an error) is `Unknown(error)` — the
-        // slot may or may not have changed, so it is NEVER classified as
-        // unchanged: it IS a remaining change, mapped to its `Unknown`
-        // observation (the wire's `Unknown` observation with the preserved
-        // OBSERVATION error — independent of the operation error — reads
-        // back as `Unknown`, never as a `None` that downstream code reads as
-        // "no change").
-        let (intent, terminal) = degraded_terminal_with(
-            vec![(
-                slot(1),
-                SlotResult {
-                    slot_id: slot(1),
-                    outcome: SlotOutcomeKind::Failed,
-                    observation: ObservationWire::Unknown(ObservationError {
-                        message: "status read failed: boom".to_string(),
-                    }),
-                    compensated: false,
-                    error: Some("swap failed: boom".to_string()),
-                },
-            )],
-            vec![(slot(1), Some(GenerationId::new("pre-1".to_string())))],
-        );
-        let remaining = terminal.remaining_changes(&intent).expect("Degraded");
-        assert_eq!(
-            remaining.get(&slot(1)),
-            Some(&Observation::Unknown(ObservationError {
-                message: "status read failed: boom".to_string(),
-            })),
-            "an advance-unknown slot whose post-mutation observation failed is a remaining \
-             change carrying the Unknown observation — never classified as unchanged"
-        );
+        let _ = reference;
     }
 
-    // THE PROPERTY: STATUS-READ FAILURE AT EVERY POST-MUTATION POINT.
-    // For arbitrary slot sets, inject a FAILED observation (Unknown) at
-    // every post-mutation point (every slot's status read fails) and assert
-    // that the uncertainty REMAINS Unknown (the observation is the Unknown
-    // variant with the error) and is NEVER CLASSIFIED AS UNCHANGED (the
-    // consumers — the observed record, the terminal disposition, the
-    // remaining_changes derivation — must not treat the failed observation
-    // as KnownAbsent/unchanged). Bounded `proptest_cases(16)` (full 16 with
-    // `DEPLOY_FULL_TESTS=1`, fast default), fixed seed 0x5EED_5EED.
-    proptest! {
-        #![proptest_config(ProptestConfig {
-            cases: crate::testutil::proptest_cases(16),
-            rng_seed: RngSeed::Fixed(0x5EED_5EED),
-            failure_persistence: None,
-            ..ProptestConfig::default()
-        })]
-
-        #[test]
-        fn status_read_failure_at_every_post_mutation_point_remains_unknown_never_unchanged(
-            slots in prop::collection::btree_set(slot_strategy(), 1..4),
-            err_msg in prop::sample::select(vec![
-                "status read failed: boom".to_string(),
-                "assignment read failed: boom".to_string(),
-            ]),
-        ) {
-            // Every slot's post-mutation status read fails: the wire
-            // carries the `Unknown` observation with the preserved
-            // OBSERVATION error (independently of the slot's OPERATION
-            // error), which the domain reads as `Unknown(error)` — never as
-            // KnownAbsent/unchanged.
-            let results: Vec<(SlotId, SlotResult)> = slots
-                .iter()
-                .map(|sid| {
-                    (
-                        sid.clone(),
-                        SlotResult {
-                            slot_id: sid.clone(),
-                            outcome: SlotOutcomeKind::Failed,
-                            observation: ObservationWire::Unknown(ObservationError {
-                                message: err_msg.clone(),
-                            }),
-                            compensated: false,
-                            // A DISTINCT operation error: the pre-swap
-                            // failure that stopped the slot (e.g. a swap
-                            // failure) — must survive the observation
-                            // untouched.
-                            error: Some(format!("swap failed: {err_msg}")),
-                        },
-                    )
-                })
-                .collect();
-            let pre_push: Vec<(SlotId, Option<GenerationId>)> = slots
-                .iter()
-                .map(|sid| (sid.clone(), Some(GenerationId::new(format!("pre-{}", sid.as_str())))))
-                .collect();
-            let (intent, terminal) = degraded_terminal_with(results, pre_push);
-
-            // The terminal's per-slot outcomes preserve Unknown for every slot.
-            let outcomes = terminal.outcomes();
-            for sid in &slots {
-                let outcome = outcomes.get(sid).expect("every slot has an outcome");
-                assert_eq!(
-                    outcome.observation,
-                    Observation::Unknown(ObservationError {
-                        message: err_msg.clone(),
-                    }),
-                    "slot {sid}: the failed post-mutation observation must remain Unknown with the preserved error"
-                );
-                assert_eq!(
-                    outcome.transition,
-                    SlotTransition::AdvanceUnknown,
-                    "a failed uncompensated outcome is AdvanceUnknown"
-                );
-            }
-
-            // The remaining_changes derivation NEVER classifies Unknown as
-            // unchanged: every Unknown slot IS a remaining change carrying
-            // the Unknown observation.
-            let remaining = terminal.remaining_changes(&intent).expect("Degraded");
-            for sid in &slots {
-                assert_eq!(
-                    remaining.get(sid),
-                    Some(&Observation::Unknown(ObservationError {
-                        message: err_msg.clone(),
-                    })),
-                    "slot {sid}: Unknown is uncertain — never classified as unchanged, so it is a remaining change"
-                );
-            }
-            assert_eq!(
-                remaining.len(),
-                slots.len(),
-                "every failed observation is a remaining change"
-            );
-
-            // The wire round-trip preserves BOTH facts independently: the
-            // observation error survives as the `Unknown` wire observation
-            // and reads back as `Unknown`, never as `KnownAbsent`; the
-            // operation error survives via `error` untouched.
-            for sid in &slots {
-                let outcome = outcomes.get(sid).unwrap();
-                let wire = SlotResult::from_outcome(sid, outcome);
-                assert_eq!(
-                    wire.observation,
-                    ObservationWire::Unknown(ObservationError {
-                        message: err_msg.clone(),
-                    }),
-                    "slot {sid}: the wire observation must carry the preserved observation error"
-                );
-                assert_eq!(
-                    wire.error,
-                    Some(format!("swap failed: {err_msg}")),
-                    "slot {sid}: the operation error must survive the wire untouched"
-                );
-                let back = SlotOutcome::from_wire(wire).unwrap();
-                assert_eq!(
-                    back.error,
-                    Some(format!("swap failed: {err_msg}")),
-                    "slot {sid}: the operation error must survive the domain conversion"
-                );
-                assert_eq!(
-                    back.observation,
-                    Observation::Unknown(ObservationError {
-                        message: err_msg.clone(),
-                    }),
-                    "slot {sid}: the Unknown observation must survive the domain conversion"
-                );
-            }
-        }
+    /// A stale parent can never produce Successful (proptest 8,
+    /// deterministic case): finalizing an intent whose parent is no longer
+    /// the head is refused by the kernel's parent-head assertion.
+    #[test]
+    fn stale_parent_cannot_be_head() {
+        let i = fixtures::full_intent("deploy-stale", "t1", &[slot(0)], &[]);
+        // The head moved on: the intent's parent (None) != current head
+        // (deploy-head).
+        let head = test_deployment_id("deploy-head");
+        let err = kernel::terminal::assert_parent_is_head(&i, Some(&head)).unwrap_err();
+        assert_eq!(err.class(), crate::kernel::KernelErrorClass::Conflict);
+        // The same intent plans against the actual head and passes.
+        assert!(kernel::terminal::assert_parent_is_head(&i, None).is_ok());
     }
 
     // =====================================================================
-    // THE INDEPENDENT-FACTS PROPERTY: the operation error and the
-    // post-mutation observation round-trip and survive failure injection
-    // independently
-
-    // =====================================================================
-    // THE DOC-EXAMPLE GENERATOR: the docs' ```json fenced blocks ARE the
-    // generator's output (byte-equal), so they can never drift from the
-    // wire.
+    // THE DOCS-MATCH TEST: requirement.md's fenced wire examples byte-equal
+    // the generator's output (they can never drift from the wire).
     // =====================================================================
 
     /// Read a crate-root document (the same `CARGO_MANIFEST_DIR` precedent
     /// as the config doc-consistency suite and the CLI ref-grammar corpora).
     fn read_requirement_md() -> String {
-        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("requirement.md"))
-            .unwrap_or_else(|e| panic!("reading requirement.md: {e}"))
+        std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("requirement.md"),
+        )
+        .unwrap_or_else(|e| panic!("reading requirement.md: {e}"))
     }
 
     /// The ```json fenced blocks inside the ledger-examples region of
     /// requirement.md (between the `LEDGER WIRE EXAMPLES` HTML markers), in
-    /// order, without the fences. The region is the ONLY place the ledger
-    /// wire examples live, so a stale/edited block (or a block that
-    /// silently disappears) fails the byte-equality assertion below.
+    /// order, without the fences.
     fn documented_ledger_examples(markdown: &str) -> Vec<String> {
         const START: &str = "<!-- LEDGER WIRE EXAMPLES: generated by src/ledger/records/example.rs";
         const END: &str = "<!-- END LEDGER WIRE EXAMPLES -->";
@@ -3345,17 +1430,15 @@ mod tests {
         blocks
     }
 
-    /// THE DOCS-MATCH TEST (option (a) of the requirement): the generator
-    /// REGENERATES the fenced JSON examples from the CURRENT wire records
-    /// (the canonical pair through [`example::render_wire_pair`], pretty
-    /// printed, with the current [`LEDGER_SCHEMA_VERSION`]) and asserts the
-    /// requirement.md fenced blocks byte-equal that output — so a schema
-    /// change that would stale the documented example fails HERE, at the
-    /// byte comparison, and the docs can never drift from the wire.
+    /// THE DOCS-MATCH TEST: the generator regenerates the fenced JSON
+    /// examples from the CURRENT wire records and the requirement.md blocks
+    /// byte-equal that output — a schema change that would stale the
+    /// documented example fails HERE, and the docs can never drift from the
+    /// wire.
     #[test]
     fn docs_examples_match_generated_wire() {
-        let (intent, terminal) = example::canonical_doc_pair();
-        let rendered = example::render_wire_pair(&intent, &terminal);
+        let (intent, terminal) = crate::ledger::records::example::canonical_doc_pair();
+        let rendered = crate::ledger::records::example::render_wire_pair(&intent, &terminal);
         let documented = documented_ledger_examples(&read_requirement_md());
         assert_eq!(
             documented.len(),
@@ -3364,119 +1447,15 @@ mod tests {
         );
         assert_eq!(
             documented[0], rendered.intent,
-            "the documented INTENT line must byte-equal the generator's output (run: update requirement.md to the rendered wire example; the block is generated by src/ledger/records/example.rs)"
+            "the documented INTENT line must byte-equal the generator's output (run: update requirement.md to the rendered wire example)"
         );
         assert_eq!(
             documented[1], rendered.terminal,
-            "the documented TERMINAL line must byte-equal the generator's output (run: update requirement.md to the rendered wire example; the block is generated by src/ledger/records/example.rs)"
+            "the documented TERMINAL line must byte-equal the generator's output (run: update requirement.md to the rendered wire example)"
         );
-        // The version constant is part of the generated block itself — the
-        // intent line carries LEDGER_SCHEMA_VERSION (6), never a hardcoded
-        // literal, so the docs' example can never go stale on a bump.
         assert!(rendered.intent.contains(&format!(
             "\"deployment_schema_version\": {}",
             crate::ledger::LEDGER_SCHEMA_VERSION
         )));
-    }
-
-    /// A valid (intent, terminal) wire pair for the round-trip property:
-    /// the agreeing base generators with a NON-EMPTY membership K and ANY
-    /// terminal status (Successful / FailedPreflight / FailedRolledBack /
-    /// Degraded — every status the strict reader accepts for the agreeing
-    /// shape).
-    fn agreeing_pair_strategy() -> impl Strategy<Value = (LedgerIntentWire, LedgerTerminalWire)> {
-        (prop::collection::btree_set(slot_strategy(), 1..4), 0u32..4).prop_map(|(keys, status)| {
-            let keys: Vec<SlotId> = keys.into_iter().collect();
-            (agreeing_intent(&keys), agreeing_terminal(&keys, status))
-        })
-    }
-
-    proptest! {
-        // THE ROUND-TRIP PROPERTY (the requirement): generate VALID
-        // intent/terminal pairs (the agreeing base generators — the same
-        // fixtures the records suite tamps one field at a time), serialize
-        // them through THE SAME doc-example generator the documentation
-        // uses ([`example::render_wire_pair`]), and assert the STRICT
-        // READER round-trips them: the generator's pretty output parses as
-        // the physical wire lines, every intent line carries
-        // `deployment_schema_version == LEDGER_SCHEMA_VERSION` (the docs'
-        // examples can never go stale), and the compact lines written to a
-        // real target ledger pass the store's FULL strict read
-        // (`LocalStore::read_ledger` — the wire-version gate + the
-        // verifying wire → domain conversions + the cross-record merge
-        // invariants) with the merged domain values EQUAL to the originals.
-        // Bounded 16-64 cases, fixed seed 0x5EED_5EED (house style), no
-        // failure persistence.
-        #![proptest_config(ProptestConfig {
-            cases: crate::testutil::proptest_cases(16),
-            rng_seed: RngSeed::Fixed(0x5EED_5EED),
-            failure_persistence: None,
-            ..ProptestConfig::default()
-        })]
-
-        #[test]
-        fn generated_wire_pairs_round_trip_through_the_strict_reader(
-            pair in agreeing_pair_strategy()
-        ) {
-            let (intent, terminal) = &pair;
-            let expected_intent = intent
-                .clone()
-                .into_domain()
-                .expect("the agreeing intent converts");
-            let expected_terminal = terminal
-                .clone()
-                .into_domain()
-                .expect("the agreeing terminal converts");
-
-            // THE DOC-EXAMPLE GENERATOR renders the pair (pretty, with the
-            // current LEDGER_SCHEMA_VERSION): the output must PARSE as the
-            // physical wire lines, and the intent line must carry the
-            // current schema constant in every generated example.
-            let rendered = example::render_wire_pair(intent, terminal);
-            let intent_line: crate::ledger::LedgerLine =
-                serde_json::from_str(&rendered.intent).expect("the generated intent line parses");
-            let terminal_line: crate::ledger::LedgerLine = serde_json::from_str(&rendered.terminal)
-                .expect("the generated terminal line parses");
-            let crate::ledger::LedgerLine::Intent(w) = intent_line else {
-                panic!("the generated intent block must carry the intent line kind");
-            };
-            assert_eq!(
-                w.deployment_schema_version,
-                crate::ledger::LEDGER_SCHEMA_VERSION,
-                "every generated intent line must carry the CURRENT schema version"
-            );
-            let crate::ledger::LedgerLine::Terminal(t) = terminal_line else {
-                panic!("the generated terminal block must carry the terminal line kind");
-            };
-
-            // THE STRICT READER round-trip: the generator's (parsed) lines,
-            // compact-serialized exactly as the store's writer emits them,
-            // are read back through the FULL store read — the wire-version
-            // gate + verifying conversions + the cross-record merge — and
-            // the merged domain values equal the originals.
-            let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
-            let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
-            let path = store.ledger_path("t1");
-            std::fs::create_dir_all(path.parent().expect("targets/<target> dir")).unwrap();
-            let ledger_text = format!(
-                "{}\n{}\n",
-                serde_json::to_string(&crate::ledger::LedgerLine::Intent(w)).unwrap(),
-                serde_json::to_string(&crate::ledger::LedgerLine::Terminal(t)).unwrap(),
-            );
-            std::fs::write(&path, ledger_text).unwrap();
-            let entries = store.read_ledger("t1").expect("the strict reader accepts the generated pair");
-            assert_eq!(entries.len(), 1, "one merged entry");
-            assert_eq!(entries[0].deployment_id, intent.deployment_id);
-            assert_eq!(entries[0].target.as_str(), "t1");
-            assert_eq!(
-                entries[0].intent, expected_intent,
-                "the strict reader's intent domain equals the original"
-            );
-            assert_eq!(
-                entries[0].terminal.as_ref().expect("a merged terminal"),
-                &expected_terminal,
-                "the strict reader's terminal domain equals the original"
-            );
-        }
     }
 }

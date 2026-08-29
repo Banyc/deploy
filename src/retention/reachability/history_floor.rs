@@ -68,7 +68,7 @@ use crate::error::{Error, Result};
 // carries parsed entries) are both live imports — keep both.
 use super::gc::SweepStageStats;
 use crate::identity::DeploymentId;
-use crate::ledger::{LedgerEntry, ObservedAssignment, TerminalDisposition};
+use crate::ledger::{LedgerEntry, ObservedAssignment};
 use crate::store::atomic::{path_state, write_atomic_replace};
 use crate::store::local::LocalStore;
 use std::collections::BTreeSet;
@@ -76,8 +76,13 @@ use std::collections::BTreeSet;
 #[cfg(test)]
 use crate::identity::SlotId;
 #[cfg(test)]
+use crate::ledger::records::{
+    NonEmptySlotTable, Observation, ObservedGeneration, SlotOutcome, SlotOutcomeKind,
+    SlotTransition,
+};
+#[cfg(test)]
 use crate::ledger::{
-    DeploymentIntent, DeploymentStatus, LedgerTerminal, SlotResult, SlotTable, TargetSnapshot,
+    DeploymentIntent, DeploymentStatus, LedgerTerminal, SlotResult, SlotTable, TerminalDisposition,
 };
 #[cfg(test)]
 use crate::testutil::test_faults::FaultKind;
@@ -193,9 +198,9 @@ impl LocalStore {
                 "checkpoint requires a SUCCESSFUL deployment: deployment '{checkpoint_id}' on target '{target}' has no terminal event (the deployment is still in flight or pending)"
             ))
         })?;
-        if !matches!(terminal.disposition, TerminalDisposition::Successful(_)) {
+        if !terminal.disposition().is_successful() {
             return Err(Error::r#ref(format!(
-                "checkpoint requires a successful deployment: deployment '{checkpoint_id}' on target '{target}' ended {:?} — only successful deployments carry a rollback state",
+                "checkpoint requires a successful deployment: deployment '{checkpoint_id}' on target '{target}' ended {:?} — only successful deployments carry a snapshot",
                 terminal.status()
             )));
         }
@@ -371,34 +376,37 @@ impl LocalStore {
                 // nothing, and an `Unknown` assignment FAILS CLOSED below
                 // (the sweep cannot verify what the slot ran before the
                 // attempt, so reachability would be incomplete).
-                for sid in entry.intent.selected.keys() {
-                    let snap_entry = entry
-                        .intent
-                        .resulting_snapshot
-                        .get(sid)
-                        .expect("selected in snapshot");
+                // Intent-referenced artifacts: the ONE authoritative slot
+                // table carries every slot's RESULT artifact (planned /
+                // inherited — a successful deployment's snapshot resolves
+                // from it) plus the Deploy slots' observed PRE-PUSH
+                // artifacts. A `Known` pre-push artifact contributes its
+                // release + tree, `KnownAbsent` contributes nothing, and an
+                // `Unknown` assignment FAILS CLOSED below (the sweep cannot
+                // verify what the slot ran before the attempt, so
+                // reachability would be incomplete).
+                let slot_snapshot = entry.intent.resulting_snapshot();
+                for (sid, _p) in entry.intent.slots().iter() {
+                    let snap_entry = slot_snapshot.get(sid).expect("slot in snapshot");
                     out.releases
                         .insert(snap_entry.artifact().release.as_str().to_string());
                     out.trees
                         .insert(snap_entry.artifact().tree.as_str().to_string());
-                    if let Some(gr) = &entry.intent.selected.get(sid).unwrap().pre_push {
-                        out.releases
-                            .insert(gr.assignment.artifact.release.as_str().to_string());
-                        out.trees
-                            .insert(gr.assignment.artifact.tree.as_str().to_string());
-                    }
-                }
-                // The terminal's rollback payload: every slot's OWN artifact
-                // binding (release + tree). A partial snapshot can carry
-                // several releases, so reachability is derived per slot —
-                // there is no snapshot-wide release.
-                if let Some(t) = entry.terminal.as_ref()
-                    && let TerminalDisposition::Successful(st) = &t.disposition
-                {
-                    for (_, e) in st.rollback().iter() {
-                        out.releases
-                            .insert(e.artifact().release.as_str().to_string());
-                        out.trees.insert(e.artifact().tree.as_str().to_string());
+                    if let Some(pre) = entry.intent.pre_push(sid) {
+                        match pre {
+                            crate::ledger::Observation::Known(prev) => {
+                                out.releases
+                                    .insert(prev.artifact.release.as_str().to_string());
+                                out.trees.insert(prev.artifact.tree.as_str().to_string());
+                            }
+                            crate::ledger::Observation::Unknown(e) => {
+                                return Err(Error::integrity(format!(
+                                    "reachability sweep for target '{name}': deployment '{}' slot '{sid}' has an Unknown pre-push assignment ({}) — the sweep cannot verify what the slot ran before the attempt",
+                                    entry.deployment_id, e.message
+                                )));
+                            }
+                            crate::ledger::Observation::KnownAbsent => {}
+                        }
                     }
                 }
             }
@@ -780,7 +788,11 @@ impl LocalStore {
     }
 
     /// TEST-ONLY: append a terminal event for a deployment (the old
-    /// `append_transition`). Outcomes are empty (status-only append).
+    /// `append_transition`). The terminal is BUILT FROM the deployment's
+    /// intent (the digest binds it); the disposition matches the status and
+    /// carries the outcome payload the disposition requires (the status-only
+    /// shapes build the minimal valid payload over the intent's selected
+    /// membership).
     pub fn append_transition(
         &self,
         id: &str,
@@ -788,82 +800,80 @@ impl LocalStore {
         reason: Option<&str>,
     ) -> Result<()> {
         let target = self.target_for(id)?;
-        // The TEST adapter appends a status-only terminal; map the status to
-        // its DISPOSITION (the domain truth table is structural — a
-        // `Successful` terminal always carries its rollback payload, and a
-        // `Degraded` one needs its remaining changes, which a status-only
-        // append cannot supply).
+        let entries = self.read_ledger(&target)?;
+        let intent = entries
+            .iter()
+            .find(|e| e.deployment_id.as_str() == id)
+            .map(|e| e.intent.clone())
+            .ok_or_else(|| Error::store(format!("no intent for deployment '{id}'")))?;
+        let selected: Vec<crate::identity::SlotId> = intent.selected().map(|(k, _)| k).collect();
         let disposition = match status {
-            DeploymentStatus::Successful => TerminalDisposition::Successful(
-                crate::ledger::SuccessfulTerminal::try_new(
-                    {
-                        let __slots: BTreeMap<
-                            crate::identity::SlotId,
-                            crate::identity::GenerationRef,
-                        > = BTreeMap::new();
-                        let __bindings: BTreeMap<
-                            crate::identity::SlotId,
-                            crate::ledger::records::PhysicalBinding,
-                        > = BTreeMap::new();
-                        let mut __entries: BTreeMap<
-                            crate::identity::SlotId,
-                            crate::ledger::records::SnapshotEntry,
-                        > = BTreeMap::new();
-                        for (k, v) in __slots.clone() {
-                            let b = __bindings.get(&k).cloned().unwrap_or(
-                                crate::ledger::records::PhysicalBinding {
-                                    server: crate::identity::ServerId::new("s1"),
-                                    deploy_dir: format!("/srv/deploy/{}", k.as_str()),
-                                },
-                            );
-                            __entries.insert(
-                                k.clone(),
-                                crate::ledger::records::SnapshotEntry::new(
-                                    v.generation.clone(),
-                                    v.assignment.artifact.clone(),
-                                    b,
-                                ),
-                            );
-                        }
-                        for (k, b) in __bindings.clone() {
-                            __entries.entry(k.clone()).or_insert_with(|| {
-                                crate::ledger::records::SnapshotEntry::new(
-                                    crate::identity::GenerationId::new("gen-missing".to_string()),
-                                    crate::identity::ArtifactRef {
-                                        release: crate::identity::test_release_id("rel-missing"),
-                                        variant: crate::identity::VariantName::new(
-                                            "standard".to_string(),
-                                        ),
-                                        tree: crate::identity::test_tree_digest("missing"),
-                                    },
-                                    b.clone(),
-                                )
-                            });
-                        }
-                        TargetSnapshot::from_entries(__entries)
-                    },
-                    crate::identity::NonEmptySlotSet::try_new(BTreeSet::new()).unwrap(),
-                )
-                .unwrap(),
-            ),
+            DeploymentStatus::Successful => TerminalDisposition::Successful,
             DeploymentStatus::FailedPreflight => TerminalDisposition::FailedPreflight,
-            DeploymentStatus::FailedRolledBack => TerminalDisposition::FailedRolledBack {
-                outcomes: SlotTable::new(),
-            },
-            other => {
-                return Err(Error::store(format!(
-                    "append_transition cannot record status {other:?} as a status-only terminal"
-                )));
+            DeploymentStatus::FailedRolledBack => {
+                let outcomes = SlotTable::from_map(
+                    selected
+                        .iter()
+                        .map(|sid| {
+                            (
+                                sid.clone(),
+                                SlotOutcome {
+                                    outcome: SlotOutcomeKind::Restored,
+                                    observation: Observation::Known(ObservedGeneration {
+                                        generation: crate::identity::test_generation_id(
+                                            sid.as_str(),
+                                        ),
+                                    }),
+                                    compensated: true,
+                                    error: None,
+                                    transition: SlotTransition::Restored,
+                                },
+                            )
+                        })
+                        .collect(),
+                );
+                let payload = crate::kernel::terminal::FailedRolledBackTerminal::try_new(outcomes)
+                    .map_err(|e| Error::store(format!("append_transition: {e}")))?;
+                TerminalDisposition::FailedRolledBack(payload)
+            }
+            DeploymentStatus::Degraded => {
+                let degraded_outcomes: std::collections::BTreeMap<
+                    crate::identity::SlotId,
+                    SlotOutcome,
+                > = selected
+                    .iter()
+                    .map(|sid| {
+                        (
+                            sid.clone(),
+                            SlotOutcome {
+                                outcome: SlotOutcomeKind::Failed,
+                                observation: Observation::Known(ObservedGeneration {
+                                    generation: crate::identity::test_generation_id(sid.as_str()),
+                                }),
+                                compensated: false,
+                                error: None,
+                                transition: SlotTransition::AdvanceUnknown,
+                            },
+                        )
+                    })
+                    .collect();
+                let outcomes = NonEmptySlotTable::build(degraded_outcomes)
+                    .map_err(|e| Error::store(format!("append_transition outcomes: {e}")))?;
+                let payload = crate::kernel::terminal::DegradedTerminal::try_new(outcomes)
+                    .map_err(|e| Error::store(format!("append_transition: {e}")))?;
+                TerminalDisposition::Degraded(payload)
             }
         };
+        let terminal = crate::kernel::terminal::LedgerTerminal::new(
+            crate::remote::helper::now_rfc3339_ts(),
+            crate::kernel::terminal::intent_digest(&intent),
+            disposition,
+            reason.map(str::to_string),
+        );
         self.append_terminal(
             &target,
-            &DeploymentId::new(id.to_string()),
-            &LedgerTerminal {
-                recorded_at: crate::remote::helper::now_rfc3339(),
-                disposition,
-                reason: reason.map(str::to_string),
-            },
+            &crate::identity::DeploymentId::new(id.to_string()),
+            &terminal,
         )
     }
 

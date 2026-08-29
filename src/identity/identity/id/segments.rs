@@ -45,6 +45,7 @@ id_newtype!(
      from [`crate::identity`])."
 );
 
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::identity::RolloutGroupName;

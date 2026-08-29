@@ -15,7 +15,6 @@ use crate::identity::DeploymentId;
 use crate::identity::GenerationId;
 use crate::identity::OperationId;
 use crate::identity::SlotId;
-use crate::ledger::DeploymentStatus;
 use crate::ledger::Observation;
 use crate::ledger::ObservationWire;
 use crate::ledger::ObservedGeneration;
@@ -65,7 +64,7 @@ pub(crate) fn apply_failure_policy(
     advanced: &mut Vec<SlotId>,
     compensated: &mut Vec<SlotId>,
     results: &mut BTreeMap<SlotId, SlotResult>,
-) -> Result<DeploymentStatus> {
+) -> Result<bool> {
     // 13. Failure policy compensation of still-advanced servers. The policy
     // is matched EXHAUSTIVELY (no `_ =>` fallback, no string compare):
     //
@@ -119,27 +118,26 @@ pub(crate) fn apply_failure_policy(
         }
     }
 
-    // 14. Determine attempt status — again an EXHAUSTIVE match on the typed
-    // policy (no string compare, no fallback): a failed push is
-    // `FailedRolledBack` under `RollbackChanged` when every advanced server
-    // was compensated (or nothing had advanced), `Degraded` when any
-    // compensation failed; under `LeaveChanged` a failed push is always
-    // `Degraded` (the advances are retained deliberately).
-    let status = if !had_failure {
-        DeploymentStatus::Successful
+    // 14. GATHER THE FAILURE EVIDENCE (the STATUS DECISION IS THE KERNEL'S
+    // — [`crate::kernel::transition::decide_terminal`] owns the complete
+    // truth table; the engine only reports whether every attempted mutation
+    // was restored or never advanced): under `RollbackChanged` every
+    // advanced server was compensated (or nothing had advanced) — i.e. the
+    // failure left nothing changed; under `LeaveChanged` the advances are
+    // retained deliberately, so something remains changed. A push with NO
+    // failure returns `true` (the success decision is the finalizer's
+    // verification evidence).
+    let everything_restored = if !had_failure {
+        true
     } else {
         match failure_policy {
             FailurePolicy::RollbackChanged => {
-                if compensated.len() == assignments.len() || advanced.is_empty() {
-                    DeploymentStatus::FailedRolledBack
-                } else {
-                    DeploymentStatus::Degraded
-                }
+                compensated.len() == assignments.len() || advanced.is_empty()
             }
-            FailurePolicy::LeaveChanged => DeploymentStatus::Degraded,
+            FailurePolicy::LeaveChanged => false,
         }
     };
-    Ok(status)
+    Ok(everything_restored)
 }
 
 /// A pre-swap failure (never advanced) records the ACTUAL observed
