@@ -38,7 +38,7 @@ use crate::env::SysEnv;
 use crate::error::{Error, Result};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
@@ -329,12 +329,14 @@ fn meta_to_remote(m: &std::fs::Metadata) -> RemoteMeta {
 /// permissions would silently depend on the caller's umask.
 pub(crate) const IMMUTABLE_RECORD_MODE: u32 = 0o644;
 
-/// Bounded retry budget for the sidecar mutex: a contended sidecar fails
-/// explicitly, never hangs. Non-blocking `flock(LOCK_EX|LOCK_NB)` is retried
-/// this many times with a `yield_now` between attempts; this respects the
-/// repo's "nothing is unbounded" rule while remaining deadlock-free
-/// (kernel releases flock on holder death, so no lease needed).
-pub(crate) const SIDECAR_RETRY_ATTEMPTS: usize = 32;
+/// How long a contender waits for the sidecar mutex before failing: a
+/// MONOTONIC deadline (not an attempt count). Ordinary critical sections
+/// (file syncs inside the flock) finish well within it; a holder that is
+/// still alive after the deadline is a genuinely stuck/unbounded operation.
+pub(crate) const SIDECAR_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+/// The sleep between non-blocking flock retries (bounded by the remaining
+/// time to the deadline, so no retry ever extends past it).
+pub(crate) const SIDECAR_RETRY_INTERVAL: Duration = Duration::from_millis(5);
 
 // Thread-local re-entrancy depth for the sidecar critical section. When
 // `>0`, the current thread already holds the sidecar flock, so nested
@@ -388,10 +390,11 @@ pub(crate) fn ensure_operation_lock_sidecar_durable(base: &Path) -> Result<()> {
 
 /// Run `f` while holding an exclusive `flock` on the sidecar mutex file.
 /// The sidecar is ensured durably before locking. Uses non-blocking
-/// `LOCK_EX|LOCK_NB` with a bounded retry budget (`SIDECAR_RETRY_ATTEMPTS`)
-/// and `yield_now` between attempts; a contended sidecar after the budget
-/// fails with an explicit transport error, never hangs. Re-entrant: if the
-/// current thread already holds the sidecar (depth>0), `f` runs directly.
+/// `LOCK_EX|LOCK_NB` with a monotonic deadline (`SIDECAR_WAIT_TIMEOUT`)
+/// and a 5ms sleep between attempts (bounded by the remaining time to the
+/// deadline); a contended sidecar after the deadline fails with an explicit
+/// transport error, never hangs. Re-entrant: if the current thread already
+/// holds the sidecar (depth>0), `f` runs directly.
 pub(crate) fn with_operation_lock_sidecar<R>(
     base: &Path,
     f: impl FnOnce() -> Result<R>,
@@ -409,37 +412,74 @@ pub(crate) fn with_operation_lock_sidecar<R>(
         .map_err(|e| Error::transport(format!("open sidecar {}: {e}", p.display())))?;
     use std::os::unix::io::AsRawFd;
     let fd = file.as_raw_fd();
-    let mut acquired = false;
-    for _ in 0..SIDECAR_RETRY_ATTEMPTS {
-        let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-        if ret == 0 {
-            acquired = true;
-            break;
-        }
-        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-        if errno == libc::EWOULDBLOCK {
-            std::thread::yield_now();
-            continue;
-        } else {
-            return Err(Error::transport(format!(
-                "flock sidecar {}: {}",
-                p.display(),
-                std::io::Error::last_os_error()
-            )));
-        }
-    }
-    if !acquired {
-        return Err(Error::transport(format!(
-            "sidecar mutex contended after {} attempts: {}",
-            SIDECAR_RETRY_ATTEMPTS,
-            p.display()
-        )));
-    }
+    wait_for_sidecar_flock(
+        fd,
+        &p,
+        SIDECAR_WAIT_TIMEOUT,
+        SIDECAR_RETRY_INTERVAL,
+        || {
+            let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+            if ret == 0 { 0 } else { -1 }
+        },
+        || std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+        Instant::now,
+        std::thread::sleep,
+    )?;
     SIDECAR_DEPTH.with(|c| c.set(depth + 1));
     let res = f();
     SIDECAR_DEPTH.with(|c| c.set(depth));
     unsafe { libc::flock(fd, libc::LOCK_UN) };
     res
+}
+
+/// The flock-contention wait, with the OS interactions injected so the
+/// timeout/retry policy can be property-tested deterministically. `try_flock`
+/// returns the flock(2) result convention (0 = acquired, -1 = error with
+/// errno consultable via `last_errno`), `now` the monotonic clock, `sleep`
+/// the wait primitive. The policy: keep acquiring until the deadline —
+/// `EWOULDBLOCK` sleeps `interval.min(deadline - now)`, `EINTR` retries
+/// immediately, any other errno fails immediately; a holder that is still
+/// contended when the deadline passes fails with the timeout error.
+pub(crate) fn wait_for_sidecar_flock(
+    fd: std::os::unix::io::RawFd,
+    path: &std::path::Path,
+    timeout: Duration,
+    interval: Duration,
+    mut try_flock: impl FnMut() -> i32,
+    mut last_errno: impl FnMut() -> i32,
+    mut now: impl FnMut() -> Instant,
+    mut sleep: impl FnMut(Duration),
+) -> Result<()> {
+    let _ = fd;
+    let deadline = now() + timeout;
+    loop {
+        if try_flock() == 0 {
+            break;
+        }
+        let errno = last_errno();
+        match errno {
+            x if x == libc::EWOULDBLOCK => {
+                let cur = now();
+                if cur >= deadline {
+                    return Err(Error::transport(format!(
+                        "sidecar mutex remained contended for {:?}: {}",
+                        timeout,
+                        path.display()
+                    )));
+                }
+                sleep(interval.min(deadline - cur));
+            }
+            x if x == libc::EINTR => continue,
+            _ => {
+                return Err(Error::transport(format!(
+                    "flock sidecar {}: {}",
+                    path.display(),
+                    std::io::Error::from_raw_os_error(errno)
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The verdict of one atomic compare-and-delete attempt
@@ -2617,5 +2657,155 @@ mod tests {
                 }
             }
         }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: crate::testutil::proptest_cases(64),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn wait_for_sidecar_flock_simulated_contention(
+            hold_ms in prop_oneof![
+                Just(0u64),
+                Just(1u64),
+                Just(1999u64),
+                Just(2000u64),
+                Just(2500u64),
+                Just(3000u64),
+                0u64..=3000u64,
+            ],
+        ) {
+            let timeout = SIDECAR_WAIT_TIMEOUT;
+            let interval = SIDECAR_RETRY_INTERVAL;
+            let hold = Duration::from_millis(hold_ms);
+            let start = Instant::now();
+            let release_at = start + hold;
+            let deadline = start + timeout;
+            let simulated = std::cell::Cell::new(start);
+            let sleeps = std::cell::RefCell::new(Vec::<Duration>::new());
+            let try_count = std::cell::Cell::new(0usize);
+            let last_now = std::cell::Cell::new(None::<Instant>);
+            let path = Path::new("/tmp/sidecar.test");
+            let fd: std::os::unix::io::RawFd = 42;
+            let res = wait_for_sidecar_flock(
+                fd,
+                path,
+                timeout,
+                interval,
+                || {
+                    try_count.set(try_count.get() + 1);
+                    last_now.set(Some(simulated.get()));
+                    if simulated.get() > release_at { 0 } else { -1 }
+                },
+                || libc::EWOULDBLOCK,
+                || simulated.get(),
+                |d| {
+                    sleeps.borrow_mut().push(d);
+                    simulated.set(simulated.get() + d);
+                },
+            );
+            if hold < timeout {
+                prop_assert!(res.is_ok(), "hold {hold:?} < timeout {timeout:?} must succeed, got {res:?} sleeps={:?} try_count={}", sleeps.borrow(), try_count.get());
+                // Success must have observed the release.
+                prop_assert!(simulated.get() >= release_at, "simulated time must have reached release_at");
+            } else {
+                prop_assert!(res.is_err(), "hold {hold:?} >= timeout {timeout:?} must fail");
+                let msg = res.unwrap_err().to_string();
+                prop_assert!(msg.contains("remained contended for"), "timeout error must contain 'remained contended for', got: {msg}");
+                // Failure happens only after deadline.
+                let last = last_now.get().expect("at least one try");
+                prop_assert!(last >= deadline, "failure must happen only after deadline: last_now={last:?} deadline={deadline:?}");
+                // No sleep extends beyond deadline.
+                for s in sleeps.borrow().iter() {
+                    prop_assert!(*s <= interval, "every sleep <= interval, got {s:?}");
+                }
+                let elapsed = simulated.get().duration_since(start);
+                prop_assert!(elapsed <= timeout + interval, "total elapsed {elapsed:?} must be <= timeout+interval {:?}", timeout + interval);
+                // Also no sleep took us beyond deadline+interval: simulated never beyond deadline+epsilon.
+                prop_assert!(simulated.get() <= deadline + interval, "simulated {:?} must not exceed deadline+interval", simulated.get());
+            }
+            // Every sleep is bounded by interval and by remaining time (checked above for interval, and elapsed bound covers deadline).
+            for s in sleeps.borrow().iter() {
+                prop_assert!(*s <= interval);
+            }
+        }
+    }
+
+    #[test]
+    fn wait_for_sidecar_flock_non_contention_fails_immediately() {
+        let timeout = SIDECAR_WAIT_TIMEOUT;
+        let interval = SIDECAR_RETRY_INTERVAL;
+        let start = Instant::now();
+        let simulated = std::cell::Cell::new(start);
+        let try_count = std::cell::Cell::new(0usize);
+        let sleeps = std::cell::RefCell::new(Vec::<Duration>::new());
+        let path = Path::new("/tmp/sidecar.test");
+        let fd: std::os::unix::io::RawFd = 42;
+        let res = wait_for_sidecar_flock(
+            fd,
+            path,
+            timeout,
+            interval,
+            || {
+                try_count.set(try_count.get() + 1);
+                -1
+            },
+            || libc::EIO,
+            || simulated.get(),
+            |d| {
+                sleeps.borrow_mut().push(d);
+                simulated.set(simulated.get() + d);
+            },
+        );
+        assert!(res.is_err(), "EIO must fail");
+        assert_eq!(
+            try_count.get(),
+            1,
+            "non-contention error must fail immediately (one try)"
+        );
+        assert!(sleeps.borrow().is_empty(), "no sleeps on immediate failure");
+        assert!(
+            !res.unwrap_err()
+                .to_string()
+                .contains("remained contended for")
+        );
+    }
+
+    #[test]
+    fn wait_for_sidecar_flock_eintr_retries_without_sleep() {
+        let timeout = SIDECAR_WAIT_TIMEOUT;
+        let interval = SIDECAR_RETRY_INTERVAL;
+        let start = Instant::now();
+        let simulated = std::cell::Cell::new(start);
+        let sleeps = std::cell::RefCell::new(Vec::<Duration>::new());
+        let calls = std::cell::Cell::new(0usize);
+        let path = Path::new("/tmp/sidecar.test");
+        let fd: std::os::unix::io::RawFd = 42;
+        let res = wait_for_sidecar_flock(
+            fd,
+            path,
+            timeout,
+            interval,
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() == 1 { -1 } else { 0 }
+            },
+            || if calls.get() == 1 { libc::EINTR } else { 0 },
+            || simulated.get(),
+            |d| {
+                sleeps.borrow_mut().push(d);
+                simulated.set(simulated.get() + d);
+            },
+        );
+        assert!(res.is_ok(), "EINTR then success must retry and succeed");
+        assert_eq!(calls.get(), 2, "should have retried once after EINTR");
+        assert!(
+            sleeps.borrow().is_empty(),
+            "EINTR must retry without sleeping"
+        );
     }
 }
