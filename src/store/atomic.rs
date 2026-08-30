@@ -212,7 +212,7 @@ pub(crate) fn write_atomic_replace_seam(
 /// old content is still visible; the post-rename parent-directory stage
 /// converts a hook error (or a real open/fsync failure) into
 /// [`ReplaceOutcome::ReplacedDurabilityUnknown`] with the error carried.
-fn write_atomic_replace_impl(
+pub(crate) fn write_atomic_replace_impl(
     path: &Path,
     bytes: &[u8],
     fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
@@ -412,4 +412,38 @@ pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Recursively fsync a directory tree, deepest-first: every regular FILE's
+/// content is fsynced (its bytes are durable), then every DIRECTORY is
+/// fsynced bottom-up (each directory's own entries are durable), ending at
+/// the tree root. The caller then renames the tree into place (the rename
+/// makes the tree VISIBLE atomically) and fsyncs the PARENT of the final
+/// location (the rename itself durable) — together the staged-tree publish
+/// protocol's durability floor: a crash can never expose a tree whose
+/// files were not durable before the rename. Symlinks are SKIPPED (a
+/// symlink's durability is its directory entry, which the parent-dir fsync
+/// covers; opening it would follow it outside the tree).
+pub(crate) fn fsync_tree_recursive(path: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(path)
+        .map_err(|e| Error::store(format!("read_dir {}: {e}", path.display())))?
+    {
+        let entry = entry.map_err(|e| Error::store(format!("entry {}: {e}", path.display())))?;
+        let p = entry.path();
+        let ft = entry
+            .file_type()
+            .map_err(|e| Error::store(format!("file_type {}: {e}", p.display())))?;
+        if ft.is_dir() {
+            fsync_tree_recursive(&p)?;
+        } else if ft.is_file() {
+            let f = std::fs::File::open(&p)
+                .map_err(|e| Error::store(format!("open {}: {e}", p.display())))?;
+            f.sync_all()
+                .map_err(|e| Error::store(format!("fsync {}: {e}", p.display())))?;
+        }
+    }
+    let dir = std::fs::File::open(path)
+        .map_err(|e| Error::store(format!("open dir {}: {e}", path.display())))?;
+    dir.sync_all()
+        .map_err(|e| Error::store(format!("fsync dir {}: {e}", path.display())))
 }

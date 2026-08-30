@@ -6,14 +6,45 @@ use crate::error::{Error, Result};
 use crate::identity::SlotId;
 use crate::ledger::{ObservedSlot, ObservedTarget, ServerState};
 use crate::store::atomic::{ensure_private_dir, path_state, read_json};
-use crate::store::local::{LocalStore, write_json};
+use crate::store::local::LocalStore;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[cfg(test)]
 use crate::ledger::ObservedAssignment;
 #[cfg(test)]
+use crate::store::atomic::ReplaceStage;
+#[cfg(not(test))]
+use crate::store::local::write_json;
+#[cfg(test)]
+use crate::store::local::write_json_seam;
+#[cfg(test)]
 use crate::testutil::test_faults::FaultKind;
+
+/// TEST-ONLY: the per-stage fault kinds of a slot-observed record's atomic
+/// replacement (keyed by the slot id), mirroring the checkpoint's
+/// [`FaultKind::LedgerReplace*`] stage pattern.
+#[cfg(test)]
+fn observed_replace_kind(stage: ReplaceStage) -> FaultKind {
+    match stage {
+        ReplaceStage::Write => FaultKind::ObservedReplaceWrite,
+        ReplaceStage::Sync => FaultKind::ObservedReplaceSync,
+        ReplaceStage::Rename => FaultKind::ObservedReplaceRename,
+        ReplaceStage::DirSync => FaultKind::ObservedReplaceDirSync,
+    }
+}
+
+/// TEST-ONLY: the per-stage fault kinds of a server record's atomic
+/// replacement (keyed by the server id).
+#[cfg(test)]
+fn server_replace_kind(stage: ReplaceStage) -> FaultKind {
+    match stage {
+        ReplaceStage::Write => FaultKind::ServerReplaceWrite,
+        ReplaceStage::Sync => FaultKind::ServerReplaceSync,
+        ReplaceStage::Rename => FaultKind::ServerReplaceRename,
+        ReplaceStage::DirSync => FaultKind::ServerReplaceDirSync,
+    }
+}
 
 impl LocalStore {
     // ---- slots: the ONE physical observed state ---------------------------
@@ -66,6 +97,18 @@ impl LocalStore {
             .parent()
             .expect("a slot observed record always sits inside a slot directory");
         ensure_private_dir(dir)?;
+        // The mutable observed record is replaced ATOMICALLY (temp + fsync +
+        // chmod + rename + parent-dir fsync — see [`write_json`]), so a
+        // crash never leaves a torn record: the slot reads wholly-old or
+        // wholly-new. The test seam faults each replacement stage from the
+        // fixture's OWN registry (keyed by the slot id), so the
+        // crash-consistency property can force every stage.
+        #[cfg(test)]
+        {
+            let mut hook = self.replace_stage_hook(slot.as_str(), observed_replace_kind);
+            write_json_seam(&p, observed, &mut hook)
+        }
+        #[cfg(not(test))]
         write_json(&p, observed)
     }
 
@@ -171,6 +214,14 @@ impl LocalStore {
             .base
             .join("servers")
             .join(format!("{}.json", state.id.as_str()));
+        // The mutable server record is replaced ATOMICALLY (see [`write_json`]);
+        // the test seam faults each replacement stage keyed by the server id.
+        #[cfg(test)]
+        {
+            let mut hook = self.replace_stage_hook(state.id.as_str(), server_replace_kind);
+            write_json_seam(&p, state, &mut hook)
+        }
+        #[cfg(not(test))]
         write_json(&p, state)
     }
 

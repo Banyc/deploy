@@ -336,6 +336,91 @@ pub(crate) mod test_faults {
         /// (established, durability warning, sweep deferred), no sweep ran,
         /// and a retry recomputes the suffix + reachability and converges.
         LedgerReplaceDirSync,
+        /// The mutable SLOT-OBSERVED record's atomic replacement
+        /// (`slots/<slot-id>/observed.json`) — TEMP-WRITE stage (keyed by the
+        /// slot id). Fires before any I/O: the visible record is wholly OLD.
+        ObservedReplaceWrite,
+        /// The SLOT-OBSERVED record's atomic replacement — TEMP-FSYNC stage
+        /// (keyed by the slot id): an invisible dot-prefixed temp exists;
+        /// the visible record is wholly OLD.
+        ObservedReplaceSync,
+        /// The SLOT-OBSERVED record's atomic replacement — RENAME stage
+        /// (keyed by the slot id): the visible record is wholly OLD.
+        ObservedReplaceRename,
+        /// The SLOT-OBSERVED record's atomic replacement — PARENT-DIRECTORY
+        /// open/fsync stage (keyed by the slot id), fired AFTER the rename:
+        /// the new record IS visible but its durability is unconfirmed — the
+        /// writer downgrades the unknown-durability outcome to `Err` (fail
+        /// closed).
+        ObservedReplaceDirSync,
+        /// The mutable SERVER record's atomic replacement
+        /// (`servers/<id>.json`) — TEMP-WRITE stage (keyed by the server
+        /// id). The visible record is wholly OLD.
+        ServerReplaceWrite,
+        /// The SERVER record's atomic replacement — TEMP-FSYNC stage (keyed
+        /// by the server id). The visible record is wholly OLD.
+        ServerReplaceSync,
+        /// The SERVER record's atomic replacement — RENAME stage (keyed by
+        /// the server id). The visible record is wholly OLD.
+        ServerReplaceRename,
+        /// The SERVER record's atomic replacement — PARENT-DIRECTORY
+        /// open/fsync stage (keyed by the server id), fired AFTER the
+        /// rename: the new record IS visible but its durability is
+        /// unconfirmed — downgraded to `Err` (fail closed).
+        ServerReplaceDirSync,
+        /// The target's mutable retention-debt marker's atomic replacement
+        /// (`targets/<target>/retention-debt.json`) — TEMP-WRITE stage
+        /// (keyed by the target). The visible marker is wholly OLD.
+        RetentionDebtReplaceWrite,
+        /// The retention-debt marker's atomic replacement — TEMP-FSYNC
+        /// stage (keyed by the target). The visible marker is wholly OLD.
+        RetentionDebtReplaceSync,
+        /// The retention-debt marker's atomic replacement — RENAME stage
+        /// (keyed by the target). The visible marker is wholly OLD.
+        RetentionDebtReplaceRename,
+        /// The retention-debt marker's atomic replacement — PARENT-DIRECTORY
+        /// open/fsync stage (keyed by the target), fired AFTER the rename:
+        /// the new marker IS visible but its durability is unconfirmed —
+        /// downgraded to `Err` (fail closed).
+        RetentionDebtReplaceDirSync,
+        /// The store-global sweep-debt marker's atomic replacement
+        /// (`<base>/sweep-debt.json`) — TEMP-WRITE stage (keyed by the
+        /// empty global key). The visible marker is wholly OLD.
+        SweepDebtReplaceWrite,
+        /// The sweep-debt marker's atomic replacement — TEMP-FSYNC stage
+        /// (keyed by the empty global key). The visible marker is wholly
+        /// OLD.
+        SweepDebtReplaceSync,
+        /// The sweep-debt marker's atomic replacement — RENAME stage (keyed
+        /// by the empty global key). The visible marker is wholly OLD.
+        SweepDebtReplaceRename,
+        /// The sweep-debt marker's atomic replacement — PARENT-DIRECTORY
+        /// open/fsync stage (keyed by the empty global key), fired AFTER the
+        /// rename: the new marker IS visible but its durability is
+        /// unconfirmed — downgraded to `Err` (fail closed).
+        SweepDebtReplaceDirSync,
+        /// The immutable tree-object STAGED PUBLISH ([`LocalStore::store_object`])
+        /// — STAGING-COPY stage (keyed by the digest): fires before any copy
+        /// into the unique staging dir; the final object location is wholly
+        /// ABSENT (at most a disposable dot-prefixed staging dir).
+        StoreObjectCopy,
+        /// The tree-object staged publish — STAGED-TREE FSYNC stage (keyed
+        /// by the digest): fires after the complete staged tree was verified,
+        /// before its recursive fsync; the final object location is wholly
+        /// ABSENT.
+        StoreObjectSync,
+        /// The tree-object staged publish — PUBLISH-RENAME stage (keyed by
+        /// the digest): fires after the staged tree was synced, before the
+        /// atomic rename into the final location; the final object location
+        /// is wholly ABSENT (a retry re-stages, never refuses a partial).
+        StoreObjectRename,
+        /// The tree-object staged publish — PARENT-DIRECTORY open/fsync
+        /// stage (keyed by the digest), fired AFTER the atomic publish
+        /// rename: the object IS wholly present under its final name but its
+        /// durability is unconfirmed — the publish PROPAGATES the failure
+        /// (never reports durable success for an unsynced directory entry);
+        /// a retry reuses the whole published object.
+        StoreObjectDirSync,
         /// The checkpoint sweep's DEPLOYMENT-DIR stage (keyed by target),
         /// fired at the stage's entry: no deployment dir is deleted and the
         /// report says sweep retry-required.

@@ -4,10 +4,19 @@
 
 use crate::error::{Error, Result};
 use crate::identity::{DeploymentId, TargetName};
-use crate::store::atomic::{path_state, read_json};
-use crate::store::local::{LocalStore, write_json};
+use crate::store::atomic::{path_state, read_json, sync_parent_dir};
+use crate::store::local::LocalStore;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+
+#[cfg(test)]
+use crate::store::atomic::ReplaceStage;
+#[cfg(not(test))]
+use crate::store::local::write_json;
+#[cfg(test)]
+use crate::store::local::write_json_seam;
+#[cfg(test)]
+use crate::testutil::test_faults::FaultKind;
 
 /// THE TYPED, two-state store-global sweep-debt marker (`<base>/sweep-debt.json`).
 /// The checkpoint's best-effort GLOBAL sweep is POST-COMMIT maintenance: an
@@ -53,8 +62,30 @@ pub enum SweepDebt {
     },
 }
 
+/// TEST-ONLY: the per-stage fault kinds of a retention-debt marker's atomic
+/// replacement (keyed by the target), mirroring the checkpoint's
+/// [`FaultKind::LedgerReplace*`] stage pattern.
 #[cfg(test)]
-use crate::testutil::test_faults::FaultKind;
+fn retention_debt_replace_kind(stage: ReplaceStage) -> FaultKind {
+    match stage {
+        ReplaceStage::Write => FaultKind::RetentionDebtReplaceWrite,
+        ReplaceStage::Sync => FaultKind::RetentionDebtReplaceSync,
+        ReplaceStage::Rename => FaultKind::RetentionDebtReplaceRename,
+        ReplaceStage::DirSync => FaultKind::RetentionDebtReplaceDirSync,
+    }
+}
+
+/// TEST-ONLY: the per-stage fault kinds of the store-global sweep-debt
+/// marker's atomic replacement (keyed by the empty global key).
+#[cfg(test)]
+fn sweep_debt_replace_kind(stage: ReplaceStage) -> FaultKind {
+    match stage {
+        ReplaceStage::Write => FaultKind::SweepDebtReplaceWrite,
+        ReplaceStage::Sync => FaultKind::SweepDebtReplaceSync,
+        ReplaceStage::Rename => FaultKind::SweepDebtReplaceRename,
+        ReplaceStage::DirSync => FaultKind::SweepDebtReplaceDirSync,
+    }
+}
 
 impl LocalStore {
     // ---- retention maintenance debt ---------------------------------------
@@ -123,14 +154,26 @@ impl LocalStore {
         if debt.is_empty() {
             // Tri-state removal decision: a genuine NotFound is nothing to
             // remove; any other stat error propagates (an unreadable marker
-            // must not silently survive as a stale "debt" record).
+            // must not silently survive as a stale "debt" record). The
+            // removal is made DURABLE before returning (a removal is a
+            // directory-entry change; never report success while the entry
+            // is unsynced).
             if path_state(&p)? {
                 std::fs::remove_file(&p).map_err(|e| {
                     Error::store(format!("remove retention debt {}: {e}", p.display()))
                 })?;
+                sync_parent_dir(&p)?;
             }
             return Ok(());
         }
+        // The mutable debt marker is replaced ATOMICALLY (see [`write_json`]);
+        // the test seam faults each replacement stage keyed by the target.
+        #[cfg(test)]
+        {
+            let mut hook = self.replace_stage_hook(target, retention_debt_replace_kind);
+            write_json_seam(&p, debt, &mut hook)
+        }
+        #[cfg(not(test))]
         write_json(&p, debt)
     }
 
@@ -191,14 +234,29 @@ impl LocalStore {
                 // Tri-state removal decision: a genuine NotFound is nothing
                 // to remove; any other stat error propagates (an unreadable
                 // marker must not silently survive as a stale "debt" record).
+                // The removal is made DURABLE before returning (a removal is
+                // a directory-entry change; never report success while the
+                // entry is unsynced).
                 if path_state(&p)? {
                     std::fs::remove_file(&p).map_err(|e| {
                         Error::store(format!("remove sweep debt {}: {e}", p.display()))
                     })?;
+                    sync_parent_dir(&p)?;
                 }
                 Ok(())
             }
-            Some(d) => write_json(&p, d),
+            Some(d) => {
+                // The mutable sweep-debt marker is replaced ATOMICALLY (see
+                // [`write_json`]); the test seam faults each replacement
+                // stage keyed by the empty global key.
+                #[cfg(test)]
+                {
+                    let mut hook = self.replace_stage_hook("", sweep_debt_replace_kind);
+                    write_json_seam(&p, d, &mut hook)
+                }
+                #[cfg(not(test))]
+                write_json(&p, d)
+            }
         }
     }
 }
