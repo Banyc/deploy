@@ -73,7 +73,12 @@ impl ExecutionOutcome {
 
     /// THE FAILED TERMINAL INPUTS: the executions → the STRUCTURAL DOMAIN
     /// outcomes ([`SlotOutcome`]) the kernel's decision consumes, with the
-    /// post-mutation OBSERVATION attached per state:
+    /// post-mutation OBSERVATION attached per state — PLUS the
+    /// ADAPTER-RESTORATION EVIDENCE (the review's P1 fix): the slots whose
+    /// adapter side effects were VERIFIED restored, carrying the sealed
+    /// proof extracted from the `Restored` executions. The kernel refuses a
+    /// rolled-back classification for a `Restored` outcome without this
+    /// evidence.
     ///
     /// * `Advanced` / `Restored` / `FailedAfterAdvance` carry their RECORDED
     ///   swap-result observation (the deployment's generation / the restored
@@ -82,45 +87,73 @@ impl ExecutionOutcome {
     ///   LIVE post-mutation observation (the never-advanced rule — the
     ///   actual observed post-state, never the desired generation; a failed
     ///   read is `Unknown`, never read as "unchanged").
-    pub(crate) fn failure_outcomes(&self) -> Result<BTreeMap<SlotId, SlotOutcome>> {
+    pub(crate) fn failure_evidence(&self) -> Result<FailureEvidence> {
         let live = |sid: &SlotId| {
             self.actual_observations
                 .get(sid)
                 .cloned()
                 .unwrap_or(Observation::KnownAbsent)
         };
-        self.executions
-            .iter()
-            .map(|(sid, e)| {
-                let outcome = match e {
-                    SlotExecution::NotStarted => SlotOutcome::Skipped {
-                        observation: live(sid),
-                    },
-                    SlotExecution::FailedBeforeAdvance { .. } => SlotOutcome::FailedBeforeAdvance {
-                        observation: live(sid),
-                        error: e.failed_error().map(str::to_string),
-                    },
-                    SlotExecution::Advanced { observation, .. } => SlotOutcome::Activated {
+        let mut outcomes = BTreeMap::new();
+        let mut adapter_restored = BTreeMap::new();
+        for (sid, e) in self.executions.iter() {
+            let outcome = match e {
+                SlotExecution::NotStarted => SlotOutcome::Skipped {
+                    observation: live(sid),
+                },
+                SlotExecution::FailedBeforeAdvance { .. } => SlotOutcome::FailedBeforeAdvance {
+                    observation: live(sid),
+                    error: e.failed_error().map(str::to_string),
+                },
+                SlotExecution::Advanced { observation, .. } => SlotOutcome::Activated {
+                    observation: observation.clone(),
+                },
+                SlotExecution::Restored {
+                    observation,
+                    adapter_restored: proof,
+                } => {
+                    // The sealed proof rides the outcome evidence: only a
+                    // VERIFIED adapter restoration makes this slot
+                    // rolled-back-eligible.
+                    adapter_restored.insert(sid.clone(), proof.clone());
+                    SlotOutcome::Restored {
                         observation: observation.clone(),
-                    },
-                    SlotExecution::Restored { observation } => SlotOutcome::Restored {
-                        observation: observation.clone(),
-                    },
-                    SlotExecution::FailedAfterAdvance {
-                        observation, error, ..
-                    } => SlotOutcome::FailedAfterAdvance {
-                        observation: observation.clone(),
-                        error: error.clone(),
-                    },
-                    SlotExecution::Indeterminate { .. } => SlotOutcome::Indeterminate {
-                        observation: live(sid),
-                        error: e.failed_error().map(str::to_string),
-                    },
-                };
-                Ok((sid.clone(), outcome))
-            })
-            .collect()
+                    }
+                }
+                SlotExecution::FailedAfterAdvance {
+                    observation, error, ..
+                } => SlotOutcome::FailedAfterAdvance {
+                    observation: observation.clone(),
+                    error: error.clone(),
+                },
+                SlotExecution::Indeterminate { .. } => SlotOutcome::Indeterminate {
+                    observation: live(sid),
+                    error: e.failed_error().map(str::to_string),
+                },
+            };
+            outcomes.insert(sid.clone(), outcome);
+        }
+        Ok(FailureEvidence {
+            outcomes,
+            adapter_restored,
+        })
     }
+}
+
+/// THE FAILED TERMINAL EVIDENCE (the review's P1 fix): the per-slot domain
+/// outcomes AND the ADAPTER-RESTORATION EVIDENCE — the slots whose adapter
+/// side effects were VERIFIED restored, carrying the sealed proof
+/// ([`VerifiedAdapterRestoration`]) extracted from the `Restored`
+/// executions. The kernel's rolled-back decision ([`decide_terminal`])
+/// refuses a `Restored` outcome without its proof: a slot whose generation
+/// delta is `Unchanged` but whose adapter side effect was NOT verified
+/// restored can never silently classify as rolled back.
+///
+/// [`decide_terminal`]: crate::kernel::transition::decide_terminal
+pub(crate) struct FailureEvidence {
+    pub(crate) outcomes: BTreeMap<SlotId, SlotOutcome>,
+    pub(crate) adapter_restored:
+        BTreeMap<SlotId, crate::verify::adapters::transaction::VerifiedAdapterRestoration>,
 }
 
 /// Run every mutation phase (steps 10-15), in the numbered order. The batch

@@ -16,6 +16,7 @@ use crate::config::SlotConfig;
 use crate::deploy::push::slot_vars;
 use crate::deploy::rollout::SlotExecution;
 use crate::deploy::rollout::compensate_server;
+use crate::deploy::rollout::server::CompensationOutcome;
 use crate::error::Result;
 use crate::identity::DeploymentId;
 use crate::identity::GenerationId;
@@ -97,21 +98,30 @@ pub(crate) fn apply_failure_policy(
                         advanced_gen: new_gen[sid].clone(),
                         template_vars: vars.clone(),
                     };
-                    let ok = compensate_server(&helpers[sid], &request).unwrap_or_default();
-                    if ok {
+                    let comp = compensate_server(&helpers[sid], &request)
+                        .unwrap_or(CompensationOutcome::Refused);
+                    if let CompensationOutcome::Restored { adapter_restored } = comp {
                         // Compensation is a TRANSITION between states: the
                         // compensated slot becomes `Restored` with the
                         // restored generation's observation (the observed
                         // post-state the decision compares against pre_push —
                         // the old flat wire kept the DESIRED generation here,
-                        // which would classify an uncompensated slot).
+                        // which would classify an uncompensated slot). The
+                        // slot is rolled-back-eligible ONLY with the
+                        // VERIFIED-adapter-restoration proof the compensation
+                        // produced (the review's P1 fix: a generation-delta
+                        // `Unchanged` alone cannot see the unit file left in
+                        // the new state).
                         let observation = match prior {
                             Some(g) => Observation::Known(ObservedGeneration {
                                 generation: g.clone(),
                             }),
                             None => Observation::KnownAbsent,
                         };
-                        *execution = SlotExecution::Restored { observation };
+                        *execution = SlotExecution::Restored {
+                            observation,
+                            adapter_restored,
+                        };
                     }
                     // A failed compensation leaves the execution as-is
                     // (`Advanced` keeps the bookkeeping error — the demotion

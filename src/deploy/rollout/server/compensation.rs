@@ -1,6 +1,7 @@
 //! Per-slot prior-generation restore: [`compensate_server`] re-installs the
 //! previous generation on a slot whose swap/activate failed.
 
+use crate::config::Activation;
 use crate::error::Error;
 use crate::error::Result;
 use crate::identity::DeploymentId;
@@ -8,8 +9,8 @@ use crate::identity::GenerationId;
 use crate::identity::OperationId;
 use crate::remote::helper::HeldSlotLock;
 use crate::remote::layout;
+use crate::verify::adapters::transaction::VerifiedAdapterRestoration;
 use crate::verify::command::run_verification;
-use crate::verify::systemd::run_activation;
 
 // PER-SLOT COMPENSATION (A1 step 11): restore the prior generation after a
 // failed activation/verification (or remove `current` on a first deploy),
@@ -18,6 +19,18 @@ use crate::verify::systemd::run_activation;
 // the failed push advanced (compare-and-swap). Consumed by the per-server
 // process ([`process_server`]) and by the
 // failure-policy pass (failure section).
+//
+// THE ADAPTER-RESTORATION EVIDENCE (the review's P1 fix): the compensation
+// is complete ONLY when the mutating adapter's side effects are VERIFIED
+// restored — the installed units are READ BACK against the prior contract's
+// rendered content (and any advanced-only unit is proven absent) via
+// [`verify_adapter_restored`](crate::verify::systemd::verify_adapter_restored),
+// producing the sealed
+// [`VerifiedAdapterRestoration`](crate::verify::adapters::transaction::VerifiedAdapterRestoration)
+// proof the [`CompensationOutcome::Restored`] carries. A slot whose adapter
+// restoration is NOT verified is `Refused` (the slot stays on the advanced
+// generation → `FailedAfterAdvance` → Degraded), never a rolled-back
+// candidate.
 
 /// Pure input data for compensation. The helper, transport and remote root
 /// are derived from the held guard — never passed independently.
@@ -31,6 +44,52 @@ pub(crate) struct CompensationRequest {
     pub template_vars: crate::remote::canonical::TemplateVars,
 }
 
+/// THE COMPENSATION OUTCOME: either the slot was FULLY restored — the
+/// GENERATION (CAS back to the prior generation / removed on a first
+/// deploy) AND the adapter's side effects, with the VERIFIED-adapter-
+/// restoration proof ([`VerifiedAdapterRestoration`]) — or the compensation
+/// REFUSED (current no longer names the advanced generation, the prior
+/// contract is unavailable, or any restore step failed / was NOT verified:
+/// the slot stays on the advanced generation). The OLD `bool` is GONE: a
+/// "restored" compensation must PROVE the adapter restoration, not just
+/// claim it.
+pub(crate) enum CompensationOutcome {
+    /// The slot was fully restored; `adapter_restored` is the sealed proof
+    /// (produced by a successful READ-BACK verification of the adapter's
+    /// restored side effects).
+    Restored {
+        adapter_restored: VerifiedAdapterRestoration,
+    },
+    /// The compensation refused (CAS failure / unverified restoration): the
+    /// slot stays on the advanced generation.
+    Refused,
+}
+
+/// Load the behavior contract of a generation's stored assignment (its
+/// release + variant) — used to learn the ADVANCED contract's declared units
+/// (the side effects a compensation back to the PRIOR state must remove and
+/// verify absent).
+fn load_generation_behavior(
+    helper: &crate::remote::helper::RemoteHelper,
+    gid: &str,
+) -> Result<crate::identity::BehaviorContract> {
+    let assignment = helper.read_assignment(gid).map_err(|e| {
+        Error::remote(format!(
+            "compensation: read assignment of '{gid}' failed: {e}"
+        ))
+    })?;
+    helper
+        .read_behavior(
+            &assignment.artifact.release,
+            assignment.artifact.variant.as_str(),
+        )
+        .map_err(|e| {
+            Error::remote(format!(
+                "compensation: behavior of '{gid}' unavailable: {e}"
+            ))
+        })
+}
+
 /// Restore the prior generation (or remove `current` on first deploy). Uses the
 /// prior generation's stored behavior contract rather than the caller's current
 /// configuration. `advanced_gen` is the generation this slot was just advanced
@@ -38,11 +97,13 @@ pub(crate) struct CompensationRequest {
 /// controller cannot have its `current` clobbered. `template_vars` supplies the
 /// slot context (deploy_dir, application, ...); the VARIANT is overridden with
 /// the prior assignment's variant, because compensation re-runs the PRIOR
-/// generation's contract. Returns true if compensation restored prior state.
+/// generation's contract. Returns the compensation outcome: a FULL restoration
+/// (generation + ADAPTER side effects, the latter VERIFIED by a read-back)
+/// or a refusal — never a bare "true".
 pub(crate) fn compensate_server_locked(
     held: &HeldSlotLock<'_>,
     request: &CompensationRequest,
-) -> Result<bool> {
+) -> Result<CompensationOutcome> {
     let helper = held.helper();
     let remote = helper.remote();
     match &request.prior_gen {
@@ -50,7 +111,7 @@ pub(crate) fn compensate_server_locked(
             // Load the prior generation's behavior contract from the remote.
             let prior_assignment = match helper.read_assignment(prior.as_str()) {
                 Ok(a) => a,
-                Err(_) => return Ok(false),
+                Err(_) => return Ok(CompensationOutcome::Refused),
             };
             // Load the prior generation's behavior contract from the remote. If it
             // is unavailable we cannot verify what we are restoring, so we must
@@ -77,7 +138,7 @@ pub(crate) fn compensate_server_locked(
                 )
                 .is_err()
             {
-                return Ok(false);
+                return Ok(CompensationOutcome::Refused);
             }
             let root = remote
                 .root()
@@ -93,34 +154,96 @@ pub(crate) fn compensate_server_locked(
             // combination (e.g. the prior variant with the desired release, or
             // the prior artifact with the failed generation's deployment id).
             let prior_vars = request.template_vars.with_assignment(&prior_assignment);
-            run_activation(remote, &root, &prior_behavior.activation, &prior_vars)
-                .map_err(|e| Error::remote(format!("compensation activation failed: {e}")))?;
+            // THE ADAPTER-RESTORATION EVIDENCE (the review's P1 fix): the
+            // advanced contract's units that the prior contract does not
+            // declare must be REMOVED (the prior state has them ABSENT) and
+            // the prior units VERIFIED back at their rendered content — the
+            // sealed proof a `Restored` execution must carry. The unit-file
+            // restore runs BEFORE the prior verification health check.
+            let advanced_behavior =
+                load_generation_behavior(helper, request.advanced_gen.as_str())?;
+            let advanced_units =
+                crate::verify::systemd::declared_user_units(&advanced_behavior.activation);
+            let prior_units =
+                crate::verify::systemd::declared_user_units(&prior_behavior.activation);
+            let advanced_only_units: Vec<String> = advanced_units
+                .iter()
+                .filter(|n| !prior_units.iter().any(|p| p == *n))
+                .cloned()
+                .collect();
+            crate::verify::systemd::restore_adapter_to(
+                remote,
+                &root,
+                &prior_behavior.activation,
+                &prior_vars,
+                &advanced_only_units,
+            )
+            .map_err(|e| Error::remote(format!("compensation adapter restore failed: {e}")))?;
+            let adapter_restored = crate::verify::systemd::verify_adapter_restored(
+                remote,
+                &root,
+                &prior_behavior.activation,
+                &prior_vars,
+                &advanced_only_units,
+            )
+            .map_err(|e| {
+                Error::remote(format!("compensation adapter restore NOT verified: {e}"))
+            })?;
             run_verification(remote, &prior_behavior.verification, &prior_vars)
                 .map_err(|e| Error::remote(format!("compensation verification failed: {e}")))?;
-            Ok(true)
+            Ok(CompensationOutcome::Restored { adapter_restored })
         }
         None => {
             // First deploy: remove `current` only if it still points at the
             // generation we advanced (compare-and-swap style).
-            Ok(held
+            if !held
                 .remove_current_if(&crate::remote::helper::ExpectedCurrent::Generation(
                     request.advanced_gen.clone(),
                 ))
-                .unwrap_or(false))
+                .unwrap_or(false)
+            {
+                return Ok(CompensationOutcome::Refused);
+            }
+            // THE ADAPTER-RESTORATION EVIDENCE: the prior adapter state of a
+            // first deploy is ABSENT — the advanced contract's installed units
+            // are removed and their absence VERIFIED by reading the remote.
+            let advanced_behavior =
+                load_generation_behavior(helper, request.advanced_gen.as_str())?;
+            let advanced_units =
+                crate::verify::systemd::declared_user_units(&advanced_behavior.activation);
+            crate::verify::systemd::restore_adapter_to(
+                remote,
+                remote.root(),
+                &Activation::None,
+                &request.template_vars,
+                &advanced_units,
+            )
+            .map_err(|e| Error::remote(format!("compensation adapter restore failed: {e}")))?;
+            let adapter_restored = crate::verify::systemd::verify_adapter_restored(
+                remote,
+                remote.root(),
+                &Activation::None,
+                &request.template_vars,
+                &advanced_units,
+            )
+            .map_err(|e| {
+                Error::remote(format!("compensation adapter restore NOT verified: {e}"))
+            })?;
+            Ok(CompensationOutcome::Restored { adapter_restored })
         }
     }
 }
 
 /// External wrapper: acquires the slot mutation lock ONCE, calls
 /// `compensate_server_locked`, and drops the guard at the end. An acquire
-/// failure is swallowed as `Ok(false)` (slot stays advanced → attempt Degraded).
+/// failure is swallowed as `Refused` (slot stays advanced → attempt Degraded).
 pub(crate) fn compensate_server(
     helper: &crate::remote::helper::RemoteHelper,
     request: &CompensationRequest,
-) -> Result<bool> {
+) -> Result<CompensationOutcome> {
     let guard = match helper.acquire_lock_guard(&request.op_id) {
         Ok(g) => g,
-        Err(_) => return Ok(false),
+        Err(_) => return Ok(CompensationOutcome::Refused),
     };
     compensate_server_locked(&guard, request)
 }
@@ -253,8 +376,10 @@ mod compensation_tests {
                 advanced_gen: first_gen.clone(),
                 template_vars: desired_vars,
             };
-            let ok = compensate_server(&helper, &request).map_err(|e| e.to_string())?;
-            assert!(ok, "compensation must restore the prior generation");
+            let outcome = compensate_server(&helper, &request).map_err(|e| e.to_string())?;
+            let CompensationOutcome::Restored { .. } = outcome else {
+                return Err("compensation must restore the prior generation (verified)".into());
+            };
 
             // The installed unit was re-rendered with the PRIOR assignment:
             // its own immutable release id, variant, tree, AND the prior
@@ -432,9 +557,9 @@ mod compensation_tests {
             advanced_gen: g2.clone(),
             template_vars: vars,
         };
-        let ok = compensate_server(&helper, &request).unwrap();
+        let outcome = compensate_server(&helper, &request).unwrap();
         assert!(
-            !ok,
+            matches!(outcome, CompensationOutcome::Refused),
             "compensation must refuse when current no longer names the advanced generation"
         );
         // The foreign current (g3) survives untouched.

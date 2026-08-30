@@ -19,11 +19,29 @@
 // is the intended no-op), so the old `if cfg.adapter != "systemd" { return
 // Ok(()) }` silent no-op on unknown adapter names is structurally gone — an
 // unknown adapter cannot construct an [`Activation`] in the first place.
+//
+// # THE ADAPTER TRANSACTION (the review's P1 fix)
+//
+// The systemd adapter is the MUTATING adapter: its apply installs unit
+// files, enables and restarts services — persistent side effects OUTSIDE
+// the generation pointer. It implements the
+// [`ActivationTransaction`](crate::verify::adapters::transaction::ActivationTransaction)
+// protocol (prepare/apply/restore/verify_restored): `prepare` captures the
+// PRIOR live unit state (the undo record) and stages the rendered units,
+// `apply` installs/enables/restarts, `restore` reverses the side effects
+// back to the captured prior state (prior content / enabled / running), and
+// `verify_restored` RE-READS the remote (the installed unit files / the
+// active state) — the ONLY producer of the sealed
+// [`VerifiedAdapterRestoration`](crate::verify::adapters::transaction::VerifiedAdapterRestoration)
+// proof. The engine runs the adapter through this protocol: on an apply
+// failure it calls `restore` + `verify_restored`, and only a VERIFIED
+// restoration classifies the slot `Restored` — never "we called restore".
 use crate::config::activation::validate_unit_name;
 use crate::config::{Activation, ActivationScope, ValidatedSystemd, validate_relative_path};
 use crate::error::{Error, Result};
 use crate::remote::canonical::TemplateVars;
 use crate::remote::transport::Remote;
+use crate::verify::adapters::transaction::{ActivationTransaction, VerifiedAdapterRestoration};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -33,6 +51,14 @@ use std::time::Duration;
 /// `adapters/systemd.json` state file (a file and a directory can coexist
 /// under `adapters/`).
 const RENDERED_UNITS_DIR: &str = "adapters/systemd";
+
+/// Remote-root-relative directory where the PRIOR unit content is staged
+/// during [`restore`](SystemdActivation::restore) before being installed
+/// back over the unit link (the prior content was captured by `prepare` and
+/// lives only in the controller's memory, so restore re-materializes it on
+/// the remote). Distinct from [`RENDERED_UNITS_DIR`] so the prior content
+/// never collides with the rendered units `apply` staged.
+const RESTORE_UNITS_DIR: &str = "adapters/systemd-restore";
 
 /// Resolve the XDG configuration home base from explicit variables.
 ///
@@ -187,18 +213,25 @@ pub fn activation_commands(
     cmds
 }
 
-/// Render every declared unit's artifact content with the slot context and
-/// stage the rendered REGULAR FILE under the remote root
-/// (`adapters/systemd/<unit>`). The subsequent `cp` in
-/// [`activation_commands`] installs the rendered copy into the user service
-/// manager directory. A template error (unknown variable, malformed syntax)
-/// fails loudly here, before any command runs.
-pub fn stage_rendered_units(
+/// One declared unit's RENDERED content (the bytes `apply` installs and
+/// `verify_restored`/`verify_adapter_restored` compare the installed file
+/// against).
+pub(crate) struct RenderedUnit {
+    pub(crate) name: String,
+    pub(crate) content: Vec<u8>,
+}
+
+/// Render every declared unit's artifact content with the slot context —
+/// the bytes the unit file must contain after the adapter's apply (and the
+/// expected bytes a restore/compensation must reproduce). A template error
+/// (unknown variable, malformed syntax) fails loudly here, before any
+/// command runs.
+pub(crate) fn render_units(
     remote: &dyn Remote,
     generation_root: &Path,
     sa: &ValidatedSystemd,
     vars: &TemplateVars,
-) -> Result<()> {
+) -> Result<Vec<RenderedUnit>> {
     // `generation_root` is an absolute host path (`remote.root()` joined with
     // the generation layout); the transport's read/write surface is anchored
     // at the remote root, so strip the root prefix back off.
@@ -209,6 +242,7 @@ pub fn stage_rendered_units(
             remote.root().display()
         ))
     })?;
+    let mut out = Vec::new();
     for u in &sa.units {
         let src = gen_rel.join(&u.artifact_path);
         let raw = remote.read(&src).map_err(|e| {
@@ -225,9 +259,30 @@ pub fn stage_rendered_units(
                 u.name, u.artifact_path
             ))
         })?;
+        out.push(RenderedUnit {
+            name: u.name.clone(),
+            content: rendered.as_bytes().to_vec(),
+        });
+    }
+    Ok(out)
+}
+
+/// Render every declared unit's artifact content with the slot context and
+/// stage the rendered REGULAR FILE under the remote root
+/// (`adapters/systemd/<unit>`). The subsequent `cp` in
+/// [`activation_commands`] installs the rendered copy into the user service
+/// manager directory. A template error (unknown variable, malformed syntax)
+/// fails loudly here, before any command runs.
+pub fn stage_rendered_units(
+    remote: &dyn Remote,
+    generation_root: &Path,
+    sa: &ValidatedSystemd,
+    vars: &TemplateVars,
+) -> Result<()> {
+    for u in render_units(remote, generation_root, sa, vars)? {
         let dest = Path::new(RENDERED_UNITS_DIR).join(&u.name);
         remote
-            .write(&dest, rendered.as_bytes(), 0o644)
+            .write(&dest, &u.content, 0o644)
             .map_err(|e| Error::remote(format!("stage rendered unit '{}': {e}", u.name)))?;
     }
     Ok(())
@@ -266,6 +321,14 @@ pub fn validate_artifact_paths(
 /// (the source of each unit's artifact content); `vars` is the slot context
 /// ([`TemplateVars::slot`]) whose `deploy_dir`/`variant`/... are substituted
 /// into the unit content and any templated argv.
+///
+/// The adapter is run through its TRANSACTION protocol (`SystemdActivation`:
+/// `prepare` — validate + capture the prior state + stage — then `apply` —
+/// install/enable/restart + state record). The engine's
+/// per-slot flow drives the transaction itself (so a failed apply can be
+/// reversed + verified); this entry point is the adapter's plain
+/// "activate" call used by the compensation paths that re-run a prior
+/// contract.
 pub fn run_activation(
     remote: &dyn Remote,
     generation_root: &Path,
@@ -276,42 +339,603 @@ pub fn run_activation(
     // `None` variant is the DELIBERATE no-op of `adapter = "none"`. There is
     // no other arm: an unknown adapter cannot construct an [`Activation`], so
     // an unsupported adapter can never silently skip activation here.
-    let Activation::Systemd(sa) = activation else {
-        return Ok(());
+    let mut txn = match SystemdActivation::new(remote, generation_root, activation, vars) {
+        Some(t) => t,
+        None => return Ok(()),
     };
-    // Validate every declared unit name and artifact path before touching any
-    // remote state; a path traversal here would escape the generation root.
-    // (The config/record closed-enum boundary already validated these, so
-    // this is a defense-in-depth re-check for hand-built payloads.)
-    for u in &sa.units {
-        validate_unit_name(&u.name)?;
-        validate_relative_path(Path::new(&u.artifact_path))
-            .map_err(|e| Error::remote(format!("unit '{}' artifact path invalid: {e}", u.name)))?;
+    let prepared = txn.prepare()?;
+    txn.apply(&prepared)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// THE ADAPTER TRANSACTION (the review's P1 fix) — see the module docs.
+// ---------------------------------------------------------------------------
+
+/// THE ONE PRIOR-STATE RECORD of one unit, captured by [`SystemdActivation::prepare`]:
+/// the unit's live state BEFORE apply — what `restore` must reverse apply to
+/// and what `verify_restored` RE-READS to confirm.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UnitPriorState {
+    pub(crate) name: String,
+    /// The installed content before apply (`None` = the unit was ABSENT —
+    /// restore removes the installed unit, verify requires absence).
+    pub(crate) content: Option<Vec<u8>>,
+    /// Whether the unit was enabled before apply (restore re-enables /
+    /// disables back).
+    pub(crate) enabled: bool,
+}
+
+/// The `Prepared` state of the systemd transaction: the captured prior unit
+/// state — `apply`'s undo record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SystemdPrepared {
+    pub(crate) prior: Vec<UnitPriorState>,
+}
+
+/// The `Applied` state of the systemd transaction: the undo record survives
+/// the mutation so `restore` can reverse it. Also constructible from a
+/// `Prepared` when `apply` FAILED partway — `restore` only needs the captured
+/// prior state, so the engine reverses whatever apply may have installed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SystemdApplied {
+    pub(crate) prepared: SystemdPrepared,
+}
+
+impl SystemdApplied {
+    /// The engine builds the applied record from the prepared state when
+    /// `apply` failed partway: restore reverses "whatever apply may have
+    /// installed" back to the captured prior state, so the undo record is
+    /// fully contained in `Prepared`.
+    pub(crate) fn from_prepared(prepared: &SystemdPrepared) -> Self {
+        SystemdApplied {
+            prepared: prepared.clone(),
+        }
     }
-    // Render + stage the units BEFORE any command runs: a template error
-    // (unknown variable, malformed syntax) must fail activation loudly, never
-    // install a half-rendered unit or leave the previous unit in place.
-    if matches!(sa.scope, ActivationScope::User) {
-        stage_rendered_units(remote, generation_root, sa, vars)?;
+}
+
+/// The `Restored` state of the systemd transaction: the expected prior state
+/// `verify_restored` reads back against.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SystemdRestored {
+    pub(crate) expected: Vec<UnitPriorState>,
+}
+
+/// THE SYSTEMD ACTIVATION TRANSACTION: the mutating adapter's
+/// prepare→apply→restore→verify_restored discipline. `Activation::None`
+/// (no mutating adapter) has NO transaction — [`new`](Self::new) returns
+/// `None` for it.
+pub(crate) struct SystemdActivation<'a> {
+    remote: &'a dyn Remote,
+    /// The generation tree root the units render from (absolute, on the
+    /// remote host).
+    generation_root: PathBuf,
+    sa: &'a ValidatedSystemd,
+    vars: &'a TemplateVars,
+    /// The remote config base (resolved in `prepare` — needed for the unit
+    /// link paths in apply/restore/verify).
+    config_home: Option<PathBuf>,
+}
+
+impl<'a> SystemdActivation<'a> {
+    /// Build the transaction for the behavior's activation adapter: `None`
+    /// for `Activation::None` (no mutating adapter — nothing to transact).
+    pub(crate) fn new(
+        remote: &'a dyn Remote,
+        generation_root: &Path,
+        activation: &'a Activation,
+        vars: &'a TemplateVars,
+    ) -> Option<Self> {
+        let Activation::Systemd(sa) = activation else {
+            return None;
+        };
+        Some(SystemdActivation {
+            remote,
+            generation_root: generation_root.to_path_buf(),
+            sa,
+            vars,
+            config_home: None,
+        })
     }
-    // Resolve the unit directory base on the *remote* host, not the controller.
-    let config_home = resolve_remote_config_home(remote)?;
-    let cmds = activation_commands(remote.root(), &config_home, sa);
-    for argv in &cmds {
-        let outcome = remote.exec(argv, Duration::from_secs(30))?;
+}
+
+impl ActivationTransaction for SystemdActivation<'_> {
+    type Prepared = SystemdPrepared;
+    type Applied = SystemdApplied;
+    type Restored = SystemdRestored;
+
+    /// Validate every declared unit name and artifact path, capture the
+    /// PRIOR live unit state (the undo record), and stage the rendered units
+    /// — all BEFORE apply installs anything. A template error (unknown
+    /// variable, malformed syntax) fails loudly here, never after a
+    /// half-installed unit.
+    fn prepare(&mut self) -> Result<Self::Prepared> {
+        let sa = self.sa;
+        // Defense-in-depth re-check for hand-built payloads (the
+        // config/record closed-enum boundary already validated these): a
+        // path traversal here would escape the generation root.
+        for u in &sa.units {
+            validate_unit_name(&u.name)?;
+            validate_relative_path(Path::new(&u.artifact_path)).map_err(|e| {
+                Error::remote(format!("unit '{}' artifact path invalid: {e}", u.name))
+            })?;
+        }
+        // Resolve the unit directory base on the *remote* host, not the
+        // controller.
+        let config_home = resolve_remote_config_home(self.remote)?;
+        self.config_home = Some(config_home.clone());
+        let scope_user = matches!(sa.scope, ActivationScope::User);
+        let mut prior = Vec::new();
+        if scope_user {
+            for u in &sa.units {
+                let link = user_unit_link_for(&config_home, &u.name);
+                // The PRIOR installed content: a clean absence (`cat` exit
+                // != 0) is `None`; a transport failure is an error.
+                let content = match self.remote.exec(
+                    &["cat".into(), link.to_string_lossy().into_owned()],
+                    Duration::from_secs(30),
+                ) {
+                    Ok(out) if out.success() => Some(out.stdout.into_bytes()),
+                    Ok(_) => None,
+                    Err(e) => {
+                        return Err(Error::remote(format!("read prior unit '{}': {e}", u.name)));
+                    }
+                };
+                // The PRIOR enabled state (`systemctl --user is-enabled`; a
+                // missing/disabled/unreporting unit is treated as not
+                // enabled). Captured for RESTORE (enable/disable back) — the
+                // READ-BACK verification checks the unit FILE content.
+                let enabled = self
+                    .remote
+                    .exec(
+                        &[
+                            "systemctl".into(),
+                            "--user".into(),
+                            "is-enabled".into(),
+                            u.name.clone(),
+                        ],
+                        Duration::from_secs(30),
+                    )
+                    .map(|o| o.success() && enabledish(&o.stdout))
+                    .unwrap_or(false);
+                prior.push(UnitPriorState {
+                    name: u.name.clone(),
+                    content,
+                    enabled,
+                });
+            }
+        } else {
+            // System scope: restart-only, no installed files — the prior
+            // state is the unit NAMES (restore re-applies the restart; verify
+            // checks the ACTIVE state).
+            for u in &sa.units {
+                prior.push(UnitPriorState {
+                    name: u.name.clone(),
+                    content: None,
+                    enabled: false,
+                });
+            }
+        }
+        // Render + stage the units BEFORE any command runs (user scope only).
+        if scope_user {
+            stage_rendered_units(self.remote, &self.generation_root, sa, self.vars)?;
+        }
+        Ok(SystemdPrepared { prior })
+    }
+
+    /// Install/enable/restart the staged units and record the managed unit
+    /// links. A failure may be PARTIAL (some commands ran, some did not):
+    /// the engine still calls `restore` (against an `Applied` built from the
+    /// prepared undo record) to reverse whatever was installed.
+    fn apply(&mut self, prepared: &Self::Prepared) -> Result<Self::Applied> {
+        let sa = self.sa;
+        let config_home = self.config_home.as_ref().expect("prepare ran before apply");
+        let cmds = activation_commands(self.remote.root(), config_home, sa);
+        for argv in &cmds {
+            let outcome = self.remote.exec(argv, Duration::from_secs(30))?;
+            if !outcome.success() {
+                return Err(Error::remote(format!(
+                    "systemd activation command {:?} failed: {}",
+                    argv, outcome.stderr
+                )));
+            }
+        }
+        let managed: Vec<String> = sa.units.iter().map(|u| u.name.clone()).collect();
+        let payload = serde_json::json!({ "managed_units": managed });
+        let bytes = serde_json::to_vec_pretty(&payload)
+            .map_err(|e| Error::remote(format!("serialize systemd state: {e}")))?;
+        self.remote
+            .write(Path::new("adapters/systemd.json"), &bytes, 0o644)?;
+        Ok(SystemdApplied {
+            prepared: prepared.clone(),
+        })
+    }
+
+    /// Reverse the mutation: restore the PRIOR live unit state — prior
+    /// content (or removal when the unit was absent before), prior enabled
+    /// state, and a restart so the restored unit is the one running. For
+    /// system scope (restart-only, no persistent state) reversing the
+    /// transient restart is re-applying it.
+    fn restore(&mut self, applied: &Self::Applied) -> Result<Self::Restored> {
+        let sa = self.sa;
+        let config_home = self.config_home.as_ref().expect("prepare ran");
+        if matches!(sa.scope, ActivationScope::User) {
+            for p in &applied.prepared.prior {
+                let link = user_unit_link_for(config_home, &p.name);
+                match &p.content {
+                    Some(bytes) => {
+                        // Re-materialize the prior content under the remote
+                        // root and install it back over the unit link (the
+                        // link lies outside the remote root, so the install
+                        // goes through exec).
+                        let staged = Path::new(RESTORE_UNITS_DIR).join(&p.name);
+                        self.remote.write(&staged, bytes, 0o644).map_err(|e| {
+                            Error::remote(format!("stage prior unit '{}': {e}", p.name))
+                        })?;
+                        let abs = self.remote.root().join(&staged);
+                        let argv = [
+                            "install".to_string(),
+                            "-m".to_string(),
+                            "0644".to_string(),
+                            abs.to_string_lossy().into_owned(),
+                            link.to_string_lossy().into_owned(),
+                        ];
+                        let outcome = self.remote.exec(&argv, Duration::from_secs(30))?;
+                        if !outcome.success() {
+                            return Err(Error::remote(format!(
+                                "restore unit '{}' install failed: {}",
+                                p.name, outcome.stderr
+                            )));
+                        }
+                        // Enabled state back to prior.
+                        let act = if p.enabled { "enable" } else { "disable" };
+                        let outcome = self.remote.exec(
+                            &[
+                                "systemctl".into(),
+                                "--user".into(),
+                                act.into(),
+                                p.name.clone(),
+                            ],
+                            Duration::from_secs(30),
+                        )?;
+                        if !outcome.success() {
+                            return Err(Error::remote(format!(
+                                "restore unit '{}' {act} failed: {}",
+                                p.name, outcome.stderr
+                            )));
+                        }
+                    }
+                    None => {
+                        // The prior state had NO unit: remove the installed
+                        // one.
+                        let outcome = self.remote.exec(
+                            &[
+                                "rm".into(),
+                                "-f".into(),
+                                link.to_string_lossy().into_owned(),
+                            ],
+                            Duration::from_secs(30),
+                        )?;
+                        if !outcome.success() {
+                            return Err(Error::remote(format!(
+                                "restore: remove unit '{}' failed: {}",
+                                p.name, outcome.stderr
+                            )));
+                        }
+                    }
+                }
+            }
+            let outcome = self.remote.exec(
+                &["systemctl".into(), "--user".into(), "daemon-reload".into()],
+                Duration::from_secs(30),
+            )?;
+            if !outcome.success() {
+                return Err(Error::remote(format!(
+                    "restore: daemon-reload failed: {}",
+                    outcome.stderr
+                )));
+            }
+            // Re-apply the restored units (the service runs the prior
+            // content).
+            for p in &applied.prepared.prior {
+                if p.content.is_some() {
+                    let outcome = self.remote.exec(
+                        &[
+                            "systemctl".into(),
+                            "--user".into(),
+                            "restart".into(),
+                            p.name.clone(),
+                        ],
+                        Duration::from_secs(30),
+                    )?;
+                    if !outcome.success() {
+                        return Err(Error::remote(format!(
+                            "restore: restart '{}' failed: {}",
+                            p.name, outcome.stderr
+                        )));
+                    }
+                }
+            }
+            // Record the restored managed set (the prior units).
+            let managed: Vec<String> = applied
+                .prepared
+                .prior
+                .iter()
+                .map(|p| p.name.clone())
+                .collect();
+            let payload = serde_json::json!({ "managed_units": managed });
+            let bytes = serde_json::to_vec_pretty(&payload)
+                .map_err(|e| Error::remote(format!("serialize systemd state: {e}")))?;
+            self.remote
+                .write(Path::new("adapters/systemd.json"), &bytes, 0o644)?;
+        } else {
+            // System scope: no persistent state — reversing the restart is
+            // re-applying it.
+            let cmds = activation_commands(self.remote.root(), Path::new(""), sa);
+            for argv in &cmds {
+                let outcome = self.remote.exec(argv, Duration::from_secs(30))?;
+                if !outcome.success() {
+                    return Err(Error::remote(format!(
+                        "restore: systemd command {:?} failed: {}",
+                        argv, outcome.stderr
+                    )));
+                }
+            }
+        }
+        Ok(SystemdRestored {
+            expected: applied.prepared.prior.clone(),
+        })
+    }
+
+    /// RE-READ the remote and confirm the restoration took effect: the
+    /// installed unit file equals the prior content (or is absent when it
+    /// was absent before); system scope: the wrapper is ACTIVE. THE ONLY
+    /// producer of the sealed [`VerifiedAdapterRestoration`] proof — a
+    /// restore that did NOT take effect (content mismatch, a unit still
+    /// installed, an inactive wrapper) is refused here.
+    fn verify_restored(&self, restored: &Self::Restored) -> Result<VerifiedAdapterRestoration> {
+        let sa = self.sa;
+        let config_home = self.config_home.as_ref().expect("prepare ran");
+        if matches!(sa.scope, ActivationScope::User) {
+            for p in &restored.expected {
+                let link = user_unit_link_for(config_home, &p.name);
+                match &p.content {
+                    Some(bytes) => {
+                        let outcome = self
+                            .remote
+                            .exec(
+                                &["cat".into(), link.to_string_lossy().into_owned()],
+                                Duration::from_secs(30),
+                            )
+                            .map_err(|e| {
+                                Error::remote(format!("verify restored unit '{}': {e}", p.name))
+                            })?;
+                        if !outcome.success() || outcome.stdout.as_bytes() != bytes.as_slice() {
+                            return Err(Error::remote(format!(
+                                "verify restored: unit '{}' is not back at its prior content",
+                                p.name
+                            )));
+                        }
+                    }
+                    None => {
+                        let outcome = self
+                            .remote
+                            .exec(
+                                &[
+                                    "test".into(),
+                                    "!".into(),
+                                    "-e".into(),
+                                    link.to_string_lossy().into_owned(),
+                                ],
+                                Duration::from_secs(30),
+                            )
+                            .map_err(|e| {
+                                Error::remote(format!(
+                                    "verify restored unit '{}' absent: {e}",
+                                    p.name
+                                ))
+                            })?;
+                        if !outcome.success() {
+                            return Err(Error::remote(format!(
+                                "verify restored: unit '{}' is still installed (prior state: absent)",
+                                p.name
+                            )));
+                        }
+                    }
+                }
+            }
+        } else {
+            for p in &restored.expected {
+                let outcome = self
+                    .remote
+                    .exec(
+                        &["systemctl".into(), "is-active".into(), p.name.clone()],
+                        Duration::from_secs(30),
+                    )
+                    .map_err(|e| {
+                        Error::remote(format!("verify restored unit '{}': {e}", p.name))
+                    })?;
+                if !outcome.success() {
+                    return Err(Error::remote(format!(
+                        "verify restored: unit '{}' is not active",
+                        p.name
+                    )));
+                }
+            }
+        }
+        Ok(VerifiedAdapterRestoration::verified())
+    }
+}
+
+/// Parse a `systemctl is-enabled` output: the unit is ENABLED iff the
+/// output names an enabled state ("enabled", "enabled-runtime", ...); every
+/// other state (disabled, static, indirect, masked, not-found, or an
+/// empty/unparsable fake-shim output) is NOT enabled. Tolerant by design:
+/// the enabled state is captured for RESTORE (enable/disable back), while
+/// the READ-BACK verification checks the unit FILE content — the
+/// authoritative persistent fact.
+fn enabledish(stdout: &str) -> bool {
+    stdout.contains("enabled") && !stdout.contains("disabled")
+}
+
+/// The declared USER-SCOPE unit names of an activation contract — the only
+/// FILE-INSTALLED units (system scope only restarts a fixed root-owned
+/// wrapper; it installs nothing, so it has no removable file side effect).
+pub(crate) fn declared_user_units(activation: &Activation) -> Vec<String> {
+    let Activation::Systemd(sa) = activation else {
+        return Vec::new();
+    };
+    if !matches!(sa.scope, ActivationScope::User) {
+        return Vec::new();
+    }
+    sa.units.iter().map(|u| u.name.clone()).collect()
+}
+
+/// RESTORE the adapter side effects to the state the TARGET contract would
+/// install (the compensation-time restore — used when no transaction undo
+/// record exists, e.g. the failure-policy pass compensating an earlier
+/// batch's slot, or an activation `prepare` failure): run the target's
+/// activation (installs the target's units), then REMOVE any unit the
+/// ADVANCED contract installed that the target does not declare (the
+/// target's prior state has those units ABSENT). For `Activation::None`
+/// only the removals run.
+pub(crate) fn restore_adapter_to(
+    remote: &dyn Remote,
+    generation_root: &Path,
+    target: &Activation,
+    vars: &TemplateVars,
+    advanced_only_units: &[String],
+) -> Result<()> {
+    // Re-run the target's activation (installs the target's units).
+    run_activation(remote, generation_root, target, vars)?;
+    // Remove any advanced-only units (user scope only — they are the only
+    // file-installed side effects).
+    if !advanced_only_units.is_empty() {
+        let config_home = resolve_remote_config_home(remote)?;
+        for name in advanced_only_units {
+            let link = user_unit_link_for(&config_home, name);
+            let outcome = remote.exec(
+                &[
+                    "rm".into(),
+                    "-f".into(),
+                    link.to_string_lossy().into_owned(),
+                ],
+                Duration::from_secs(30),
+            )?;
+            if !outcome.success() {
+                return Err(Error::remote(format!(
+                    "restore: remove advanced unit '{name}' failed: {}",
+                    outcome.stderr
+                )));
+            }
+        }
+        let outcome = remote.exec(
+            &["systemctl".into(), "--user".into(), "daemon-reload".into()],
+            Duration::from_secs(30),
+        )?;
         if !outcome.success() {
             return Err(Error::remote(format!(
-                "systemd activation command {:?} failed: {}",
-                argv, outcome.stderr
+                "restore: daemon-reload failed: {}",
+                outcome.stderr
             )));
         }
     }
-    let managed: Vec<String> = sa.units.iter().map(|u| u.name.clone()).collect();
-    let payload = serde_json::json!({ "managed_units": managed });
-    let bytes = serde_json::to_vec_pretty(&payload)
-        .map_err(|e| Error::remote(format!("serialize systemd state: {e}")))?;
-    remote.write(Path::new("adapters/systemd.json"), &bytes, 0o644)?;
     Ok(())
+}
+
+/// VERIFY the adapter side effects are back at the state the TARGET
+/// contract would install (plus: every unit the ADVANCED contract installed
+/// that the target does not declare is ABSENT): RE-READ the remote — the
+/// installed unit files against the target's rendered content, the
+/// advanced-only units' absence, and (system scope) the active state. THE
+/// READ-BACK — the ONLY producer of the sealed
+/// [`VerifiedAdapterRestoration`] proof on the compensation paths.
+pub(crate) fn verify_adapter_restored(
+    remote: &dyn Remote,
+    generation_root: &Path,
+    target: &Activation,
+    vars: &TemplateVars,
+    advanced_only_units: &[String],
+) -> Result<VerifiedAdapterRestoration> {
+    let Activation::Systemd(sa) = target else {
+        // `Activation::None`: no mutating adapter — no persistent side
+        // effects to verify; the advanced-only units (if any) must be ABSENT.
+        if !advanced_only_units.is_empty() {
+            let config_home = resolve_remote_config_home(remote)?;
+            for name in advanced_only_units {
+                let link = user_unit_link_for(&config_home, name);
+                let outcome = remote.exec(
+                    &[
+                        "test".into(),
+                        "!".into(),
+                        "-e".into(),
+                        link.to_string_lossy().into_owned(),
+                    ],
+                    Duration::from_secs(30),
+                )?;
+                if !outcome.success() {
+                    return Err(Error::remote(format!(
+                        "verify restored: unit '{name}' is still installed (prior state: absent)"
+                    )));
+                }
+            }
+        }
+        return Ok(VerifiedAdapterRestoration::verified());
+    };
+    if matches!(sa.scope, ActivationScope::User) {
+        let config_home = resolve_remote_config_home(remote)?;
+        // Render the target's units: the EXPECTED installed content.
+        for u in render_units(remote, generation_root, sa, vars)? {
+            let link = user_unit_link_for(&config_home, &u.name);
+            let outcome = remote
+                .exec(
+                    &["cat".into(), link.to_string_lossy().into_owned()],
+                    Duration::from_secs(30),
+                )
+                .map_err(|e| Error::remote(format!("verify restored unit '{}': {e}", u.name)))?;
+            if !outcome.success() || outcome.stdout.as_bytes() != u.content.as_slice() {
+                return Err(Error::remote(format!(
+                    "verify restored: unit '{}' is not back at the prior content",
+                    u.name
+                )));
+            }
+        }
+        // The advanced-only units must be ABSENT.
+        for name in advanced_only_units {
+            let link = user_unit_link_for(&config_home, name);
+            let outcome = remote.exec(
+                &[
+                    "test".into(),
+                    "!".into(),
+                    "-e".into(),
+                    link.to_string_lossy().into_owned(),
+                ],
+                Duration::from_secs(30),
+            )?;
+            if !outcome.success() {
+                return Err(Error::remote(format!(
+                    "verify restored: unit '{name}' is still installed (prior state: absent)"
+                )));
+            }
+        }
+    } else {
+        let mut names: Vec<&str> = sa.units.iter().map(|u| u.name.as_str()).collect();
+        for n in advanced_only_units {
+            names.push(n);
+        }
+        for name in names {
+            let outcome = remote.exec(
+                &["systemctl".into(), "is-active".into(), name.to_string()],
+                Duration::from_secs(30),
+            )?;
+            if !outcome.success() {
+                return Err(Error::remote(format!(
+                    "verify restored: unit '{name}' is not active"
+                )));
+            }
+        }
+    }
+    Ok(VerifiedAdapterRestoration::verified())
 }
 
 #[cfg(test)]
@@ -782,5 +1406,209 @@ pub(crate) mod tests {
         );
         // Adapter state recorded on the remote root.
         assert!(base.join("adapters/systemd.json").is_file());
+    }
+
+    /// A hermetic systemd activation context: a local transport with a fake
+    /// `systemctl` on PATH (every command succeeds), a temp `XDG_CONFIG_HOME`
+    /// (the installed unit lands there), and a generation tree holding the
+    /// unit artifact (rendered with the slot context).
+    fn hermetic_ctx() -> (
+        tempfile::TempDir,
+        crate::env::SysEnv,
+        LocalTransport,
+        PathBuf,
+        PathBuf,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let base = tmp.path().join("remote");
+        let bindir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let fake = bindir.join("systemctl");
+        std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config_home = tmp.path().join("xdg");
+        let base_env = crate::testutil::fixture_env();
+        let mut vars: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> =
+            base_env.child_env().into_iter().collect();
+        vars.insert(
+            "PATH".into(),
+            format!(
+                "{}:{}",
+                bindir.display(),
+                base_env
+                    .path()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            )
+            .into(),
+        );
+        vars.insert("XDG_CONFIG_HOME".into(), config_home.as_os_str().to_owned());
+        let env = crate::env::SysEnv::from_map(vars);
+        let remote = LocalTransport::new(&env, base.clone()).unwrap();
+        // The unit artifact under the tree content root + the generation
+        // symlink, exactly as the engine builds it.
+        let tree_rel = crate::remote::layout::tree_root("abc123");
+        let unit_rel = tree_rel.join("integration/systemd/example.service");
+        std::fs::create_dir_all(base.join(unit_rel.parent().unwrap())).unwrap();
+        std::fs::write(
+            base.join(&unit_rel),
+            "[Service]\nExecStart={{ deploy_dir }}/current/app/server\n",
+        )
+        .unwrap();
+        let gen_dir = base.join(crate::remote::layout::generation("g1"));
+        std::fs::create_dir_all(&gen_dir).unwrap();
+        std::os::unix::fs::symlink(
+            crate::remote::layout::generation_root_link("abc123"),
+            gen_dir.join("root"),
+        )
+        .unwrap();
+        let generation_root = base
+            .join(crate::remote::layout::generation("g1"))
+            .join("root");
+        (tmp, env, remote, config_home, generation_root)
+    }
+
+    /// THE TRANSACTION ROUND TRIP (the review's P1 fix): prepare captures
+    /// the PRIOR state, apply installs the rendered unit, restore reverses
+    /// the apply back to the captured prior, and verify_restored RE-READS
+    /// the remote and confirms the restoration — producing the sealed
+    /// [`VerifiedAdapterRestoration`] proof. First a PRIOR-GENERATION-style
+    /// prior (a unit already installed), then a first-deploy-style prior
+    /// (absent).
+    #[test]
+    fn transaction_round_trips_apply_restore_and_verify_restored_reads_back() {
+        let (_tmp, _env, remote, config_home, generation_root) = hermetic_ctx();
+        let c = cfg(ActivationScope::User, vec!["example.service"]);
+        let vars = slot_vars();
+
+        // A PRIOR unit already installed (as a prior deploy would leave it):
+        // prepare must capture it, apply must overwrite it, restore must put
+        // it back, verify_restored must read it back.
+        let link = config_home.join("systemd/user/example.service");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        let prior_content = "[Service]\nExecStart=/srv/eng/current/app/server-v1\n";
+        std::fs::write(&link, prior_content).unwrap();
+
+        let activation = Activation::Systemd(c.clone());
+        let mut txn = SystemdActivation::new(&remote, &generation_root, &activation, &vars)
+            .expect("a systemd activation builds a transaction");
+        let prepared = txn.prepare().unwrap();
+        assert_eq!(prepared.prior.len(), 1);
+        assert_eq!(
+            prepared.prior[0]
+                .content
+                .as_deref()
+                .map(String::from_utf8_lossy),
+            Some(std::borrow::Cow::Borrowed(prior_content)),
+            "prepare captures the prior installed content"
+        );
+        let applied = txn.apply(&prepared).unwrap();
+        let installed = std::fs::read_to_string(&link).unwrap();
+        assert_ne!(
+            installed, prior_content,
+            "apply installs the rendered (new) unit over the prior one"
+        );
+        assert!(
+            installed.contains("ExecStart=/srv/deploy/example/current/app/server"),
+            "the applied unit renders the slot context, got: {installed}"
+        );
+        let restored = txn.restore(&applied).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&link).unwrap(),
+            prior_content,
+            "restore writes the captured PRIOR content back over the unit link"
+        );
+        // THE READ-BACK: verify_restored must READ the remote and confirm.
+        let proof = txn.verify_restored(&restored).unwrap();
+        let _ = proof; // the sealed proof exists — that IS the assertion
+
+        // FIRST-DEPLOY-style prior (absent): prepare captures absence, apply
+        // installs the unit, restore REMOVES it, verify_restored confirms
+        // the absence by reading.
+        std::fs::remove_file(&link).unwrap();
+        let activation2 = Activation::Systemd(c.clone());
+        let mut txn2 = SystemdActivation::new(&remote, &generation_root, &activation2, &vars)
+            .expect("a systemd activation builds a transaction");
+        let prepared2 = txn2.prepare().unwrap();
+        assert_eq!(
+            prepared2.prior[0].content, None,
+            "prepare captures the ABSENT prior unit"
+        );
+        let applied2 = txn2.apply(&prepared2).unwrap();
+        assert!(link.exists(), "apply installs the unit");
+        let restored2 = txn2.restore(&applied2).unwrap();
+        assert!(
+            !link.exists(),
+            "restore REMOVES the installed unit (prior absent)"
+        );
+        txn2.verify_restored(&restored2)
+            .expect("verify_restored confirms the absence by reading the remote");
+    }
+
+    /// THE MUTATION TEST (the review's acceptance: "verify_restored's read
+    /// truly checks the remote — a verify_restored that always succeeds must
+    /// be detectable"): after apply installed the NEW unit, verify_restored
+    /// against the captured PRIOR (absent) MUST FAIL — the remote still
+    /// carries the new side effect. A fabricated always-Ok verify_restored
+    /// would pass this scenario; the real read-back refuses it.
+    #[test]
+    fn verify_restored_detects_a_still_installed_unit_when_prior_was_absent() {
+        let (_tmp, _env, remote, config_home, generation_root) = hermetic_ctx();
+        let c = cfg(ActivationScope::User, vec!["example.service"]);
+        let vars = slot_vars();
+        let activation = Activation::Systemd(c.clone());
+        let mut txn = SystemdActivation::new(&remote, &generation_root, &activation, &vars)
+            .expect("a systemd activation builds a transaction");
+        let prepared = txn.prepare().unwrap();
+        txn.apply(&prepared).unwrap();
+        // The unit is INSTALLED (the new side effect) — the restore never
+        // ran, so verify_restored must detect that the remote is NOT back at
+        // the captured prior (absent).
+        let link = config_home.join("systemd/user/example.service");
+        assert!(link.exists(), "apply installed the unit");
+        // Build the restored state from the CAPTURED prior WITHOUT restoring
+        // (simulating a skipped/failed restore): the read-back must catch it.
+        let restored = SystemdRestored {
+            expected: prepared.prior.clone(),
+        };
+        let err = txn.verify_restored(&restored).unwrap_err();
+        assert!(
+            err.to_string().contains("still installed"),
+            "verify_restored must READ the remote and detect the unit left in the new state, got: {err}"
+        );
+    }
+
+    /// THE MUTATION TEST, prior-content variant: a restore that did NOT
+    /// take effect (the installed file still carries the NEW content) must
+    /// be caught by verify_restored's content read-back.
+    #[test]
+    fn verify_restored_detects_a_content_divergence_after_a_failed_restore() {
+        let (_tmp, _env, remote, config_home, generation_root) = hermetic_ctx();
+        let c = cfg(ActivationScope::User, vec!["example.service"]);
+        let vars = slot_vars();
+        let link = config_home.join("systemd/user/example.service");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        let prior_content = "[Service]\nExecStart=/srv/eng/current/app/server-v1\n";
+        std::fs::write(&link, prior_content).unwrap();
+        let activation = Activation::Systemd(c.clone());
+        let mut txn = SystemdActivation::new(&remote, &generation_root, &activation, &vars)
+            .expect("a systemd activation builds a transaction");
+        let prepared = txn.prepare().unwrap();
+        txn.apply(&prepared).unwrap();
+        // The unit is now in the NEW (rendered) state — a restore that did
+        // NOT take effect would leave it here. verify_restored against the
+        // captured PRIOR content must detect the divergence (a fabricated
+        // always-Ok verify would pass).
+        let installed = std::fs::read_to_string(&link).unwrap();
+        assert_ne!(installed, prior_content, "apply installed the new content");
+        let restored = SystemdRestored {
+            expected: prepared.prior.clone(),
+        };
+        let err = txn.verify_restored(&restored).unwrap_err();
+        assert!(
+            err.to_string().contains("not back at its prior content"),
+            "verify_restored must read the bytes and detect the divergence, got: {err}"
+        );
     }
 }

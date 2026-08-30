@@ -654,15 +654,30 @@ pub enum ExecutionReport {
     /// planned result.
     Verified,
     /// The attempt failed after mutating slots: the per-slot outcomes
-    /// (restored / never-advanced / remaining changes). The outcome keys
-    /// must EXACTLY equal the intent's selected membership (the kernel
-    /// validates that at decision time); the disposition is DERIVED from
-    /// the outcomes' OBSERVATIONS against the intent's pre-push and DESIRED
-    /// generations through the ONE per-slot classifier
-    /// ([`SlotDelta`] /
-    /// [`crate::kernel::terminal::classify_slot_delta`]).
+    /// (restored / never-advanced / remaining changes) PLUS the
+    /// ADAPTER-RESTORATION EVIDENCE (the review's P1 fix): the slots whose
+    /// ADAPTER side effects were VERIFIED restored, keyed by slot and
+    /// carrying the sealed proof (produced only by a successful adapter
+    /// `verify_restored` read-back). The outcome keys must EXACTLY equal the
+    /// intent's selected membership (the kernel validates that at decision
+    /// time); the disposition is DERIVED from the outcomes' OBSERVATIONS
+    /// against the intent's pre-push and DESIRED generations through the
+    /// ONE per-slot classifier ([`SlotDelta`] /
+    /// [`crate::kernel::terminal::classify_slot_delta`]). A `Restored`
+    /// outcome WITHOUT its adapter-restoration evidence is refused by the
+    /// rolled-back derivation — the generation delta alone cannot see the
+    /// unit file left in the new state.
     Failed {
         outcomes: NonEmptySlotTable<SlotOutcome>,
+        /// THE VERIFIED-ADAPTER-RESTORATION EVIDENCE: the slots whose
+        /// adapter side effects were VERIFIED restored (the sealed proof
+        /// [`crate::verify::adapters::transaction::VerifiedAdapterRestoration`]
+        /// — only a successful `verify_restored` read-back produces it). The
+        /// rolled-back derivation requires it for every `Restored` outcome.
+        adapter_restored: std::collections::BTreeMap<
+            crate::identity::SlotId,
+            crate::verify::adapters::transaction::VerifiedAdapterRestoration,
+        >,
     },
 }
 
@@ -699,7 +714,10 @@ pub fn decide_terminal(
     match report {
         ExecutionReport::PreflightFailed => Ok(TerminalDisposition::FailedPreflight),
         ExecutionReport::Verified => Ok(TerminalDisposition::Successful),
-        ExecutionReport::Failed { outcomes } => {
+        ExecutionReport::Failed {
+            outcomes,
+            adapter_restored,
+        } => {
             // 1. THE KERNEL OWNS THE KEY-SET CHECK at decision time: the
             // failed outcome keys must EXACTLY equal the intent's selected
             // membership. (The existing [`validate_terminal_vs_intent`]
@@ -720,6 +738,27 @@ pub fn decide_terminal(
                 crate::kernel::terminal::outcome_slot_delta(intent, sid, o) == SlotDelta::Unchanged
             });
             if rolled_back {
+                // THE ADAPTER-RESTORATION GATE (the review's P1 fix — the
+                // review: "FailedRolledBack must require verified adapter
+                // restoration IN ADDITION to the generation delta being
+                // unchanged"): a slot whose GENERATION is back (delta
+                // `Unchanged`) but whose ADAPTER side effect was NOT
+                // VERIFIED restored (e.g. the unit file left in the new
+                // state, the new unit still enabled) is NOT rolled back. The
+                // sealed [`VerifiedAdapterRestoration`] proof cannot be
+                // fabricated outside the adapter verification, so an
+                // unverified `Restored` outcome here is a hand-crafted
+                // report or an engine bug — REFUSE as integrity, never
+                // silently produce `FailedRolledBack`.
+                for (sid, o) in outcomes.iter() {
+                    if matches!(o, SlotOutcome::Restored { .. })
+                        && !adapter_restored.contains_key(sid)
+                    {
+                        return Err(KernelError::Integrity(IntegrityError::Message(format!(
+                            "the rolled-back decision cannot include slot '{sid}': its adapter restoration is NOT verified — a Restored slot is rolled-back-eligible only with a verified adapter restoration"
+                        ))));
+                    }
+                }
                 let payload = FailedRolledBackTerminal::try_new(
                     SlotTable::from_map(outcomes.clone().into_map()),
                     intent,
@@ -764,6 +803,7 @@ mod tests {
     use crate::kernel::snapshot::SnapshotSlot;
     use crate::ledger::{Observation, TargetSnapshot};
     use crate::testutil::fixtures;
+    use crate::verify::adapters::transaction::VerifiedAdapterRestoration;
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
     use std::collections::{BTreeMap, BTreeSet};
@@ -1520,6 +1560,28 @@ mod tests {
             })
     }
 
+    /// An arbitrary ADAPTER-RESTORATION EVIDENCE map over ALL generated
+    /// slots (the review's P1 fix): the sealed [`VerifiedAdapterRestoration`]
+    /// proof the engine carries for every VERIFIED restored slot. Generated
+    /// independently of the outcome table (a random subset of all slots), so
+    /// a `Restored` outcome appears both WITH and WITHOUT its evidence — the
+    /// property asserts the rolled-back refusal for the unverified half.
+    fn arbitrary_adapter_evidence()
+    -> impl Strategy<Value = BTreeMap<SlotId, VerifiedAdapterRestoration>> {
+        prop::collection::vec(prop::bool::ANY, 4).prop_map(|flags| {
+            (0u32..4)
+                .zip(flags)
+                .filter(|(_, f)| *f)
+                .map(|(i, _)| {
+                    (
+                        SlotId::new(format!("p{i}")),
+                        VerifiedAdapterRestoration::verified(),
+                    )
+                })
+                .collect()
+        })
+    }
+
     /// A FULL-PUSH intent over the given selected membership (fresh target,
     /// group None — the selected set is the entire membership, so the
     /// intent is valid for ANY non-empty selection).
@@ -1557,6 +1619,7 @@ mod tests {
         fn decide_terminal_uses_the_intent_and_derives_the_disposition(
             selected in selected_slots(),
             outcome_table in arbitrary_outcome_table(),
+            adapter_restored in arbitrary_adapter_evidence(),
             shape in 0u8..3,
         ) {
             let intent = full_intent("deploy-decide", &selected);
@@ -1581,20 +1644,63 @@ mod tests {
                     let keys: BTreeSet<SlotId> = outcome_table.keys().cloned().collect();
                     let table = NonEmptySlotTable::build(outcome_table).expect("non-empty table");
                     if keys == selected_set {
-                        let d = decide_terminal(
+                        let all_unchanged = table.iter().all(|(sid, o)| {
+                            crate::kernel::terminal::outcome_slot_delta(&intent, sid, o)
+                                == SlotDelta::Unchanged
+                        });
+                        let unverified_restored = table.iter().any(|(sid, o)| {
+                            matches!(o, SlotOutcome::Restored { .. })
+                                && !adapter_restored.contains_key(sid)
+                        });
+                        match decide_terminal(
                             &intent,
-                            ExecutionReport::Failed { outcomes: table },
-                        )
-                        .unwrap();
-                        let dkeys: BTreeSet<SlotId> = d.outcomes().keys().cloned().collect();
-                        prop_assert_eq!(
-                            dkeys, selected_set,
-                            "the decided terminal's outcome keys must EXACTLY equal the intent's selected membership"
-                        );
+                            ExecutionReport::Failed {
+                                outcomes: table,
+                                adapter_restored: adapter_restored.clone(),
+                            },
+                        ) {
+                            Ok(d) => {
+                                let dkeys: BTreeSet<SlotId> =
+                                    d.outcomes().keys().cloned().collect();
+                                prop_assert_eq!(
+                                    dkeys, selected_set,
+                                    "the decided terminal's outcome keys must EXACTLY equal the intent's selected membership"
+                                );
+                                // THE ADAPTER-RESTORATION GATE: an accepted
+                                // rolled-back terminal NEVER contains a
+                                // `Restored` outcome without its verified
+                                // adapter restoration.
+                                if all_unchanged {
+                                    prop_assert!(
+                                        !unverified_restored,
+                                        "an all-Unchanged table with an UNVERIFIED Restored slot must be refused — never silently FailedRolledBack"
+                                    );
+                                }
+                            }
+                            Err(_) => {
+                                // The ONLY refusal left on an exact-keys
+                                // report is the ADAPTER-RESTORATION GATE: an
+                                // all-Unchanged table with a `Restored`
+                                // outcome whose adapter restoration is
+                                // UNVERIFIED is refused as integrity (the
+                                // review: MUST NOT silently produce
+                                // FailedRolledBack).
+                                prop_assert!(
+                                    all_unchanged && unverified_restored,
+                                    "the rolled-back refusal fires exactly when every delta is Unchanged but some Restored slot lacks its verified adapter restoration"
+                                );
+                            }
+                        }
                     } else {
                         prop_assert!(
-                            decide_terminal(&intent, ExecutionReport::Failed { outcomes: table })
-                                .is_err(),
+                            decide_terminal(
+                                &intent,
+                                ExecutionReport::Failed {
+                                    outcomes: table,
+                                    adapter_restored,
+                                },
+                            )
+                            .is_err(),
                             "a failure report whose outcome keys do not exactly match the selected membership must be refused with an integrity error"
                         );
                     }
@@ -1604,13 +1710,18 @@ mod tests {
 
         /// THE TERMINAL-STATE INVARIANTS PROPERTY (the review's P1 /
         /// acceptance item 2): for every generated intent/outcome/
-        /// observation combination over the selected membership — including
-        /// an UNCOMPENSATED failure AFTER the slot advanced (an outcome
-        /// whose state is `FailedAfterAdvance` with the desired-generation
-        /// observation — the old rule could call it rolled back) — the
-        /// decision is EXACTLY ONE terminal, and:
+        /// observation/ADAPTER-EVIDENCE combination over the selected
+        /// membership — including an UNCOMPENSATED failure AFTER the slot
+        /// advanced (an outcome whose state is `FailedAfterAdvance` with the
+        /// desired-generation observation — the old rule could call it
+        /// rolled back) and a `Restored` outcome WITH/WITHOUT its verified
+        /// adapter restoration — the decision is EXACTLY ONE terminal (or
+        /// the adapter-evidence integrity refusal), and:
         ///
-        /// * `FailedRolledBack` ⇒ EVERY slot's [`SlotDelta`] is `Unchanged`;
+        /// * `FailedRolledBack` ⇒ EVERY slot's [`SlotDelta`] is `Unchanged`
+        ///   AND every `Restored` slot carries its verified adapter
+        ///   restoration (the review's P1 fix: the generation delta alone
+        ///   cannot see the unit file left in the new state);
         /// * `Degraded` ⇒ AT LEAST ONE `Desired`/`Diverged`/`Unknown` delta;
         /// * `remaining_changes` contains EXACTLY the
         ///   `Desired`/`Diverged`/`Unknown` slots.
@@ -1618,6 +1729,7 @@ mod tests {
         fn terminal_state_invariants_review_p1(
             selected in selected_slots(),
             outcome_table in arbitrary_outcome_table(),
+            adapter_restored in arbitrary_adapter_evidence(),
         ) {
             let intent = full_intent("deploy-inv", &selected);
             let selected_set: BTreeSet<SlotId> = selected.iter().cloned().collect();
@@ -1626,7 +1738,38 @@ mod tests {
                 return Ok(()); // mismatched-key reports are refused (covered above)
             }
             let table = NonEmptySlotTable::build(outcome_table).expect("non-empty table");
-            let d = decide_terminal(&intent, ExecutionReport::Failed { outcomes: table }).unwrap();
+            let all_unchanged = table.iter().all(|(sid, o)| {
+                crate::kernel::terminal::outcome_slot_delta(&intent, sid, o)
+                    == SlotDelta::Unchanged
+            });
+            let unverified_restored = table.iter().any(|(sid, o)| {
+                matches!(o, SlotOutcome::Restored { .. }) && !adapter_restored.contains_key(sid)
+            });
+            // THE ADAPTER-RESTORATION GATE: an all-Unchanged table with an
+            // UNVERIFIED `Restored` slot is REFUSED (integrity) — never
+            // silently FailedRolledBack (the review's P1 fix).
+            if all_unchanged && unverified_restored {
+                prop_assert!(
+                    decide_terminal(
+                        &intent,
+                        ExecutionReport::Failed {
+                            outcomes: table,
+                            adapter_restored,
+                        },
+                    )
+                    .is_err(),
+                    "an all-Unchanged table with an UNVERIFIED Restored slot must be refused — never FailedRolledBack"
+                );
+                return Ok(());
+            }
+            let d = decide_terminal(
+                &intent,
+                ExecutionReport::Failed {
+                    outcomes: table,
+                    adapter_restored,
+                },
+            )
+            .unwrap();
             let deltas: Vec<(SlotId, SlotDelta)> = d
                 .outcomes()
                 .iter()
@@ -1642,9 +1785,6 @@ mod tests {
                 .filter(|(_, delta)| *delta != SlotDelta::Unchanged)
                 .map(|(sid, _)| sid.clone())
                 .collect();
-            let all_unchanged = deltas
-                .iter()
-                .all(|(_, delta)| *delta == SlotDelta::Unchanged);
             // The terminal-level derivation under test: remaining_changes
             // (the same classifier) must equal EXACTLY the deltas' set.
             let terminal = LedgerTerminal::new(
@@ -1658,6 +1798,10 @@ mod tests {
                     prop_assert!(
                         all_unchanged,
                         "FailedRolledBack requires EVERY slot's delta to be Unchanged (the review's P1 rule)"
+                    );
+                    prop_assert!(
+                        !unverified_restored,
+                        "FailedRolledBack requires EVERY Restored slot's adapter restoration to be VERIFIED (the review's P1 fix)"
                     );
                     prop_assert!(
                         terminal.remaining_changes(&intent).is_none(),

@@ -71,9 +71,8 @@ pub(crate) fn run_commit(
         // engine completes the execution table with `NotStarted` fillers); a
         // set that could be empty is REFUSED with an integrity error — never
         // an accepted empty failure.
-        let outcomes: NonEmptySlotTable<SlotOutcome> = NonEmptySlotTable::build(
-            execution.failure_outcomes()?,
-        )
+        let evidence = execution.failure_evidence()?;
+        let outcomes: NonEmptySlotTable<SlotOutcome> = NonEmptySlotTable::build(evidence.outcomes)
             .map_err(|e| {
             crate::error::Error::integrity(format!(
                 "push {deployment_id}: the failure outcomes must cover the selected membership (nonempty): {e}"
@@ -81,7 +80,10 @@ pub(crate) fn run_commit(
         })?;
         let disposition = crate::kernel::transition::decide_terminal(
             attempt_intent,
-            crate::kernel::transition::ExecutionReport::Failed { outcomes },
+            crate::kernel::transition::ExecutionReport::Failed {
+                outcomes,
+                adapter_restored: evidence.adapter_restored,
+            },
         )
         .map_err(|e| {
             crate::error::Error::integrity(format!(
@@ -237,8 +239,9 @@ pub(crate) fn run_commit(
                 // (the engine completed the execution table); an empty set
                 // is REFUSED with an integrity error, never an accepted
                 // empty failure.
+                let evidence = execution.failure_evidence()?;
                 let outcomes: NonEmptySlotTable<SlotOutcome> =
-                    NonEmptySlotTable::build(execution.failure_outcomes()?)
+                    NonEmptySlotTable::build(evidence.outcomes)
                         .map_err(|e| {
                             crate::error::Error::integrity(format!(
                                 "push {deployment_id}: the refused disposition's outcomes must cover the selected membership (nonempty): {e}"
@@ -246,7 +249,10 @@ pub(crate) fn run_commit(
                         })?;
                 let disposition = crate::kernel::transition::decide_terminal(
                     attempt_intent,
-                    crate::kernel::transition::ExecutionReport::Failed { outcomes },
+                    crate::kernel::transition::ExecutionReport::Failed {
+                        outcomes,
+                        adapter_restored: evidence.adapter_restored,
+                    },
                 )
                 .map_err(|e| {
                     crate::error::Error::integrity(format!(

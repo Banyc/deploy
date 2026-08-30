@@ -10,6 +10,12 @@
 //!   slot-rendered units plus `systemctl --user` enable/restart, system-scope
 //!   wrapper-only restart, `reconcile_managed_units` recording, unit-name
 //!   safety, and artifact-path validation.
+//! * [`transaction`] — the ADAPTER TRANSACTION PROTOCOL (the review's P1
+//!   fix): the prepare→apply→restore→verify_restored discipline every
+//!   MUTATING adapter must expose, plus the sealed
+//!   [`VerifiedAdapterRestoration`](transaction::VerifiedAdapterRestoration)
+//!   proof a rolled-back terminal requires.
 
 pub mod command;
 pub mod systemd;
+pub mod transaction;

@@ -61,7 +61,13 @@ pub(crate) use server::*;
 /// * [`Restored`](SlotExecution::Restored) — the slot advanced then was
 ///   compensated back to its pre-push state (in-process, or by the
 ///   failure-policy pass flipping a failed-advance slot); its observation
-///   is the generation restored to.
+///   is the generation restored to. A `Restored` slot is rolled-back-
+///   eligible ONLY with its [`adapter_restored`](SlotExecution::Restored::adapter_restored)
+///   proof: the sealed value a successful adapter `verify_restored`
+///   produces — a slot whose ADAPTER side effects were NOT verified
+///   restored is `FailedAfterAdvance`, never `Restored` (the review's P1
+///   fix: the generation delta alone cannot see the unit file left in the
+///   new state).
 /// * [`FailedAfterAdvance`](SlotExecution::FailedAfterAdvance) — the slot
 ///   advanced (its `current` moved to the attempt's generation) and was
 ///   NOT restored: STILL ON the advanced generation — always a remaining
@@ -88,6 +94,18 @@ pub(crate) enum SlotExecution {
     },
     Restored {
         observation: Observation<ObservedGeneration>,
+        /// THE VERIFIED-ADAPTER-RESTORATION PROOF (the review's P1 fix): a
+        /// sealed value that can ONLY be produced by a successful
+        /// [`verify_restored`](crate::verify::adapters::transaction::ActivationTransaction::verify_restored)
+        /// — an adapter restoration RE-READ from the remote, never "we
+        /// called restore". The terminal decision
+        /// ([`crate::kernel::transition::decide_terminal`]) refuses a
+        /// rolled-back classification for a `Restored` slot without this
+        /// evidence: a slot whose generation is back but whose adapter side
+        /// effect was NOT verified restored is `FailedAfterAdvance`, never
+        /// `Restored`. NEVER serialized (the wire outcome body carries the
+        /// delta classification, not the adapter internals).
+        adapter_restored: crate::verify::adapters::transaction::VerifiedAdapterRestoration,
     },
     FailedAfterAdvance {
         observation: Observation<ObservedGeneration>,
@@ -170,7 +188,10 @@ impl SlotExecution {
     pub(crate) fn observed_generation(&self) -> Option<&GenerationId> {
         match self {
             SlotExecution::Advanced { observation, .. }
-            | SlotExecution::Restored { observation }
+            | SlotExecution::Restored {
+                observation,
+                adapter_restored: _,
+            }
             | SlotExecution::FailedAfterAdvance { observation, .. } => match observation {
                 Observation::Known(og) => Some(&og.generation),
                 _ => None,
@@ -356,7 +377,16 @@ mod tests_slot_executions {
                 observation,
                 bookkeeping_error: None,
             }),
-            arbitrary_observation().prop_map(|observation| SlotExecution::Restored { observation }),
+            arbitrary_observation().prop_map(|observation| SlotExecution::Restored {
+                observation,
+                // A Restored execution carries the VERIFIED-adapter-
+                // restoration proof (the sealed value — the test generator
+                // models the engine, which only produces Restored with the
+                // proof; the classifier property drives the evidence
+                // separately).
+                adapter_restored:
+                    crate::verify::adapters::transaction::VerifiedAdapterRestoration::verified(),
+            }),
             (arbitrary_observation(), prop::bool::ANY).prop_map(|(observation, has_error)| {
                 SlotExecution::FailedAfterAdvance {
                     observation,
