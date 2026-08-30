@@ -38,7 +38,11 @@
 //!    truncated ledger IS visibly committed, so the checkpoint returns a
 //!    STRUCTURED report (`established: true`) carrying a DURABILITY WARNING
 //!    and DEFERRING the sweep — no deletion is ever attempted against a
-//!    floor whose durability is unconfirmed. ONCE THE REPLACE IS DURABLE
+//!    floor whose durability is unconfirmed, and the owed sweep is recorded
+//!    as the TYPED [`crate::store::local::debt::SweepDebt::AwaitingCheckpointDurability`]
+//!    marker (see
+//!    step 3) so the push-side sweep runner REFUSES to sweep until the
+//!    ledger is durably rewritten. ONCE THE REPLACE IS DURABLE
 //!    (or the unknown-durability report is made), the checkpoint cannot
 //!    return `Err` for any post-commit maintenance failure (scan,
 //!    enumeration, deletion, or the debt-marker write): each is converted
@@ -53,9 +57,14 @@
 //!    current/incomplete state (observed artifacts, pending intent-only
 //!    entries, in-flight deployment dirs), or a PIN. A failed sweep is
 //!    retried by RECOMPUTING reachability — no persisted deletion worklist,
-//!    no backup — and an incomplete sweep records a DURABLE SWEEP-DEBT
-//!    marker (`<base>/sweep-debt.json`) so the NEXT PUSH (not just the next
-//!    checkpoint) retries it. Sweeps are best-effort and NOT secure erasure.
+//!    no backup — and an incomplete sweep records a DURABLE, TYPED
+//!    SWEEP-DEBT marker ("<base>/sweep-debt.json"):
+//!    [`crate::store::local::debt::SweepDebt::Ready`] when
+//!    the ledger commit was durable (the sweep may run on a later push),
+//!    [`crate::store::local::debt::SweepDebt::AwaitingCheckpointDurability`] when the commit's
+//!    durability is unconfirmed (the sweep is gated until the
+//!    durability-confirming rewrite). Sweeps are best-effort and NOT secure
+//!    erasure.
 //!
 //! # Preview == execution (the ledger override)
 //!
@@ -98,7 +107,7 @@ pub(crate) mod debt;
 
 use crate::deploy::lock::FileLock;
 use crate::error::Result;
-use crate::identity::{DeploymentId, OperationId};
+use crate::identity::{DeploymentId, OperationId, TargetName};
 use crate::retention::reachability::history_floor::{LedgerDiscards, LedgerOverride};
 use crate::store::atomic::ReplaceOutcome;
 use crate::store::local::LocalStore;
@@ -214,6 +223,31 @@ pub(crate) fn run_checkpoint_unlocked(
     checkpoint_inner(store, config, target, deployment_id)
 }
 
+/// Build the checkpoint's NEW ledger payload: the checkpoint EVENT line
+/// (the record of the discarded prefix) followed by the retained suffix
+/// lines. Shared by the checkpoint and the durability-confirming retry —
+/// the retry recomputes the retained suffix deterministically, so the
+/// rewritten ledger's retained content is identical to the visible ledger's
+/// whenever the ledger is still the trigger-time one (and the CURRENT
+/// suffix when another push appended).
+fn checkpoint_ledger_payload(
+    deployment_id: &DeploymentId,
+    discarded: usize,
+    suffix: &[String],
+) -> Result<Vec<String>> {
+    let checkpoint_line = serde_json::to_string(&crate::ledger::LedgerEventWire::Checkpoint(
+        crate::ledger::CheckpointWire::new(
+            deployment_id,
+            discarded as u64,
+            &crate::remote::helper::now_rfc3339(),
+        ),
+    ))
+    .map_err(|e| crate::error::Error::store(format!("serialize ledger checkpoint: {e}")))?;
+    let mut new_ledger = vec![checkpoint_line];
+    new_ledger.extend(suffix.iter().cloned());
+    Ok(new_ledger)
+}
+
 /// The real (locked) checkpoint: compute the retained suffix, ATOMICALLY
 /// replace the ledger with it (the ONLY logical commit — a pre-rename
 /// failure is a plain `Err`, nothing was deleted, the full history stands;
@@ -259,6 +293,11 @@ fn checkpoint_inner(
     target: &str,
     deployment_id: &DeploymentId,
 ) -> Result<CheckpointReport> {
+    // The TYPED sweep-debt marker carries the checkpoint's validated target
+    // identity; parse it UP FRONT (pre-commit — an invalid target name fails
+    // the checkpoint before any state change, exactly as a missing ledger
+    // would).
+    let target_name = TargetName::parse(target)?;
     // 1. Calculate the retained suffix (the physical LINES for the atomic
     //    replacement + the SAME suffix parsed as entries) and the entries it
     //    discards.
@@ -280,16 +319,7 @@ fn checkpoint_inner(
     //    NO DELETION HAPPENS — the previous ledger stands. `?` is correct
     //    here: a failed replacement is a PRE-COMMIT failure and the
     //    checkpoint returns a plain `Err`.
-    let checkpoint_line = serde_json::to_string(&crate::ledger::LedgerEventWire::Checkpoint(
-        crate::ledger::CheckpointWire::new(
-            deployment_id,
-            discarded_entries.len() as u64,
-            &crate::remote::helper::now_rfc3339(),
-        ),
-    ))
-    .map_err(|e| crate::error::Error::store(format!("serialize ledger checkpoint: {e}")))?;
-    let mut new_ledger = vec![checkpoint_line];
-    new_ledger.extend(suffix.iter().cloned());
+    let new_ledger = checkpoint_ledger_payload(deployment_id, discarded_entries.len(), &suffix)?;
     // 2. THE LOGICAL COMMIT — the replace reports its TWO COMMIT POINTS
     //    (the rename → the truncated ledger becomes VISIBLE; the
     //    parent-directory fsync → it becomes DURABLE) explicitly, so the
@@ -307,9 +337,17 @@ fn checkpoint_inner(
             // 3. POST-COMMIT MAINTENANCE: the ledger commit is
             //    irreversible, so the sweep + debt marker run in the
             //    non-fallible [`run_post_commit_sweep`] — never an `Err`
-            //    from this point on.
-            let post =
-                run_post_commit_sweep(store, config, deployment_id.as_str(), &ledger_override);
+            //    from this point on. The marker reconcile writes
+            //    [`SweepDebt::Ready`] when the sweep stays outstanding
+            //    (the floor IS durable) or clears it on completion.
+            let post = run_post_commit_sweep(
+                store,
+                config,
+                deployment_id.as_str(),
+                &ledger_override,
+                &target_name,
+                deployment_id,
+            );
             Ok(CheckpointReport {
                 target: target.to_string(),
                 deployment_id: deployment_id.clone(),
@@ -330,18 +368,21 @@ fn checkpoint_inner(
         // deletion (no reachability scan, no sweep, no `run_post_commit_sweep`:
         // a sweep against a floor whose durability is unconfirmed could let
         // an interrupted retry expose history below the floor). Record the
-        // owed sweep as durable sweep-debt (best-effort — a marker write
-        // failure becomes a warning, never an `Err`) and report the commit
-        // as ESTABLISHED with the durability warning. A repeated checkpoint
-        // recomputes the SAME suffix (an identical rewrite), obtains
-        // `ReplacedDurable`, and runs the sweep to convergence.
+        // owed sweep as the TYPED [`SweepDebt::AwaitingCheckpointDurability`]
+        // marker (best-effort — a marker write failure becomes a warning,
+        // never an `Err`) so the push-side sweep runner REFUSES the sweep
+        // until the durability-confirming rewrite transitions the marker to
+        // `Ready` — and report the commit as ESTABLISHED with the durability
+        // warning. A repeated checkpoint recomputes the SAME suffix (an
+        // identical rewrite), obtains `ReplacedDurable`, and runs the sweep
+        // to convergence.
         ReplaceOutcome::ReplacedDurabilityUnknown { error } => {
             let warning = format!(
                 "ledger replaced for target '{target}' but its durability is unconfirmed \
                  (the parent-directory fsync failed: {error}); NO sweep ran — the sweep is \
                  deferred until a repeated checkpoint re-establishes durability or the next push"
             );
-            let debt_warning = debt::reconcile_sweep_debt(store, false, &Some(warning.clone()));
+            let debt_warning = debt::record_awaiting_durability(store, &target_name, deployment_id);
             Ok(CheckpointReport {
                 target: target.to_string(),
                 deployment_id: deployment_id.clone(),
@@ -358,6 +399,86 @@ fn checkpoint_inner(
             })
         }
     }
+}
+
+/// The durability-confirming retry (the P1 gate): the push-side sweep
+/// runner ([`crate::deploy::maintenance::retry_pending_sweep`]) calls this
+/// when the sweep-debt marker is
+/// [`crate::store::local::debt::SweepDebt::AwaitingCheckpointDurability`] — the sweep MUST NOT run
+/// until the triggering checkpoint's ledger replace is durable, because a
+/// crash could restore an OLDER, longer ledger that still references
+/// below-floor history already deleted by the sweep. It recomputes the
+/// CURRENT retained suffix (deterministic from the current ledger: identical
+/// to the trigger-time suffix while the ledger is unchanged; the CURRENT
+/// suffix if another push landed) and rewrites the ledger — the identical
+/// rewrite that obtains [`ReplaceOutcome::ReplacedDurable`] (the rename AND
+/// the parent-directory fsync confirmed) — then transitions the marker to
+/// [`crate::store::local::debt::SweepDebt::Ready`]. It NEVER runs the sweep: the sweep executes only
+/// once the marker reads `Ready` (a later maintenance pass, or a user
+/// re-run). The caller (a push / no-op push) already holds the advisory
+/// locks, so none are taken here — and the transition to `Ready` requires
+/// EXACTLY the durable rewrite (same suffix bytes + parent-dir fsync
+/// confirmed), never a bare "fsync the current bytes" shortcut that could
+/// confirm the WRONG ledger state.
+pub(crate) fn confirm_checkpoint_durability(
+    store: &LocalStore,
+    target: &TargetName,
+    retained_from: &DeploymentId,
+) -> Result<CheckpointDurabilityOutcome> {
+    // 1. Recompute the retained suffix from the CURRENT ledger and the
+    //    exact ledger payload the checkpoint would build (see
+    //    [`checkpoint_ledger_payload`]).
+    let (suffix, _suffix_entries, discarded_entries) =
+        store.ledger_suffix(target.as_str(), retained_from)?;
+    let new_ledger = checkpoint_ledger_payload(retained_from, discarded_entries.len(), &suffix)?;
+    // 2. THE DURABLE REWRITE — the ONLY acceptable transition: an EXACT
+    //    ledger rewrite whose rename + parent-directory fsync are BOTH
+    //    confirmed (`ReplacedDurable`) is what may move the marker to
+    //    `Ready`; a pre-rename failure is a plain `Err` (nothing changed,
+    //    the marker stays as it is); a post-rename fsync failure keeps the
+    //    floor unconfirmed and the marker `AwaitingCheckpointDurability`.
+    match store.write_ledger_suffix(target.as_str(), &new_ledger)? {
+        ReplaceOutcome::ReplacedDurable => {
+            // 3. Transition the marker: the durable rewrite means the sweep
+            //    may run — record `SweepDebt::Ready` (a marker-write failure
+            //    is a warning, never an `Err`). NO sweep here.
+            let debt_warning = debt::reconcile_sweep_debt(store, false, target, retained_from);
+            Ok(CheckpointDurabilityOutcome::Durable { debt_warning })
+        }
+        ReplaceOutcome::ReplacedDurabilityUnknown { error } => {
+            // The rewrite's rename stands but the fsync failed AGAIN: the
+            // floor is STILL not durable — re-record the
+            // `AwaitingCheckpointDurability` marker; the sweep stays refused.
+            let warning = format!(
+                "ledger replace for target '{target}' STILL has unconfirmed durability \
+                 (the parent-directory fsync failed: {error}); the sweep stays deferred until a \
+                 durability-confirming rewrite succeeds"
+            );
+            let debt_warning = debt::record_awaiting_durability(store, target, retained_from);
+            Ok(CheckpointDurabilityOutcome::StillUnconfirmed {
+                warning,
+                debt_warning,
+            })
+        }
+    }
+}
+
+/// The outcome of a durability-confirming retry
+/// ([`confirm_checkpoint_durability`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CheckpointDurabilityOutcome {
+    /// The rewrite confirmed BOTH commit points ([`ReplaceOutcome::ReplacedDurable`]):
+    /// the ledger is DURABLE and the marker was transitioned to
+    /// [`crate::store::local::debt::SweepDebt::Ready`] — the sweep may run. `debt_warning` is the
+    /// marker-write warning when the transition could not be persisted.
+    Durable { debt_warning: Option<String> },
+    /// The rewrite's rename stands but the fsync failed again: durability is
+    /// STILL unconfirmed — the marker stays
+    /// [`crate::store::local::debt::SweepDebt::AwaitingCheckpointDurability`] and NO sweep may run.
+    StillUnconfirmed {
+        warning: String,
+        debt_warning: Option<String>,
+    },
 }
 
 /// Post-commit maintenance after the irreversible ledger commit: the
@@ -380,6 +501,8 @@ fn run_post_commit_sweep(
     config: &ProjectConfig,
     deployment_id: &str,
     ledger_override: &LedgerOverride,
+    target: &TargetName,
+    checkpoint_deployment: &DeploymentId,
 ) -> PostCommitSweep {
     // The sweep's DELETION stages are absorbed into `completed = false` by
     // `run_sweep` itself (stage faults and deletion errors); its READ stages
@@ -401,8 +524,10 @@ fn run_post_commit_sweep(
     // persisted deletion worklist) and finishes it; a COMPLETED sweep clears
     // any stale marker. The write/clear is itself non-fallible maintenance:
     // a failure is a warning on the report, never an `Err` — the
-    // orchestration lives in [`debt`].
-    let debt_warning = debt::reconcile_sweep_debt(store, completed, &warning);
+    // orchestration lives in [`debt`]. The ledger commit is DURABLE here
+    // (both commit points confirmed), so the recorded marker is the sweepable
+    // [`SweepDebt::Ready`] state, never an awaiting-durability gate.
+    let debt_warning = debt::reconcile_sweep_debt(store, completed, target, checkpoint_deployment);
     PostCommitSweep {
         discards,
         completed,
@@ -560,11 +685,13 @@ fn plural(n: usize) -> &'static str {
 mod tests {
     use super::*;
 
+    use crate::deploy::maintenance::retry_pending_sweep;
     use crate::identity::{
         ArtifactRef, DeploymentId, ReleaseId, ServerId, SlotId, TargetName, TreeDigest,
         VariantName, test_deployment_id, test_generation_id, test_tree_digest,
     };
     use crate::ledger::{DeploymentIntent, LedgerTerminal, ObservedAssignment, ObservedSlot, Pins};
+    use crate::store::local::debt::SweepDebt;
     #[cfg(test)]
     use proptest::prelude::*;
     #[cfg(test)]
@@ -1365,10 +1492,16 @@ interval_seconds = 0
                     store.object_root(&test_tree_digest("tree-ghost")).exists(),
                     "fault {fault:?}: no sweep may run against an unconfirmed floor"
                 );
-                // The owed sweep is recorded as durable debt (deferred).
+                // The owed sweep is recorded as the TYPED durability-gated
+                // marker: AwaitingCheckpointDurability (the floor is NOT
+                // durable — no sweep may run until a durability-confirming
+                // rewrite transitions it).
                 assert!(
-                    store.read_sweep_debt().unwrap().is_some(),
-                    "fault {fault:?}: the deferred sweep is recorded as durable debt"
+                    matches!(
+                        store.read_sweep_debt().unwrap(),
+                        Some(SweepDebt::AwaitingCheckpointDurability { .. })
+                    ),
+                    "fault {fault:?}: the deferred sweep is recorded as the typed awaiting-durability marker"
                 );
                 // The report's discards carry step 1's suffix computation
                 // (the entries strictly before the checkpoint); the sweep
@@ -1431,8 +1564,11 @@ interval_seconds = 0
                             "fault {fault:?}: the debt marker itself wrote cleanly"
                         );
                         assert!(
-                            store.read_sweep_debt().unwrap().is_some(),
-                            "fault {fault:?}: the pending sweep is recorded as durable debt"
+                            matches!(
+                                store.read_sweep_debt().unwrap(),
+                                Some(SweepDebt::Ready { .. })
+                            ),
+                            "fault {fault:?}: the pending sweep is recorded as the typed Ready marker (the ledger commit IS durable)"
                         );
                     }
                     // The debt-marker WRITE failure: the report carries the
@@ -1464,8 +1600,11 @@ interval_seconds = 0
                             "fault {fault:?}: the debt marker recorded cleanly"
                         );
                         assert!(
-                            store.read_sweep_debt().unwrap().is_some(),
-                            "fault {fault:?}: a pending sweep records durable debt"
+                            matches!(
+                                store.read_sweep_debt().unwrap(),
+                                Some(SweepDebt::Ready { .. })
+                            ),
+                            "fault {fault:?}: a pending sweep records the typed Ready marker (the ledger commit IS durable)"
                         );
                     }
                 }
@@ -1657,7 +1796,15 @@ interval_seconds = 0
         assert!(rep.sweep_debt_warning.is_none());
         // The truncation stands (deploy-0 discarded) and no sweep ran.
         assert_eq!(rep.discards.discarded_entries, vec![ids[0].clone()]);
-        assert!(store.read_sweep_debt().unwrap().is_some());
+        // The owed sweep is recorded as the TYPED AwaitingCheckpointDurability
+        // marker (the floor is NOT durable — the sweep is gated).
+        assert!(
+            matches!(
+                store.read_sweep_debt().unwrap(),
+                Some(SweepDebt::AwaitingCheckpointDurability { .. })
+            ),
+            "the deferred sweep is recorded as the typed awaiting-durability marker"
+        );
         assert!(
             store
                 .deployment_dir(test_deployment_id("ghost-deploy").as_str())
@@ -1733,6 +1880,305 @@ interval_seconds = 0
                 .exists(),
             "no sweep ran against the unconfirmed floor"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // THE DURABILITY GATE PROPERTY (P1 review fix): a checkpoint whose
+    // ledger replace is VISIBLE but whose durability is UNCONFIRMED records
+    // the TYPED [`SweepDebt::AwaitingCheckpointDurability`] marker, and NO
+    // maintenance path (a no-op push, a cross-target push) may sweep until a
+    // durability-confirming retry durably rewrites the SAME ledger and
+    // transitions the marker to [`SweepDebt::Ready`]. The sweep runs ONLY
+    // against a `Ready` marker — below-floor objects are never deleted
+    // before the durable transition (the monotone invariant: the `Awaiting`
+    // state is never skipped).
+    // ---------------------------------------------------------------------
+
+    /// Run ONE durability-gate case: seed t1 history (every entry carries a
+    /// UNIQUE release+tree pair, so the artifacts strictly BEFORE the
+    /// checkpoint are below-floor content referenced only by the discarded
+    /// prefix), a second target's ledger, and ghost garbage; fault the t1
+    /// checkpoint's parent-dir fsync so it lands `ReplacedDurabilityUnknown`
+    /// and the typed `AwaitingCheckpointDurability` marker; then drive the
+    /// maintenance paths:
+    ///
+    /// * CRASH RECOVERY — a fresh store over the same base re-reads the same
+    ///   shortened (visible) ledger and the same typed marker (the
+    ///   durable-restore possibility);
+    /// * THE NO-OP PUSH PATH — with the marker `Awaiting`, the maintenance
+    ///   runner REFUSES the sweep: it runs ONLY the durability-confirming
+    ///   rewrite (same-suffix durable replace → `ReplacedDurable`) and
+    ///   transitions the marker to `Ready` — NOTHING is deleted;
+    /// * THE CROSS-TARGET CHECKPOINT + PUSH PATH — a second checkpoint on t2
+    ///   faults the same stage (a fresh `Awaiting{t2}` marker overwrites the
+    ///   store-global slot), and the cross-target push's maintenance REFUSES
+    ///   again (confirmation only, marker → `Ready{t2}`, still NOTHING
+    ///   deleted — t1's below-floor content survives the cross-target push);
+    /// * THE READY SWEEP — the next maintenance pass reads `Ready` and ONLY
+    ///   THEN the sweep deletes the below-floor objects and clears the
+    ///   marker.
+    ///
+    /// The invariant is asserted at every step: no below-floor object is
+    /// ever deleted while the marker is `Awaiting` (the typed transition is
+    /// monotone — `Awaiting` is never skipped).
+    fn run_durability_gate_case(t1_len: usize, at: usize) {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        // t1's history: every entry carries a UNIQUE release+tree pair, so
+        // the artifacts strictly before the checkpoint are below-floor
+        // content referenced only by the discarded prefix.
+        for i in 0..t1_len {
+            let id = format!("dep-t1-{i}");
+            let rel = format!("rel-{i}");
+            let tree = format!("tree-{i}");
+            seed_success(&store, TARGET, &id, &rel, &tree);
+            seed_unreachable(&store, &id, &rel, &tree);
+        }
+        // A second target's ledger: a push to t2 runs the SAME store-global
+        // maintenance; its content is reachable and must survive.
+        seed_success(&store, "t2", "dep-t2-0", "rel-t2-0", "tree-t2-0");
+        seed_unreachable(&store, "dep-t2-0", "rel-t2-0", "tree-t2-0");
+        // Ghost garbage unreachable from any ledger.
+        seed_unreachable(&store, "ghost-deploy", "rel-sha256-ghost", "tree-ghost");
+
+        // The assert helper: every below-floor artifact (the discarded
+        // entries' deployment dirs, release records, and trees) exists.
+        let below_floor_exists = |s: &LocalStore| -> bool {
+            (0..at).all(|i| {
+                s.deployment_dir(test_deployment_id(&format!("dep-t1-{i}")).as_str())
+                    .exists()
+                    && s.release_dir(&crate::identity::test_release_id(&format!("rel-{i}")))
+                        .exists()
+                    && s.object_root(&test_tree_digest(&format!("tree-{i}")))
+                        .exists()
+            })
+        };
+
+        let checkpoint_id = test_deployment_id(&format!("dep-t1-{at}"));
+        let cfg = config_for(&dir);
+
+        // 1. THE FAULTED CHECKPOINT: the parent-dir fsync of the ledger
+        //    replace fails — the truncation IS visible (established) but its
+        //    durability is UNCONFIRMED: NO sweep ran, the marker is the
+        //    TYPED AwaitingCheckpointDurability, below-floor content intact.
+        store.fault_registry().arm_ledger_replace_dir_sync(TARGET);
+        let rep = run_checkpoint_unlocked(&store, &cfg, TARGET, &checkpoint_id)
+            .expect("the durability-unconfirmed checkpoint is a structured report, never Err");
+        assert!(rep.established && !rep.sweep_completed);
+        assert!(
+            rep.durability_warning
+                .as_ref()
+                .is_some_and(|w| w.contains("durability is unconfirmed")),
+            "the report carries the durability warning"
+        );
+        assert!(
+            matches!(
+                store.read_sweep_debt().unwrap(),
+                Some(SweepDebt::AwaitingCheckpointDurability { target, retained_from })
+                    if target.as_str() == TARGET && retained_from == checkpoint_id
+            ),
+            "the owed sweep is the typed AwaitingCheckpointDurability marker for the faulted checkpoint"
+        );
+        assert!(
+            below_floor_exists(&store),
+            "no sweep ran against the unconfirmed floor"
+        );
+        assert!(
+            store
+                .deployment_dir(test_deployment_id("ghost-deploy").as_str())
+                .exists()
+        );
+
+        // 2. CRASH-RECOVERY RE-READ: a FRESH store over the same base reads
+        //    the same shortened (visible) ledger and the same typed marker —
+        //    the durable-restore possibility under test: even while the
+        //    marker is Awaiting, the maintenance gate holds.
+        let fresh = LocalStore::with_base(store.base().to_path_buf()).unwrap();
+        assert!(
+            matches!(
+                fresh.read_sweep_debt().unwrap(),
+                Some(SweepDebt::AwaitingCheckpointDurability { .. })
+            ),
+            "a fresh store re-reads the typed awaiting marker"
+        );
+        assert_eq!(
+            fresh.read_ledger(TARGET).unwrap().len(),
+            t1_len - at,
+            "the shortened ledger is visible to the fresh store"
+        );
+        assert!(
+            below_floor_exists(&fresh),
+            "crash recovery: nothing was deleted"
+        );
+
+        // 3. THE NO-OP PUSH PATH with the marker Awaiting: the maintenance
+        //    runner REFUSES the sweep — it runs ONLY the durability-
+        //    confirming rewrite (the same-suffix durable replace →
+        //    `ReplacedDurable`) and transitions the marker to `Ready`; the
+        //    below-floor content is NOT deleted (the sweep never runs while
+        //    the marker is Awaiting).
+        let w = retry_pending_sweep(&store, &cfg, "noop-push");
+        assert!(
+            w.iter().all(|s| s.contains("sweep still deferred")),
+            "the no-op push defers the sweep: {w:?}"
+        );
+        assert!(
+            matches!(
+                store.read_sweep_debt().unwrap(),
+                Some(SweepDebt::Ready { target, retained_from })
+                    if target.as_str() == TARGET && retained_from == checkpoint_id
+            ),
+            "the durability-confirming retry transitions the marker to Ready"
+        );
+        assert!(
+            below_floor_exists(&store),
+            "the no-op push must NOT delete below-floor content while the marker was Awaiting"
+        );
+        assert!(
+            store
+                .deployment_dir(test_deployment_id("ghost-deploy").as_str())
+                .exists()
+        );
+
+        // 4. THE CROSS-TARGET PATH: a second checkpoint on t2 faults the
+        //    same stage — its OWN visible-but-unconfirmed ledger replace
+        //    records a FRESH AwaitingCheckpointDurability marker (the
+        //    store-global slot now names t2's floor); the cross-target
+        //    push's maintenance then REFUSES the sweep again (confirmation
+        //    only, marker → Ready{t2}), and t1's below-floor content stays
+        //    intact while the marker is Awaiting.
+        store.fault_registry().arm_ledger_replace_dir_sync("t2");
+        let rep2 = run_checkpoint_unlocked(&store, &cfg, "t2", &test_deployment_id("dep-t2-0"))
+            .expect("the t2 durability-unconfirmed checkpoint is a structured report, never Err");
+        assert!(rep2.established && rep2.durability_warning.is_some());
+        assert!(
+            matches!(
+                store.read_sweep_debt().unwrap(),
+                Some(SweepDebt::AwaitingCheckpointDurability { target, retained_from })
+                    if target.as_str() == "t2" && retained_from == test_deployment_id("dep-t2-0")
+            ),
+            "the t2 faulted checkpoint records a fresh Awaiting marker"
+        );
+        assert!(
+            below_floor_exists(&store),
+            "no sweep ran against t2's unconfirmed floor either"
+        );
+        let w2 = retry_pending_sweep(&store, &cfg, "cross-target-push");
+        assert!(
+            w2.iter().all(|s| s.contains("sweep still deferred")),
+            "the cross-target push defers the sweep: {w2:?}"
+        );
+        assert!(
+            matches!(
+                store.read_sweep_debt().unwrap(),
+                Some(SweepDebt::Ready { target, retained_from })
+                    if target.as_str() == "t2" && retained_from == test_deployment_id("dep-t2-0")
+            ),
+            "the cross-target push's confirmation transitions t2's marker to Ready"
+        );
+        assert!(
+            below_floor_exists(&store),
+            "the CROSS-TARGET push must NOT delete below-floor content while the marker was Awaiting"
+        );
+        assert!(
+            store
+                .deployment_dir(test_deployment_id("ghost-deploy").as_str())
+                .exists()
+        );
+
+        // 5. THE READY SWEEP: the marker is now `Ready` (the floor is
+        //    durable) — ONLY NOW may the sweep delete: the next maintenance
+        //    pass runs the global sweep, which removes the unreachable
+        //    below-floor content (t1's discarded entries' artifacts + the
+        //    ghost) and clears the marker.
+        let w3 = retry_pending_sweep(&store, &cfg, "final-pass");
+        assert!(w3.is_empty(), "the Ready sweep converges cleanly: {w3:?}");
+        assert_eq!(
+            store.read_sweep_debt().unwrap(),
+            None,
+            "the completed sweep clears the marker"
+        );
+        for i in 0..at {
+            assert!(
+                !store
+                    .deployment_dir(test_deployment_id(&format!("dep-t1-{i}")).as_str())
+                    .exists(),
+                "below-floor deployment {i} deleted only after the durable transition"
+            );
+            assert!(
+                !store
+                    .release_dir(&crate::identity::test_release_id(&format!("rel-{i}")))
+                    .exists(),
+                "below-floor release {i} deleted only after the durable transition"
+            );
+            assert!(
+                !store
+                    .object_root(&test_tree_digest(&format!("tree-{i}")))
+                    .exists(),
+                "below-floor tree {i} deleted only after the durable transition"
+            );
+        }
+        assert!(
+            !store
+                .deployment_dir(test_deployment_id("ghost-deploy").as_str())
+                .exists(),
+            "the ghost deployment is swept"
+        );
+        // Retained content survives: the t1 checkpoint entry + later
+        // entries' artifacts, and t2's sole entry.
+        for i in at..t1_len {
+            assert!(
+                store
+                    .deployment_dir(test_deployment_id(&format!("dep-t1-{i}")).as_str())
+                    .exists()
+                    && store
+                        .release_dir(&crate::identity::test_release_id(&format!("rel-{i}")))
+                        .exists()
+                    && store
+                        .object_root(&test_tree_digest(&format!("tree-{i}")))
+                        .exists(),
+                "retained entry {i} survives the sweep"
+            );
+        }
+        assert!(
+            store
+                .deployment_dir(test_deployment_id("dep-t2-0").as_str())
+                .exists()
+        );
+        assert!(
+            store
+                .release_dir(&crate::identity::test_release_id("rel-t2-0"))
+                .exists()
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            // Bounded `proptest_cases(4)` (full 4 with `DEPLOY_FULL_TESTS=1`,
+            // fast default), fixed seed per house style.
+            cases: crate::testutil::proptest_cases(4),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        /// THE DURABILITY GATE PROPERTY: for every generated checkpoint
+        /// position, a dir-sync-faulted checkpoint lands
+        /// `ReplacedDurabilityUnknown` + the typed
+        /// [`SweepDebt::AwaitingCheckpointDurability`] marker; the NO-OP
+        /// PUSH path and the CROSS-TARGET PUSH path both refuse the sweep
+        /// while the marker is `Awaiting` (confirmation-only: the
+        /// same-suffix durable rewrite transitions the marker to `Ready`,
+        /// and below-floor objects are NOT deleted); the sweep runs only for
+        /// a `Ready` marker and deletes the below-floor objects then. No
+        /// below-floor object is ever deleted before the durable transition
+        /// (the `Awaiting` state is never skipped).
+        #[test]
+        fn sweep_never_runs_before_checkpoint_durability(
+            (t1_len, at) in (3usize..=5).prop_flat_map(|n| (Just(n), 1usize..n)),
+        ) {
+            run_durability_gate_case(t1_len, at);
+        }
     }
 
     // ---------------------------------------------------------------------

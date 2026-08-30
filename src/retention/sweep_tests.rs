@@ -47,6 +47,7 @@ use crate::remote::transport::{LocalTransport, Remote};
 use crate::retention::checkpoint::run_checkpoint_unlocked;
 use crate::retention::compute_retained;
 use crate::store::local::LocalStore;
+use crate::store::local::debt::SweepDebt;
 use crate::testutil::test_faults::FaultKind;
 use crate::testutil::test_remotes::FailOnceInventoryRemote;
 #[cfg(test)]
@@ -657,8 +658,11 @@ fn run_fault_case(pusher_history: Vec<bool>, checkpoint_at: usize, fault: SweepF
         "the sweep is reported retry-required, never an error"
     );
     assert!(
-        store.read_sweep_debt().unwrap().is_some(),
-        "durable sweep debt is recorded"
+        matches!(
+            store.read_sweep_debt().unwrap(),
+            Some(SweepDebt::Ready { .. })
+        ),
+        "durable sweep debt is recorded (the floor IS durable — the marker is the sweepable Ready state)"
     );
     // The faulted stage's content remains (extra garbage, never less).
     match fault {
@@ -750,18 +754,26 @@ proptest! {
 // FOCUSED UNIT TESTS
 // ---------------------------------------------------------------------------
 
-/// The sweep-debt marker round-trips: absent → recorded → cleared (the
-/// marker file is removed, leaving no trace).
+/// The sweep-debt marker round-trips THROUGH BOTH TYPED STATES: absent →
+/// [`SweepDebt::AwaitingCheckpointDurability`] → [`SweepDebt::Ready`] →
+/// cleared (the marker file is removed, leaving no trace).
 #[test]
 fn sweep_debt_marker_roundtrip() {
     let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let store = LocalStore::with_base(dir.path().join("store")).unwrap();
     assert_eq!(store.read_sweep_debt().unwrap(), None);
-    store.write_sweep_debt(Some("sweep pending")).unwrap();
-    assert_eq!(
-        store.read_sweep_debt().unwrap().as_deref(),
-        Some("sweep pending")
-    );
+    let awaiting = SweepDebt::AwaitingCheckpointDurability {
+        target: TargetName::new(TARGET.to_string()),
+        retained_from: test_deployment_id("deploy-1"),
+    };
+    store.write_sweep_debt(Some(&awaiting)).unwrap();
+    assert_eq!(store.read_sweep_debt().unwrap(), Some(awaiting));
+    let ready = SweepDebt::Ready {
+        target: TargetName::new(TARGET.to_string()),
+        retained_from: test_deployment_id("deploy-1"),
+    };
+    store.write_sweep_debt(Some(&ready)).unwrap();
+    assert_eq!(store.read_sweep_debt().unwrap(), Some(ready));
     store.write_sweep_debt(None).unwrap();
     assert_eq!(store.read_sweep_debt().unwrap(), None);
     assert!(
@@ -784,8 +796,15 @@ fn sweep_debt_io_faults_are_warnings_not_errors() {
     assert_eq!(w.len(), 1, "the read fault warns: {w:?}");
     assert!(w[0].contains("failed to read sweep debt"), "{w:?}");
     // A debt WRITE failure (clearing the marker) is a warning, never an Err;
-    // the marker stays for a later push to retry.
-    store.write_sweep_debt(Some("pending")).unwrap();
+    // the marker stays for a later push to retry. The marker is the
+    // sweepable [`SweepDebt::Ready`] state (a durable floor): the retry runs
+    // the sweep and only the marker CLEAR fails.
+    store
+        .write_sweep_debt(Some(&SweepDebt::Ready {
+            target: TargetName::new(TARGET.to_string()),
+            retained_from: test_deployment_id("deploy-1"),
+        }))
+        .unwrap();
     store.fault_registry().arm_write_sweep_debt();
     let w = retry_pending_sweep(&store, &cfg, "anchor");
     assert_eq!(w.len(), 1, "the write fault warns: {w:?}");

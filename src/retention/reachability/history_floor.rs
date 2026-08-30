@@ -19,9 +19,15 @@
 //! maintenance debt that remains is the SWEEP-DEBT marker
 //! (`<base>/sweep-debt.json`, see [`LocalStore::read_sweep_debt`]): the
 //! checkpoint's best-effort global sweep is POST-COMMIT MAINTENANCE, so an
-//! incomplete sweep records a durable marker and the NEXT PUSH (not just the
-//! next checkpoint) retries the sweep and clears it — see
-//! `crate::deploy::retry_pending_sweep`.
+//! incomplete sweep records a durable TYPED marker and the NEXT PUSH (not
+//! just the next checkpoint) retries the sweep and clears it — see
+//! `crate::deploy::retry_pending_sweep`. The marker is TWO-STATE
+//! ([`crate::store::local::debt::SweepDebt`]):
+//! [`crate::store::local::debt::SweepDebt::Ready`] when the
+//! checkpoint's ledger replace is durable (the sweep may run), and
+//! [`crate::store::local::debt::SweepDebt::AwaitingCheckpointDurability`] when the replace is visible
+//! but its durability is unconfirmed (the sweep must NOT run until a
+//! durability-confirming rewrite transitions the marker).
 //!
 //! A checkpoint (`deploy checkpoint <target> <deployment-id>`) is exactly
 //! three steps:

@@ -597,10 +597,13 @@ rest. It is exactly three steps:
    SUCCEEDED but whose parent-directory fsync failed means the new ledger
    IS visible but its durability is UNCONFIRMED: the checkpoint NEVER
    returns an error in that state — it records the owed sweep as durable
-   sweep-debt and returns an ESTABLISHED report with a durability warning
-   and the sweep deferred (zero artifacts deleted until a repeated
-   checkpoint — an identical rewrite — re-establishes durability and runs
-   the sweep). From the moment the replacement is durable the checkpoint is
+   sweep-debt (the TWO-STATE marker `<store>/sweep-debt.json` is recorded
+   as AWAITING-CHECKPOINT-DURABILITY — the gate, never a free-form reason —
+   so the next push can only durability-confirm, never sweep) and returns
+   an ESTABLISHED report with a durability warning and the sweep deferred
+   (zero artifacts deleted until a repeated checkpoint — an identical
+   rewrite that obtains `ReplacedDurable` — re-establishes durability,
+   transitions the marker to READY, and runs the sweep). From the moment the replacement is durable the checkpoint is
    IRREVERSIBLY committed, and no post-commit
    sweep failure may surface as an error (each is converted into a report
    with the sweep retry-required and a warning).
@@ -611,8 +614,16 @@ rest. It is exactly three steps:
    retry — no persisted deletion worklist, no backup. An incomplete sweep
    records a durable sweep-debt marker (`<store>/sweep-debt.json`) so the
    NEXT PUSH (not just the next checkpoint) retries it, recomputing
-   reachability fresh; a completed sweep clears the marker. Sweeps are
-   best-effort and are NOT secure erasure.
+   reachability fresh; a completed sweep clears the marker. THE MARKER IS
+   TWO-STATE: `AwaitingCheckpointDurability` (the triggering checkpoint's
+   ledger replace is VISIBLE but its durability is UNCONFIRMED — the
+   sweep must NOT run until a durability-confirming retry rewrites the
+   SAME ledger and transitions the marker to `Ready`) and `Ready` (the
+   floor IS durable — the sweep may run). The push-side runner serves the
+   sweep ONLY for a `Ready` marker; on an awaiting marker it runs only the
+   durability-confirming rewrite (the identical-retry ledger replace +
+   parent-dir fsync → `ReplacedDurable`) and defers the sweep to the next
+   pass. Sweeps are best-effort and are NOT secure erasure.
 
 THE RETAINED SET is computed GLOBALLY — release records and tree objects are
 content-addressed and SHARED across targets, so the retained set cannot be
@@ -703,8 +714,11 @@ retention failure records a durable retention-debt marker
 (`targets/<target>/retention-debt.json`) and the NEXT PUSH (real or no-op)
 retries the retention under the slot's mutation lock and clears the marker
 once it succeeds. The PUSHER side (the local store) is swept by the
-checkpoint above; an incomplete sweep records `<store>/sweep-debt.json` and
-the next push retries it. BOTH sweeps are POST-COMMIT MAINTENANCE, never
+checkpoint above; an incomplete sweep records `<store>/sweep-debt.json`
+(two-state: `AwaitingCheckpointDurability` gates the sweep until the
+ledger is durably rewritten, `Ready` allows it) and the next push retries
+it — on an awaiting marker the push runs only the durability-confirming
+rewrite first, then sweeps on the pass that reads `Ready`. BOTH sweeps are POST-COMMIT MAINTENANCE, never
 corrections: a sweep failure (or a sweep that has not run) never blocks or
 rolls back the operation that triggered it, and both reports surface a
 pending sweep as a WARNING, never an error.

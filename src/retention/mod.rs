@@ -52,11 +52,19 @@
 //!   the retained suffix, the atomic replace, the post-commit sweep,
 //!   preview/override parity, and the post-commit warnings. Its sweep-debt
 //!   orchestration nests with it:
-//!   * `checkpoint::debt` — when a sweep is incomplete the durable marker is
-//!     recorded so the next push retries it; a completed sweep clears the
-//!     marker. The marker I/O lives in
-//!     [`crate::store::local::LocalStore`] (`LocalStore::read_sweep_debt` /
-//!     `LocalStore::write_sweep_debt`); the orchestration lives here.
+//!   * `checkpoint::debt` — when a sweep is incomplete the durable TYPED
+//!     marker is recorded so the next push retries it; a completed sweep
+//!     clears the marker. The marker
+//!     ([`crate::store::local::debt::SweepDebt`],
+//!     two states —
+//!     [`crate::store::local::debt::SweepDebt::AwaitingCheckpointDurability`] when the
+//!     checkpoint's ledger replace is visible but its durability is
+//!     unconfirmed, [`crate::store::local::debt::SweepDebt::Ready`] when the floor IS durable) gates
+//!     the sweep: the push-side runner refuses to sweep an awaiting marker
+//!     until a durability-confirming rewrite transitions it. The marker I/O
+//!     lives in [`crate::store::local::LocalStore`]
+//!     (`LocalStore::read_sweep_debt` / `LocalStore::write_sweep_debt`); the
+//!     orchestration lives here.
 //! * `sweep_tests` (test-only) — the two-sided sweep contract tests (moved
 //!   from `crate::sweep`): receiver retention +
 //!   pusher checkpoint independence, no-leak, and maintenance-not-correction.

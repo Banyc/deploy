@@ -29,6 +29,7 @@ use crate::ledger::{ObservationError, ObservedAssignment, ObservedSlot};
 use crate::remote::helper::RemoteHelper;
 use crate::retention::compute_retained;
 use crate::store::local::LocalStore;
+use crate::store::local::debt::SweepDebt;
 #[cfg(test)]
 use crate::testutil::step17_hook::HookPhase;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -530,6 +531,15 @@ pub(crate) fn retry_deferred_retentions(
 /// returned vec, so a debt-file fault can never turn a push (real or no-op)
 /// into an error after the deployment durably committed. Returns the
 /// pending-sweep warnings for the push report's maintenance channel.
+///
+/// THE DURABILITY GATE (the P1 fix): the marker is TYPED, two-state.
+/// [`SweepDebt::Ready`] means the triggering checkpoint's ledger replace is
+/// DURABLE — the sweep may run. [`SweepDebt::AwaitingCheckpointDurability`]
+/// means the ledger replace is VISIBLE but its durability is UNCONFIRMED —
+/// the sweep MUST NOT run (a crash could restore an OLDER, longer ledger
+/// that still references below-floor history already deleted by the sweep):
+/// the ONLY thing this pass may do is the durability-confirming rewrite,
+/// and the sweep is deferred to the pass that reads the marker as `Ready`.
 pub(crate) fn retry_pending_sweep(
     store: &LocalStore,
     config: &ProjectConfig,
@@ -546,46 +556,122 @@ pub(crate) fn retry_pending_sweep(
             )];
         }
     };
-    let Some(reason) = pending else {
+    let Some(debt) = pending else {
         return Vec::new();
     };
-    // The push-side sweep retry recomputes reachability from the CURRENT
-    // ledgers — NO checkpoint ledger override: the override is the
-    // checkpoint's retained-suffix hypothetical and exists only while a
-    // checkpoint sweep runs (see `crate::retention::checkpoint`).
-    match store.run_sweep(config, anchor, None) {
-        Ok((_, true)) => {
-            // The sweep completed: clear the marker. A write/remove failure
-            // is post-commit maintenance: warn and leave the marker as it
-            // is — a later push retries and converges. Never an `Err`.
-            if let Err(e) = store.write_sweep_debt(None) {
-                return vec![format!(
-                    "sweep debt maintenance deferred: failed to clear sweep debt: {e}"
-                )];
+    match debt {
+        // THE DURABILITY GATE: the triggering checkpoint's ledger replace is
+        // VISIBLE but its durability is UNCONFIRMED — REFUSE to execute the
+        // sweep. Run ONLY the durability-confirming retry
+        // ([`crate::retention::checkpoint::confirm_checkpoint_durability`]):
+        // recompute the CURRENT retained suffix (deterministic from the
+        // current ledger — identical to the trigger-time suffix while the
+        // ledger is unchanged, the CURRENT suffix if another push landed)
+        // and rewrite it, obtaining `ReplacedDurable` (the rename + the
+        // parent-directory fsync confirmed — the exact transition, never a
+        // bare "fsync the current bytes" shortcut). The marker transitions
+        // to `Ready` inside the confirmation; the sweep itself is deferred to
+        // the pass that reads `Ready`.
+        SweepDebt::AwaitingCheckpointDurability {
+            target,
+            retained_from,
+        } => {
+            match crate::retention::checkpoint::confirm_checkpoint_durability(
+                store,
+                &target,
+                &retained_from,
+            ) {
+                Ok(crate::retention::checkpoint::CheckpointDurabilityOutcome::Durable {
+                    debt_warning,
+                }) => {
+                    let mut w = vec![format!(
+                        "sweep still deferred: the durability-confirming ledger rewrite for target \
+                         '{target}' succeeded — the checkpoint ledger is now DURABLE — but the \
+                         sweep was not run this pass; the next push sweeps"
+                    )];
+                    if let Some(d) = debt_warning {
+                        w.push(d);
+                    }
+                    w
+                }
+                Ok(
+                    crate::retention::checkpoint::CheckpointDurabilityOutcome::StillUnconfirmed {
+                        warning,
+                        debt_warning,
+                    },
+                ) => {
+                    let mut w = vec![format!("sweep still deferred: {warning}")];
+                    if let Some(d) = debt_warning {
+                        w.push(d);
+                    }
+                    w
+                }
+                Err(e) => vec![format!(
+                    "sweep still deferred: the durability-confirming checkpoint retry failed ({e}); \
+                     a later push retries it"
+                )],
             }
-            Vec::new()
         }
-        Ok((_, false)) => {
-            // Still incomplete: keep the marker with the fresh reason.
-            if let Err(e) = store.write_sweep_debt(Some(
-                "sweep still incomplete on retry; a later push retries it",
-            )) {
-                return vec![format!(
-                    "sweep debt maintenance deferred: failed to write sweep debt: {e}"
-                )];
+        // The floor IS durable: the sweep may run. Recompute reachability
+        // from the CURRENT ledgers (fresh, no persisted deletion worklist)
+        // and reconcile the marker; every failure stays a warning, never an
+        // `Err`.
+        SweepDebt::Ready {
+            target,
+            retained_from,
+        } => {
+            // The push-side sweep retry recomputes reachability from the
+            // CURRENT ledgers — NO checkpoint ledger override: the override
+            // is the checkpoint's retained-suffix hypothetical and exists
+            // only while a checkpoint sweep runs (see
+            // `crate::retention::checkpoint`).
+            match store.run_sweep(config, anchor, None) {
+                Ok((_, true)) => {
+                    // The sweep completed: clear the marker. A write/remove
+                    // failure is post-commit maintenance: warn and leave the
+                    // marker as it is — a later push retries and converges.
+                    // Never an `Err`.
+                    if let Err(e) = store.write_sweep_debt(None) {
+                        return vec![format!(
+                            "sweep debt maintenance deferred: failed to clear sweep debt: {e}"
+                        )];
+                    }
+                    Vec::new()
+                }
+                Ok((_, false)) => {
+                    // Still incomplete: keep the marker `Ready` (the floor is
+                    // durable — the marker's pair identifies the checkpoint
+                    // whose sweep stays owed).
+                    let marker = SweepDebt::Ready {
+                        target: target.clone(),
+                        retained_from: retained_from.clone(),
+                    };
+                    if let Err(e) = store.write_sweep_debt(Some(&marker)) {
+                        return vec![format!(
+                            "sweep debt maintenance deferred: failed to write sweep debt: {e}"
+                        )];
+                    }
+                    vec![
+                        "sweep still deferred: the global sweep did not complete; \
+                         a later push retries it"
+                            .to_string(),
+                    ]
+                }
+                Err(e) => {
+                    // The sweep failed: keep the marker `Ready` with the
+                    // durable floor.
+                    let marker = SweepDebt::Ready {
+                        target: target.clone(),
+                        retained_from: retained_from.clone(),
+                    };
+                    if let Err(e2) = store.write_sweep_debt(Some(&marker)) {
+                        return vec![format!(
+                            "sweep debt maintenance deferred: failed to write sweep debt: {e2}"
+                        )];
+                    }
+                    vec![format!("sweep still deferred: {e}")]
+                }
             }
-            vec![format!(
-                "sweep still deferred: the global sweep did not complete ({reason}); a later push retries it"
-            )]
-        }
-        Err(e) => {
-            // The sweep failed: keep the marker with the fresh reason.
-            if let Err(e2) = store.write_sweep_debt(Some(&e.to_string())) {
-                return vec![format!(
-                    "sweep debt maintenance deferred: failed to write sweep debt: {e2}"
-                )];
-            }
-            vec![format!("sweep still deferred: {e}")]
         }
     }
 }
