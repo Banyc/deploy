@@ -4721,6 +4721,11 @@ exec /bin/mv "$@"
         fn verify_existing_swap_at_every_boundary_ssh(
             (boundary, kind) in ssh_swap_case(),
         ) {
+            // SLOW-test gate: exceeds ~20 s under the FULL gate
+            if !crate::testutil::slow_tests_enabled() {
+                eprintln!("skipped: slow test — set DEPLOY_FULL_TESTS=1 to run");
+                return Ok(());
+            }
             use std::os::unix::fs::PermissionsExt;
 
             let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();

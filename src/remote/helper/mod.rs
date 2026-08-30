@@ -963,6 +963,11 @@ mod tests {
                     1..=crate::testutil::proptest_steps(40)
                 )
             ) {
+                // SLOW-test gate: exceeds ~20 s under the FULL gate
+                if !crate::testutil::slow_tests_enabled() {
+                    eprintln!("skipped: slow test — set DEPLOY_FULL_TESTS=1 to run");
+                    return Ok(());
+                }
                 let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
                 let remote = LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote")).unwrap();
                 let holder_bytes = lock_bytes(&holder, holder_seq);
@@ -1737,6 +1742,11 @@ mod cross_remote_guard_mutation {
         })]
         #[test]
         fn cross_remote_guard_only_owning_server_changes(ops in prop::collection::vec(arb_guard_op(), 0..=8)) {
+            // SLOW-test gate: exceeds ~20 s under the FULL gate
+            if !crate::testutil::slow_tests_enabled() {
+                eprintln!("skipped: slow test — set DEPLOY_FULL_TESTS=1 to run");
+                return Ok(());
+            }
             run_cross_remote_guard_case(ops)?;
         }
     }

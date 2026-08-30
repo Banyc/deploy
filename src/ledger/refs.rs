@@ -846,6 +846,11 @@ mod tests {
             history in chain_strategy(),
             token in ref_token_strategy(),
         ) {
+            // SLOW-test gate: exceeds ~20 s under the FULL gate
+            if !crate::testutil::slow_tests_enabled() {
+                eprintln!("skipped: slow test — set DEPLOY_FULL_TESTS=1 to run");
+                return Ok(());
+            }
             ref_grammar_resolve_case(history, token);
         }
     }
@@ -867,6 +872,11 @@ mod tests {
             history in chain_strategy(),
             token in ref_token_strategy(),
         ) {
+            // SLOW-test gate: exceeds ~20 s under the FULL gate
+            if !crate::testutil::slow_tests_enabled() {
+                eprintln!("skipped: slow test — set DEPLOY_FULL_TESTS=1 to run");
+                return Ok(());
+            }
             ref_grammar_resolve_case(history, token);
         }
     }

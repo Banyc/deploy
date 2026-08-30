@@ -3459,6 +3459,11 @@ proptest! {
         policy in failure_policy_strategy(),
         position in 0..2usize,
     ) {
+        // SLOW-test gate: exceeds ~20 s under the FULL gate
+        if !crate::testutil::slow_tests_enabled() {
+            eprintln!("skipped: slow test — set DEPLOY_FULL_TESTS=1 to run");
+            return Ok(());
+        }
         run_failure_position_case(policy, position);
     }
 }
@@ -3590,6 +3595,11 @@ proptest! {
         policy in failure_policy_strategy(),
         position in 0..2usize,
     ) {
+        // SLOW-test gate: exceeds ~20 s under the FULL gate
+        if !crate::testutil::slow_tests_enabled() {
+            eprintln!("skipped: slow test — set DEPLOY_FULL_TESTS=1 to run");
+            return Ok(());
+        }
         run_remaining_changes_case(policy, position);
     }
 }

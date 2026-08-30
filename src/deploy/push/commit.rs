@@ -1515,6 +1515,11 @@ pub(crate) mod commit_tests {
                 1..=4,
             ),
         ) {
+            // SLOW-test gate: exceeds ~20 s under the FULL gate
+            if !crate::testutil::slow_tests_enabled() {
+                eprintln!("skipped: slow test — set DEPLOY_FULL_TESTS=1 to run");
+                return Ok(());
+            }
             let h = TwoSlotHarness::new();
             let slot_a = SlotId::parse("p1").unwrap();
             let slot_b = SlotId::parse("p2").unwrap();

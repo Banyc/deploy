@@ -22,6 +22,16 @@
 //! Note: each integration-test *binary* (`tests/*.rs`) is a separate process
 //! and cannot race the lib tests.
 //!
+//! # The slow-test gate
+//!
+//! A test that individually exceeds ~20 SECONDS under the FULL gate
+//! (`DEPLOY_FULL_TESTS=1 cargo nextest run --no-fail-fast`) is a SLOW test:
+//! it runs ONLY under the full gate. The default gate (no env var) SKIPS it
+//! with a printed `skipped:` note — a quick guarded no-op that still counts
+//! as a passing test — so no default-gate test can exceed the ~20 s budget.
+//! The skip guard is [`slow_tests_enabled`]; run the slow tests with
+//! `DEPLOY_FULL_TESTS=1 cargo nextest run --no-fail-fast`.
+//!
 //! # Fault injection: per-fixture registries, no process-global slots
 //!
 //! One-shot store-fault injection lives in [`test_faults`] as a
@@ -76,6 +86,17 @@ pub(crate) fn fixture_tmpdir(env: &crate::env::SysEnv) -> std::io::Result<tempfi
 #[cfg(test)]
 pub(crate) fn full_proptest_suites() -> bool {
     std::env::var_os("DEPLOY_FULL_TESTS").is_some_and(|v| v != "0")
+}
+
+/// Whether SLOW tests are allowed to run (`DEPLOY_FULL_TESTS=1`). The
+/// default (no env var) SKIPS the tests that individually exceed ~20 s
+/// (measured under the full gate) so the default gate stays fast. The guard
+/// lives at the top of each slow test's body: a default-gate run prints a
+/// `skipped:` note and returns immediately (the test still shows as a
+/// fast PASS), while a `DEPLOY_FULL_TESTS=1` run exercises the test in full.
+#[cfg(test)]
+pub(crate) fn slow_tests_enabled() -> bool {
+    full_proptest_suites()
 }
 
 /// The proptest `cases:` budget: the full budget when full suites are
