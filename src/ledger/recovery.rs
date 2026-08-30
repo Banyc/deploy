@@ -307,6 +307,10 @@ fn append_degraded(
         attempt,
         crate::kernel::transition::ExecutionReport::Failed {
             outcomes: non_empty,
+            // Recovery never runs the mutating adapters itself — its
+            // outcomes are the evidence-kind (Indeterminate/Failed), never
+            // `Restored` — so no adapter-restoration proof is owed.
+            adapter_restored: std::collections::BTreeMap::new(),
         },
     )
     .map_err(|e| {
@@ -1202,6 +1206,7 @@ mod tests {
             &intent,
             crate::kernel::transition::ExecutionReport::Failed {
                 outcomes: non_empty,
+                adapter_restored: std::collections::BTreeMap::new(),
             },
         )
         .expect(
