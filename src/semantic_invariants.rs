@@ -3206,15 +3206,6 @@ fn observed_scope_pre_swap_failure_keeps_prior_record_untouched() {
 // bounded 16-case property (both supported policies x every batch position,
 // fixed seed 0x5EED_5EED).
 
-/// The wire-visible `compensated` fact of a structural outcome (only
-/// `Failed` carries it; every other variant is uncompensated).
-fn compensated_of(o: &crate::ledger::SlotOutcome) -> bool {
-    match o {
-        crate::ledger::SlotOutcome::Failed { compensated, .. } => *compensated,
-        _ => false,
-    }
-}
-
 /// Drive one failure-position case: baseline push (tree v1) on both `t1`
 /// slots, then a real push (tree v2) whose batch `position` fails pre-swap,
 /// then assert the policy's postconditions on the live remote generations,
@@ -3365,7 +3356,6 @@ fn run_failure_position_case(policy: FailurePolicy, position: usize) {
                     matches!(out, crate::ledger::SlotOutcome::Activated { .. }),
                     "slot {sid}: the advance is retained"
                 );
-                assert!(!compensated_of(out), "slot {sid}: no compensation pass ran");
             }
             // The failed batch k itself.
             (_, std::cmp::Ordering::Equal) => {
@@ -3376,12 +3366,8 @@ fn run_failure_position_case(policy: FailurePolicy, position: usize) {
                     "slot {sid}: the failed batch never advanced"
                 );
                 assert!(
-                    matches!(out, crate::ledger::SlotOutcome::Failed { .. }),
-                    "slot {sid}: batch {position} is recorded failed"
-                );
-                assert!(
-                    !compensated_of(out),
-                    "slot {sid}: a pre-swap failure is not compensated"
+                    matches!(out, crate::ledger::SlotOutcome::FailedBeforeAdvance { .. }),
+                    "slot {sid}: batch {position} is recorded as a pre-swap failure"
                 );
             }
             // Batches after the failed batch: skipped under stop_on_failure.
@@ -3390,10 +3376,6 @@ fn run_failure_position_case(policy: FailurePolicy, position: usize) {
                 assert!(
                     matches!(out, crate::ledger::SlotOutcome::Skipped { .. }),
                     "slot {sid}: the later batch is skipped"
-                );
-                assert!(
-                    !compensated_of(out),
-                    "slot {sid}: skipped slots are not compensated"
                 );
             }
         }
@@ -4742,7 +4724,7 @@ fn integrity_incoming_record_field_deletion_fails_closed() {
     // The TERMINAL line: every required field rejected individually. The
     // optional members (`outcomes` on a Successful terminal, `reason`)
     // carry serde defaults — deleting them stays valid. The redundant
-    // `target` member is GONE from the v10 wire (the enclosing entry owns
+    // `target` member is GONE from the v11 wire (the enclosing entry owns
     // target).
     let terminal_line = lines[1].clone();
     for field in ["deployment_id", "status", "recorded_at", "intent_digest"] {

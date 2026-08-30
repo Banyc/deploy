@@ -1961,7 +1961,11 @@ pub(crate) mod fixtures {
     }
 
     /// A FAILED-ROLLED-BACK terminal whose outcomes cover exactly `slots`
-    /// (all Restored — the rolled-back class).
+    /// (all Restored — the rolled-back class): each restored outcome's
+    /// observation is the slot's OWN pre-push observation (the delta
+    /// classifier sees observed == pre-push → `Unchanged`, so the payload
+    /// satisfies the all-Unchanged validator for the intent it was built
+    /// over).
     pub(crate) fn rolled_back_terminal(
         intent: &crate::kernel::intent::DeploymentIntent,
         slots: &[SlotId],
@@ -1970,20 +1974,19 @@ pub(crate) mod fixtures {
             slots
                 .iter()
                 .map(|sid| {
-                    (
-                        sid.clone(),
-                        SlotOutcome::Restored {
-                            observation: Observation::Known(
-                                crate::ledger::records::ObservedGeneration {
-                                    generation: test_generation_id(sid.as_str()),
-                                },
-                            ),
-                        },
-                    )
+                    let observation = match intent.pre_push(sid) {
+                        Some(Observation::Known(prev)) => {
+                            Observation::Known(crate::ledger::records::ObservedGeneration {
+                                generation: prev.generation.clone(),
+                            })
+                        }
+                        _ => Observation::KnownAbsent,
+                    };
+                    (sid.clone(), SlotOutcome::Restored { observation })
                 })
                 .collect(),
         );
-        let payload = crate::kernel::terminal::FailedRolledBackTerminal::try_new(outcomes)
+        let payload = crate::kernel::terminal::FailedRolledBackTerminal::try_new(outcomes, intent)
             .expect("a rolled-back payload is valid");
         LedgerTerminal::new(
             Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
@@ -1994,7 +1997,9 @@ pub(crate) mod fixtures {
     }
 
     /// A DEGRADED terminal whose outcomes cover exactly `slots` (all
-    /// Failed/Advanced — the remaining-changes class).
+    /// FailedAfterAdvance at the mocked desired generation — the
+    /// remaining-changes class, valid for the fixture intents whose
+    /// planned result is `snapshot_slot(sid)`).
     pub(crate) fn degraded_terminal(
         intent: &crate::kernel::intent::DeploymentIntent,
         slots: &[SlotId],
@@ -2004,13 +2009,12 @@ pub(crate) mod fixtures {
             .map(|sid| {
                 (
                     sid.clone(),
-                    SlotOutcome::Failed {
+                    SlotOutcome::FailedAfterAdvance {
                         observation: Observation::Known(
                             crate::ledger::records::ObservedGeneration {
                                 generation: test_generation_id(sid.as_str()),
                             },
                         ),
-                        compensated: false,
                         error: Some("test failure".to_string()),
                     },
                 )
@@ -2019,7 +2023,8 @@ pub(crate) mod fixtures {
         let non_empty =
             NonEmptySlotTable::build(outcomes.iter().map(|(k, v)| (k.clone(), v.clone())))
                 .expect("a degraded fixture outcome set is non-empty");
-        let payload = DegradedTerminal::try_new(non_empty).expect("a degraded payload is valid");
+        let payload =
+            DegradedTerminal::try_new(non_empty, intent).expect("a degraded payload is valid");
         LedgerTerminal::new(
             Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
             kernel::terminal::intent_digest(intent),

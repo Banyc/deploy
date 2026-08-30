@@ -3,14 +3,16 @@
 //! the DOMAIN terminal (owned by the semantic kernel,
 //! [`crate::kernel::terminal`]).
 //!
-//! Schema v10: a successful terminal is PAYLOAD-FREE — it only says "the
+//! Schema v11: a successful terminal is PAYLOAD-FREE — it only says "the
 //! intent's planned result was achieved" — and binds itself to its intent
 //! by `intent_digest` (the sha256 of the intent's canonical wire bytes, a
 //! validated scalar). The old duplicates are GONE: no rollback payload, no
 //! outcomes object on success (the failed dispositions carry their outcome
 //! ROW ARRAY), no `target` member — the ENCLOSING ENTRY owns target, so the
 //! wire no longer duplicates the entry's identity and the reader's
-//! target-equality check went away with it.
+//! target-equality check went away with it. The failed dispositions' per-slot
+//! outcomes are the STRUCTURAL v11 rows ([`SlotOutcomeRowWire`] — each row
+//! owns its slot id + its execution-state body).
 
 use crate::error::{Error, Result};
 use crate::identity::DeploymentId;
@@ -126,12 +128,15 @@ impl LedgerTerminalWire {
                 )));
             }
             (DeploymentStatus::FailedRolledBack, _) => {
-                let payload = FailedRolledBackTerminal::try_new(outcomes).map_err(|e| {
-                    Error::integrity(format!(
-                        "terminal {}: status FailedRolledBack refuses its outcome payload: {e}",
-                        self.deployment_id
-                    ))
-                })?;
+                // The reader has NO intent at deserialization time, so the
+                // intent-dependent delta validation (every slot's
+                // [`crate::kernel::terminal::SlotDelta`] `Unchanged`) is
+                // enforced by the cross-record terminal agreement
+                // ([`crate::kernel::transition::validate_terminal_vs_intent`])
+                // where the entry's intent exists — on the read fold AND the
+                // append path — never by a second rule here. The unchecked
+                // constructor carries the wire rows over.
+                let payload = FailedRolledBackTerminal::new_unchecked(outcomes);
                 kernel::terminal::TerminalDisposition::FailedRolledBack(payload)
             }
             (DeploymentStatus::Degraded, _) => {
@@ -143,12 +148,11 @@ impl LedgerTerminalWire {
                                 self.deployment_id
                             ))
                         })?;
-                let payload = DegradedTerminal::try_new(non_empty).map_err(|e| {
-                    Error::integrity(format!(
-                        "terminal {}: status Degraded refuses its outcome payload: {e}",
-                        self.deployment_id
-                    ))
-                })?;
+                // See the FailedRolledBack arm: the intent-dependent
+                // delta validation (at least one
+                // `Desired`/`Diverged`/`Unknown` delta) is enforced by
+                // [`crate::kernel::transition::validate_terminal_vs_intent`].
+                let payload = DegradedTerminal::new_unchecked(non_empty);
                 kernel::terminal::TerminalDisposition::Degraded(payload)
             }
         };

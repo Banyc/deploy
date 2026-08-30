@@ -9,10 +9,13 @@ use crate::config::SlotConfig;
 use crate::deploy::push::PreflightOutcome;
 use crate::deploy::push::PushContext;
 use crate::deploy::rollout::BatchRun;
+use crate::deploy::rollout::SlotExecution;
 use crate::error::Result;
 use crate::identity::SlotId;
 use crate::ledger::ActualSlotState;
-use crate::ledger::SlotResult;
+use crate::ledger::Observation;
+use crate::ledger::ObservedGeneration;
+use crate::ledger::SlotOutcome;
 use crate::remote::helper::RemoteHelper;
 use crate::remote::transport::Remote;
 use std::collections::BTreeMap;
@@ -24,28 +27,100 @@ use std::collections::HashMap;
 // observation. [`run_execution`] is the single coordinator and returns the
 // [`ExecutionOutcome`] the commit phases consume.
 // Everything here runs AFTER the intent was persisted (preflight) and BEFORE
-// the terminal event is finalized; a pre-swap failure records the ACTUAL
-// observed post-state via [`record_never_advanced_outcomes`].
+// the terminal event is finalized; the never-started slots' post-mutation
+// OBSERVATION is attached when the terminal inputs are derived below.
 
 /// The outcome of the mutation phases: the gathered EVIDENCE only — the
 /// engine never decides the status (the kernel's
 /// [`crate::kernel::transition::decide_terminal`] owns the complete truth
 /// table). The successful path's verification evidence is gathered by the
-/// shared lock-verified finalizer at commit time.
+/// shared lock-verified finalizer at commit time. The per-slot execution
+/// STATE lives in ONE ordered table ([`SlotExecution`] — the review's P2
+/// fix: a slot is exactly one of six mutually exclusive states, never a
+/// combination of booleans/lists that could disagree); every summary
+/// (`had_failure`, the failed outcomes, the display actuals) is DERIVED
+/// from it.
 pub(crate) struct ExecutionOutcome {
-    /// The per-slot results (every SELECTED slot; never-advanced outcomes
-    /// carry the ACTUAL observed post-state).
-    pub results: BTreeMap<SlotId, SlotResult>,
-    /// Whether any slot failed during the mutation loop (the failure-path
-    /// evidence; a successful yield feeds the finalizer's verification).
-    pub had_failure: bool,
+    /// The ONE per-slot execution table (every SELECTED slot).
+    pub executions: BTreeMap<SlotId, SlotExecution>,
+    /// The post-mutation OBSERVATION of each slot's live state (read from
+    /// the remote generation it currently points at — never the desired
+    /// plan values): the evidence the terminal decision's per-slot
+    /// classification compares against pre_push. Attached to the
+    /// observation-less executions ([`SlotExecution::NotStarted`] /
+    /// `FailedBeforeAdvance` / `Indeterminate`) when the terminal outcomes
+    /// are derived — the old `record_never_advanced_outcomes` wire-row
+    /// fix-up moved here.
+    pub(crate) actual_observations: BTreeMap<SlotId, Observation<ObservedGeneration>>,
     /// The per-slot ACTUAL final state (read from the live remote
     /// generation) — the structural [`ActualSlotState`] per member slot
     /// (a desired artifact NEVER rides an actual).
-    pub actual_servers: BTreeMap<SlotId, ActualSlotState>,
+    pub(crate) actual_servers: BTreeMap<SlotId, ActualSlotState>,
     /// The deployment-order slot list (step 17's per-slot retention runs in
     /// the same order).
-    pub servers_order: Vec<SlotId>,
+    pub(crate) servers_order: Vec<SlotId>,
+}
+
+impl ExecutionOutcome {
+    /// Whether any slot FAILED during the mutation loop — DERIVED from the
+    /// execution table (a pre-advance failure, a post-advance failure, or
+    /// an indeterminate outcome). An `Advanced` slot whose bookkeeping
+    /// record write failed is NOT a failure (the demotion signal lives in
+    /// the execution's `bookkeeping_error`).
+    pub(crate) fn had_failure(&self) -> bool {
+        self.executions.iter().any(|(_, e)| e.is_failure())
+    }
+
+    /// THE FAILED TERMINAL INPUTS: the executions → the STRUCTURAL DOMAIN
+    /// outcomes ([`SlotOutcome`]) the kernel's decision consumes, with the
+    /// post-mutation OBSERVATION attached per state:
+    ///
+    /// * `Advanced` / `Restored` / `FailedAfterAdvance` carry their RECORDED
+    ///   swap-result observation (the deployment's generation / the restored
+    ///   generation / the advanced generation);
+    /// * `NotStarted` / `FailedBeforeAdvance` / `Indeterminate` carry the
+    ///   LIVE post-mutation observation (the never-advanced rule — the
+    ///   actual observed post-state, never the desired generation; a failed
+    ///   read is `Unknown`, never read as "unchanged").
+    pub(crate) fn failure_outcomes(&self) -> Result<BTreeMap<SlotId, SlotOutcome>> {
+        let live = |sid: &SlotId| {
+            self.actual_observations
+                .get(sid)
+                .cloned()
+                .unwrap_or(Observation::KnownAbsent)
+        };
+        self.executions
+            .iter()
+            .map(|(sid, e)| {
+                let outcome = match e {
+                    SlotExecution::NotStarted => SlotOutcome::Skipped {
+                        observation: live(sid),
+                    },
+                    SlotExecution::FailedBeforeAdvance { .. } => SlotOutcome::FailedBeforeAdvance {
+                        observation: live(sid),
+                        error: e.failed_error().map(str::to_string),
+                    },
+                    SlotExecution::Advanced { observation, .. } => SlotOutcome::Activated {
+                        observation: observation.clone(),
+                    },
+                    SlotExecution::Restored { observation } => SlotOutcome::Restored {
+                        observation: observation.clone(),
+                    },
+                    SlotExecution::FailedAfterAdvance {
+                        observation, error, ..
+                    } => SlotOutcome::FailedAfterAdvance {
+                        observation: observation.clone(),
+                        error: error.clone(),
+                    },
+                    SlotExecution::Indeterminate { .. } => SlotOutcome::Indeterminate {
+                        observation: live(sid),
+                        error: e.failed_error().map(str::to_string),
+                    },
+                };
+                Ok((sid.clone(), outcome))
+            })
+            .collect()
+    }
 }
 
 /// Run every mutation phase (steps 10-15), in the numbered order. The batch
@@ -87,17 +162,11 @@ pub(crate) fn run_execution(
         .collect();
 
     // The deployment-order batch loop (batch_size, stop_on_failure, the
-    // `'batches` iteration) and the never-started `Skipped` filler live in
-    // [`crate::deploy::rollout`]; the outcome is the per-slot results plus
-    // the failure-policy signals (`advanced` / `compensated` /
-    // `never_advanced` / `had_failure`).
-    let BatchRun {
-        mut results,
-        mut advanced,
-        mut compensated,
-        never_advanced,
-        had_failure,
-    } = crate::deploy::rollout::run_batches(
+    // `'batches` iteration) and the never-started `NotStarted` filler live
+    // in [`crate::deploy::rollout`]; the outcome is the ONE per-slot
+    // execution table the failure-policy pass and the terminal decision
+    // derive from.
+    let BatchRun { mut executions } = crate::deploy::rollout::run_batches(
         &outcome.assignments,
         &outcome.behavior_index,
         members,
@@ -117,62 +186,50 @@ pub(crate) fn run_execution(
     )?;
 
     // 13 & 14. The FAILURE-POLICY PASS lives in [`crate::deploy::rollout`]:
-    // the step-13 compensation of still-advanced servers (RollbackChanged)
-    // — the STATUS DECISION IS THE KERNEL'S
+    // the step-13 compensation of the ADVANCE-REQUIRED set (an `Advanced`
+    // or `FailedAfterAdvance` execution is flipped to `Restored` on a
+    // successful compensation) — the STATUS DECISION IS THE KERNEL'S
     // ([`crate::kernel::transition::decide_terminal`] now DERIVES the
-    // rolled-back-vs-degraded disposition from the outcomes' derived
-    // transitions, so the engine no longer gathers an all_restored boolean);
-    // the engine gathers evidence only. The commit-marker step for an
+    // rolled-back-vs-degraded disposition from the per-slot outcomes'
+    // observations against the intent's pre-push/desired generations); the
+    // engine gathers evidence only. The commit-marker step for an
     // otherwise-successful attempt lives in the shared lock-verified
     // finalizer ([`crate::ledger::finalize::finalize_successful_locked`]) at
     // commit time.
     crate::deploy::rollout::apply_failure_policy(
-        had_failure,
         failure_policy,
-        &outcome.assignments,
         members,
         config,
         target_name,
-        store,
-        remotes,
         helpers,
         op_id,
         deployment_id,
         &outcome.plan_servers,
         &outcome.new_gen,
-        &mut advanced,
-        &mut compensated,
-        &mut results,
+        &mut executions,
     )?;
 
     // 16 & 17. Record attempt, history, retention.
     //
     // The per-slot ACTUAL observation (each slot's *real* final state, read
-    // from the remote generation it currently points at, as the two parallel
-    // tables `actual_servers` + `actual_observations` — including the
+    // from the remote generation it currently points at — including the
     // THREE-STATE `Observation::Unknown(error)` handling for failed reads)
     // lives in [`crate::deploy::rollout::observe_actual_servers`] (the
-    // result-table shaping module).
+    // result-table shaping module). The observation map is the evidence the
+    // terminal decision's per-slot classification attaches to the
+    // observation-less executions (never-started / pre-swap failures /
+    // indeterminate) — the old `record_never_advanced_outcomes` wire-row
+    // fix-up is GONE (its role moved into [`ExecutionOutcome::failure_outcomes`]).
     let (actual_servers, actual_observations) =
         crate::deploy::rollout::observe_actual_servers(&outcome.assignments, helpers);
-    // A pre-swap failure (never advanced) records the ACTUAL observed
-    // post-state — the outcome's observation is the observed post-state the
-    // remaining-changes derivation compares against pre_push, never the
-    // desired generation. The fix-up lives in [`crate::deploy::rollout`]
-    // (`record_never_advanced_outcomes`).
-    crate::deploy::rollout::record_never_advanced_outcomes(
-        &mut results,
-        &actual_observations,
-        &never_advanced,
-    );
     // `desired` (each slot's minted generation for its planned artifact, as a
     // complete [`GenerationRef`]) was computed BEFORE the mutation loop and
     // persisted as part of the immutable intent (`attempt_intent`); it is not
     // recomputed here.
 
     Ok(ExecutionOutcome {
-        results,
-        had_failure,
+        executions,
+        actual_observations,
         actual_servers,
         servers_order,
     })
@@ -188,7 +245,7 @@ pub(crate) mod execute_tests {
 
     use crate::deploy::testsupport::*;
     use crate::identity::test_deployment_id;
-    use crate::ledger::SlotOutcomeKind;
+    use crate::ledger::SlotOutcomeBodyWire;
     use crate::remote::helper::RemoteHelper;
     use crate::remote::transport::LocalTransport;
     use crate::testutil::test_remotes::FailOnceGenerationRemote;
@@ -251,7 +308,10 @@ pub(crate) mod execute_tests {
             Some(DeploymentStatus::FailedRolledBack)
         );
         let results = h.store.read_results(id.as_str()).unwrap();
-        assert_eq!(results[&SlotId::new("p1")].outcome, SlotOutcomeKind::Failed);
+        assert!(matches!(
+            results[&SlotId::new("p1")].result,
+            SlotOutcomeBodyWire::FailedBeforeAdvance { .. }
+        ));
 
         // The remote never advanced: no `current`, no durable generation
         // record (the mid-mutation fault fired before the assignment write, so
@@ -403,16 +463,18 @@ pub(crate) mod execute_tests {
         );
 
         // results.json records the compensation: the slot FAILED (verification)
-        // and was compensated inside the per-server pipeline — outcome `Failed`
-        // with `compensated: true`, at the PRIOR generation. (`Restored` is
-        // reserved for Activated slots compensated by the failure-policy pass.)
+        // and was compensated inside the per-server pipeline — the RESTORED
+        // state (`Restored` is also the failure-policy-compensated Activated
+        // state), at the PRIOR generation.
         let results = h.store.read_results(id2.as_str()).unwrap();
         let res = &results[&SlotId::new("p1")];
-        assert_eq!(res.outcome, SlotOutcomeKind::Failed);
-        assert!(res.compensated);
+        assert!(
+            matches!(res.result, SlotOutcomeBodyWire::Restored { .. }),
+            "an in-process-compensated failure is the Restored execution state"
+        );
         assert_eq!(
-            res.observation,
-            ObservationWire::Known(ObservedGenerationWire {
+            res.result.observation(),
+            &ObservationWire::Known(ObservedGenerationWire {
                 generation: prior_gen.clone()
             }),
             "the wire outcome records the compensated slot's PRIOR generation"
@@ -713,21 +775,37 @@ interval_seconds = 0
         assert_eq!(results.len(), 4);
         // The first batch advanced, then compensated back (no prior state ->
         // `current` removed): Restored.
-        assert_eq!(
-            results[&SlotId::new("p1")].outcome,
-            SlotOutcomeKind::Restored
+        assert!(
+            matches!(
+                results[&SlotId::new("p1")].result,
+                SlotOutcomeBodyWire::Restored { .. }
+            ),
+            "p1 must be compensated back (Restored)"
         );
-        assert_eq!(
-            results[&SlotId::new("p2")].outcome,
-            SlotOutcomeKind::Restored
+        assert!(
+            matches!(
+                results[&SlotId::new("p2")].result,
+                SlotOutcomeBodyWire::Restored { .. }
+            ),
+            "p2 must be compensated back (Restored)"
         );
-        // The failing slot of the second batch.
-        assert_eq!(results[&SlotId::new("p3")].outcome, SlotOutcomeKind::Failed);
+        // The failing slot of the second batch (verified then compensated
+        // in-process back to its first-deploy absence): Restored.
+        assert!(
+            matches!(
+                results[&SlotId::new("p3")].result,
+                SlotOutcomeBodyWire::Restored { .. }
+            ),
+            "p3 failed verification and was compensated in-process (Restored)"
+        );
         // The slot after the failing one in the same/later batch was never
         // started.
-        assert_eq!(
-            results[&SlotId::new("p4")].outcome,
-            SlotOutcomeKind::Skipped
+        assert!(
+            matches!(
+                results[&SlotId::new("p4")].result,
+                SlotOutcomeBodyWire::Skipped { .. }
+            ),
+            "p4 was never started (Skipped)"
         );
 
         // The never-started server (p4) was left untouched: no `current`
@@ -993,19 +1071,25 @@ interval_seconds = 0
         // sorted-by-id order p1 would have failed FIRST and p3 would never
         // have advanced.
         let results = store.read_results(id.as_str()).unwrap();
-        assert_eq!(
-            results[&SlotId::new("p3")].outcome,
-            SlotOutcomeKind::Restored,
+        assert!(
+            matches!(
+                results[&SlotId::new("p3")].result,
+                SlotOutcomeBodyWire::Restored { .. }
+            ),
             "p3 (first in the deployment order) advanced before the failure and was compensated back"
         );
-        assert_eq!(
-            results[&SlotId::new("p1")].outcome,
-            SlotOutcomeKind::Failed,
-            "p1 (second in the deployment order) is the failing slot"
+        assert!(
+            matches!(
+                results[&SlotId::new("p1")].result,
+                SlotOutcomeBodyWire::Restored { .. }
+            ),
+            "p1 (second in the deployment order) is the failing slot, compensated in-process back to its first-deploy absence (Restored)"
         );
-        assert_eq!(
-            results[&SlotId::new("p2")].outcome,
-            SlotOutcomeKind::Skipped,
+        assert!(
+            matches!(
+                results[&SlotId::new("p2")].result,
+                SlotOutcomeBodyWire::Skipped { .. }
+            ),
             "p2 (after the failing slot) was never started"
         );
     }
@@ -1091,15 +1175,17 @@ interval_seconds = 0
         );
 
         // results.json records the compensation: the slot FAILED (activation)
-        // and was compensated inside the per-server pipeline at the PRIOR
-        // generation.
+        // and was compensated inside the per-server pipeline — the RESTORED
+        // state — at the PRIOR generation.
         let results = h.store.read_results(id2.as_str()).unwrap();
         let res = &results[&SlotId::new("p1")];
-        assert_eq!(res.outcome, SlotOutcomeKind::Failed);
-        assert!(res.compensated, "activation failure must be compensated");
+        assert!(
+            matches!(res.result, SlotOutcomeBodyWire::Restored { .. }),
+            "activation failure must be compensated (Restored)"
+        );
         assert_eq!(
-            res.observation,
-            ObservationWire::Known(ObservedGenerationWire {
+            res.result.observation(),
+            &ObservationWire::Known(ObservedGenerationWire {
                 generation: prior_gen.clone()
             }),
             "the wire outcome records the compensated slot's PRIOR generation"
@@ -1186,26 +1272,30 @@ interval_seconds = 0
     }
 
     #[test]
-    fn activation_failure_compensation_failure_is_rolled_back_by_the_derived_evidence() {
+    fn activation_failure_compensation_failure_is_degraded_and_evidences_the_change() {
         // Same scenario, but the marker is NEVER consumed (`once = false`):
         // the desired activation fails AND the compensation's prior-activation
         // restart fails too. The in-process compensation records the failure
-        // WITHOUT `compensated` (the per-server pipeline could not fully
-        // restore the prior service) — an uncompensated `Failed` outcome. The
-        // kernel's DERIVED disposition rule
-        // ([`crate::kernel::transition::decide_terminal`]) classifies from
-        // the outcome evidence, never a stored boolean: rolled-back iff NO
-        // outcome has an `Advanced` transition (no slot PROVABLY ON the new
-        // state). This slot's outcome derives `AdvanceUnknown` — the
-        // compensation swap-back DID move `current` back to the prior
-        // generation, so it is NOT provably on the new state — and the
-        // attempt therefore ends `FailedRolledBack`, with the uncompensated
-        // `Failed` outcome visible in the rolled-back terminal's compensation
-        // report ("which compensations failed"). This is a pure-policy edge
-        // where the old `all_restored` boolean (compensation count — DSL
-        // "otherwise mark it degraded") disagreed with the outcome evidence;
-        // the structural evidence is authoritative now (requirement.md step
-        // 13 updated to the derived rule).
+        // WITHOUT restoring the slot — an uncompensated POST-ADVANCE failure:
+        // the swap happened and was NOT restored, so the execution state is
+        // `FailedAfterAdvance` (the old flat `Failed` + `compensated: false`
+        // could not distinguish it from a pre-swap failure). The kernel's ONE
+        // classifier
+        // ([`crate::kernel::terminal::classify_slot_delta`]) sees the
+        // outcome's recorded observation — the advanced desired generation —
+        // against the intent's pre_push and DESIRED generations: the delta is
+        // `Desired`, a REMAINING CHANGE. THE REVIEW'S P1 CASE: an
+        // uncompensated failure that happened AFTER the slot advanced must
+        // classify `Degraded` with a nonempty delta — the old transition-
+        // based rule (rolled back iff no slot PROVABLY ON the new state,
+        // which a post-swap compensation failure satisfied even though it
+        // advanced) called it `FailedRolledBack`. The delta is evidenced in
+        // the terminal's remaining_changes below. (The observed refresh
+        // reads the ACTUAL `current`, which the compensation swap-back moved
+        // to the prior generation even though the prior service could not be
+        // re-activated — the physical state is mixed, which is exactly why
+        // the recorded post-advance failure evidence, not a backend
+        // re-read, classifies the slot: it was advanced and not restored.)
         let env_dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let marker = env_dir.path().join("fail-restart");
         // Hermetic env: the fake systemctl and its markers ride the snapshot's
@@ -1237,8 +1327,8 @@ interval_seconds = 0
         let r2 = h.push_head(&id2).unwrap();
         assert_eq!(
             r2.status,
-            Some(DeploymentStatus::FailedRolledBack),
-            "the derived rule sees no slot PROVABLY ON the new state (the compensation swap-back moved current to the prior generation), so the attempt is rolled back, got {:?}",
+            Some(DeploymentStatus::Degraded),
+            "an uncompensated POST-ADVANCE failure (the swap happened and was not restored) is NEVER rolled-back: the slot's recorded observation is the advanced desired generation, so its delta is Desired — a remaining change — and the attempt is Degraded, got {:?}",
             r2.status
         );
         assert!(
@@ -1248,21 +1338,45 @@ interval_seconds = 0
 
         // results.json records the failure WITHOUT compensation: the slot
         // stayed on the DESIRED generation (the compensation swap-back could
-        // not re-activate the prior service).
+        // not re-activate the prior service) — the post-ADVANCE uncompensated
+        // failure state `FailedAfterAdvance` (the swap happened and was not
+        // restored: a remaining change, NEVER rolled-back).
         let results = h.store.read_results(id2.as_str()).unwrap();
         let res = &results[&SlotId::new("p1")];
-        assert_eq!(res.outcome, SlotOutcomeKind::Failed);
         assert!(
-            !res.compensated,
-            "the failed compensation must not be recorded as compensated"
+            matches!(res.result, SlotOutcomeBodyWire::FailedAfterAdvance { .. }),
+            "the failed compensation must be recorded as the FailedAfterAdvance execution state"
+        );
+        assert!(
+            matches!(res.result.observation(), ObservationWire::Known(_)),
+            "the outcome records the advanced (desired) generation"
         );
 
-        // The attempt is terminal FailedRolledBack (the uncompensated Failed
-        // outcome rides the rolled-back terminal's compensation report) and
-        // produced no snapshot; s0 is untouched.
+        // The attempt is terminal Degraded — the uncompensated post-advance
+        // failure evidenced as the terminal's remaining change — and produced
+        // no snapshot; s0 is untouched.
         assert_eq!(
             h.store.latest_status(id2.as_str()).unwrap(),
-            Some(DeploymentStatus::FailedRolledBack)
+            Some(DeploymentStatus::Degraded)
+        );
+        // THE DELTA IS EVIDENCED: the Degraded terminal's remaining_changes
+        // contains the slot (its recorded observation — the advanced desired
+        // generation — is NOT its pre-push state).
+        let entries = h.store.read_ledger("t1").unwrap();
+        let entry = entries
+            .iter()
+            .find(|e| e.deployment_id == id2)
+            .expect("the failed attempt has a ledger entry");
+        let terminal = entry
+            .terminal
+            .as_ref()
+            .expect("the failed attempt has a terminal");
+        let remaining = terminal
+            .remaining_changes(&entry.intent)
+            .expect("a Degraded terminal derives remaining changes");
+        assert!(
+            remaining.contains_key(&SlotId::new("p1")),
+            "the uncompensated post-advance failure is a remaining change (its delta is Desired), evidenced in the Degraded terminal"
         );
         let snapshots = h.store.read_snapshots("t1").unwrap();
         assert_eq!(snapshots.len(), 1, "only the baseline snapshot exists");
@@ -1350,15 +1464,19 @@ interval_seconds = 0
             "no current generation may remain after first-deploy compensation"
         );
 
-        // results.json records the failure WITH compensation (the failure AND
-        // the compensation result are both recorded, step 11) at the advanced
-        // (then removed) generation.
+        // results.json records the failure WITH compensation: the first-deploy
+        // activation failure was compensated in-process (removing `current`)
+        // — the RESTORED state.
         let results = h.store.read_results(id.as_str()).unwrap();
         let res = &results[&SlotId::new("p1")];
-        assert_eq!(res.outcome, SlotOutcomeKind::Failed);
         assert!(
-            res.compensated,
-            "first-deploy compensation must be recorded as compensated"
+            matches!(res.result, SlotOutcomeBodyWire::Restored { .. }),
+            "first-deploy compensation must be recorded as the Restored state"
+        );
+        assert_eq!(
+            res.result.observation(),
+            &ObservationWire::KnownAbsent,
+            "a compensated first-deploy slot records the absent (restored-to) state"
         );
 
         // The attempt is terminal FailedRolledBack and produced no snapshot /
@@ -1674,25 +1792,28 @@ interval_seconds = 0
             "the never-started slot has no current"
         );
 
-        // Per-slot outcomes: advanced, failed(+compensated), skipped.
+        // Per-slot outcomes: advanced, failed-then-compensated (Restored),
+        // skipped.
         let results = store.read_results(id.as_str()).unwrap();
-        assert_eq!(
-            results[&SlotId::new("p1")].outcome,
-            SlotOutcomeKind::Activated
-        );
-        assert_eq!(
-            results[&SlotId::new("p2")].outcome,
-            SlotOutcomeKind::Activated
-        );
-        assert_eq!(results[&SlotId::new("p3")].outcome, SlotOutcomeKind::Failed);
+        assert!(matches!(
+            results[&SlotId::new("p1")].result,
+            SlotOutcomeBodyWire::Activated { .. }
+        ));
+        assert!(matches!(
+            results[&SlotId::new("p2")].result,
+            SlotOutcomeBodyWire::Activated { .. }
+        ));
         assert!(
-            results[&SlotId::new("p3")].compensated,
-            "the failing slot's in-process compensation is recorded"
+            matches!(
+                results[&SlotId::new("p3")].result,
+                SlotOutcomeBodyWire::Restored { .. }
+            ),
+            "the failing slot's in-process compensation is recorded (Restored)"
         );
-        assert_eq!(
-            results[&SlotId::new("p4")].outcome,
-            SlotOutcomeKind::Skipped
-        );
+        assert!(matches!(
+            results[&SlotId::new("p4")].result,
+            SlotOutcomeBodyWire::Skipped { .. }
+        ));
 
         // No snapshot/ref for a degraded attempt.
         assert!(

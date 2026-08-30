@@ -9,6 +9,7 @@ use crate::config::SlotConfig;
 use crate::deploy::push::ExecutionOutcome;
 use crate::deploy::push::PushContext;
 use crate::deploy::push::PushReport;
+use crate::deploy::rollout::SlotExecution;
 use crate::error::Result;
 use crate::identity::SlotId;
 use crate::ledger;
@@ -19,7 +20,6 @@ use crate::ledger::LedgerTerminal;
 use crate::ledger::NonEmptySlotTable;
 use crate::ledger::SlotOutcome;
 use crate::remote::helper::RemoteHelper;
-use std::collections::BTreeMap;
 
 // POST-MUTATION phases of the push transaction (steps 16-17): the terminal
 // event finalization (the `Successful` / `Degraded` / `FailedRolledBack`
@@ -63,29 +63,22 @@ pub(crate) fn run_commit(
 
     let message;
     let status;
-    if execution.had_failure {
+    if execution.had_failure() {
         // THE FAILURE PATH: the engine gathered the per-slot outcome
         // evidence; the KERNEL decides `FailedRolledBack` / `Degraded` and
         // validates the payload through the constructors. The failure
         // outcomes ALWAYS cover the nonempty selected membership (the
-        // engine completes the results table with `Skipped` fillers); a set
-        // that could be empty is REFUSED with an integrity error — never an
-        // accepted empty failure.
-        let outcomes: NonEmptySlotTable<SlotOutcome> =
-            NonEmptySlotTable::build(
-                execution
-                    .results
-                    .iter()
-                    .map(|(key, result)| {
-                        Ok((key.clone(), SlotOutcome::from_wire(result.clone())?))
-                    })
-                    .collect::<Result<BTreeMap<SlotId, SlotOutcome>>>()?,
-            )
+        // engine completes the execution table with `NotStarted` fillers); a
+        // set that could be empty is REFUSED with an integrity error — never
+        // an accepted empty failure.
+        let outcomes: NonEmptySlotTable<SlotOutcome> = NonEmptySlotTable::build(
+            execution.failure_outcomes()?,
+        )
             .map_err(|e| {
-                crate::error::Error::integrity(format!(
-                    "push {deployment_id}: the failure outcomes must cover the selected membership (nonempty): {e}"
-                ))
-            })?;
+            crate::error::Error::integrity(format!(
+                "push {deployment_id}: the failure outcomes must cover the selected membership (nonempty): {e}"
+            ))
+        })?;
         let disposition = crate::kernel::transition::decide_terminal(
             attempt_intent,
             crate::kernel::transition::ExecutionReport::Failed { outcomes },
@@ -129,9 +122,14 @@ pub(crate) fn run_commit(
         // finalize `Successful` — it stays intent-only (the recoverable
         // PENDING state a later push reconciles before its own no-op
         // check).
-        if execution.results.values().any(|r| {
-            use crate::ledger::records::SlotOutcomeKind as K;
-            r.outcome == K::Activated && r.error.is_some()
+        if execution.executions.values().any(|e| {
+            matches!(
+                e,
+                SlotExecution::Advanced {
+                    bookkeeping_error: Some(_),
+                    ..
+                }
+            )
         }) {
             let (_observed, observed_warnings) =
                 crate::deploy::maintenance::refresh_observed_from_live(
@@ -231,28 +229,21 @@ pub(crate) fn run_commit(
                 // `Degraded` terminal — NEVER `Successful`. The kernel
                 // decides the disposition from the failure evidence: a
                 // refusal means the attempt did NOT fully run, so its
-                // evidence carries a non-restored (Advanced) transition —
-                // some slot is still on the deployed generation — which the
-                // DERIVED rule (rolled back iff no `Advanced` transition)
-                // classifies `Degraded`. The failure outcomes ALWAYS cover
-                // the nonempty selected membership (the engine completed the
-                // results table); an empty set is REFUSED with an integrity
-                // error, never an accepted empty failure.
+                // evidence carries a remaining change — some slot is still
+                // on the deployed generation — which the DERIVED rule
+                // (rolled back iff every slot's observation is back at its
+                // pre-push state) classifies `Degraded`. The failure
+                // outcomes ALWAYS cover the nonempty selected membership
+                // (the engine completed the execution table); an empty set
+                // is REFUSED with an integrity error, never an accepted
+                // empty failure.
                 let outcomes: NonEmptySlotTable<SlotOutcome> =
-                    NonEmptySlotTable::build(
-                        execution
-                            .results
-                            .iter()
-                            .map(|(key, result)| {
-                                Ok((key.clone(), SlotOutcome::from_wire(result.clone())?))
-                            })
-                            .collect::<Result<BTreeMap<SlotId, SlotOutcome>>>()?,
-                    )
-                    .map_err(|e| {
-                        crate::error::Error::integrity(format!(
-                            "push {deployment_id}: the refused disposition's outcomes must cover the selected membership (nonempty): {e}"
-                        ))
-                    })?;
+                    NonEmptySlotTable::build(execution.failure_outcomes()?)
+                        .map_err(|e| {
+                            crate::error::Error::integrity(format!(
+                                "push {deployment_id}: the refused disposition's outcomes must cover the selected membership (nonempty): {e}"
+                            ))
+                        })?;
                 let disposition = crate::kernel::transition::decide_terminal(
                     attempt_intent,
                     crate::kernel::transition::ExecutionReport::Failed { outcomes },
@@ -1995,21 +1986,32 @@ pub(crate) mod commit_tests {
                 }
                 other => {
                     // NO SUCCESSFUL TERMINAL MAY APPEAR for a drifted /
-                    // diverged / membership-lost attempt — it must end
-                    // Degraded (or stay pending on a transient failure, which
-                    // this fixture never produces).
+                    // diverged / membership-lost attempt — the ONE
+                    // classifier decides it: `Degraded` (at least one
+                    // `Desired`/`Diverged`/`Unknown` evidence delta — e.g. a
+                    // moved deploy_dir whose live generation is the desired
+                    // one, or a membership-mismatch `Unknown`) or
+                    // `FailedRolledBack` (EVERY slot's live state is back at
+                    // its pre-push state — e.g. a server rebind whose
+                    // rebound location never saw the deployment: a Degraded
+                    // terminal with NO remaining change is unrepresentable,
+                    // the review's P1 rule — it can never stay pending on
+                    // this fixture.
                     assert!(
                         !success_permitted,
                         "an attempt whose live state matches the frozen intent must succeed, got {other:?} (mutation {mutation:?}, generation_copied {generation_copied})"
                     );
-                    assert_eq!(
-                        other,
-                        DeploymentStatus::Degraded,
-                        "a drifted/diverged pending attempt must end Degraded — no Successful terminal may appear (mutation {mutation:?}, generation_copied {generation_copied})"
+                    assert!(
+                        matches!(
+                            other,
+                            DeploymentStatus::Degraded
+                                | DeploymentStatus::FailedRolledBack
+                        ),
+                        "a drifted/diverged pending attempt must end Degraded (or FailedRolledBack when the evidence is all-Unchanged) — the ONE classifier decides; no Successful terminal may appear (mutation {mutation:?}, generation_copied {generation_copied}, got {other:?})"
                     );
                     assert!(
                         h.store.read_snapshots("t1").unwrap().is_empty(),
-                        "a degraded attempt records no snapshot"
+                        "a non-successful attempt records no snapshot"
                     );
                 }
             }

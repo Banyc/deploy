@@ -856,21 +856,24 @@ impl LocalStore {
                     selected
                         .iter()
                         .map(|sid| {
-                            (
-                                sid.clone(),
-                                SlotOutcome::Restored {
-                                    observation: Observation::Known(ObservedGeneration {
-                                        generation: crate::identity::test_generation_id(
-                                            sid.as_str(),
-                                        ),
-                                    }),
-                                },
-                            )
+                            // The restored observation is the slot's OWN
+                            // pre-push state (the delta classifier sees
+                            // observed == pre-push → Unchanged).
+                            let observation = match intent.pre_push(sid) {
+                                Some(Observation::Known(prev)) => {
+                                    Observation::Known(ObservedGeneration {
+                                        generation: prev.generation.clone(),
+                                    })
+                                }
+                                _ => Observation::KnownAbsent,
+                            };
+                            (sid.clone(), SlotOutcome::Restored { observation })
                         })
                         .collect(),
                 );
-                let payload = crate::kernel::terminal::FailedRolledBackTerminal::try_new(outcomes)
-                    .map_err(|e| Error::store(format!("append_transition: {e}")))?;
+                let payload =
+                    crate::kernel::terminal::FailedRolledBackTerminal::try_new(outcomes, &intent)
+                        .map_err(|e| Error::store(format!("append_transition: {e}")))?;
                 TerminalDisposition::FailedRolledBack(payload)
             }
             DeploymentStatus::Degraded => {
@@ -882,19 +885,18 @@ impl LocalStore {
                     .map(|sid| {
                         (
                             sid.clone(),
-                            SlotOutcome::Failed {
+                            SlotOutcome::FailedAfterAdvance {
                                 observation: Observation::Known(ObservedGeneration {
                                     generation: crate::identity::test_generation_id(sid.as_str()),
                                 }),
-                                compensated: false,
-                                error: None,
+                                error: Some("test failure".to_string()),
                             },
                         )
                     })
                     .collect();
                 let outcomes = NonEmptySlotTable::build(degraded_outcomes)
                     .map_err(|e| Error::store(format!("append_transition outcomes: {e}")))?;
-                let payload = crate::kernel::terminal::DegradedTerminal::try_new(outcomes)
+                let payload = crate::kernel::terminal::DegradedTerminal::try_new(outcomes, &intent)
                     .map_err(|e| Error::store(format!("append_transition: {e}")))?;
                 TerminalDisposition::Degraded(payload)
             }

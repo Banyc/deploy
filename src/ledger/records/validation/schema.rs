@@ -14,7 +14,7 @@
 /// version themselves separately from the configuration format, so bumping
 /// one never invalidates the other.
 ///
-/// The current format is version 10 (the ONLY version writers emit and
+/// The current format is version 11 (the ONLY version writers emit and
 /// readers accept): the intent freezes the COMPLETE resulting snapshot as
 /// an ORDERED ROW ARRAY (`slots` — each row OWNS its slot id and its
 /// plan-minted result + Deploy/Inherit action, in DEPLOYMENT ORDER, never
@@ -26,7 +26,14 @@
 /// survive a round trip) and slot-identity-owning (the key and any
 /// row-internal id can never disagree); the wire → domain conversions
 /// REFUSE a duplicate row explicitly (ambiguous JSON is never last-wins)
-/// and fold the rows in FILE ORDER into the domain's ordered tables. The
+/// and fold the rows in FILE ORDER into the domain's ordered tables.
+/// SINCE v11 the outcome rows are STRUCTURAL ([`crate::ledger::records::SlotOutcomeBodyWire`]):
+/// each row carries its EXECUTION-STATE body (`activated` / `restored` /
+/// `skipped` / `failed_before_advance` / `failed_after_advance` /
+/// `indeterminate`) with EXACTLY its own fields (`deny_unknown_fields` —
+/// the old flat `outcome` + `compensated` + `error` members are GONE, so
+/// a persisted document can no longer represent `Activated + compensated`
+/// or drop an irrelevant `error` silently: the wire is BIJECTIVE). The
 /// deployment records still use the canonical placement-slot-keyed identity
 /// and the STRICT WIRE OBSERVATIONS — the pre-push assignments' artifact
 /// and the per-slot outcomes' post-mutation observation serialize as the
@@ -42,7 +49,22 @@
 /// current one is REJECTED on read (no compatibility fallback), so a
 /// record is interpreted only under exactly the schema that wrote it:
 ///
-/// * version 10 (CURRENT): the INTENT record FREEZES the COMPLETE result
+/// * version 11 (CURRENT): the OUTCOME ROWS become STRUCTURAL — the
+///   terminal's per-slot outcomes carry their execution-state body
+///   ([`crate::ledger::records::SlotOutcomeBodyWire`]) instead of the flat
+///   `outcome`/`compensated`/`error` members; the body is EXACTLY one of
+///   six mutually exclusive states, each with EXACTLY its own fields
+///   (`deny_unknown_fields` — the old contradictory combinations, e.g.
+///   `Activated` + `compensated`, are UNREPRESENTABLE: deserialization
+///   rejects them). The post-mutation OBSERVATION stays as the per-slot
+///   EVIDENCE (each body variant carries its own observation; the failed
+///   variants carry their operation error). The domain taxonomy is the
+///   same six states — [`crate::ledger::records::SlotOutcome`] — and every
+///   terminal decision derives from the ONE per-slot classifier
+///   ([`crate::kernel::terminal::classify_slot_delta`] / [`crate::kernel::terminal::SlotDelta`]).
+///   REJECTED on read: a version 10 record's outcome rows carry the flat
+///   `outcome`/`compensated`/`error` shape.
+/// * version 10: the INTENT record FREEZES the COMPLETE result
 ///   as an ORDERED ROW ARRAY — `slots: [PlannedSlotRowWire]` (each row
 ///   owns its slot id + plan-minted result + action, in DEPLOYMENT
 ///   ORDER — the exact order the user recorded, never re-sorted), the
@@ -125,7 +147,7 @@
 /// frozen bindings are REQUIRED, no serde default). A hypothetical
 /// pre-rekeying shape that keyed these maps by server ID with flat
 /// artifact fields is NOT the current schema and never loads.
-pub(crate) const LEDGER_SCHEMA_VERSION: u32 = 10;
+pub(crate) const LEDGER_SCHEMA_VERSION: u32 = 11;
 
 /// The `pins.json` record format version (`Pins.schema_version`). Pins are
 /// durable, store-global retention anchors for artifact CONTENT ONLY (see

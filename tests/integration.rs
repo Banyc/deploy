@@ -2397,9 +2397,9 @@ interval_seconds = 0
     assert!(
         matches!(
             results[&SlotId::parse("p1").unwrap()],
-            deploy::ledger::SlotOutcome::Failed { .. }
+            deploy::ledger::SlotOutcome::Restored { .. }
         ),
-        "the first slot's outcome is Failed"
+        "the first slot's verification failure was compensated in-process (Restored)"
     );
     assert!(
         matches!(

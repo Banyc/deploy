@@ -38,9 +38,9 @@ use crate::identity::{GenerationId, OperationId, SlotId};
 use crate::kernel;
 use crate::ledger::finalize::{FinalizeOutcome, FinalizeSettings, finalize_successful_locked};
 use crate::ledger::records::{
-    DegradedTerminal, DeploymentIntent, LedgerTerminal, NonEmptySlotTable, Observation,
-    ObservationError, ObservedGeneration, PhysicalBinding, SlotOutcome, SlotTable,
-    TerminalDisposition,
+    DegradedTerminal, DeploymentIntent, FailedRolledBackTerminal, LedgerTerminal,
+    NonEmptySlotTable, Observation, ObservationError, ObservedGeneration, PhysicalBinding,
+    SlotOutcome, SlotTable, TerminalDisposition,
 };
 use crate::remote::helper::{HeldSlotLock, RemoteHelper};
 use crate::store::local::LocalStore;
@@ -234,19 +234,30 @@ pub(crate) fn reconcile_pending_commits(
     Ok(outcome)
 }
 
-/// Append the `Degraded` TERMINAL of a recovered attempt whose live state
-/// no longer admits `Successful`: one per-slot [`SlotOutcome::Failed`]
-/// outcome per SELECTED slot, with `compensated: false` — the causal-
-/// agnostic `AdvanceUnknown` shape (recovery never claims a slot was
-/// `Restored`/compensated or `Skipped`/never-started without transaction
-/// evidence). The outcome's OBSERVATION is copied from the per-slot
-/// EVIDENCE ([`RecoverySlotEvidence`]) that `reconcile_pending_commits`
-/// collected from the backends BEFORE deciding the terminal; this function
-/// NEVER reads a generation from `attempt.resulting_snapshot()` (the
-/// plan-time DESIRED state) to populate an observation — a plan may create
-/// desired facts, but only a successful BACKEND READ may create an
-/// OBSERVED fact, and a recovery-degraded terminal records observed facts
-/// only.
+/// Append the RECOVERY TERMINAL of a recovered attempt whose live state no
+/// longer admits `Successful`: one per-slot causal-agnostic
+/// [`SlotOutcome::Indeterminate`] outcome per SELECTED slot (recovery never
+/// claims a slot was `Restored`/compensated or `Skipped`/never-started
+/// without transaction evidence). The outcome's OBSERVATION is copied from
+/// the per-slot EVIDENCE ([`RecoverySlotEvidence`]) that
+/// `reconcile_pending_commits` collected from the backends BEFORE deciding
+/// the terminal; this function NEVER reads a generation from
+/// `attempt.resulting_snapshot()` (the plan-time DESIRED state) to populate
+/// an observation — a plan may create desired facts, but only a successful
+/// BACKEND READ may create an OBSERVED fact, and a recovery terminal
+/// records observed facts only.
+///
+/// THE DISPOSITION IS DECIDED BY THE ONE CLASSIFIER (the shared-type-
+/// forced recovery adjustment — the review's P1 rule): the evidence's
+/// deltas (vs the attempt's pre-push and DESIRED generations) decide — AT
+/// LEAST ONE `Desired`/`Diverged`/`Unknown` delta → `Degraded` (nonempty
+/// deltas); EVERY slot `Unchanged` (e.g. a binding drift whose live
+/// generations all still match pre-push) → `FailedRolledBack` — a Degraded
+/// terminal with NO remaining change is unrepresentable (exactly the
+/// review's finding a Degraded disposition could contain no remaining
+/// changes). The follow-up feature formalizes recovery's decision through
+/// the same path; this is the minimal classification the shared type
+/// requires.
 fn append_degraded(
     store: &LocalStore,
     target_name: &str,
@@ -254,6 +265,7 @@ fn append_degraded(
     per_slot_evidence: &BTreeMap<SlotId, RecoverySlotEvidence>,
     reason: &str,
 ) -> Result<()> {
+    use crate::kernel::terminal::{SlotDelta, outcome_slot_delta};
     let outcomes: BTreeMap<SlotId, SlotOutcome> = attempt
         .selected()
         .map(|(sid, _)| {
@@ -264,14 +276,28 @@ fn append_degraded(
         })
         .collect();
     let outcomes: SlotTable<SlotOutcome> = SlotTable::from_map(outcomes);
-    let non_empty = NonEmptySlotTable::build(outcomes.iter().map(|(k, v)| (k.clone(), v.clone())))
-        .map_err(|e| Error::integrity(format!("recovery degraded outcomes: {e}")))?;
-    let dt = DegradedTerminal::try_new(non_empty)
-        .map_err(|e| Error::integrity(format!("recovery degraded terminal: {e}")))?;
+    let has_remaining = outcomes
+        .iter()
+        .any(|(sid, o)| outcome_slot_delta(attempt, sid, o) != SlotDelta::Unchanged);
+    let disposition = if has_remaining {
+        let non_empty =
+            NonEmptySlotTable::build(outcomes.iter().map(|(k, v)| (k.clone(), v.clone())))
+                .map_err(|e| Error::integrity(format!("recovery degraded outcomes: {e}")))?;
+        let dt = DegradedTerminal::try_new(non_empty, attempt)
+            .map_err(|e| Error::integrity(format!("recovery degraded terminal: {e}")))?;
+        TerminalDisposition::Degraded(dt)
+    } else {
+        // Every slot is back at its pre-push state: the truthful
+        // disposition is FailedRolledBack (all-Unchanged deltas), never a
+        // Degraded terminal with no remaining change.
+        let frb = FailedRolledBackTerminal::try_new(outcomes, attempt)
+            .map_err(|e| Error::integrity(format!("recovery rolled-back terminal: {e}")))?;
+        TerminalDisposition::FailedRolledBack(frb)
+    };
     let terminal = LedgerTerminal::new(
         crate::remote::helper::now_rfc3339_ts(),
         kernel::terminal::intent_digest(attempt),
-        TerminalDisposition::Degraded(dt),
+        disposition,
         Some(reason.to_string()),
     );
     store.append_terminal(target_name, attempt.deployment_id(), &terminal)
@@ -388,16 +414,17 @@ fn recovery_evidence_from_backend(
 }
 
 /// The causal-agnostic per-slot outcome a recovery-degraded terminal
-/// records for the given evidence: `Failed { compensated: false }` (deriving
-/// `AdvanceUnknown` — recovery never claims `Restored`/compensation or
-/// `Skipped`/never-started without transaction evidence). The observation is
-/// the evidence's TRUTHFUL backend observation; the `error` is the
-/// evidence's read error (the only operation-level error a non-mutating
-/// recovery carries). The plan's desired snapshot NEVER appears here.
+/// records for the given evidence: [`SlotOutcome::Indeterminate`] — the
+/// backend read reports the observed state, but recovery has NO transaction
+/// evidence of what the attempt's mutation did (recovery never claims
+/// `Restored`/compensated or `Skipped`/never-started without transaction
+/// evidence). The observation is the evidence's TRUTHFUL backend
+/// observation; the `error` is the evidence's read error (the only
+/// operation-level error a non-mutating recovery carries). The plan's
+/// desired snapshot NEVER appears here.
 fn failed_outcome_from_evidence(evidence: &RecoverySlotEvidence) -> SlotOutcome {
-    SlotOutcome::Failed {
+    SlotOutcome::Indeterminate {
         observation: evidence.observation.clone(),
-        compensated: false,
         error: evidence.error.clone(),
     }
 }
@@ -458,70 +485,24 @@ fn collect_recovery_evidence(
     Ok(Some(evidence))
 }
 
-/// THE DERIVED PER-SLOT RECOVERY CLASSIFICATION (test/assertion view — the
-/// degraded terminal itself stays the causal-agnostic `Failed` regardless;
-/// this is a derived view, never a stored field, and adds NO wire variant):
-/// compare the EVIDENCE's observed generation against the intent's DESIRED
-/// generation (the frozen snapshot entry) and the intent's PRE-PUSH
-/// generation (the plan's pre-push observation):
-///
-/// * [`SlotRecoveryClass::Advanced`] — the observed state IS the desired
-///   generation (backend-read confirmed);
-/// * [`SlotRecoveryClass::Unchanged`] — the observed state equals the
-///   pre-push generation, or the slot was observed absent with no known
-///   prior generation — the slot is back at its pre-push state WITHOUT
-///   claiming restored vs never-started (no transaction evidence proves
-///   which occurred);
-/// * [`SlotRecoveryClass::Diverged`] — the observed state is a THIRD
-///   generation, or absent while a prior generation was known;
-/// * [`SlotRecoveryClass::Unknown`] — the observation read failed.
-///
-/// The checked order is desired-first (the assumption: a real deploy
-/// advances the generation, so the desired generation differs from the
-/// pre-push one). Under that assumption the classification matches the
-/// kernel's `remaining_changes` exactly for the evidence-built `Failed`
-/// outcomes: a slot is a remaining change iff its class is not `Unchanged`.
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SlotRecoveryClass {
-    /// The observed state is the DESIRED generation (backend-read
-    /// confirmed — a remaining change under desired != pre-push).
-    Advanced,
-    /// The observed state equals the pre-push state (or is absent with no
-    /// known prior generation) — never a remaining change.
-    Unchanged,
-    /// The observed state is a third generation / vanished prior state — a
-    /// remaining change.
-    Diverged,
-    /// The observation read failed — always a remaining change.
-    Unknown,
-}
-
+/// The causal-agnostic per-slot classification of a recovery evidence
+/// (test/assertion view — the degraded terminal itself stays the
+/// causal-agnostic `Indeterminate`; this is a derived view, never a stored
+/// field): delegates to the SHARED classifier
+/// ([`crate::kernel::terminal::classify_slot_delta`] / [`crate::kernel::terminal::SlotDelta`]) —
+/// the same `Desired`/`Unchanged`/`Diverged`/`Unknown` taxonomy the
+/// terminal decision, the payload validators, and `remaining_changes` use
+/// (the old recovery-specific `Advanced`/`Unchanged`/`Diverged`/`Unknown`
+/// classification is REPLACED — [`SlotDelta::Desired`] is the backend-
+/// confirmed verified slot, and a slot is a remaining change iff its class
+/// is not `Unchanged`, exactly as before).
 #[cfg(test)]
 pub(crate) fn classify_recovery_slot(
     evidence: &RecoverySlotEvidence,
     desired: &GenerationId,
     pre_push: Option<&GenerationId>,
-) -> SlotRecoveryClass {
-    match &evidence.observation {
-        Observation::Unknown(_) => SlotRecoveryClass::Unknown,
-        Observation::KnownAbsent => match pre_push {
-            // Never deployed and still not deployed: nothing changed
-            // (never-started, observed).
-            None => SlotRecoveryClass::Unchanged,
-            // A known prior generation vanished — the state MOVED.
-            Some(_) => SlotRecoveryClass::Diverged,
-        },
-        Observation::Known(og) => {
-            if og.generation == *desired {
-                SlotRecoveryClass::Advanced
-            } else if Some(&og.generation) == pre_push {
-                SlotRecoveryClass::Unchanged
-            } else {
-                SlotRecoveryClass::Diverged
-            }
-        }
-    }
+) -> crate::kernel::terminal::SlotDelta {
+    crate::kernel::terminal::classify_slot_delta(&evidence.observation, desired, pre_push)
 }
 
 #[cfg(test)]
@@ -535,6 +516,7 @@ mod tests {
     };
     use crate::kernel::intent::{PlanInput, PlannedDeploy};
     use crate::kernel::snapshot::{PreviousGeneration, SnapshotSlot};
+    use crate::kernel::terminal::SlotDelta;
     use crate::ledger::{DeploymentStatus, PhysicalBinding};
     use crate::remote::helper::{ExpectedCurrent, GenerationAssignment, RemoteHelper};
     use crate::remote::transport::{LocalTransport, Remote};
@@ -1073,24 +1055,26 @@ mod tests {
             "the binding is Known under the same read — the current configured binding, never the intent's frozen snapshot binding"
         );
 
-        // (3) THE DERIVED CLASSIFICATION: actual == desired -> Advanced
-        // (the backend-confirmed verified slot), actual == pre-push ->
-        // Unchanged, third generation / vanished prior state -> Diverged,
-        // failed read -> Unknown.
+        // (3) THE DERIVED CLASSIFICATION (the SHARED classifier — the
+        // recovery `classify_recovery_slot` delegating to
+        // [`crate::kernel::terminal::classify_slot_delta`]): actual ==
+        // desired -> Desired (the backend-confirmed verified slot), actual
+        // == pre-push -> Unchanged, third generation / vanished prior state
+        // -> Diverged, failed read -> Unknown.
         let expected_class = match backend {
-            PropBackend::AtDesired => SlotRecoveryClass::Advanced,
-            PropBackend::AtPrePush => SlotRecoveryClass::Unchanged,
-            PropBackend::AtThird | PropBackend::Absent => SlotRecoveryClass::Diverged,
-            PropBackend::ReadError => SlotRecoveryClass::Unknown,
+            PropBackend::AtDesired => SlotDelta::Desired,
+            PropBackend::AtPrePush => SlotDelta::Unchanged,
+            PropBackend::AtThird | PropBackend::Absent => SlotDelta::Diverged,
+            PropBackend::ReadError => SlotDelta::Unknown,
         };
         assert_eq!(
             class, expected_class,
             "the derived per-slot classification matches the evidence vs desired/pre-push ({backend:?})"
         );
 
-        // (4) THE RECOVERED TERMINAL: the causal-agnostic Failed
-        // (AdvanceUnknown) outcome built from the evidence, carrying the
-        // case's recovery failure as the reason; the honest remaining set.
+        // (4) THE RECOVERED TERMINAL: the causal-agnostic Indeterminate
+        // outcome built from the evidence, carrying the case's recovery
+        // failure as the reason; the honest remaining set.
         let artifact = art("rel-evidence");
         let intent = evidence_prop_intent(&slot, &desired, &pre_push, &config_binding, artifact);
         let outcome = failed_outcome_from_evidence(&evidence);
@@ -1099,18 +1083,38 @@ mod tests {
             &evidence.observation,
             "the degraded outcome copies the BACKEND-observed fact from the evidence"
         );
-        assert_eq!(
-            outcome.transition(),
-            crate::ledger::records::SlotTransition::AdvanceUnknown,
-            "the degraded terminal stays the causal-agnostic Failed {{ compensated: false }} (AdvanceUnknown) — never Restored/Skipped without transaction evidence"
+        assert!(
+            matches!(
+                outcome,
+                crate::ledger::records::SlotOutcome::Indeterminate { .. }
+            ),
+            "the degraded terminal stays the causal-agnostic Indeterminate — never Restored/Skipped without transaction evidence"
         );
         let outcomes: SlotTable<SlotOutcome> =
             SlotTable::from_map(BTreeMap::from([(slot.clone(), outcome)]));
         let non_empty =
             NonEmptySlotTable::build(outcomes.iter().map(|(k, v)| (k.clone(), v.clone())))
                 .expect("a single outcome builds a non-empty table");
-        let dt = DegradedTerminal::try_new(non_empty)
-            .expect("a Failed {{ compensated: false }} outcome is a valid degraded result");
+
+        // (5) THE NONEMPTY-DELTAS INVARIANT (the shared type's rule — the
+        // review's P1 fix): a Degraded terminal requires at least one
+        // `Desired`/`Diverged`/`Unknown` delta. An ALL-UNCHANGED evidence
+        // case (the backend reports every slot at its pre-push state) is
+        // REFUSED by the validator — a Degraded terminal can no longer
+        // contain NO remaining change (recovery's own decision rework — how
+        // the all-unchanged case must be disposed — is a FOLLOW-UP feature;
+        // the shared classifier/constructor rule is what THIS feature
+        // formalizes).
+        if class == SlotDelta::Unchanged {
+            let err = DegradedTerminal::try_new(non_empty, &intent).unwrap_err();
+            assert!(
+                err.to_string().contains("remaining change"),
+                "an all-Unchanged evidence set is refused as Degraded, got: {err}"
+            );
+            return;
+        }
+        let dt = DegradedTerminal::try_new(non_empty, &intent)
+            .expect("a non-Unchanged evidence set builds a valid degraded terminal");
         let terminal = LedgerTerminal::new(
             crate::remote::helper::now_rfc3339_ts(),
             kernel::terminal::intent_digest(&intent),
@@ -1120,33 +1124,21 @@ mod tests {
         assert_eq!(terminal.status(), DeploymentStatus::Degraded);
         assert_eq!(terminal.reason(), Some(failure.reason()));
 
-        // (5) ONLY THE HONESTLY-CHANGED SLOTS APPEAR AS remaining_changes:
+        // (6) ONLY THE HONESTLY-CHANGED SLOTS APPEAR AS remaining_changes:
         // the Unchanged class (observed == pre-push) is never a remaining
-        // change; every Advanced/Diverged/Unknown slot is.
+        // change; every Desired/Diverged/Unknown slot is.
         let remaining = terminal
             .remaining_changes(&intent)
             .expect("a Degraded terminal derives remaining changes");
-        let expected_remaining = if class == SlotRecoveryClass::Unchanged {
-            0
-        } else {
-            1
-        };
         assert_eq!(
             remaining.len(),
-            expected_remaining,
-            "remaining_changes contains exactly the honestly-changed slots: only the Unchanged class is never a remaining change ({class:?}, {backend:?})"
+            1,
+            "a non-Unchanged slot is the one remaining change ({class:?}, {backend:?})"
         );
-        if class != SlotRecoveryClass::Unchanged {
-            assert!(
-                remaining.contains_key(&slot),
-                "a {class:?} slot is a remaining change (its observed state differs from pre-push or is unknown)"
-            );
-        } else {
-            assert!(
-                !remaining.contains_key(&slot),
-                "an Unchanged slot (observed == pre-push) is never a remaining change"
-            );
-        }
+        assert!(
+            remaining.contains_key(&slot),
+            "a {class:?} slot is a remaining change (its observed state differs from pre-push or is unknown)"
+        );
     }
 
     /// THE BINDING-JUDGMENT CALL, pinned: a selected slot that is NO LONGER

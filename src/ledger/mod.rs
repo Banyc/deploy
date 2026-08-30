@@ -23,8 +23,9 @@
 //!   records ([`Pins`] / [`ServerState`]), the intent facet
 //!   ([`LedgerIntentWire`] / [`DeploymentIntent`] / [`LedgerIntentReport`]),
 //!   the terminal facet ([`LedgerTerminalWire`] / [`LedgerTerminal`] /
-//!   [`TerminalDisposition`]), the per-slot outcomes ([`SlotOutcome`] /
-//!   [`SlotOutcomeKind`] / [`SlotTransition`] / [`SlotResult`]), the
+//!   [`TerminalDisposition`]), the STRUCTURAL per-slot outcomes
+//!   ([`SlotOutcome`] / [`SlotOutcomeBodyWire`] / [`SlotResult`] — the
+//!   old `SlotOutcomeKind`/`SlotTransition` names are DELETED), the
 //!   three-state observations ([`Observation`] and friends), the merged
 //!   entry ([`LedgerEntry`]), the rebinding proof ([`RebindingPlan`] /
 //!   [`VerifiedReleaseRebinding`] / [`FrozenSlotTopology`]), the
@@ -91,8 +92,8 @@ pub use records::{
     LedgerEventWire, LedgerIntentReport, LedgerIntentWire, LedgerTerminal, LedgerTerminalWire,
     NonEmptySlotTable, Observation, ObservationError, ObservationWire, ObservedAssignment,
     ObservedGeneration, ObservedGenerationWire, ObservedSlot, ObservedTarget, PhysicalBinding,
-    Pins, PlanOrigin, PlanSource, RebindingPlan, ServerState, SlotOutcome, SlotOutcomeKind,
-    SlotPlan, SlotResult, SlotTable, SlotTransition, SnapshotEntry, SnapshotSlotWire,
+    Pins, PlanOrigin, PlanSource, RebindingPlan, ServerState, SlotOutcome, SlotOutcomeBodyWire,
+    SlotOutcomeRowWire, SlotPlan, SlotResult, SlotTable, SnapshotEntry, SnapshotSlotWire,
     TargetSnapshot, TerminalDisposition, VerifiedReleaseRebinding,
 };
 pub use refs::{

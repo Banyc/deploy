@@ -133,7 +133,6 @@ mod compensation_tests {
     };
     use crate::deploy::rollout::*;
     use crate::identity::{ArtifactRef, TreeDigest, VariantName, test_deployment_id};
-    use crate::ledger::SlotOutcomeKind;
     use std::os::unix::fs::PermissionsExt;
 
     /// Compensation re-runs the PRIOR generation's activation contract with the
@@ -189,19 +188,20 @@ mod compensation_tests {
             // carries the immutable release id of the PRIOR assignment and the PRIOR
             // deployment identity (deployment_id + generation_id).
             let first = h.run(None);
-            assert_eq!(
-                first.kind,
-                SlotOutcomeKind::Activated,
+            assert!(
+                matches!(first.state, SlotExecution::Advanced { .. }),
                 "first deploy must activate: {:?}",
-                first.error
+                first.state
             );
+            let first_gen = first
+                .state
+                .observed_generation()
+                .expect("an advanced first deploy records its generation")
+                .clone();
             // The prior generation's assignment is the source of truth for the
             // five values compensation must render: read it back from the
             // remote record (generations/<gen>/assignment.json).
-            let prior_assignment = h
-                .helper()
-                .read_assignment(first.generation.as_str())
-                .unwrap();
+            let prior_assignment = h.helper().read_assignment(first_gen.as_str()).unwrap();
 
             // A subsequent (desired) push fails activation and the engine
             // compensates back to the prior generation. Drive the same
@@ -249,8 +249,8 @@ mod compensation_tests {
             let request = CompensationRequest {
                 op_id: op_id.clone(),
                 deployment_id: failed_deployment_id.clone(),
-                prior_gen: Some(first.generation.clone()),
-                advanced_gen: first.generation.clone(),
+                prior_gen: Some(first_gen.clone()),
+                advanced_gen: first_gen.clone(),
                 template_vars: desired_vars,
             };
             let ok = compensate_server(&helper, &request).map_err(|e| e.to_string())?;
@@ -327,7 +327,15 @@ mod compensation_tests {
         );
         // First deploy: the PRIOR generation g1 is live.
         let first = h.run(None);
-        assert_eq!(first.kind, SlotOutcomeKind::Activated);
+        assert!(
+            matches!(first.state, SlotExecution::Advanced { .. }),
+            "first deploy must activate"
+        );
+        let first_gen = first
+            .state
+            .observed_generation()
+            .expect("an advanced first deploy records its generation")
+            .clone();
         let helper = h.helper();
 
         // The failed push advanced to g2 (its generation record exists, and
@@ -345,7 +353,7 @@ mod compensation_tests {
                     tree: h.tree.clone(),
                 },
                 behavior_sha256: "b".into(),
-                prior_generation: Some(first.generation.clone()),
+                prior_generation: Some(first_gen.clone()),
                 created_at: crate::remote::helper::now_rfc3339(),
                 target: Some(crate::identity::TargetName::new("t1")),
             })
@@ -354,7 +362,7 @@ mod compensation_tests {
             .acquire_lock_guard(&crate::identity::OperationId::new("op2".to_string()))
             .unwrap()
             .swap_current(
-                &crate::remote::helper::ExpectedCurrent::Generation(first.generation.clone()),
+                &crate::remote::helper::ExpectedCurrent::Generation(first_gen.clone()),
                 g2.as_str(),
                 "op2",
             )
@@ -420,7 +428,7 @@ mod compensation_tests {
         let request = CompensationRequest {
             op_id: OperationId::generate(),
             deployment_id: DeploymentId::generate(),
-            prior_gen: Some(first.generation.clone()),
+            prior_gen: Some(first_gen.clone()),
             advanced_gen: g2.clone(),
             template_vars: vars,
         };

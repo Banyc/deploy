@@ -12,6 +12,7 @@ pub(crate) use compensation::*;
 // [`ServerProc`] outcome, the tree download helper.
 
 use crate::config::ProjectConfig;
+use crate::deploy::rollout::SlotExecution;
 use crate::error::Error;
 use crate::error::Result;
 use crate::identity::ArtifactRef;
@@ -21,7 +22,8 @@ use crate::identity::GenerationId;
 use crate::identity::OperationId;
 use crate::identity::ReleaseId;
 use crate::identity::TargetName;
-use crate::ledger::SlotOutcomeKind;
+use crate::ledger::Observation;
+use crate::ledger::ObservedGeneration;
 use crate::remote::canonical as tree;
 use crate::remote::helper::RemoteHelper;
 use crate::remote::layout;
@@ -43,21 +45,69 @@ use std::path::Path;
 // tree-download helper and the per-process release-JSON publication cache
 // shared with `push::engine`. Extracted from `push::engine`.
 
+/// The per-server mutation OUTCOME: the slot's ONE recorded execution state
+/// ([`SlotExecution`]) — the mutually exclusive state the attempt's ordered
+/// execution table stores (the pre-swap / post-advance / restored /
+/// activated classification, with the recorded generation observation on
+/// the states whose evidence is the swap result). The old
+/// `kind`/`did_advance`/`did_compensate` report is GONE: the state IS the
+/// fact — an in-process-compensated post-swap failure is a `Restored`
+/// state, an uncompensated post-swap failure is `FailedAfterAdvance` (the
+/// attempt advanced it and did NOT restore it), never a flat `Failed` that
+/// loses whether the swap happened.
 pub(crate) struct ServerProc {
-    pub(crate) kind: SlotOutcomeKind,
-    pub(crate) generation: GenerationId,
-    /// True when this slot's `current` was advanced (the per-slot commit point
-    /// was moved to the new generation) at some point during the attempt —
-    /// either it still points there, or compensation moved it back. This is
-    /// the failure-policy/status signal for "a server this deployment
-    /// advanced", distinct from `did_compensate`: a pre-swap failure never
-    /// advanced the slot (nothing to roll back, `FailedRolledBack` is
-    /// vacuously accurate), while a post-swap failure whose compensation
-    /// failed IS still changed from prior state and the attempt must be
-    /// `Degraded`, never a falsely clean `FailedRolledBack`.
-    pub(crate) did_advance: bool,
-    pub(crate) did_compensate: bool,
-    pub(crate) error: Option<String>,
+    pub(crate) state: SlotExecution,
+}
+
+impl ServerProc {
+    /// A pre-swap failure: the attempt never mutated the slot (the
+    /// recorded state carries the operation error; the observed post-state
+    /// is attached later from the live read — the never-advanced rule).
+    fn failed_before(error: String) -> Self {
+        ServerProc {
+            state: SlotExecution::FailedBeforeAdvance { error: Some(error) },
+        }
+    }
+
+    /// An INDETERMINATE outcome: the swap/activation I/O failed with a
+    /// transport error, so the attempt cannot know whether `current` moved
+    /// (the slot may or may not have advanced — never classified as a
+    /// deterministic no-advance).
+    fn indeterminate(error: String) -> Self {
+        ServerProc {
+            state: SlotExecution::Indeterminate { error: Some(error) },
+        }
+    }
+
+    /// A successfully advanced slot (the observation is the deployment's
+    /// own generation — the swap + activation + verification succeeded).
+    fn advanced(new_gen: &GenerationId, bookkeeping_error: Option<String>) -> Self {
+        ServerProc {
+            state: SlotExecution::Advanced {
+                observation: Observation::Known(ObservedGeneration {
+                    generation: new_gen.clone(),
+                }),
+                bookkeeping_error,
+            },
+        }
+    }
+
+    /// An in-process-compensated slot: the post-swap failure was restored
+    /// by the per-server pipeline (back to the prior generation, or removed
+    /// on a first deploy) — the `Restored` state with the restored
+    /// generation as its observation.
+    fn restored(expected_gen: Option<&GenerationId>) -> Self {
+        ServerProc {
+            state: SlotExecution::Restored {
+                observation: match expected_gen {
+                    Some(g) => Observation::Known(ObservedGeneration {
+                        generation: g.clone(),
+                    }),
+                    None => Observation::KnownAbsent,
+                },
+            },
+        }
+    }
 }
 
 // 13 parameters: the per-server deployment is the full publication context
@@ -89,13 +139,9 @@ pub(crate) fn process_server(
     let held = match helper.acquire_lock_guard(op_id) {
         Ok(g) => g,
         Err(e) => {
-            return Ok(ServerProc {
-                kind: SlotOutcomeKind::Failed,
-                generation: new_gen.clone(),
-                did_advance: false,
-                did_compensate: false,
-                error: Some(format!("lock acquire failed: {e}")),
-            });
+            return Ok(ServerProc::failed_before(format!(
+                "lock acquire failed: {e}"
+            )));
         }
     };
 
@@ -103,39 +149,22 @@ pub(crate) fn process_server(
     let status = match helper.status() {
         Ok(s) => s,
         Err(e) => {
-            return Ok(ServerProc {
-                kind: SlotOutcomeKind::Failed,
-                generation: new_gen.clone(),
-                did_advance: false,
-                did_compensate: false,
-                error: Some(format!("status failed: {e}")),
-            });
+            return Ok(ServerProc::failed_before(format!("status failed: {e}")));
         }
     };
     if let Some(exp) = expected_gen
         && status.current_generation.as_ref().map(|g| g.as_str()) != Some(exp.as_str())
     {
+        // A compare-and-swap skip: the attempt never started this slot (its
+        // post-mutation observation is the live state, attached later).
         return Ok(ServerProc {
-            kind: SlotOutcomeKind::Skipped,
-            generation: exp.clone(),
-            did_advance: false,
-            did_compensate: false,
-            error: Some(format!(
-                "compare-and-swap precondition failed: current {:?} expected {exp}",
-                status.current_generation
-            )),
+            state: SlotExecution::NotStarted,
         });
     }
 
     // 1. Publish the staged tree (from incoming), reusing an existing object.
     if let Err(e) = held.publish_from_incoming(deployment_id.as_str(), artifact.tree.as_str()) {
-        return Ok(ServerProc {
-            kind: SlotOutcomeKind::Failed,
-            generation: new_gen.clone(),
-            did_advance: false,
-            did_compensate: false,
-            error: Some(format!("publish failed: {e}")),
-        });
+        return Ok(ServerProc::failed_before(format!("publish failed: {e}")));
     }
 
     // 2. Canonically hash the remote tree and compare with the requested digest.
@@ -143,59 +172,35 @@ pub(crate) fn process_server(
     let verify_tmp = match tempfile::tempdir() {
         Ok(t) => t,
         Err(e) => {
-            return Ok(ServerProc {
-                kind: SlotOutcomeKind::Failed,
-                generation: new_gen.clone(),
-                did_advance: false,
-                did_compensate: false,
-                error: Some(format!("tempdir: {e}")),
-            });
+            return Ok(ServerProc::failed_before(format!("tempdir: {e}")));
         }
     };
     let object_rel = layout::tree_root(artifact.tree.as_str());
     if let Err(e) = download_tree_to_host(remote, &object_rel, verify_tmp.path()) {
-        return Ok(ServerProc {
-            kind: SlotOutcomeKind::Failed,
-            generation: new_gen.clone(),
-            did_advance: false,
-            did_compensate: false,
-            error: Some(format!("download for verify failed: {e}")),
-        });
+        return Ok(ServerProc::failed_before(format!(
+            "download for verify failed: {e}"
+        )));
     }
     let meta = match tree::canonicalize_tree(verify_tmp.path()) {
         Ok(m) => m,
         Err(e) => {
-            return Ok(ServerProc {
-                kind: SlotOutcomeKind::Failed,
-                generation: new_gen.clone(),
-                did_advance: false,
-                did_compensate: false,
-                error: Some(format!("canonicalize remote tree failed: {e}")),
-            });
+            return Ok(ServerProc::failed_before(format!(
+                "canonicalize remote tree failed: {e}"
+            )));
         }
     };
     if meta.tree_sha256 != artifact.tree.as_str() {
-        return Ok(ServerProc {
-            kind: SlotOutcomeKind::Failed,
-            generation: new_gen.clone(),
-            did_advance: false,
-            did_compensate: false,
-            error: Some(format!(
-                "integrity: remote tree digest {} does not match requested {}",
-                meta.tree_sha256, artifact.tree
-            )),
-        });
+        return Ok(ServerProc::failed_before(format!(
+            "integrity: remote tree digest {} does not match requested {}",
+            meta.tree_sha256, artifact.tree
+        )));
     }
 
     // 3. Validate all declared artifact paths and types before changing current.
     if let Err(e) = validate_artifact_paths(remote, &object_rel, &behavior.activation) {
-        return Ok(ServerProc {
-            kind: SlotOutcomeKind::Failed,
-            generation: new_gen.clone(),
-            did_advance: false,
-            did_compensate: false,
-            error: Some(format!("artifact validation: {e}")),
-        });
+        return Ok(ServerProc::failed_before(format!(
+            "artifact validation: {e}"
+        )));
     }
 
     // 4. Publish the release record (idempotent) and create the generation.
@@ -204,13 +209,9 @@ pub(crate) fn process_server(
         && let Err(e) =
             helper.publish_release(artifact.release.as_str(), &release_json, &behavior_json)
     {
-        return Ok(ServerProc {
-            kind: SlotOutcomeKind::Failed,
-            generation: new_gen.clone(),
-            did_advance: false,
-            did_compensate: false,
-            error: Some(format!("publish release failed: {e}")),
-        });
+        return Ok(ServerProc::failed_before(format!(
+            "publish release failed: {e}"
+        )));
     }
     let assignment = crate::remote::helper::GenerationAssignment {
         deployment_id: deployment_id.clone(),
@@ -222,22 +223,14 @@ pub(crate) fn process_server(
         target: Some(TargetName::parse(target_name).expect("target name is a safe segment")),
     };
     if let Err(e) = held.create_generation(&assignment) {
-        return Ok(ServerProc {
-            kind: SlotOutcomeKind::Failed,
-            generation: new_gen.clone(),
-            did_advance: false,
-            did_compensate: false,
-            error: Some(format!("create generation failed: {e}")),
-        });
+        return Ok(ServerProc::failed_before(format!(
+            "create generation failed: {e}"
+        )));
     }
     if let Err(e) = held.transaction_record(op_id.as_str(), "prepared") {
-        return Ok(ServerProc {
-            kind: SlotOutcomeKind::Failed,
-            generation: new_gen.clone(),
-            did_advance: false,
-            did_compensate: false,
-            error: Some(format!("transaction record failed: {e}")),
-        });
+        return Ok(ServerProc::failed_before(format!(
+            "transaction record failed: {e}"
+        )));
     }
 
     // Atomically move `current` (the per-slot commit point).
@@ -249,18 +242,17 @@ pub(crate) fn process_server(
         new_gen.as_str(),
         op_id.as_str(),
     );
-    match swap {
-        Ok(()) => {}
-        Err(e) => {
-            return Ok(ServerProc {
-                kind: SlotOutcomeKind::Failed,
-                generation: new_gen.clone(),
-                did_advance: false,
-                did_compensate: false,
-                error: Some(format!("swap failed: {e}")),
-            });
+    if let Err(e) = swap {
+        // A TRANSPORT/IO failure mid-swap is INDETERMINATE — the swap may or
+        // may not have moved `current`, so the outcome is unknown (never
+        // classified as a deterministic no-advance). A CAS-refusal or
+        // validation error is a DETERMINISTIC no-advance (the swap provably
+        // did not happen) — `FailedBeforeAdvance`.
+        if matches!(e, crate::error::Error::Transport(_)) {
+            return Ok(ServerProc::indeterminate(format!("swap failed: {e}")));
         }
-    };
+        return Ok(ServerProc::failed_before(format!("swap failed: {e}")));
+    }
     // The generation's tree content root: `generations/<gen>/root` is a
     // symlink to `objects/sha256/<tree>/root`, the same directory `current`
     // points at (it is the tree content root, not a nested `root/root`).
@@ -287,22 +279,26 @@ pub(crate) fn process_server(
         let comp = compensate_server_locked(&held, &request);
         let _ = held.transaction_record(op_id.as_str(), "compensated");
         let did_comp = matches!(comp, Ok(true));
-        let generation = if did_comp {
-            expected_gen.cloned().unwrap_or_else(|| new_gen.clone())
+        return Ok(if did_comp {
+            // In-process compensation succeeded: the slot is back at its
+            // pre-push state — a `Restored` execution.
+            ServerProc::restored(expected_gen)
         } else {
-            new_gen.clone()
-        };
-        return Ok(ServerProc {
-            kind: SlotOutcomeKind::Failed,
-            generation,
-            // The desired swap already moved `current` to the new generation:
-            // this slot WAS advanced by the attempt, even if compensation
-            // (partially) moved it back. A failed compensation must not be
-            // mistaken for a never-advanced slot (the status logic treats
-            // empty `advanced` as "nothing to roll back").
-            did_advance: true,
-            did_compensate: did_comp,
-            error: Some(format!("activation failed: {e}")),
+            // The desired swap already moved `current` to the new
+            // generation and the compensation FAILED: the slot is STILL ON
+            // the advanced generation — `FailedAfterAdvance`, NEVER a
+            // never-advanced slot (the old flat `Failed` lost exactly this:
+            // an uncompensated post-advance failure must classify degraded,
+            // never rolled-back). The observation is the generation the
+            // attempt advanced it to.
+            ServerProc {
+                state: SlotExecution::FailedAfterAdvance {
+                    observation: Observation::Known(ObservedGeneration {
+                        generation: new_gen.clone(),
+                    }),
+                    error: Some(format!("activation failed: {e}")),
+                },
+            }
         });
     }
 
@@ -318,17 +314,19 @@ pub(crate) fn process_server(
         let comp = compensate_server_locked(&held, &request);
         let _ = held.transaction_record(op_id.as_str(), "compensated");
         let did_comp = matches!(comp, Ok(true));
-        let generation = if did_comp {
-            expected_gen.cloned().unwrap_or_else(|| new_gen.clone())
+        return Ok(if did_comp {
+            // In-process compensation succeeded: the slot is back at its
+            // pre-push state — a `Restored` execution.
+            ServerProc::restored(expected_gen)
         } else {
-            new_gen.clone()
-        };
-        return Ok(ServerProc {
-            kind: SlotOutcomeKind::Failed,
-            generation,
-            did_advance: true,
-            did_compensate: did_comp,
-            error: Some(format!("verification failed: {e}")),
+            ServerProc {
+                state: SlotExecution::FailedAfterAdvance {
+                    observation: Observation::Known(ObservedGeneration {
+                        generation: new_gen.clone(),
+                    }),
+                    error: Some(format!("verification failed: {e}")),
+                },
+            }
         });
     }
 
@@ -336,31 +334,22 @@ pub(crate) fn process_server(
     // is live (current points at it and the service is healthy). A failure to
     // write the bookkeeping record is a *recoverable metadata* failure: the
     // service is active but the attempt cannot be durably marked committed. We
-    // still report the server as Activated, but carry the error so the attempt
-    // status is demoted to `PendingCommit` rather than erroneously `Successful`.
-    // A later push's `reconcile_pending_commits` completes the marker set
-    // without touching the healthy server when its generation still matches.
+    // still report the server as Advanced, but carry the bookkeeping error so
+    // the attempt status is demoted (stays intent-only) rather than erroneously
+    // `Successful`.
     if held
         .transaction_record(op_id.as_str(), "committed")
         .is_err()
     {
-        return Ok(ServerProc {
-            kind: SlotOutcomeKind::Activated,
-            generation: new_gen.clone(),
-            did_advance: true,
-            did_compensate: false,
-            error: Some(
+        return Ok(ServerProc::advanced(
+            new_gen,
+            Some(
                 "committed transaction record write failed; server active but bookkeeping incomplete"
                     .to_string(),
-            )});
+            ),
+        ));
     }
-    Ok(ServerProc {
-        kind: SlotOutcomeKind::Activated,
-        generation: new_gen.clone(),
-        did_advance: true,
-        did_compensate: false,
-        error: None,
-    })
+    Ok(ServerProc::advanced(new_gen, None))
 }
 
 pub(crate) fn download_tree_to_host(
@@ -757,8 +746,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             ],
         );
         let proc = h.run(None);
-        assert_eq!(proc.kind, SlotOutcomeKind::Activated);
-        assert!(!proc.did_compensate);
+        assert!(
+            matches!(proc.state, SlotExecution::Advanced { .. }),
+            "clean publish must advance the slot, got {:?}",
+            proc.state
+        );
         assert!(h.remote.exists(layout::current()));
     }
 
@@ -774,7 +766,15 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             ],
         );
         let first = h.run(None);
-        assert_eq!(first.kind, SlotOutcomeKind::Activated);
+        assert!(
+            matches!(first.state, SlotExecution::Advanced { .. }),
+            "first deploy must advance"
+        );
+        let first_gen = first
+            .state
+            .observed_generation()
+            .expect("an advanced first deploy records its generation")
+            .clone();
 
         // Corrupt the already-published remote object's content.
         let obj_file = h
@@ -790,9 +790,18 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
         // A second generation reuses the corrupted object and must detect the
         // digest mismatch before advancing `current`.
-        let second = h.run(Some(first.generation.clone()));
-        assert_eq!(second.kind, SlotOutcomeKind::Failed);
-        assert!(second.error.unwrap().contains("integrity"));
+        let second = h.run(Some(first_gen.clone()));
+        assert!(
+            matches!(second.state, SlotExecution::FailedBeforeAdvance { .. }),
+            "the digest mismatch must fail before the swap"
+        );
+        assert!(
+            second
+                .state
+                .failed_error()
+                .expect("a pre-swap failure carries its error")
+                .contains("integrity")
+        );
     }
 
     #[test]
@@ -811,8 +820,16 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         std::fs::write(&local_file, "CORRUPT-LOCAL").unwrap();
 
         let proc = h.run(None);
-        assert_eq!(proc.kind, SlotOutcomeKind::Failed);
-        assert!(proc.error.unwrap().contains("integrity"));
+        assert!(
+            matches!(proc.state, SlotExecution::FailedBeforeAdvance { .. }),
+            "the integrity failure must be pre-swap"
+        );
+        assert!(
+            proc.state
+                .failed_error()
+                .expect("a pre-swap failure carries its error")
+                .contains("integrity")
+        );
     }
 
     #[test]
@@ -829,8 +846,16 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             ],
         );
         let proc = h.run(None);
-        assert_eq!(proc.kind, SlotOutcomeKind::Failed);
-        assert!(proc.error.unwrap().contains("missing"));
+        assert!(
+            matches!(proc.state, SlotExecution::FailedBeforeAdvance { .. }),
+            "the missing-unit failure must be pre-swap"
+        );
+        assert!(
+            proc.state
+                .failed_error()
+                .expect("a pre-swap failure carries its error")
+                .contains("missing")
+        );
         assert!(!h.remote.exists(layout::current()));
     }
 
@@ -848,8 +873,17 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             ],
         );
         let proc = h.run(None);
-        assert_eq!(proc.kind, SlotOutcomeKind::Failed);
-        assert!(proc.error.unwrap().to_lowercase().contains("type"));
+        assert!(
+            matches!(proc.state, SlotExecution::FailedBeforeAdvance { .. }),
+            "the wrong-artifact-type failure must be pre-swap"
+        );
+        assert!(
+            proc.state
+                .failed_error()
+                .expect("a pre-swap failure carries its error")
+                .to_lowercase()
+                .contains("type")
+        );
     }
 
     /// Regression: the engine must hand the activation adapter
@@ -912,22 +946,24 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             // (through the `root` symlink into the tree content root). A
             // `root/root` double-join would fail that read and never reach
             // Activated.
-            assert_eq!(
-                proc.kind,
-                SlotOutcomeKind::Activated,
+            assert!(
+                matches!(proc.state, SlotExecution::Advanced { .. }),
                 "activation failed (root/root double-join?): {:?}",
-                proc.error
+                proc.state
             );
-            assert!(!proc.did_compensate);
+            let deployed_gen = proc
+                .state
+                .observed_generation()
+                .expect("an activated slot records its generation");
             let gen_root = h
                 .remote
                 .root()
-                .join(crate::remote::layout::generation(proc.generation.as_str()))
+                .join(crate::remote::layout::generation(deployed_gen.as_str()))
                 .join("root");
             assert!(
                 gen_root.ends_with(
                     Path::new("generations")
-                        .join(proc.generation.as_str())
+                        .join(deployed_gen.as_str())
                         .join("root")
                 ),
                 "activation generation root must be <root>/generations/<gid>/root, got {}",
@@ -942,7 +978,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             assert!(
                 !h.remote
                     .root()
-                    .join(crate::remote::layout::generation(proc.generation.as_str()))
+                    .join(crate::remote::layout::generation(deployed_gen.as_str()))
                     .join("root/root")
                     .exists(),
                 "published tree must have no nested root dir (root/root double-join would ENOENT)"

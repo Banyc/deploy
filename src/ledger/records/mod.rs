@@ -25,9 +25,10 @@
 //!   [`LedgerTerminal`]) with the VERIFYING CONVERSION, the
 //!   [`TerminalDisposition`] enum, and the status accessor (the "two line
 //!   kinds — terminal" half);
-//! * **outcomes** — the per-slot outcomes ([`SlotOutcome`] /
-//!   [`SlotOutcomeKind`] / [`SlotTransition`], the WIRE outcome row
-//!   [`SlotOutcomeRowWire`] — the pre-row-array name [`SlotResult`] stays
+//! * **outcomes** — the STRUCTURAL per-slot outcomes ([`SlotOutcome`] —
+//!   the six execution states; the old `SlotOutcomeKind`/`SlotTransition`
+//!   names are DELETED), the WIRE outcome row
+//!   [`SlotOutcomeRowWire`] (the pre-row-array name [`SlotResult`] stays
 //!   as a re-export alias) + the remaining-changes / compensation
 //!   derivations;
 //! * **observation** — the three-state observations ([`Observation`] and
@@ -144,7 +145,7 @@ pub(crate) use validation::{LEDGER_SCHEMA_VERSION, PINS_SCHEMA_VERSION};
 pub use wire::{
     CompensationReport, LedgerEntry, LedgerIntentReport, LedgerIntentWire, LedgerTerminalWire,
     PlannedSlotRowWire, PlannedSlotWire, PreviousGenerationWire, SlotActionWire, SlotOutcome,
-    SlotOutcomeKind, SlotOutcomeRowWire, SlotResult, SlotTransition, SnapshotSlotWire,
+    SlotOutcomeBodyWire, SlotOutcomeRowWire, SlotResult, SnapshotSlotWire,
 };
 
 /// THE PHYSICAL LEDGER EVENT LINE — the WIRE enum the append-only JSONL
@@ -1331,12 +1332,11 @@ mod tests {
         let mut wire = valid_terminal_wire(&keys, "deploy-t", DeploymentStatus::Successful);
         wire.outcomes.push(SlotResult {
             slot_id: keys[0].clone(),
-            outcome: SlotOutcomeKind::Activated,
-            observation: ObservationWire::Known(ObservedGenerationWire {
-                generation: test_generation_id("g"),
-            }),
-            compensated: false,
-            error: None,
+            result: SlotOutcomeBodyWire::Activated {
+                observation: ObservationWire::Known(ObservedGenerationWire {
+                    generation: test_generation_id("g"),
+                }),
+            },
         });
         assert!(
             wire.clone().into_domain().is_err(),
@@ -1346,12 +1346,12 @@ mod tests {
         let mut wire = valid_terminal_wire(&keys, "deploy-t", DeploymentStatus::FailedPreflight);
         wire.outcomes.push(SlotResult {
             slot_id: keys[0].clone(),
-            outcome: SlotOutcomeKind::Failed,
-            observation: ObservationWire::Known(ObservedGenerationWire {
-                generation: test_generation_id("g"),
-            }),
-            compensated: false,
-            error: Some("boom".to_string()),
+            result: SlotOutcomeBodyWire::FailedBeforeAdvance {
+                observation: ObservationWire::Known(ObservedGenerationWire {
+                    generation: test_generation_id("g"),
+                }),
+                error: Some("boom".to_string()),
+            },
         });
         assert!(
             wire.clone().into_domain().is_err(),
@@ -1568,26 +1568,25 @@ mod tests {
         let mut outcomes = BTreeMap::new();
         outcomes.insert(
             keys[0].clone(),
-            SlotOutcome::Failed {
+            SlotOutcome::FailedAfterAdvance {
                 observation: Observation::Known(ObservedGeneration {
                     generation: test_generation_id("g0"),
                 }),
-                compensated: false,
-                error: None,
+                error: Some("test failure".to_string()),
             },
         );
         outcomes.insert(
             keys[1].clone(),
-            SlotOutcome::Failed {
+            SlotOutcome::FailedAfterAdvance {
                 observation: Observation::Known(ObservedGeneration {
                     generation: test_generation_id("g1"),
                 }),
-                compensated: false,
-                error: None,
+                error: Some("test failure".to_string()),
             },
         );
         let non_empty = NonEmptySlotTable::build(outcomes).unwrap();
-        let g_t = crate::kernel::terminal::DegradedTerminal::try_new(non_empty).unwrap();
+        let g_t =
+            crate::kernel::terminal::DegradedTerminal::try_new(non_empty, &group_intent).unwrap();
         let disposition = TerminalDisposition::Degraded(g_t);
         let terminal = LedgerTerminal::new(
             Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),

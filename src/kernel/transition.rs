@@ -75,11 +75,11 @@ use crate::identity::{DeploymentId, SlotId, TargetName, Timestamp};
 use crate::kernel::error::{ConflictError, IntegrityError, KernelError, KernelResult};
 use crate::kernel::intent::DeploymentIntent;
 use crate::kernel::terminal::{
-    DegradedTerminal, FailedRolledBackTerminal, LedgerTerminal, TerminalDisposition,
+    DegradedTerminal, FailedRolledBackTerminal, LedgerTerminal, SlotDelta, TerminalDisposition,
 };
 use crate::ledger::LedgerEntry;
 use crate::ledger::records::DeploymentStatus;
-use crate::ledger::records::{NonEmptySlotTable, SlotOutcome, SlotTable, SlotTransition};
+use crate::ledger::records::{NonEmptySlotTable, SlotOutcome, SlotTable};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
@@ -509,7 +509,13 @@ pub fn apply_event(
 ///   reports a slot the deployment did not select;
 /// * status-specific coverage: `Successful` and `FailedPreflight` carry no
 ///   outcomes; `FailedRolledBack` / `Degraded` outcomes EXACTLY cover the
-///   selected membership.
+///   selected membership;
+/// * the disposition's delta invariant (the review's P1 rule, through the
+///   ONE classifier [`crate::kernel::terminal::classify_slot_delta`]):
+///   `FailedRolledBack` requires EVERY slot's delta `Unchanged`; `Degraded`
+///   requires AT LEAST ONE `Desired`/`Diverged`/`Unknown` slot. Enforced
+///   here (where the entry's intent exists) on the terminal-append path AND
+///   the read fold.
 pub fn validate_terminal_vs_intent(
     entry: &LedgerEntry,
     terminal: &LedgerTerminal,
@@ -541,6 +547,42 @@ pub fn validate_terminal_vs_intent(
                     terminal.status(),
                     entry.deployment_id
                 ))));
+            }
+            // THE DELTA INVARIANT (the ONE classifier — the same rule the
+            // decision-time constructors enforce): a rolled-back terminal
+            // must be all-Unchanged, a degraded terminal must carry at least
+            // one remaining change. A persisted disposition that contradicts
+            // its intent's pre-push/desired evidence is corruption (fail
+            // closed — never a Degraded with no remaining changes).
+            match terminal.disposition() {
+                TerminalDisposition::FailedRolledBack(_) => {
+                    for (sid, outcome) in terminal.outcomes().iter() {
+                        let delta = crate::kernel::terminal::outcome_slot_delta(
+                            &entry.intent,
+                            sid,
+                            outcome,
+                        );
+                        if delta != SlotDelta::Unchanged {
+                            return Err(KernelError::Integrity(IntegrityError::Message(format!(
+                                "terminal FailedRolledBack for deployment '{}' carries slot '{sid}' with delta {delta:?} — every attempted mutation must be back at its pre-push state",
+                                entry.deployment_id
+                            ))));
+                        }
+                    }
+                }
+                TerminalDisposition::Degraded(_) => {
+                    let has_remaining = terminal.outcomes().iter().any(|(sid, outcome)| {
+                        crate::kernel::terminal::outcome_slot_delta(&entry.intent, sid, outcome)
+                            != SlotDelta::Unchanged
+                    });
+                    if !has_remaining {
+                        return Err(KernelError::Integrity(IntegrityError::Message(format!(
+                            "terminal Degraded for deployment '{}' has NO remaining change — every slot is at its pre-push state, so the attempt is FailedRolledBack, never Degraded",
+                            entry.deployment_id
+                        ))));
+                    }
+                }
+                _ => unreachable!("the disposition was matched above"),
             }
         }
     }
@@ -615,7 +657,10 @@ pub enum ExecutionReport {
     /// (restored / never-advanced / remaining changes). The outcome keys
     /// must EXACTLY equal the intent's selected membership (the kernel
     /// validates that at decision time); the disposition is DERIVED from
-    /// the outcomes' derived transitions.
+    /// the outcomes' OBSERVATIONS against the intent's pre-push and DESIRED
+    /// generations through the ONE per-slot classifier
+    /// ([`SlotDelta`] /
+    /// [`crate::kernel::terminal::classify_slot_delta`]).
     Failed {
         outcomes: NonEmptySlotTable<SlotOutcome>,
     },
@@ -626,23 +671,27 @@ pub enum ExecutionReport {
 ///
 /// * preflight failed                → `FailedPreflight`
 /// * execution succeeded AND verified → `Successful`
-/// * failure with NO outcome still on the new state (every derived
-///   transition is `Restored` / `NeverAdvanced` / `AdvanceUnknown` — no
-///   slot `PROVABLY ON the new state`) → `FailedRolledBack`
-/// * anything still changed/unknown → `Degraded`
+/// * failure with EVERY slot's [`SlotDelta`] `Unchanged` (no remaining
+///   change — every attempted mutation is back at its pre-push state) →
+///   `FailedRolledBack`
+/// * failure with AT LEAST ONE `Desired`/`Diverged`/`Unknown` delta →
+///   `Degraded`
 ///
-/// The disposition is DERIVED from the outcomes' DERIVED transitions
-/// ([`SlotOutcome::transition`]) — a rolled-back decision requires NO
-/// outcome with an `Advanced` transition; anything with an `Advanced`
-/// outcome (a slot still on the deployed generation) is degraded. The
-/// intent is USED: the failed outcomes' keys must EXACTLY equal the
-/// intent's selected membership (a mismatch is an integrity refusal — the
-/// kernel owns this check at decision time; the existing
-/// [`validate_terminal_vs_intent`] stays as a terminal-append re-check).
-/// The outcome payloads are constructed ONLY through the validated
-/// constructors, so an impossible combination (a rolled-back terminal with
-/// an Advanced slot; a Degraded terminal with all-restored outcomes) is
-/// unrepresentable.
+/// The disposition is DERIVED from the outcomes' OBSERVATIONS against the
+/// intent's pre-push and DESIRED generations, through the ONE classifier
+/// [`classify_slot_delta`](crate::kernel::terminal::classify_slot_delta) —
+/// the review's P1 fix: a USED class of failures (a slot advanced and NOT
+/// restored — the outcome [`SlotOutcome::FailedAfterAdvance`], whose
+/// recorded observation is the advanced generation) is NEVER rolled back
+/// even when an old transition-based rule saw "no slot PROVABLY ON the new
+/// state". The intent is USED: the failed outcomes' keys must EXACTLY equal
+/// the intent's selected membership (a mismatch is an integrity refusal —
+/// the kernel owns this check at decision time; the existing
+/// [`validate_terminal_vs_intent`] stays as a terminal-append re-check,
+/// including the same delta invariants). The outcome payloads are
+/// constructed ONLY through the validated constructors, so an impossible
+/// combination (a rolled-back terminal with a remaining change; a Degraded
+/// terminal with all-Unchanged deltas) is unrepresentable.
 pub fn decide_terminal(
     intent: &DeploymentIntent,
     report: ExecutionReport,
@@ -654,9 +703,7 @@ pub fn decide_terminal(
             // 1. THE KERNEL OWNS THE KEY-SET CHECK at decision time: the
             // failed outcome keys must EXACTLY equal the intent's selected
             // membership. (The existing [`validate_terminal_vs_intent`]
-            // stays as a terminal-append re-check.) A mismatch means the
-            // engine's evidence does not cover the attempt's plan — refuse
-            // with an integrity error, never decide on partial evidence.
+            // stays as a terminal-append re-check.)
             let selected: BTreeSet<SlotId> = intent.selected_membership();
             let keys: BTreeSet<SlotId> = outcomes.keys().cloned().collect();
             if keys != selected {
@@ -664,23 +711,22 @@ pub fn decide_terminal(
                     "the failure outcomes cover slots {keys:?} but the intent's selected membership is {selected:?} — the failed evidence must EXACTLY cover the selected membership"
                 ))));
             }
-            // 2. DERIVE the disposition from the outcomes' DERIVED
-            // transitions (NO all_restored boolean): rolled-back iff NO
-            // outcome has transition() == Advanced — a slot PROVABLY ON the
-            // new state — otherwise degraded. `AdvanceUnknown` (a pre-swap
-            // failure) and `Restored` / `NeverAdvanced` outcomes are all
-            // legitimate members of a rolled-back terminal (matching
-            // [`FailedRolledBackTerminal::try_new`]'s own validator).
-            let rolled_back = !outcomes
-                .iter()
-                .any(|(_, o)| o.transition() == SlotTransition::Advanced);
+            // 2. DERIVE the disposition from THE ONE per-slot classifier:
+            // rolled-back iff EVERY slot's delta is `Unchanged` (a slot
+            // Desired/Diverged/Unknown — PROVABLY ON the deployed state, on
+            // a third state, or unknown — is NOT rolled back); otherwise
+            // degraded (which therefore carries ≥1 non-Unchanged delta).
+            let rolled_back = outcomes.iter().all(|(sid, o)| {
+                crate::kernel::terminal::outcome_slot_delta(intent, sid, o) == SlotDelta::Unchanged
+            });
             if rolled_back {
-                let payload = FailedRolledBackTerminal::try_new(SlotTable::from_map(
-                    outcomes.clone().into_map(),
-                ))?;
+                let payload = FailedRolledBackTerminal::try_new(
+                    SlotTable::from_map(outcomes.clone().into_map()),
+                    intent,
+                )?;
                 Ok(TerminalDisposition::FailedRolledBack(payload))
             } else {
-                let payload = DegradedTerminal::try_new(outcomes)?;
+                let payload = DegradedTerminal::try_new(outcomes, intent)?;
                 Ok(TerminalDisposition::Degraded(payload))
             }
         }
@@ -1432,29 +1478,32 @@ mod tests {
         ]
     }
 
-    /// An arbitrary STRUCTURAL outcome: every variant (incl. both
-    /// compensated values and with/without an operation error on `Failed`).
+    /// An arbitrary STRUCTURAL outcome: every variant of the SIX-state
+    /// taxonomy (incl. with/without an operation error on the failed
+    /// variants).
     fn arbitrary_outcome() -> impl Strategy<Value = SlotOutcome> {
         (
             prop_oneof![
                 2 => Just(0u8), // Activated
                 2 => Just(1u8), // Restored
                 2 => Just(2u8), // Skipped
-                4 => Just(3u8), // Failed
+                1 => Just(3u8), // FailedBeforeAdvance
+                1 => Just(4u8), // FailedAfterAdvance
+                1 => Just(5u8), // Indeterminate
             ],
             arbitrary_observation(),
             prop::bool::ANY,
-            prop::bool::ANY,
         )
-            .prop_map(|(kind, observation, compensated, has_error)| match kind {
-                0 => SlotOutcome::Activated { observation },
-                1 => SlotOutcome::Restored { observation },
-                2 => SlotOutcome::Skipped { observation },
-                _ => SlotOutcome::Failed {
-                    observation,
-                    compensated,
-                    error: has_error.then(|| "boom".to_string()),
-                },
+            .prop_map(|(kind, observation, has_error)| {
+                let error = has_error.then(|| "boom".to_string());
+                match kind {
+                    0 => SlotOutcome::Activated { observation },
+                    1 => SlotOutcome::Restored { observation },
+                    2 => SlotOutcome::Skipped { observation },
+                    3 => SlotOutcome::FailedBeforeAdvance { observation, error },
+                    4 => SlotOutcome::FailedAfterAdvance { observation, error },
+                    _ => SlotOutcome::Indeterminate { observation, error },
+                }
             })
     }
 
@@ -1549,6 +1598,91 @@ mod tests {
                             "a failure report whose outcome keys do not exactly match the selected membership must be refused with an integrity error"
                         );
                     }
+                }
+            }
+        }
+
+        /// THE TERMINAL-STATE INVARIANTS PROPERTY (the review's P1 /
+        /// acceptance item 2): for every generated intent/outcome/
+        /// observation combination over the selected membership — including
+        /// an UNCOMPENSATED failure AFTER the slot advanced (an outcome
+        /// whose state is `FailedAfterAdvance` with the desired-generation
+        /// observation — the old rule could call it rolled back) — the
+        /// decision is EXACTLY ONE terminal, and:
+        ///
+        /// * `FailedRolledBack` ⇒ EVERY slot's [`SlotDelta`] is `Unchanged`;
+        /// * `Degraded` ⇒ AT LEAST ONE `Desired`/`Diverged`/`Unknown` delta;
+        /// * `remaining_changes` contains EXACTLY the
+        ///   `Desired`/`Diverged`/`Unknown` slots.
+        #[test]
+        fn terminal_state_invariants_review_p1(
+            selected in selected_slots(),
+            outcome_table in arbitrary_outcome_table(),
+        ) {
+            let intent = full_intent("deploy-inv", &selected);
+            let selected_set: BTreeSet<SlotId> = selected.iter().cloned().collect();
+            let keys: BTreeSet<SlotId> = outcome_table.keys().cloned().collect();
+            if keys != selected_set {
+                return Ok(()); // mismatched-key reports are refused (covered above)
+            }
+            let table = NonEmptySlotTable::build(outcome_table).expect("non-empty table");
+            let d = decide_terminal(&intent, ExecutionReport::Failed { outcomes: table }).unwrap();
+            let deltas: Vec<(SlotId, SlotDelta)> = d
+                .outcomes()
+                .iter()
+                .map(|(sid, o)| {
+                    (
+                        sid.clone(),
+                        crate::kernel::terminal::outcome_slot_delta(&intent, sid, o),
+                    )
+                })
+                .collect();
+            let remaining_keys: std::collections::BTreeSet<SlotId> = deltas
+                .iter()
+                .filter(|(_, delta)| *delta != SlotDelta::Unchanged)
+                .map(|(sid, _)| sid.clone())
+                .collect();
+            let all_unchanged = deltas
+                .iter()
+                .all(|(_, delta)| *delta == SlotDelta::Unchanged);
+            // The terminal-level derivation under test: remaining_changes
+            // (the same classifier) must equal EXACTLY the deltas' set.
+            let terminal = LedgerTerminal::new(
+                crate::identity::Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
+                crate::kernel::terminal::intent_digest(&intent),
+                d.clone(),
+                None,
+            );
+            match &d {
+                TerminalDisposition::FailedRolledBack(_) => {
+                    prop_assert!(
+                        all_unchanged,
+                        "FailedRolledBack requires EVERY slot's delta to be Unchanged (the review's P1 rule)"
+                    );
+                    prop_assert!(
+                        terminal.remaining_changes(&intent).is_none(),
+                        "a rolled-back terminal derives no remaining changes"
+                    );
+                }
+                TerminalDisposition::Degraded(_) => {
+                    prop_assert!(
+                        !all_unchanged,
+                        "Degraded requires AT LEAST ONE Desired/Diverged/Unknown slot (nonempty deltas)"
+                    );
+                    let remaining = terminal
+                        .remaining_changes(&intent)
+                        .expect("a Degraded terminal derives remaining changes");
+                    prop_assert_eq!(
+                        remaining.keys().cloned().collect::<std::collections::BTreeSet<_>>(),
+                        remaining_keys,
+                        "remaining_changes contains EXACTLY the Desired/Diverged/Unknown slots"
+                    );
+                }
+                _ => {
+                    prop_assert!(
+                        false,
+                        "a Failed{{outcomes}} report decides EXACTLY ONE terminal: rolled-back or degraded"
+                    );
                 }
             }
         }

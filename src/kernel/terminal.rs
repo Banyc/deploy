@@ -19,18 +19,128 @@
 //!   payload);
 //! * FailedPreflight — no mutation outcomes;
 //! * FailedRolledBack ([`FailedRolledBackTerminal`]) — every attempted
-//!   mutation is restored or never advanced;
+//!   mutation is back at its pre-push state (every slot's
+//!   [`SlotDelta`] is `Unchanged`);
 //! * Degraded ([`DegradedTerminal`]) — nonempty outcomes with at least one
-//!   non-restored/unknown result.
+//!   remaining change (at least one slot's [`SlotDelta`] is
+//!   `Desired`/`Diverged`/`Unknown`).
+//!
+//! # One per-slot classifier for every terminal decision
+//!
+//! Every terminal decision derives from the outcome's post-mutation
+//! OBSERVATION against the intent's pre-push and DESIRED generations,
+//! through the ONE classifier [`classify_slot_delta`] / [`SlotDelta`]:
+//! `FailedRolledBack` requires EVERY slot `Unchanged`; `Degraded` requires
+//! AT LEAST ONE `Desired`/`Diverged`/`Unknown` slot (nonempty deltas);
+//! [`LedgerTerminal::remaining_changes`] contains exactly the
+//! `Desired`/`Diverged`/`Unknown` slots. The old rule — a rolled-back
+//! decision from the outcome's derived TRANSITION, a different rule than
+//! `remaining_changes`' state comparison — could classify an uncompensated
+//! failure that happened AFTER the slot advanced as rolled back (its
+//! transition was `AdvanceUnknown`), with the still-changed slot invisible
+//! to the decision: the P1 finding this taxonomy fixes.
 
 use crate::identity::Timestamp;
 use crate::kernel::error::{ConflictError, IntegrityError, KernelError, KernelResult};
 use crate::kernel::intent::DeploymentIntent;
 use crate::ledger::NonEmptySlotTable;
-use crate::ledger::records::{Observation, SlotOutcome, SlotTable};
+use crate::ledger::records::{Observation, ObservedGeneration, SlotOutcome, SlotTable};
+
+/// THE ONE PER-SLOT DELTA CLASSIFICATION — the SINGLE semantic value every
+/// terminal decision derives from (the review's `SlotDelta`): each selected
+/// slot's observed post-state against the intent's pre-push and DESIRED
+/// generations. [`classify_slot_delta`] is the ONE classifier: the
+/// disposition decision ([`crate::kernel::transition::decide_terminal`]),
+/// the disposition payload validators ([`FailedRolledBackTerminal::try_new`]
+/// / [`DegradedTerminal::try_new`]), the cross-record terminal agreement
+/// ([`crate::kernel::transition::validate_terminal_vs_intent`]), and the
+/// remaining-changes derivation ([`LedgerTerminal::remaining_changes`]) all
+/// classify through it — never through an independently-stored transition
+/// state that could disagree with the outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotDelta {
+    /// The observed post-state equals the intent's pre-push state (or the
+    /// slot is absent with no known prior state): the slot is back where it
+    /// started — never a remaining change.
+    Unchanged,
+    /// The observed post-state equals the intent's DESIRED generation (the
+    /// slot is on the state the deployment planned — a remaining change).
+    Desired,
+    /// The observed post-state is a THIRD state (neither desired nor
+    /// pre-push) or vanished while a prior state was known: a remaining
+    /// change.
+    Diverged,
+    /// The observation read failed (the outcome's observation is
+    /// `Unknown`): NEVER evidence of "unchanged" — a remaining change.
+    Unknown,
+}
+
+/// THE ONE PER-SLOT CLASSIFIER: the observed post-state vs the intent's
+/// DESIRED and PRE-PUSH generations —
+///
+/// * observed == desired → [`SlotDelta::Desired`];
+/// * observed == pre-push → [`SlotDelta::Unchanged`];
+/// * observed else (a third state / vanished prior state) →
+///   [`SlotDelta::Diverged`];
+/// * the observation read failed (`Unknown`) → [`SlotDelta::Unknown`].
+///
+/// `pre_push` is `None` when the intent records no known prior generation
+/// (a `KnownAbsent` or failed pre-push observation) — an absent observed
+/// state with no known prior is `Unchanged`, with a known prior it is
+/// `Diverged` (the state vanished). Every terminal decision and the
+/// remaining-changes derivation classify through this ONE function.
+pub fn classify_slot_delta(
+    observation: &Observation<ObservedGeneration>,
+    desired: &crate::identity::GenerationId,
+    pre_push: Option<&crate::identity::GenerationId>,
+) -> SlotDelta {
+    match observation {
+        Observation::Unknown(_) => SlotDelta::Unknown,
+        Observation::KnownAbsent => {
+            if pre_push.is_none() {
+                SlotDelta::Unchanged
+            } else {
+                SlotDelta::Diverged
+            }
+        }
+        Observation::Known(obs) => {
+            if &obs.generation == desired {
+                SlotDelta::Desired
+            } else if Some(&obs.generation) == pre_push {
+                SlotDelta::Unchanged
+            } else {
+                SlotDelta::Diverged
+            }
+        }
+    }
+}
+
+/// The per-slot delta of one of the intent's SELECTED outcomes — the
+/// outcome's observation vs the intent's DESIRED (the slot's planned
+/// result generation — always present for a selected slot) and PRE-PUSH
+/// generations. Shared by the payload validators, the cross-record
+/// terminal agreement, and [`LedgerTerminal::remaining_changes`].
+pub(crate) fn outcome_slot_delta(
+    intent: &DeploymentIntent,
+    sid: &crate::identity::SlotId,
+    o: &SlotOutcome,
+) -> SlotDelta {
+    // The resulting snapshot is a DERIVED VIEW of the intent's slot table
+    // (materialized here — never a second stored fact).
+    let snapshot = intent.resulting_snapshot();
+    let desired = snapshot
+        .get(sid)
+        .map(|e| e.generation())
+        .expect("a selected outcome names a slot with a planned result");
+    let pre_push = intent.pre_push(sid).and_then(|p| match p {
+        Observation::Known(prev) => Some(&prev.generation),
+        _ => None,
+    });
+    classify_slot_delta(o.observation(), desired, pre_push)
+}
 
 /// THE COMPENSATION REPORT / outcome payload of a fully-rolled-back
-/// deployment: every attempted mutation is restored or never advanced. The
+/// deployment: every attempted mutation is back at its pre-push state. The
 /// constructor is the ONE validator of that fact.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FailedRolledBackTerminal {
@@ -38,22 +148,37 @@ pub struct FailedRolledBackTerminal {
 }
 
 impl FailedRolledBackTerminal {
-    /// VALIDATE "every attempted mutation restored or never advanced": no
-    /// outcome may show a slot PROVABLY ON the new state (a DERIVED
-    /// `Advanced` transition — [`SlotOutcome::transition`] — a slot still
-    /// on the deployed generation is never a rolled-back slot). A pre-swap
-    /// failure (an uncompensated failure — the attempt never advanced the
-    /// slot) and a restored slot are both legitimate members of a rolled-
-    /// back terminal.
-    pub fn try_new(outcomes: SlotTable<SlotOutcome>) -> KernelResult<Self> {
+    /// VALIDATE "every slot's [`SlotDelta`] is `Unchanged`": under the ONE
+    /// classifier ([`classify_slot_delta`]), a slot whose observed post-state
+    /// is Desired/Diverged/Unknown (a slot PROVABLY ON the deployed state, or
+    /// a third/unknown state) is NEVER a rolled-back slot — a pre-swap
+    /// failure still at its pre-push state and a restored slot are the only
+    /// legitimate members. The intent binds the classification (its
+    /// pre-push and DESIRED generations per slot).
+    pub fn try_new(
+        outcomes: SlotTable<SlotOutcome>,
+        intent: &DeploymentIntent,
+    ) -> KernelResult<Self> {
         for (slot, o) in outcomes.iter() {
-            if o.transition() == crate::ledger::records::SlotTransition::Advanced {
+            if outcome_slot_delta(intent, slot, o) != SlotDelta::Unchanged {
                 return Err(KernelError::Integrity(IntegrityError::Message(format!(
-                    "a FailedRolledBack terminal cannot carry slot '{slot}' with an Advanced outcome — every attempted mutation must be restored or never advanced"
+                    "a FailedRolledBack terminal cannot carry slot '{slot}' with a non-Unchanged delta ({:?}) — every attempted mutation must be back at its pre-push state",
+                    outcome_slot_delta(intent, slot, o)
                 ))));
             }
         }
         Ok(Self { outcomes })
+    }
+
+    /// The WIRE-READ constructor (no intent available at deserialization):
+    /// builds the payload from the wire rows WITHOUT the intent-dependent
+    /// delta validation — the cross-record terminal agreement
+    /// ([`crate::kernel::transition::validate_terminal_vs_intent`], where
+    /// the entry's intent exists) enforces the all-Unchanged invariant on
+    /// BOTH the read fold and the append path before any consumer sees the
+    /// terminal, so an invalid record is refused fail-closed either way.
+    pub(crate) fn new_unchecked(outcomes: SlotTable<SlotOutcome>) -> Self {
+        Self { outcomes }
     }
     pub fn outcomes(&self) -> &SlotTable<SlotOutcome> {
         &self.outcomes
@@ -61,34 +186,47 @@ impl FailedRolledBackTerminal {
 }
 
 /// THE outcome payload of a DEGRADED deployment: nonempty outcomes with at
-/// least one non-restored/unknown result. The constructor is the ONE
-/// validator of that fact.
+/// least one remaining change (a slot whose [`SlotDelta`] is `Desired` /
+/// `Diverged` / `Unknown`). The constructor is the ONE validator of that
+/// fact — the review's nonempty-deltas invariant.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DegradedTerminal {
     outcomes: NonEmptySlotTable<SlotOutcome>,
 }
 
 impl DegradedTerminal {
-    /// VALIDATE "nonempty, at least one non-restored/unknown result": the
-    /// table is non-empty by TYPE, and at least one outcome is NOT a clean
-    /// restoration — an outcome variant other than
-    /// [`SlotOutcome::Restored`] (a slot still changed or with an unknown
-    /// advance outcome), or an `Unknown` observation (a failed post-mutation
-    /// read is uncertain, so it is always a remaining change). An
-    /// all-restored outcome set is a `FailedRolledBack`, never a
-    /// `Degraded`.
-    pub fn try_new(outcomes: NonEmptySlotTable<SlotOutcome>) -> KernelResult<Self> {
-        let has_remaining = outcomes.iter().any(|(_, o)| {
-            !matches!(o, crate::ledger::records::SlotOutcome::Restored { .. })
-                || matches!(o.observation(), Observation::Unknown(_))
-        });
+    /// VALIDATE "nonempty, at least one Desired/Diverged/Unknown delta":
+    /// the table is non-empty by TYPE, and at least one outcome's delta
+    /// (under the ONE classifier [`classify_slot_delta`], bound by the
+    /// intent's pre-push and DESIRED generations) is NOT `Unchanged` — the
+    /// review's exact requirement (a Degraded terminal with NO remaining
+    /// change is unrepresentable). An all-Unchanged outcome set is a
+    /// `FailedRolledBack`, never a `Degraded`.
+    pub fn try_new(
+        outcomes: NonEmptySlotTable<SlotOutcome>,
+        intent: &DeploymentIntent,
+    ) -> KernelResult<Self> {
+        let has_remaining = outcomes
+            .iter()
+            .any(|(sid, o)| outcome_slot_delta(intent, sid, o) != SlotDelta::Unchanged);
         if !has_remaining {
             return Err(KernelError::Integrity(IntegrityError::Message(
-                "a Degraded terminal requires at least one non-restored/unknown result — an all-restored attempt is FailedRolledBack, never Degraded"
+                "a Degraded terminal requires at least one remaining change — every slot is at its pre-push state, so the attempt is FailedRolledBack, never Degraded"
                     .to_string(),
             )));
         }
         Ok(Self { outcomes })
+    }
+
+    /// The WIRE-READ constructor (no intent available at deserialization):
+    /// builds the payload from the wire rows WITHOUT the intent-dependent
+    /// delta validation — the cross-record terminal agreement
+    /// ([`crate::kernel::transition::validate_terminal_vs_intent`], where
+    /// the entry's intent exists) enforces the nonempty-deltas invariant on
+    /// BOTH the read fold and the append path before any consumer sees the
+    /// terminal.
+    pub(crate) fn new_unchecked(outcomes: NonEmptySlotTable<SlotOutcome>) -> Self {
+        Self { outcomes }
     }
     pub fn outcomes(&self) -> &NonEmptySlotTable<SlotOutcome> {
         &self.outcomes
@@ -256,22 +394,15 @@ impl LedgerTerminal {
     }
 
     /// THE REMAINING CHANGES of a [`TerminalDisposition::Degraded`]
-    /// terminal — DERIVED from the disposition's OWN per-slot outcomes (the
-    /// slots whose FINAL OBSERVED STATE differs from their pre-push state,
-    /// each mapped to its THREE-STATE OBSERVATION), never stored. `None` for
-    /// any non-Degraded disposition.
-    ///
-    /// THE DERIVATION IS THE TRANSITION STATE, NOT THE OUTCOME'S GENERATION
-    /// FIELD: each slot's [`crate::ledger::records::SlotTransition`] classifies it — a
-    /// `NeverAdvanced` slot (skipped) and a `Restored` slot (compensated
-    /// back) are back at their pre-push state (never remaining changes); an
-    /// `Advanced` slot is at the desired state (always a remaining change);
-    /// an `AdvanceUnknown` slot (a pre-swap failure — the advance outcome is
-    /// unknown) is a remaining change iff its OBSERVED state (the outcome's
-    /// observation, which the engine records as the actual post-state, never
-    /// the desired one) differs from the intent's pre-push observation of
-    /// that slot. An `Unknown` observation (the post-mutation status read
-    /// failed) is UNCERTAIN — never unchanged.
+    /// terminal — DERIVED from the disposition's OWN per-slot outcomes
+    /// through the ONE per-slot classifier
+    /// ([`classify_slot_delta`] / [`SlotDelta`]): the slots whose delta is
+    /// `Desired`/`Diverged`/`Unknown` — NOT `Unchanged` — each mapped to
+    /// its THREE-STATE OBSERVATION. This is the SAME classification the
+    /// disposition decision and the payload validators use — never a second
+    /// rule (the old derivation coupled the outcome's derived transition to
+    /// an observation-vs-pre_push comparison that could disagree with the
+    /// disposition decision). `None` for any non-Degraded disposition.
     pub fn remaining_changes(
         &self,
         intent: &DeploymentIntent,
@@ -287,32 +418,7 @@ impl LedgerTerminal {
             crate::ledger::records::Observation<crate::ledger::records::ObservedGeneration>,
         > = crate::ledger::records::SlotTable::new();
         for (sid, r) in dt.outcomes().iter() {
-            let is_change = match r.transition() {
-                crate::ledger::records::SlotTransition::NeverAdvanced
-                | crate::ledger::records::SlotTransition::Restored => false,
-                crate::ledger::records::SlotTransition::Advanced => true,
-                crate::ledger::records::SlotTransition::AdvanceUnknown => {
-                    let pre = intent.pre_push(sid).and_then(|p| match p {
-                        crate::ledger::records::Observation::Known(prev) => {
-                            Some(prev.generation.clone())
-                        }
-                        _ => None,
-                    });
-                    match r.observation() {
-                        crate::ledger::records::Observation::Known(og) => {
-                            let obs = og.generation.clone();
-                            match (Some(obs), pre) {
-                                (Some(obs), Some(pre_gen)) => obs != pre_gen,
-                                (Some(_), None) => true,
-                                _ => false,
-                            }
-                        }
-                        crate::ledger::records::Observation::KnownAbsent => pre.is_some(),
-                        crate::ledger::records::Observation::Unknown(_) => true,
-                    }
-                }
-            };
-            if is_change {
+            if outcome_slot_delta(intent, sid, r) != SlotDelta::Unchanged {
                 remaining.insert(sid.clone(), r.observation().clone());
             }
         }

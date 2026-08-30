@@ -1,73 +1,47 @@
 //! Result-table shaping: [`fill_skipped_slots`] makes every SELECTED slot
-//! appear in the results; [`observe_actual_servers`] records the
+//! appear in the execution table; [`observe_actual_servers`] records the
 //! post-mutation observation of each member slot.
 
 use crate::deploy::plan::PlannedAssignment;
+use crate::deploy::rollout::SlotExecution;
 use crate::identity::{ArtifactRef, GenerationId, SlotId};
 use crate::ledger::ActualSlotState;
 use crate::ledger::Observation;
 use crate::ledger::ObservationError;
-use crate::ledger::ObservationWire;
 use crate::ledger::ObservedGeneration;
-use crate::ledger::ObservedGenerationWire;
-use crate::ledger::SlotOutcomeKind;
-use crate::ledger::SlotResult;
 use crate::remote::helper::RemoteHelper;
-use crate::remote::helper::RemoteStatus;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 
 // Result-table shaping (A1 deployment semantics).
 //
-// The per-slot result table of a push attempt is shaped in two places:
+// The per-slot EXECUTION table of a push attempt is shaped in two places:
 //
-// * [`fill_skipped_slots`] — every SELECTED slot appears in the results even
-//   when the batch loop never started it (a later failed batch under
-//   `stop_on_failure`): the filler inserts a `Skipped` outcome carrying the
-//   slot's RECONCILED current assignment (the observed generation, never a
-//   generated desired one). Extracted from the old `push::engine` batch loop
-//   (the batching section above).
+// * [`fill_skipped_slots`] — every SELECTED slot appears in the executions
+//   even when the batch loop never started it (a later failed batch under
+//   `stop_on_failure`): the filler inserts a [`SlotExecution::NotStarted`]
+//   state (its post-mutation observation — the reconciled current
+//   assignment, never a generated desired one — is attached when the
+//   terminal inputs are derived). Extracted from the old `push::engine`
+//   batch loop.
 // * [`observe_actual_servers`] — the post-mutation observation of each
 //   slot's REAL final state, read from the remote generation it currently
-//   points at (never the desired plan values), as the two parallel tables
-//   the terminal event and the never-advanced outcome fix-up consume.
-//
-// The never-advanced OUTCOME fix-up that consumes the generation-half
-// observation ([`record_never_advanced_outcomes`])
-// stays with the failure-policy pass (failure section), where
-// the degraded derivation and the never-advanced handling are documented
-// together; the final outcome-map assembly (the `results` clone feeding the
-// terminal append) is spine glue in [`crate::deploy::push::push_inner`].
+//   points at (never the desired plan values), as the parallel tables the
+//   terminal event and the never-advanced outcomes consume.
 
 /// Any slot never started (e.g. skipped after an earlier failure under
-/// `stop_on_failure`) still appears in the attempt, with its reconciled
-/// current assignment rather than a generated desired generation.
+/// `stop_on_failure`) still appears in the execution table as
+/// [`SlotExecution::NotStarted`]; its post-mutation OBSERVATION (the
+/// reconciled current assignment) is attached when the terminal inputs are
+/// derived ([`crate::deploy::push::execute::ExecutionOutcome`]).
 pub(crate) fn fill_skipped_slots(
-    results: &mut BTreeMap<SlotId, SlotResult>,
+    executions: &mut BTreeMap<SlotId, SlotExecution>,
     assignments: &[PlannedAssignment],
-    statuses: &HashMap<SlotId, RemoteStatus>,
 ) {
     for a in assignments {
-        if !results.contains_key(&a.placement_slot) {
-            let cur = statuses
-                .get(&a.placement_slot)
-                .and_then(|s| s.current_generation.clone());
-            results.insert(
-                a.placement_slot.clone(),
-                SlotResult {
-                    slot_id: a.placement_slot.clone(),
-                    outcome: SlotOutcomeKind::Skipped,
-                    observation: match cur {
-                        Some(g) => ObservationWire::Known(ObservedGenerationWire { generation: g }),
-                        // No reconciled current assignment: a skipped slot
-                        // with no observed state reads back as `KnownAbsent`.
-                        None => ObservationWire::KnownAbsent,
-                    },
-                    compensated: false,
-                    error: None,
-                },
-            );
-        }
+        executions
+            .entry(a.placement_slot.clone())
+            .or_insert(SlotExecution::NotStarted);
     }
 }
 

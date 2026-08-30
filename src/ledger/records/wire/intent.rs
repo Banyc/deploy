@@ -128,7 +128,7 @@ pub struct PlannedSlotRowWire {
 }
 
 /// The WIRE shape of a durable intent line — the RAW serde form the
-/// ledger's JSONL carries. Schema v10: THE COMPLETE RESULT IS STORED ONCE in
+/// ledger's JSONL carries. Schema v10 (kept in v11): THE COMPLETE RESULT IS STORED ONCE in
 /// the ONE full slot ROW ARRAY (`slots`); every membership and the
 /// resulting snapshot are DERIVED views of it (the domain derives them;
 /// the wire carries no duplicated projection). The ROW ORDER IS THE

@@ -28,7 +28,6 @@ pub use intent::{
     PreviousGenerationWire, SlotActionWire, SnapshotSlotWire,
 };
 pub use outcomes::{
-    CompensationReport, SlotOutcome, SlotOutcomeKind, SlotOutcomeRowWire, SlotResult,
-    SlotTransition,
+    CompensationReport, SlotOutcome, SlotOutcomeBodyWire, SlotOutcomeRowWire, SlotResult,
 };
 pub use terminal::LedgerTerminalWire;
