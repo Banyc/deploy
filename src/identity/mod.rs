@@ -109,9 +109,11 @@ macro_rules! id_newtype {
                 self.0
             }
 
-            /// UNCHECKED constructor — TEST FIXTURES ONLY. Production code
+            /// UNCHECKED constructor — TEST FIXTURES ONLY, `#[cfg(test)]`
+            /// gated (not compiled into a production build). Production code
             /// must construct through [`Self::parse`] (or `FromStr`/`TryFrom`), so
             /// an invalid identity can never be built outside tests.
+            #[cfg(test)]
             pub fn new(s: impl Into<String>) -> Self {
                 $name(s.into())
             }
@@ -137,7 +139,8 @@ macro_rules! id_newtype {
             }
         }
 
-        /// UNCHECKED conversion — TEST FIXTURES ONLY (mirrors `$name::new`).
+        /// UNCHECKED conversion — TEST FIXTURES ONLY (mirrors `$name::new`,
+        /// which is `#[cfg(test)]` gated like this conversion).
         /// NOTE: deliberately NO `From<String>`/`From<&str>` impl — clap's
         /// value-parser inference prefers those over `FromStr`, which would
         /// silently bypass validation in test builds (and `From<&str>` would

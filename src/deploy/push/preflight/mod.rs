@@ -614,13 +614,18 @@ pub(crate) fn run_preflight(
         );
     }
 
-    let plan = DeploymentPlan {
-        deployment_id: deployment_id.clone(),
-        target: resolved_sel.target().clone(),
-        behaviors: behavior_index.clone(),
-        slots: plan_servers.clone(),
-        source: origin,
-    };
+    // The plan's fields are private (invariant-bearing domain record): the
+    // builder assembles it from already-validated parts — the per-slot plans
+    // (validated SlotIds/artifacts), the behavior index, and the VERIFIED
+    // origin ([`PlanOrigin`] — a Release origin carries its sealed rebinding
+    // proof inside the source).
+    let plan = DeploymentPlan::new(
+        deployment_id.clone(),
+        resolved_sel.target().clone(),
+        behavior_index.clone(),
+        plan_servers.clone(),
+        origin,
+    );
 
     Ok(PreflightOutcome {
         pref,
@@ -1944,10 +1949,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             // valid for the ledger to load at all.
             BTreeMap::from([(
                 SlotId::parse("p1").unwrap(),
-                crate::ledger::PhysicalBinding {
-                    server: crate::identity::ServerId::parse("s1").unwrap(),
-                    deploy_dir: "/srv/eng".to_string(),
-                },
+                crate::ledger::PhysicalBinding::new(
+                    crate::identity::ServerId::parse("s1").unwrap(),
+                    "/srv/eng",
+                )
+                .expect("test binding is absolute and traversal-free"),
             )]),
         );
 
@@ -2355,10 +2361,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             assert_eq!(r0.status, Some(DeploymentStatus::Successful));
             let chain_artifact = known_artifact(&r0.attempt.as_ref().expect("attempt").slots[&slot])
                 .clone();
-            let bindings = crate::ledger::PhysicalBinding {
-                server: crate::identity::ServerId::parse("s1").unwrap(),
-                deploy_dir: "/srv/eng".to_string(),
-            };
+            let bindings = crate::ledger::PhysicalBinding::new(
+                    crate::identity::ServerId::parse("s1").unwrap(),
+                    "/srv/eng",
+                )
+                .expect("test binding is absolute and traversal-free");
             for i in 1..=latest {
                 crate::deploy::testsupport::seed_snapshot(
                     &h.store,
@@ -2585,8 +2592,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             )
             .unwrap();
             assert_eq!(
-                plan.source,
-                crate::ledger::PlanOrigin::Deployment(
+                plan.source(),
+                &crate::ledger::PlanOrigin::Deployment(
                     DeploymentId::parse(&selected_deployment).expect("canonical selected id")
                 ),
                 "'{token}' must select the entry at successful-chain position {selected} = s{}(latest + 1) - {depth} — the POST-reconciliation selection (the pending reconciled at the top), not the pre-reconcile s{}(latest) - {depth}",
@@ -2642,9 +2649,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 release: crate::identity::test_release_id("rel-sha256-1111"),
                 variant: VariantName::parse("p1").unwrap(),
                 tree: test_tree_digest("aa")};
-            let bindings = crate::ledger::PhysicalBinding {
-                server: crate::identity::ServerId::parse("s1").unwrap(),
-                deploy_dir: "/srv/eng".to_string()};
+            let bindings = crate::ledger::PhysicalBinding::new(
+                crate::identity::ServerId::parse("s1").unwrap(),
+                "/srv/eng",
+            )
+            .expect("test binding is absolute and traversal-free");
             for i in 0..=2u64 {
                 seed_snapshot(
                     &h.store,

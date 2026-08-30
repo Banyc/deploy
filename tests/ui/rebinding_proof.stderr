@@ -1,0 +1,35 @@
+warning: unreachable expression
+  --> tests/ui/rebinding_proof.rs:21:26
+   |
+20 |         target: todo!(),
+   |                 ------- any code following this expression is unreachable
+21 |         frozen_topology: todo!(),
+   |                          ^^^^^^^ unreachable expression
+   |
+   = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+error[E0451]: fields `release`, `target`, `frozen_topology`, `membership`, `selected_plan_slots`, `current_physical_slots` and `_sealed` of struct `VerifiedReleaseRebinding` are private
+  --> tests/ui/rebinding_proof.rs:19:9
+   |
+18 |     let _proof = VerifiedReleaseRebinding {
+   |                  ------------------------ in this type
+19 |         release,
+   |         ^^^^^^^ private field
+20 |         target: todo!(),
+   |         ^^^^^^ private field
+21 |         frozen_topology: todo!(),
+   |         ^^^^^^^^^^^^^^^ private field
+22 |         membership: todo!(),
+   |         ^^^^^^^^^^ private field
+23 |         selected_plan_slots: todo!(),
+   |         ^^^^^^^^^^^^^^^^^^^ private field
+24 |         current_physical_slots: todo!(),
+   |         ^^^^^^^^^^^^^^^^^^^^^^ private field
+25 |         _sealed: (),
+   |         ^^^^^^^ private field
+
+error: type `identity::proof::proofs::MatchingMembership` is private
+  --> tests/ui/rebinding_proof.rs:22:21
+   |
+22 |         membership: todo!(),
+   |                     ^^^^^^^ private type

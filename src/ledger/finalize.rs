@@ -99,7 +99,9 @@ pub(crate) fn finalize_successful_locked(
             .selected_membership()
             .into_iter()
             .next()
-            .unwrap_or_else(|| SlotId::new("no-slot".to_string()));
+            .unwrap_or_else(|| {
+                SlotId::parse("no-slot").expect("the no-slot sentinel is a safe segment")
+            });
         return Ok(FinalizeOutcome::Refused {
             reason: parent_error.message(),
             slot,
@@ -193,10 +195,9 @@ pub(crate) fn finalize_successful_locked(
         // source the caller records on the degraded terminal).
         Err(Error::Kernel(KernelError::Conflict(conflict))) => Ok(FinalizeOutcome::Refused {
             reason: conflict.to_string(),
-            slot: selected
-                .first()
-                .cloned()
-                .unwrap_or_else(|| SlotId::new("no-slot".to_string())),
+            slot: selected.first().cloned().unwrap_or_else(|| {
+                SlotId::parse("no-slot").expect("the no-slot sentinel is a safe segment")
+            }),
         }),
         Err(e) => Err(e),
     }

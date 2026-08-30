@@ -40,11 +40,11 @@ pub(crate) fn verify_exact_rollback_bindings(
     for (slot, sdef) in members {
         let slot_id = SlotId::parse(slot.id.as_str()).expect("validated slot id is a safe segment");
 
-        let current_binding = PhysicalBinding {
-            server: ServerId::parse(sdef.id.as_str())
-                .expect("validated server id is a safe segment"),
-            deploy_dir: slot.deploy_dir().to_string_lossy().into_owned(),
-        };
+        let current_binding = PhysicalBinding::new(
+            ServerId::parse(sdef.id.as_str()).expect("validated server id is a safe segment"),
+            slot.deploy_dir(),
+        )
+        .expect("a config-validated deploy_dir is absolute and traversal-free");
         let recorded = entry.get(&slot_id).map(|e| e.binding()).ok_or_else(|| {
             Error::rollback(format!(
                 "slot '{slot_id}' has no recorded physical binding in deployment '{deployment_id}' of target '{ft}'; exact rollback cannot verify the deployment location"
@@ -53,10 +53,10 @@ pub(crate) fn verify_exact_rollback_bindings(
         if recorded != &current_binding {
             return Err(Error::rollback(format!(
                 "slot '{slot_id}' was bound to server '{}' at '{}' in deployment '{deployment_id}' of target '{ft}', now bound to '{}' at '{}'; exact rollback would deploy to the wrong host",
-                recorded.server,
-                recorded.deploy_dir,
-                current_binding.server,
-                current_binding.deploy_dir
+                recorded.server(),
+                recorded.deploy_dir(),
+                current_binding.server(),
+                current_binding.deploy_dir()
             )));
         }
     }

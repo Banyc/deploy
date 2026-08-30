@@ -417,10 +417,11 @@ impl Default for DeploymentIntent {
             )
             .unwrap(),
         };
-        let binding = crate::ledger::PhysicalBinding {
-            server: crate::identity::ServerId::parse("s1").unwrap(),
-            deploy_dir: "/srv/deploy/p1".to_string(),
-        };
+        let binding = crate::ledger::PhysicalBinding::new(
+            crate::identity::ServerId::parse("s1").unwrap(),
+            "/srv/deploy/p1",
+        )
+        .expect("test binding is absolute and traversal-free");
         let slot = SnapshotSlot::new(
             crate::identity::GenerationId::parse("gen-00000000-0000-7000-8000-000000000001")
                 .unwrap(),

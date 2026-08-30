@@ -607,10 +607,8 @@ interval_seconds = 0
                         variant: VariantName::parse("standard").unwrap(),
                         tree: test_tree_digest(tree),
                     },
-                    crate::ledger::PhysicalBinding {
-                        server: ServerId::parse("s1").unwrap(),
-                        deploy_dir: deploy_dir.to_string(),
-                    },
+                    crate::ledger::PhysicalBinding::new(ServerId::parse("s1").unwrap(), deploy_dir)
+                        .expect("test binding is absolute and traversal-free"),
                 ),
                 pre_push,
             }],

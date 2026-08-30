@@ -1546,10 +1546,11 @@ exec /usr/bin/test "$@"
                 result: SnapshotSlot::new(
                     new_gen.clone(),
                     artifact,
-                    crate::ledger::PhysicalBinding {
-                        server: crate::identity::ServerId::parse(server.id.as_str()).unwrap(),
-                        deploy_dir: slot.deploy_dir().to_string_lossy().into_owned(),
-                    },
+                    crate::ledger::PhysicalBinding::new(
+                        crate::identity::ServerId::parse(server.id.as_str()).unwrap(),
+                        slot.deploy_dir(),
+                    )
+                    .expect("test binding is absolute and traversal-free"),
                 ),
                 pre_push,
             }],

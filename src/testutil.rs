@@ -1924,10 +1924,11 @@ pub(crate) mod fixtures {
 
     /// The canonical test binding for a slot.
     pub(crate) fn binding(sid: &SlotId) -> PhysicalBinding {
-        PhysicalBinding {
-            server: crate::identity::ServerId::parse("s1").unwrap(),
-            deploy_dir: format!("/srv/deploy/{}", sid.as_str()),
-        }
+        PhysicalBinding::new(
+            crate::identity::ServerId::parse("s1").unwrap(),
+            format!("/srv/deploy/{}", sid.as_str()),
+        )
+        .expect("the canonical test binding is absolute and traversal-free")
     }
 
     /// A plan-minted result for a slot, derived deterministically from the

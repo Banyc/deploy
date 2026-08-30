@@ -395,14 +395,14 @@ mod groups_tests {
                         .get(&SlotId::new("phys"))
                         .expect("phys is a member of t1");
                     assert_ne!(
-                        cfg_phys.server.as_str(),
+                        cfg_phys.server().as_str(),
                         rec_phys.server,
                         "the fixture must realize the physical drift: config server {} vs record server {}",
-                        cfg_phys.server,
+                        cfg_phys.server(),
                         rec_phys.server
                     );
                     assert_eq!(
-                        cfg_phys.deploy_dir, rec_phys.deploy_dir,
+                        cfg_phys.deploy_dir(), rec_phys.deploy_dir,
                         "only the server drifted; deploy_dir stays put"
                     );
                 }

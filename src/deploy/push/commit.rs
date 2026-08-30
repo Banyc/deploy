@@ -963,10 +963,8 @@ pub(crate) mod commit_tests {
             &id_a,
             &target_a,
             &desired_ref.assignment.artifact,
-            crate::ledger::PhysicalBinding {
-                server: ServerId::parse("s1").unwrap(),
-                deploy_dir: "/srv/eng".to_string(),
-            },
+            crate::ledger::PhysicalBinding::new(ServerId::parse("s1").unwrap(), "/srv/eng")
+                .expect("test binding is absolute and traversal-free"),
             &baseline.behavior_sha256,
             Some(&head),
         );
@@ -1065,10 +1063,8 @@ pub(crate) mod commit_tests {
             &id_a,
             &desired_ref.generation.clone(),
             &desired_ref.assignment.artifact,
-            crate::ledger::PhysicalBinding {
-                server: ServerId::parse("s1").unwrap(),
-                deploy_dir: "/srv/eng".to_string(),
-            },
+            crate::ledger::PhysicalBinding::new(ServerId::parse("s1").unwrap(), "/srv/eng")
+                .expect("test binding is absolute and traversal-free"),
             &baseline.behavior_sha256.clone(),
             Some(&head),
         );
@@ -1134,10 +1130,8 @@ pub(crate) mod commit_tests {
                 &test_deployment_id(id),
                 &desired_ref.generation,
                 &desired_ref.assignment.artifact,
-                crate::ledger::PhysicalBinding {
-                    server: ServerId::parse("s1").unwrap(),
-                    deploy_dir: "/srv/eng".to_string(),
-                },
+                crate::ledger::PhysicalBinding::new(ServerId::parse("s1").unwrap(), "/srv/eng")
+                    .expect("test binding is absolute and traversal-free"),
                 &baseline.behavior_sha256,
                 Some(&head),
             )
@@ -1201,10 +1195,8 @@ pub(crate) mod commit_tests {
             &test_deployment_id("deploy-multi-b"),
             &desired_ref.generation,
             &desired_ref.assignment.artifact,
-            crate::ledger::PhysicalBinding {
-                server: ServerId::parse("s1").unwrap(),
-                deploy_dir: "/srv/eng".to_string(),
-            },
+            crate::ledger::PhysicalBinding::new(ServerId::parse("s1").unwrap(), "/srv/eng")
+                .expect("test binding is absolute and traversal-free"),
             &baseline.behavior_sha256,
             Some(&a),
         );
@@ -1422,13 +1414,13 @@ pub(crate) mod commit_tests {
             "the rollback plan references the baseline's own release (R1)"
         );
         assert_eq!(
-            plan.behaviors.len(),
+            plan.behaviors().len(),
             1,
             "one frozen behavior block per referenced release"
         );
         assert_eq!(
             crate::verify::release::behavior_contract_digest(
-                &plan.behaviors[&r1_release]["standard"]
+                &plan.behaviors()[&r1_release]["standard"]
             ),
             digest_a
         );

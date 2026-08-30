@@ -1,0 +1,15 @@
+error[E0451]: fields `deployment_id`, `target`, `behaviors`, `slots` and `source` of struct `DeploymentPlan` are private
+  --> tests/ui/plan_literal.rs:18:9
+   |
+17 |     let _plan = DeploymentPlan {
+   |                 -------------- in this type
+18 |         deployment_id: d(),
+   |         ^^^^^^^^^^^^^ private field
+19 |         target: d(),
+   |         ^^^^^^ private field
+20 |         behaviors: d(),
+   |         ^^^^^^^^^ private field
+21 |         slots: d(),
+   |         ^^^^^ private field
+22 |         source: d(),
+   |         ^^^^^^ private field

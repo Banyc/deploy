@@ -929,7 +929,8 @@ fn deploy_dir_is_normalized_in_the_validated_graph() {
     let bindings = cfg.target_slot_bindings("t1").unwrap();
     let binding = bindings.values().next().expect("one binding");
     assert_eq!(
-        binding.deploy_dir, "/srv/app",
+        binding.deploy_dir(),
+        "/srv/app",
         "the recorded PhysicalBinding.deploy_dir is the canonical effective root"
     );
 }
@@ -3645,7 +3646,7 @@ proptest! {
                     let binding = &bindings[&SlotId::parse(&slot.id).expect("validated slot id")];
                     prop_assert_eq!(
                         remote.root(),
-                        Path::new(binding.deploy_dir.as_str()),
+                        Path::new(binding.deploy_dir()),
                         "create_remote(...).root() must equal PhysicalBinding.deploy_dir for slot '{}'",
                         slot.id
                     );

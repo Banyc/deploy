@@ -81,11 +81,12 @@ pub(crate) fn validate_partial_rollout(
                 let slot_id =
                     SlotId::parse(slot.id.as_str()).expect("validated slot id is a safe segment");
 
-                let current_binding = PhysicalBinding {
-                    server: ServerId::parse(sdef.id.as_str())
+                let current_binding = PhysicalBinding::new(
+                    ServerId::parse(sdef.id.as_str())
                         .expect("validated server id is a safe segment"),
-                    deploy_dir: slot.deploy_dir().to_string_lossy().into_owned(),
-                };
+                    slot.deploy_dir(),
+                )
+                .expect("a config-validated deploy_dir is absolute and traversal-free");
                 if base.get(&slot_id).is_none() {
                     return Err(Error::preflight(format!(
                         "partial rollout of target '{}' with group '{}' is refused: unselected slot \
@@ -113,10 +114,10 @@ pub(crate) fn validate_partial_rollout(
                         selection.target,
                         selection.group.as_deref().unwrap_or(""),
                         slot_id,
-                        recorded.server,
-                        recorded.deploy_dir,
-                        current_binding.server,
-                        current_binding.deploy_dir
+                        recorded.server(),
+                        recorded.deploy_dir(),
+                        current_binding.server(),
+                        current_binding.deploy_dir()
                     )));
                 }
             }

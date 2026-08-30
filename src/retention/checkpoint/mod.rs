@@ -740,10 +740,11 @@ mod tests {
                         variant: VariantName::parse("standard").unwrap(),
                         tree: test_tree_digest(tree),
                     },
-                    crate::ledger::PhysicalBinding {
-                        server: ServerId::parse("s1").unwrap(),
-                        deploy_dir: "/srv/deploy/p1".to_string(),
-                    },
+                    crate::ledger::PhysicalBinding::new(
+                        ServerId::parse("s1").unwrap(),
+                        "/srv/deploy/p1",
+                    )
+                    .expect("test binding is absolute and traversal-free"),
                 ),
                 pre_push: Observation::KnownAbsent,
             }],

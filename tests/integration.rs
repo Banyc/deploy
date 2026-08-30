@@ -401,9 +401,9 @@ fn snapshot_records_each_slots_physical_binding() -> Result<()> {
     // p1 -> (server-01, /srv/deploy/example), p2 -> (server-02,
     // /srv/deploy/example), p3 -> (server-03, /srv/deploy/example) per the
     // shared CONFIG's slot declarations.
-    let binding = |server: &str| PhysicalBinding {
-        server: ServerId::parse(server).unwrap(),
-        deploy_dir: "/srv/deploy/example".to_string(),
+    let binding = |server: &str| {
+        PhysicalBinding::new(ServerId::parse(server).unwrap(), "/srv/deploy/example")
+            .expect("test binding is absolute and traversal-free")
     };
     assert_eq!(
         rollback_of(&snapshots[0])
@@ -513,10 +513,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         rollback_of(&snapshots[0])
             .get(&SlotId::parse("p1").unwrap())
             .map(|e| e.binding()),
-        Some(&PhysicalBinding {
-            server: ServerId::parse("server-01").unwrap(),
-            deploy_dir: "/srv/deploy/rebind".to_string(),
-        }),
+        Some(
+            &PhysicalBinding::new(ServerId::parse("server-01").unwrap(), "/srv/deploy/rebind",)
+                .expect("test binding is absolute and traversal-free")
+        ),
         "the snapshot records the complete physical binding the slot was deployed onto"
     );
     let s01 = remotes_base.join("server-01");
@@ -685,10 +685,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         rollback_of(&snapshots[0])
             .get(&SlotId::parse("p1").unwrap())
             .map(|e| e.binding()),
-        Some(&PhysicalBinding {
-            server: ServerId::parse("server-01").unwrap(),
-            deploy_dir: "/srv/move/movedir-a".to_string(),
-        }),
+        Some(
+            &PhysicalBinding::new(ServerId::parse("server-01").unwrap(), "/srv/move/movedir-a",)
+                .expect("test binding is absolute and traversal-free")
+        ),
         "s0 records the slot's {{server, deploy_dir}} binding"
     );
     assert!(

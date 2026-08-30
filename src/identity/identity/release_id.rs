@@ -25,10 +25,12 @@ use std::fmt;
 pub struct ReleaseId(String);
 
 impl ReleaseId {
-    /// UNCHECKED constructor — TEST FIXTURES ONLY (mirrors the
-    /// `id_newtype!` contract). Production code must construct through
+    /// UNCHECKED constructor — TEST FIXTURES ONLY, `#[cfg(test)]` gated
+    /// (not compiled into a production build; mirrors the `id_newtype!`
+    /// contract). Production code must construct through
     /// [`ReleaseId::parse`] (or `FromStr`/`TryFrom`/`from_digest`), so an
     /// invalid release id can never be built outside tests.
+    #[cfg(test)]
     pub fn new(s: impl Into<String>) -> Self {
         ReleaseId(s.into())
     }

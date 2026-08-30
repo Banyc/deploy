@@ -902,11 +902,12 @@ impl ProjectConfig {
             .map(|(slot, server)| {
                 (
                     SlotId::parse(slot.id.as_str()).expect("validated slot id is a safe segment"),
-                    PhysicalBinding {
-                        server: ServerId::parse(server.id.as_str())
+                    PhysicalBinding::new(
+                        ServerId::parse(server.id.as_str())
                             .expect("validated server id is a safe segment"),
-                        deploy_dir: slot.deploy_dir().to_string_lossy().into_owned(),
-                    },
+                        slot.deploy_dir(),
+                    )
+                    .expect("a config-validated deploy_dir is absolute and traversal-free"),
                 )
             })
             .collect())

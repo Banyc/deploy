@@ -17,7 +17,22 @@
 //!   evidence and `LedgerTerminal::successful` is unreachable;
 //! * `append_outside_txn.rs` — the raw store-level `append_intent` /
 //!   `append_terminal` / `append_checkpoint` methods do not exist: a ledger
-//!   write happens only through the crate-internal `TargetLedgerTxn`.
+//!   write happens only through the crate-internal `TargetLedgerTxn`;
+//! * `identity_new.rs` — the identity `new` constructors are
+//!   `#[cfg(test)]`-gated: `SlotId::new(...)` in production does not
+//!   compile (a caller can only build identities through the validated
+//!   `parse` path);
+//! * `plan_literal.rs` — the `DeploymentPlan` fields are private: a
+//!   library caller cannot fabricate a plan;
+//! * `binding_literal.rs` — the `PhysicalBinding` fields are private and
+//!   its constructor is the validated `PhysicalBinding::new`: a library
+//!   caller cannot hand-write a binding with a junk `deploy_dir`;
+//! * `rebinding_proof.rs` — the `VerifiedReleaseRebinding` proof is sealed
+//!   (private invariant-bearing fields + a private `_sealed` marker): no
+//!   struct literal can be written;
+//! * `rebinding_deserialize.rs` — the proof is serde-free: a wire string
+//!   can deserialize into the CLAIM `RebindingPlan`, never into a "verified"
+//!   proof — only the verification (`TryFrom`) mints it.
 //!
 //! The `.pass()` case is the CONTRAST: the non-Successful dispositions are
 //! constructible by any caller (there is nothing to fabricate).
@@ -28,5 +43,10 @@ fn sealed_ledger_writes_are_compile_enforced() {
     t.compile_fail("tests/ui/fabricate_success.rs");
     t.compile_fail("tests/ui/sealed_proof.rs");
     t.compile_fail("tests/ui/append_outside_txn.rs");
+    t.compile_fail("tests/ui/identity_new.rs");
+    t.compile_fail("tests/ui/plan_literal.rs");
+    t.compile_fail("tests/ui/binding_literal.rs");
+    t.compile_fail("tests/ui/rebinding_proof.rs");
+    t.compile_fail("tests/ui/rebinding_deserialize.rs");
     t.pass("tests/ui/non_successful_terminal_ok.rs");
 }

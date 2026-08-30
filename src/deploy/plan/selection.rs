@@ -844,7 +844,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // locations: the recorded current_physical_slots carry the CURRENT
         // (server, deploy_dir) for exactly the frozen partition's ids.
         let rebound: Vec<&str> = rp
-            .current_physical_slots
+            .current_physical_slots()
             .keys()
             .map(|s| s.as_str())
             .collect();
@@ -854,25 +854,25 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "the rebinding records exactly the frozen partition's slots"
         );
         for id in ["p1", "p3"] {
-            let got = &rp.current_physical_slots[&SlotId::new(id.to_string())];
-            assert_eq!(got.server.as_str(), format!("s{}", &id[1..]));
-            assert_eq!(got.deploy_dir, format!("/srv/{id}"));
+            let got = &rp.current_physical_slots()[&SlotId::new(id.to_string())];
+            assert_eq!(got.server().as_str(), format!("s{}", &id[1..]));
+            assert_eq!(got.deploy_dir(), format!("/srv/{id}"));
         }
         // The frozen topology records the COMPLETE frozen partition with each
         // slot's era groups (never narrowed to the selection); the membership
         // check records the FULL slot-ID sets (logical only).
-        assert_eq!(rp.frozen_topology.len(), 3);
+        assert_eq!(rp.frozen_topology().len(), 3);
         assert_eq!(
-            rp.frozen_topology[&SlotId::parse("p1").unwrap()].groups,
+            rp.frozen_topology()[&SlotId::parse("p1").unwrap()].groups,
             vec!["G".to_string()]
         );
         assert!(
-            rp.frozen_topology[&SlotId::parse("p2").unwrap()]
+            rp.frozen_topology()[&SlotId::parse("p2").unwrap()]
                 .groups
                 .is_empty()
         );
         assert_eq!(
-            rp.frozen_topology[&SlotId::parse("p3").unwrap()].groups,
+            rp.frozen_topology()[&SlotId::parse("p3").unwrap()].groups,
             vec!["G".to_string()]
         );
         // The rebinding's membership is the PROOF the gate produced: the
@@ -880,7 +880,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // non-empty slot set — read through the proof accessor; a proof can
         // only come from [`crate::identity::MatchingMembership::verify`]).
         assert_eq!(
-            rp.membership
+            rp.membership()
                 .slots()
                 .iter()
                 .map(|s| s.as_str().to_string())
@@ -1188,7 +1188,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             release_origin(&rel_origin, &release);
             let rp = release_origin(&rel_origin, &release);
             let rebound: Vec<&str> = rp
-                .current_physical_slots
+                .current_physical_slots()
                 .keys()
                 .map(|s| s.as_str())
                 .collect();
@@ -1197,9 +1197,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 "the rebinding records the frozen partition's slots, rebound to current locations"
             );
             for id in &frozen {
-                let got = &rp.current_physical_slots[&SlotId::new(id.to_string())];
-                assert_eq!(got.server.as_str(), &format!("s{}", &id[1..]));
-                assert_eq!(got.deploy_dir, format!("/srv/{id}"));
+                let got = &rp.current_physical_slots()[&SlotId::new(id.to_string())];
+                assert_eq!(got.server().as_str(), &format!("s{}", &id[1..]));
+                assert_eq!(got.deploy_dir(), format!("/srv/{id}"));
             }
         }
     }

@@ -1,0 +1,9 @@
+error[E0451]: fields `server` and `deploy_dir` of struct `PhysicalBinding` are private
+  --> tests/ui/binding_literal.rs:17:9
+   |
+16 |     let _binding = PhysicalBinding {
+   |                    --------------- in this type
+17 |         server: d(),
+   |         ^^^^^^ private field
+18 |         deploy_dir: d(),
+   |         ^^^^^^^^^^ private field

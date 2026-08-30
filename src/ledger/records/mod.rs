@@ -265,21 +265,104 @@ pub enum ActualSlotState {
 /// its server but moves its `deploy_dir` would otherwise receive the
 /// historical generations at the new location, silently deploying to the
 /// wrong place on the same host.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// The fields are PRIVATE (invariant-bearing domain value): the
+/// `deploy_dir` carries the ABSOLUTE, TRAVERSAL-FREE on-server path
+/// invariant, enforced by the ONE validated constructor
+/// ([`PhysicalBinding::new`]) — and by the serde `Deserialize` impl, which
+/// routes every wire string through the same validation (a persisted
+/// record carrying a relative/traversal path fails deserialization — fail
+/// closed). A library caller can never hand-construct a binding with a junk
+/// `deploy_dir`; the wire JSON shape is UNCHANGED (`server` + `deploy_dir`
+/// strings).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct PhysicalBinding {
     /// The physical server the slot was bound to at the time of the
     /// deployment.
-    pub server: ServerId,
+    server: ServerId,
     /// The absolute on-server directory the slot's deployment state lives
     /// in, exactly as declared in the slot's `deploy_dir` at deployment time.
-    pub deploy_dir: String,
+    deploy_dir: String,
 }
+
+impl PhysicalBinding {
+    /// THE ONE VALIDATED CONSTRUCTOR: `deploy_dir` must be an ABSOLUTE,
+    /// TRAVERSAL-FREE path with at least one normal component below the
+    /// root (the same rule as [`crate::identity::AbsoluteDeployDir`] — the
+    /// deployment cleanup/rotation/retention sweeps operate under it, so a
+    /// relative path or the filesystem root is never a legitimate binding).
+    /// The validated string is stored VERBATIM (no normalization — the wire
+    /// round trip is byte-exact).
+    pub fn new(server: ServerId, deploy_dir: impl AsRef<std::path::Path>) -> Result<Self> {
+        let s = deploy_dir.as_ref().to_string_lossy();
+        let path = std::path::Path::new(s.as_ref());
+        if !path.is_absolute() {
+            return Err(Error::config(format!(
+                "invalid physical binding deploy_dir {:?}: must be an absolute path on the server",
+                s
+            )));
+        }
+        let mut normal_components = 0usize;
+        for segment in s.split('/') {
+            match segment {
+                "" => {}
+                "." | ".." => {
+                    return Err(Error::config(format!(
+                        "invalid physical binding deploy_dir {:?}: traversal components (`.`/`..`) are not allowed",
+                        s
+                    )));
+                }
+                _ => normal_components += 1,
+            }
+        }
+        if normal_components == 0 {
+            return Err(Error::config(format!(
+                "invalid physical binding deploy_dir {:?}: must have at least one normal path component below the root",
+                s
+            )));
+        }
+        Ok(PhysicalBinding {
+            server,
+            deploy_dir: s.into_owned(),
+        })
+    }
+
+    /// The physical server the slot was bound to.
+    pub fn server(&self) -> &ServerId {
+        &self.server
+    }
+    /// The absolute on-server directory the slot's deployment state lives in.
+    pub fn deploy_dir(&self) -> &str {
+        &self.deploy_dir
+    }
+}
+
 impl Default for PhysicalBinding {
     fn default() -> Self {
-        Self {
-            server: ServerId::parse("s1").unwrap(),
-            deploy_dir: "/srv/deploy/p1".to_string(),
+        Self::new(
+            ServerId::parse("s1").expect("default server is a safe segment"),
+            "/srv/deploy/p1",
+        )
+        .expect("the default binding's deploy_dir is absolute and traversal-free")
+    }
+}
+
+/// Wire strings go through the validated constructor: a persisted record
+/// carrying a relative/traversal/root `deploy_dir` fails deserialization
+/// (fail closed), and any stray key inside the binding object is refused
+/// (`deny_unknown_fields`). The wire JSON shape is unchanged.
+impl<'de> Deserialize<'de> for PhysicalBinding {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct PhysicalBindingWire {
+            server: ServerId,
+            deploy_dir: String,
         }
+        let w = PhysicalBindingWire::deserialize(deserializer)?;
+        PhysicalBinding::new(w.server, &w.deploy_dir).map_err(serde::de::Error::custom)
     }
 }
 
@@ -450,7 +533,14 @@ pub enum PlanSource {
 /// wire's claimed rebinding and the plan's own source/target/membership,
 /// succeeding only when the claimed rebinding matches the recomputed proof
 /// (a mismatch → [`crate::error::Error::integrity`]).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// DELIBERATELY NO serde derives: the domain [`PlanOrigin`] carries the
+/// SEALED proof [`VerifiedReleaseRebinding`] (which implements neither
+/// `Serialize` nor `Deserialize`), and the on-disk shape is the wire's
+/// [`PlanSource`] + separate `rebinding` claim ([`DeploymentPlanWire`] —
+/// serialized through [`DeploymentPlan`]'s custom serde impls, never
+/// through this domain enum directly).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PlanOrigin {
     /// Materialize the currently mapped local files and assign each slot its
     /// target-configured (current) variant.
@@ -646,15 +736,14 @@ impl DeploymentPlanWire {
                 }
                 // RECOMPUTE the proof from the claimed components and the
                 // plan's own membership (the selected plan slots are the
-                // plan's `slots` map keys).
-                let proof = VerifiedReleaseRebinding::verify(
-                    claimed.release,
-                    claimed.target,
-                    claimed.frozen_topology,
-                    claimed.membership,
+                // plan's `slots` map keys) — the wire → domain conversion
+                // ([`TryFrom<(RebindingPlan, BTreeSet<SlotId>)>`]) runs the
+                // verification; deserializing a claim NEVER yields a
+                // verified proof.
+                let proof = VerifiedReleaseRebinding::try_from((
+                    claimed,
                     self.slots.keys().cloned().collect(),
-                    claimed.current_physical_slots,
-                )
+                ))
                 .map_err(|e| {
                     Error::integrity(format!(
                         "plan {}: the claimed rebinding disagrees with the recomputed proof: {e}",
@@ -681,9 +770,10 @@ impl From<&DeploymentPlan> for DeploymentPlanWire {
     fn from(p: &DeploymentPlan) -> Self {
         // The domain's [`PlanOrigin`] re-expands into the wire's `PlanSource`
         // + separate `rebinding` shape: a Release origin carries its
-        // verified proof back into the claimed [`RebindingPlan`] (the
-        // selected plan slots are re-derived from the plan's membership on
-        // the next read); HEAD and deployment origins carry `None`.
+        // verified proof back into the claimed [`RebindingPlan`] (via the
+        // [`From<&VerifiedReleaseRebinding>`] projection — the selected plan
+        // slots are re-derived from the plan's membership on the next read);
+        // HEAD and deployment origins carry `None`.
         let (source, rebinding) = match &p.source {
             PlanOrigin::Head => (PlanSource::Head, None),
             PlanOrigin::Deployment(deployment_id) => {
@@ -691,22 +781,16 @@ impl From<&DeploymentPlan> for DeploymentPlanWire {
             }
             PlanOrigin::Release { release, rebinding } => (
                 PlanSource::ReleaseRef(release.clone()),
-                Some(RebindingPlan {
-                    release: rebinding.release.clone(),
-                    target: rebinding.target.clone(),
-                    frozen_topology: rebinding.frozen_topology.clone(),
-                    membership: rebinding.membership.clone(),
-                    current_physical_slots: rebinding.current_physical_slots.clone(),
-                }),
+                Some(RebindingPlan::from(rebinding)),
             ),
         };
         DeploymentPlanWire {
-            deployment_id: p.deployment_id.clone(),
-            target: p.target.clone(),
+            deployment_id: p.deployment_id().clone(),
+            target: p.target().clone(),
             behavior_sha256: p.behavior_digest(),
-            behaviors: p.behaviors.clone(),
+            behaviors: p.behaviors().clone(),
             slot_ids: p.membership().cloned().collect(),
-            slots: p.slots.clone(),
+            slots: p.slots().clone(),
             source,
             rebinding,
             desired_releases: p.releases(),
@@ -727,20 +811,27 @@ impl From<&DeploymentPlan> for DeploymentPlanWire {
 /// here through [`DeploymentPlan::membership`], [`DeploymentPlan::releases`],
 /// [`DeploymentPlan::behavior_digest`] — the verified conversion guarantees
 /// they agree.
+///
+/// THE FIELDS ARE PRIVATE (invariant-bearing domain record): a
+/// [`DeploymentPlan`] is constructible ONLY through the verifying wire →
+/// domain conversion ([`DeploymentPlanWire::into_domain`]) and the
+/// crate-internal plan-builder (`DeploymentPlan::new`, which takes
+/// already-validated parts) — a library caller can never fabricate a plan
+/// whose `slots`/`source`/`behaviors` disagree.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeploymentPlan {
-    pub deployment_id: DeploymentId,
-    pub target: TargetName,
+    deployment_id: DeploymentId,
+    target: TargetName,
     /// The frozen, per-release name-keyed activation + verification contracts
     /// this attempt is bound to, one per declared variant per referenced
     /// release — THE AUTHORITATIVE BEHAVIOR COLLECTION (the digest is
     /// derived from it). Historical and rollback pushes carry the historical
     /// contracts here rather than the caller's current configuration.
-    pub behaviors: BehaviorIndex,
+    behaviors: BehaviorIndex,
     /// THE AUTHORITATIVE PER-SLOT COLLECTION: the selected slots (the map
     /// keys are the membership) and their plans (their artifacts are the
     /// release source).
-    pub slots: BTreeMap<SlotId, SlotPlan>,
+    slots: BTreeMap<SlotId, SlotPlan>,
     /// THE SOURCE OWNS ITS REQUIRED PAYLOAD: a Release origin
     /// ([`PlanOrigin::Release`]) CARRIES its verified rebinding proof
     /// ([`VerifiedReleaseRebinding`]) INSIDE the source — a Release origin
@@ -748,10 +839,56 @@ pub struct DeploymentPlan {
     /// carry none. The wire's separate `rebinding` field exists only in the
     /// on-disk shape ([`DeploymentPlanWire`]) and is reconciled by the
     /// verifying conversion.
-    pub source: PlanOrigin,
+    source: PlanOrigin,
 }
 
 impl DeploymentPlan {
+    /// The crate-internal constructor — the plan builder's ONLY production
+    /// mint ([`crate::deploy::push::preflight`] assembles the plan from
+    /// already-validated parts: the per-slot plans, the behavior index, and
+    /// the VERIFIED origin). `pub(crate)`: an external caller can never
+    /// fabricate a plan (the wire → domain conversion is the other —
+    /// validating — path).
+    pub(crate) fn new(
+        deployment_id: DeploymentId,
+        target: TargetName,
+        behaviors: BehaviorIndex,
+        slots: BTreeMap<SlotId, SlotPlan>,
+        source: PlanOrigin,
+    ) -> Self {
+        DeploymentPlan {
+            deployment_id,
+            target,
+            behaviors,
+            slots,
+            source,
+        }
+    }
+
+    /// The plan's identity.
+    pub fn deployment_id(&self) -> &DeploymentId {
+        &self.deployment_id
+    }
+    /// The plan's target.
+    pub fn target(&self) -> &TargetName {
+        &self.target
+    }
+    /// The attempt's frozen behavior collection (the digest is derived from
+    /// it — [`DeploymentPlan::behavior_digest`]).
+    pub fn behaviors(&self) -> &BehaviorIndex {
+        &self.behaviors
+    }
+    /// THE AUTHORITATIVE PER-SLOT COLLECTION (the map keys are the
+    /// membership — [`DeploymentPlan::membership`]).
+    pub fn slots(&self) -> &BTreeMap<SlotId, SlotPlan> {
+        &self.slots
+    }
+    /// THE VERIFIED ORIGIN — a Release origin owns its sealed rebinding
+    /// proof ([`VerifiedReleaseRebinding`]) inside the source.
+    pub fn source(&self) -> &PlanOrigin {
+        &self.source
+    }
+
     /// The plan's membership: the selected placement slots, DERIVED from the
     /// authoritative `slots` map (its keys) — never stored separately.
     pub fn membership(&self) -> impl Iterator<Item = &SlotId> {

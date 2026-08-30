@@ -506,11 +506,12 @@ pub fn plan_assignments(
                         (
                             SlotId::parse(slot.id.as_str())
                                 .expect("validated slot id is a safe segment"),
-                            PhysicalBinding {
-                                server: ServerId::parse(sdef.id.as_str())
+                            PhysicalBinding::new(
+                                ServerId::parse(sdef.id.as_str())
                                     .expect("validated server id is a safe segment"),
-                                deploy_dir: slot.deploy_dir().to_string_lossy().into_owned(),
-                            },
+                                slot.deploy_dir(),
+                            )
+                            .expect("a config-validated deploy_dir is absolute and traversal-free"),
                         )
                     })
                     .collect(),
@@ -767,10 +768,10 @@ interval_seconds = 0
                     result: SnapshotSlot::new(
                         g.generation.clone(),
                         g.assignment.artifact.clone(),
-                        bindings.get(k).cloned().unwrap_or(PhysicalBinding {
-                            server: ServerId::parse("s1").unwrap(),
-                            deploy_dir: "/srv/eng".to_string(),
-                        }),
+                        bindings.get(k).cloned().unwrap_or(
+                            PhysicalBinding::new(ServerId::parse("s1").unwrap(), "/srv/eng")
+                                .expect("the fallback binding is absolute and traversal-free"),
+                        ),
                     ),
                     pre_push: Observation::KnownAbsent,
                 }
@@ -1389,10 +1390,8 @@ interval_seconds = 0
             )]),
             BTreeMap::from([(
                 SlotId::parse("p1").unwrap(),
-                PhysicalBinding {
-                    server: ServerId::parse("s1").unwrap(),
-                    deploy_dir: "/srv/plan".to_string(),
-                },
+                PhysicalBinding::new(ServerId::parse("s1").unwrap(), "/srv/plan")
+                    .expect("test binding is absolute and traversal-free"),
             )]),
         );
 
@@ -1587,10 +1586,8 @@ interval_seconds = 0
             )]),
             BTreeMap::from([(
                 SlotId::parse("p1").unwrap(),
-                PhysicalBinding {
-                    server: ServerId::new(old_binding.0.clone()),
-                    deploy_dir: old_binding.1.clone(),
-                },
+                PhysicalBinding::new(ServerId::new(old_binding.0.clone()), old_binding.1.clone())
+                    .expect("test binding is absolute and traversal-free"),
             )]),
         );
 
@@ -1775,10 +1772,11 @@ interval_seconds = 0
                 slots.clone(),
                 BTreeMap::from([(
                     SlotId::parse("p1").unwrap(),
-                    PhysicalBinding {
-                        server: ServerId::parse("s1").unwrap(),
-                        deploy_dir: "/srv/plan".to_string(),
-                    },
+                    PhysicalBinding::new(
+                            ServerId::parse("s1").unwrap(),
+                            "/srv/plan",
+                        )
+                        .expect("test binding is absolute and traversal-free"),
                 )]),
             );
 
@@ -2003,17 +2001,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let bindings: BTreeMap<SlotId, PhysicalBinding> = BTreeMap::from([
             (
                 slot_a.clone(),
-                PhysicalBinding {
-                    server: ServerId::parse("s1").unwrap(),
-                    deploy_dir: "/srv/plan-a".to_string(),
-                },
+                PhysicalBinding::new(ServerId::parse("s1").unwrap(), "/srv/plan-a")
+                    .expect("test binding is absolute and traversal-free"),
             ),
             (
                 slot_b.clone(),
-                PhysicalBinding {
-                    server: ServerId::parse("s2").unwrap(),
-                    deploy_dir: "/srv/plan-b".to_string(),
-                },
+                PhysicalBinding::new(ServerId::parse("s2").unwrap(), "/srv/plan-b")
+                    .expect("test binding is absolute and traversal-free"),
             ),
         ]);
 
@@ -2385,21 +2379,20 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             BTreeMap::from([
                 (
                     SlotId::parse("p1").unwrap(),
-                    PhysicalBinding {
-                        server: ServerId::parse("s1").unwrap(),
-                        deploy_dir: if binding_drift {
-                            "/srv/drifted".to_string()
+                    PhysicalBinding::new(
+                        ServerId::parse("s1").unwrap(),
+                        if binding_drift {
+                            "/srv/drifted"
                         } else {
-                            "/srv/p1".to_string()
+                            "/srv/p1"
                         },
-                    },
+                    )
+                    .expect("test binding is absolute and traversal-free"),
                 ),
                 (
                     SlotId::parse("p2").unwrap(),
-                    PhysicalBinding {
-                        server: ServerId::parse("s2").unwrap(),
-                        deploy_dir: "/srv/p2".to_string(),
-                    },
+                    PhysicalBinding::new(ServerId::parse("s2").unwrap(), "/srv/p2")
+                        .expect("test binding is absolute and traversal-free"),
                 ),
             ]),
         );
@@ -2542,30 +2535,30 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 // topology is bound onto — never the deployment's recorded
                 // binding, even when the fixture drifted it.
                 let rp = release_origin(&origin, &release);
-                assert_eq!(rp.release, release);
-                assert_eq!(rp.target, TargetName::parse("t1").expect("safe segment"));
+                assert_eq!(rp.release(), &release);
+                assert_eq!(rp.target().clone(), TargetName::parse("t1").expect("safe segment"));
                 // The membership proof carries the AGREED set (frozen ==
                 // current verified): the target's complete membership.
                 assert_eq!(
-                    rp.membership
+                    rp.membership()
                         .slots()
                         .iter()
                         .map(|s| s.as_str().to_string())
                         .collect::<BTreeSet<_>>(),
                     BTreeSet::from(["p1".to_string(), "p2".to_string()])
                 );
-                assert_eq!(rp.frozen_topology.len(), 2);
-                for (slot, topo) in &rp.frozen_topology {
+                assert_eq!(rp.frozen_topology().len(), 2);
+                for (slot, topo) in rp.frozen_topology() {
                     assert_eq!(topo.variant, frozen_variant);
                     assert!(topo.groups.is_empty());
                     assert!(matches!(slot.as_str(), "p1" | "p2"));
                 }
-                let p1 = &rp.current_physical_slots[&SlotId::parse("p1").unwrap()];
-                assert_eq!(p1.server.as_str(), "s1");
-                assert_eq!(p1.deploy_dir, "/srv/p1");
-                let p2 = &rp.current_physical_slots[&SlotId::parse("p2").unwrap()];
-                assert_eq!(p2.server.as_str(), "s2");
-                assert_eq!(p2.deploy_dir, "/srv/p2");
+                let p1 = &rp.current_physical_slots()[&SlotId::parse("p1").unwrap()];
+                assert_eq!(p1.server().as_str(), "s1");
+                assert_eq!(p1.deploy_dir(), "/srv/p1");
+                let p2 = &rp.current_physical_slots()[&SlotId::parse("p2").unwrap()];
+                assert_eq!(p2.server().as_str(), "s2");
+                assert_eq!(p2.deploy_dir(), "/srv/p2");
             }
 
             // DEPLOYMENT rollback — the DEPLOYMENT's exact per-slot artifact
