@@ -588,10 +588,18 @@ rest. It is exactly three steps:
 2. ATOMICALLY REPLACE the ledger with that suffix — temp + fsync +
    chmod-private + rename + parent-directory fsync
    (`write_ledger_suffix`). THIS is the checkpoint's ONLY LOGICAL COMMIT: a
-   reader never observes a torn ledger (wholly old or wholly new). IF THE
-   REPLACEMENT FAILS, NO DELETION HAPPENS — the checkpoint is a plain error
-   and the full history stands untouched. From the moment the replacement
-   succeeds the checkpoint is IRREVERSIBLY committed, and no post-commit
+   reader never observes a torn ledger (wholly old or wholly new). FAILURES
+   ARE CLASSED BY THE TWO COMMIT POINTS: a failure BEFORE the rename (a
+   temp-write/fsync/rename error) means the old ledger is still visible —
+   no deletion happens and the checkpoint is a plain error. A rename that
+   SUCCEEDED but whose parent-directory fsync failed means the new ledger
+   IS visible but its durability is UNCONFIRMED: the checkpoint NEVER
+   returns an error in that state — it records the owed sweep as durable
+   sweep-debt and returns an ESTABLISHED report with a durability warning
+   and the sweep deferred (zero artifacts deleted until a repeated
+   checkpoint — an identical rewrite — re-establishes durability and runs
+   the sweep). From the moment the replacement is durable the checkpoint is
+   IRREVERSIBLY committed, and no post-commit
    sweep failure may surface as an error (each is converted into a report
    with the sweep retry-required and a warning).
 3. BEST-EFFORT GLOBAL SWEEP (`run_sweep`) of the unreachable deployment

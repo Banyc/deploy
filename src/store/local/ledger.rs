@@ -490,7 +490,7 @@ impl LocalStore {
     /// dot-prefixed temp is invisible to every read). The dir-sync fault
     /// fires AFTER the rename: the ledger is wholly NEW — only the directory
     /// entry is unsynced — and the append returns `Err` (the same
-    /// post-commit window the checkpoint's [`FaultKind::LedgerReplaceAfter`]
+    /// post-commit window the checkpoint's [`FaultKind::LedgerReplaceDirSync`]
     /// models).
     ///
     /// Appends are serialized by the caller's target lock (push and

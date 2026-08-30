@@ -167,9 +167,11 @@ pub(crate) fn proptest_persistence() -> Option<Box<dyn proptest::test_runner::Fa
 /// [`FaultKind::WriteObserved`], keyed additionally by TARGET), and the
 /// retention-maintenance arms ([`FaultKind::ReadRetentionDebt`],
 /// [`FaultKind::WriteRetentionDebt`], keyed by TARGET). The CHECKPOINT kinds
-/// are keyed by TARGET: the ledger replacement's before/after slots
-/// ([`FaultKind::LedgerReplaceBefore`] / [`FaultKind::LedgerReplaceAfter`])
-/// and the three best-effort sweep stages ([`FaultKind::SweepDeployments`],
+/// are keyed by TARGET: the ledger replacement's four ATOMIC-REPLACEMENT
+/// stages, mirroring the append path's stage faults
+/// ([`FaultKind::LedgerReplaceWrite`] / `LedgerReplaceSync` /
+/// `LedgerReplaceRename` / `LedgerReplaceDirSync`) and the three
+/// best-effort sweep stages ([`FaultKind::SweepDeployments`],
 /// [`FaultKind::SweepReleases`], [`FaultKind::SweepObjects`]). The old
 /// floor-marker/cleanup-debt kinds are GONE with the machinery that
 /// consumed them.
@@ -290,15 +292,29 @@ pub(crate) mod test_faults {
         /// and the stage aborts with the remaining candidates pending.
         /// Armed via [`FaultRegistry::arm_deployment_unlink_after`].
         SweepDeploymentsNth,
-        /// The checkpoint's ATOMIC LEDGER REPLACEMENT, fired BEFORE any I/O
-        /// (keyed by target): the checkpoint fails with `Err`, NO deletion
-        /// happens, and the visible ledger is wholly OLD.
-        LedgerReplaceBefore,
-        /// The checkpoint's ATOMIC LEDGER REPLACEMENT, fired AFTER the
-        /// replacement is durable (keyed by target): the visible ledger is
-        /// wholly NEW (the retained suffix), no sweep ran, and a retry
-        /// recomputes the suffix + reachability and converges.
-        LedgerReplaceAfter,
+        /// The checkpoint's ATOMIC LEDGER REPLACEMENT — TEMP-WRITE stage
+        /// (keyed by target), fired at the replacement's first I/O stage:
+        /// the checkpoint fails with `Err` (a PRE-RENAME failure — the
+        /// visible ledger is wholly OLD and nothing was discarded).
+        LedgerReplaceWrite,
+        /// The checkpoint's ATOMIC LEDGER REPLACEMENT — TEMP-FSYNC stage
+        /// (keyed by target), fired after the temp write, before its fsync:
+        /// the checkpoint fails with `Err` and the visible ledger is wholly
+        /// OLD (only an invisible dot-prefixed temp exists).
+        LedgerReplaceSync,
+        /// The checkpoint's ATOMIC LEDGER REPLACEMENT — RENAME stage (keyed
+        /// by target), fired after the chmod, before the atomic rename: the
+        /// checkpoint fails with `Err` and the visible ledger is wholly OLD.
+        LedgerReplaceRename,
+        /// The checkpoint's ATOMIC LEDGER REPLACEMENT — PARENT-DIRECTORY
+        /// open/fsync stage (keyed by target), fired AFTER the atomic rename
+        /// (the retained suffix IS visible under its final name) and converted
+        /// by the replace primitive into
+        /// [`crate::store::atomic::ReplaceOutcome::ReplacedDurabilityUnknown`]
+        /// — NEVER an `Err`. The checkpoint returns a STRUCTURED report
+        /// (established, durability warning, sweep deferred), no sweep ran,
+        /// and a retry recomputes the suffix + reachability and converges.
+        LedgerReplaceDirSync,
         /// The checkpoint sweep's DEPLOYMENT-DIR stage (keyed by target),
         /// fired at the stage's entry: no deployment dir is deleted and the
         /// report says sweep retry-required.
@@ -512,21 +528,41 @@ pub(crate) mod test_faults {
             self.arm(FaultKind::WriteRetentionDebt, target);
         }
 
-        /// Arm the next checkpoint ATOMIC LEDGER REPLACEMENT for `target` to
-        /// fail BEFORE any I/O: the checkpoint fails with `Err`, no deletion
-        /// happens, and the visible ledger is wholly OLD (nothing was
-        /// discarded).
-        pub(crate) fn arm_ledger_replace_before(&self, target: &str) {
-            self.arm(FaultKind::LedgerReplaceBefore, target);
+        /// Arm the checkpoint's ATOMIC LEDGER REPLACEMENT TEMP-WRITE stage
+        /// for `target` to fail once: the checkpoint fails with `Err` (a
+        /// PRE-RENAME failure), no deletion happens, and the visible ledger
+        /// is wholly OLD (nothing was discarded).
+        pub(crate) fn arm_ledger_replace_write(&self, target: &str) {
+            self.arm(FaultKind::LedgerReplaceWrite, target);
         }
 
-        /// Arm the next checkpoint ATOMIC LEDGER REPLACEMENT for `target` to
-        /// fail AFTER the replacement is durable: the visible ledger is
-        /// wholly NEW (the retained suffix), the sweep did not run, and a
-        /// re-run of the same checkpoint recomputes the suffix +
-        /// reachability and converges.
-        pub(crate) fn arm_ledger_replace_after(&self, target: &str) {
-            self.arm(FaultKind::LedgerReplaceAfter, target);
+        /// Arm the checkpoint's ATOMIC LEDGER REPLACEMENT TEMP-FSYNC stage
+        /// for `target` to fail once: the checkpoint fails with `Err`, the
+        /// visible ledger is wholly OLD, and no deletion happens.
+        pub(crate) fn arm_ledger_replace_sync(&self, target: &str) {
+            self.arm(FaultKind::LedgerReplaceSync, target);
+        }
+
+        /// Arm the checkpoint's ATOMIC LEDGER REPLACEMENT RENAME stage for
+        /// `target` to fail once: the checkpoint fails with `Err` (the
+        /// rename never happened), the visible ledger is wholly OLD, and no
+        /// deletion happens.
+        pub(crate) fn arm_ledger_replace_rename(&self, target: &str) {
+            self.arm(FaultKind::LedgerReplaceRename, target);
+        }
+
+        /// Arm the checkpoint's ATOMIC LEDGER REPLACEMENT PARENT-DIRECTORY
+        /// open/fsync stage for `target` to fail once: the fault fires
+        /// AFTER the rename — the retained suffix IS visible under its
+        /// final name but its durability is unconfirmed — and the replace
+        /// primitive surfaces it as
+        /// [`crate::store::atomic::ReplaceOutcome::ReplacedDurabilityUnknown`]
+        /// (never an `Err`). The checkpoint returns an ESTABLISHED report
+        /// with a durability warning and the sweep DEFERRED (no deletion,
+        /// no `run_sweep`); a re-run of the same checkpoint recomputes the
+        /// suffix + reachability and converges.
+        pub(crate) fn arm_ledger_replace_dir_sync(&self, target: &str) {
+            self.arm(FaultKind::LedgerReplaceDirSync, target);
         }
 
         /// Arm the checkpoint sweep's DEPLOYMENT-DIR stage to fail once (at

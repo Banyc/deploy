@@ -3,7 +3,7 @@
 
 use crate::error::{Error, Result};
 use crate::ledger::Pins;
-use crate::store::atomic::{path_state, read_json, write_atomic_replace};
+use crate::store::atomic::{ReplaceOutcome, path_state, read_json, write_atomic_replace};
 use crate::store::local::LocalStore;
 use std::path::PathBuf;
 
@@ -24,10 +24,28 @@ impl LocalStore {
     /// replaced atomically, never CAS'd). A no-op in the sense that the
     /// file may be absent entirely — [`LocalStore::read_pins`] treats a
     /// missing file as the empty pin set.
+    ///
+    /// FAIL CLOSED ON UNCONFIRMED DURABILITY: a
+    /// [`ReplaceOutcome::ReplacedDurabilityUnknown`] outcome — the new pin
+    /// set IS visible but the parent-directory fsync failed — is DOWNGRADED
+    /// to `Err`, never reported as success. The pins marker is a retention
+    /// anchor: the garbage collector treats a missing/unreadable pins file
+    /// as "no pins" and could delete content a pin might protect, so a
+    /// marker that may not survive power loss must not be reported written.
+    /// (Unlike the checkpoint, whose whole commit boundary and ordering
+    /// guarantee rest ON the ledger replace — there the rename itself is
+    /// the commit and the durability uncertainty is surfaced as a
+    /// structured outome so the caller knows the commit stands but the
+    /// sweep must be deferred; a pins write has no such two-phase
+    /// semantics — its caller has no facility to report "visible but
+    /// unconfirmed", so failure is the only safe answer.)
     pub fn write_pins(&self, pins: &Pins) -> Result<()> {
         let bytes = serde_json::to_vec_pretty(pins)
             .map_err(|e| Error::store(format!("serialize pins: {e}")))?;
-        write_atomic_replace(&self.pins_path(), &bytes)
+        match write_atomic_replace(&self.pins_path(), &bytes)? {
+            ReplaceOutcome::ReplacedDurable => Ok(()),
+            ReplaceOutcome::ReplacedDurabilityUnknown { error } => Err(error),
+        }
     }
 
     /// Read the store's pins record, or the DEFAULT (empty) pin set when no

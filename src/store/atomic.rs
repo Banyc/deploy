@@ -4,10 +4,17 @@
 //! durability machinery: write a UNIQUE temp file in the same directory,
 //! chmod it private (0o600) BEFORE it can become visible under its final
 //! name, fsync it, rename it into place (atomic on POSIX — a reader never
-//! sees a torn record), then fsync the parent directory WITH ERRORS
-//! PROPAGATED (fail-closed: a rename is not durable until its directory
-//! entry is synced, so swallowing a parent-sync error could let a
-//! checkpoint report success for a floor that can disappear). The
+//! sees a torn record), then fsync the parent directory. The replace has
+//! TWO DISTINCT COMMIT POINTS and [`write_atomic_replace`] reports them
+//! EXPLICITLY ([`ReplaceOutcome`]): the RENAME is commit point 1 (the new
+//! content becomes VISIBLE under its final name), and the PARENT-DIRECTORY
+//! FSYNC is commit point 2 (the rename becomes DURABLE across power loss).
+//! A failure before the rename is an `Err` — the OLD content is still
+//! visible. A failure of the parent-directory open/fsync AFTER the rename
+//! is [`ReplaceOutcome::ReplacedDurabilityUnknown`] — the NEW content IS
+//! visible but its durability is UNCONFIRMED — never a bare `Err` (a bare
+//! `Err` would conflate "the rename never happened" with "the rename
+//! happened but the durability commit could not be verified"). The
 //! durability of these writes is the checkpoint's ordering guarantee — the
 //! floor marker must be durable BEFORE the compaction deletes anything, so
 //! an interrupted compaction can never expose history below the floor; the
@@ -104,26 +111,123 @@ pub(crate) fn temp_name_for(path: &Path) -> PathBuf {
         TMP_COUNTER.fetch_add(1, Ordering::Relaxed),
     ))
 }
+/// The explicit outcome of an atomic replace: the two commit points
+/// (the rename — new content VISIBLE — and the parent-directory fsync —
+/// new content DURABLE) are reported distinctly, so a caller can always
+/// tell "the rename never happened" from "the rename happened but
+/// durability is unconfirmed" (see [`write_atomic_replace`]).
+#[derive(Debug)]
+pub enum ReplaceOutcome {
+    /// BOTH commit points confirmed: the new content is visible under its
+    /// final name AND the parent-directory fsync succeeded — the replace
+    /// is durable across power loss.
+    ReplacedDurable,
+    /// ONLY the rename (commit point 1) is confirmed: the new content IS
+    /// visible under its final name, but the parent-directory open/fsync
+    /// (commit point 2) failed AFTER the rename — durability is
+    /// UNCONFIRMED and the failure is carried. NEVER a bare `Err`: `Err`
+    /// means the rename never happened (the old content is still visible).
+    ReplacedDurabilityUnknown { error: Error },
+}
+
+/// The [`write_atomic_replace`] stage a test-injected fault fires at. The
+/// seam lives in [`write_atomic_replace_impl`]'s hook so a per-fixture
+/// registry can fault each atomic-replacement stage exactly as the append
+/// path's [`crate::testutil::test_faults::FaultKind::AppendWrite`] family
+/// does; production builds pass a no-op hook.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReplaceStage {
+    /// The temp-file CREATE/WRITE stage (before any I/O on the temp): the
+    /// visible target is wholly OLD; a fault here is an `Err`.
+    Write,
+    /// The temp-file FSYNC stage (after the write, before the chmod): an
+    /// invisible dot-prefixed temp exists; the visible target is wholly
+    /// OLD; a fault here is an `Err`.
+    Sync,
+    /// The RENAME stage (after the chmod, before the atomic rename): the
+    /// visible target is wholly OLD; a fault here is an `Err`.
+    Rename,
+    /// The PARENT-DIRECTORY open/fsync stage, AFTER the rename: the new
+    /// content IS visible under its final name but its durability is
+    /// unconfirmed — reported as
+    /// [`ReplaceOutcome::ReplacedDurabilityUnknown`], never an `Err`.
+    DirSync,
+}
+
 /// Durably replace a mutable marker file (the history floor): write a
 /// UNIQUE temp file in the same directory, chmod it private, fsync it,
 /// rename over the target (atomic on POSIX — a reader never sees a torn
-/// record), then fsync the parent directory WITH ERRORS PROPAGATED. The
-/// durability of this write is the checkpoint's ordering guarantee — the
-/// floor marker must be durable BEFORE the compaction deletes anything, so
-/// an interrupted compaction can never expose history below the floor.
+/// record), then fsync the parent directory. The durability of this write
+/// is the checkpoint's ordering guarantee — the floor marker must be
+/// durable BEFORE the compaction deletes anything, so an interrupted
+/// compaction can never expose history below the floor.
+///
+/// # The TWO COMMIT POINTS — the tri-state contract
+///
+/// * `Err` — the rename NEVER succeeded: a failure at any PRE-RENAME
+///   stage (temp create/write, temp fsync, chmod, rename) propagates as
+///   `Err` and the OLD content remains visible.
+/// * [`ReplaceOutcome::ReplacedDurable`] — the new content is visible AND
+///   the parent-directory fsync was confirmed: the replace is durable
+///   across power loss.
+/// * [`ReplaceOutcome::ReplacedDurabilityUnknown`] — the new content IS
+///   visible under its final name (the rename — commit point 1 —
+///   happened), but durability is UNCONFIRMED: the parent-directory
+///   `File::open` or `sync_all` (commit point 2) failed after the rename
+///   and the failure is carried. The fail-closed behaviour is preserved —
+///   the unconfirmed durability is never reported as success — but it
+///   surfaces as the EXPLICIT unknown-durability outcome, never an
+///   ambiguous `Err`.
 ///
 /// Ordering: the temp file is chmodded 0o600 BEFORE the rename, so the
 /// marker never becomes visible under its final name with default
-/// permissions; and the parent-directory fsync is FAIL-CLOSED — a failed
-/// `File::open` OR a failed `sync_all` is an error (the rename may not
-/// survive power loss without the directory fsync, so swallowing it would
-/// let a checkpoint report success for a floor that can disappear).
-pub(crate) fn write_atomic_replace(path: &Path, bytes: &[u8]) -> Result<()> {
+/// permissions.
+pub(crate) fn write_atomic_replace(path: &Path, bytes: &[u8]) -> Result<ReplaceOutcome> {
+    write_atomic_replace_impl(path, bytes, &mut |_stage| None)
+}
+
+/// TEST-ONLY seam: the same replacement as [`write_atomic_replace`] with a
+/// per-stage fault hook, so a per-fixture registry can inject a failure at
+/// EVERY atomic-replacement stage ([`ReplaceStage`]) and assert the
+/// stage→outcome mapping. The hook returns the faulted error for the stage
+/// it wants to fail (`None` passes the stage through). Not part of the
+/// production surface — [`write_atomic_replace`] keeps its exact
+/// production signature `(path, &[u8]) -> Result<ReplaceOutcome>`.
+///
+/// The fault hook is the caller's closure over ITS OWN fixture registry, so
+/// fault isolation stays per-fixture (never process-global state).
+#[cfg(test)]
+pub(crate) fn write_atomic_replace_seam(
+    path: &Path,
+    bytes: &[u8],
+    fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
+) -> Result<ReplaceOutcome> {
+    write_atomic_replace_impl(path, bytes, fault)
+}
+
+/// The shared replacement body: the four stages with a fault-injection
+/// hook invoked at each stage's entry (production passes a no-op hook; the
+/// test seam passes the fixture's registry-backed closure). The pre-rename
+/// stages (write / sync / rename) propagate a hook error as `Err` — the
+/// old content is still visible; the post-rename parent-directory stage
+/// converts a hook error (or a real open/fsync failure) into
+/// [`ReplaceOutcome::ReplacedDurabilityUnknown`] with the error carried.
+fn write_atomic_replace_impl(
+    path: &Path,
+    bytes: &[u8],
+    fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
+) -> Result<ReplaceOutcome> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| Error::store(format!("mkdir {}: {e}", parent.display())))?;
     }
     let tmp = temp_name_for(path);
+    // Stage 1: the temp create/write. A failure (or an injected
+    // [`ReplaceStage::Write`] fault) is a PRE-RENAME `Err`: the visible
+    // target is wholly OLD.
+    if let Some(e) = fault(ReplaceStage::Write) {
+        return Err(e);
+    }
     {
         let mut f = std::fs::OpenOptions::new()
             .write(true)
@@ -132,23 +236,56 @@ pub(crate) fn write_atomic_replace(path: &Path, bytes: &[u8]) -> Result<()> {
             .map_err(|e| Error::store(format!("create {}: {e}", tmp.display())))?;
         f.write_all(bytes)
             .map_err(|e| Error::store(format!("write {}: {e}", tmp.display())))?;
+    }
+    // Stage 2: the temp fsync. A failure (or an injected
+    // [`ReplaceStage::Sync`] fault) is a PRE-RENAME `Err`: only an
+    // invisible dot-prefixed temp exists.
+    if let Some(e) = fault(ReplaceStage::Sync) {
+        return Err(e);
+    }
+    {
+        let f = std::fs::File::open(&tmp)
+            .map_err(|e| Error::store(format!("open {}: {e}", tmp.display())))?;
         f.sync_all()
             .map_err(|e| Error::store(format!("fsync {}: {e}", tmp.display())))?;
     }
     // Private BEFORE visible: the temp carries 0o600 before the rename, so
     // no reader ever observes the marker with default permissions.
     set_private(&tmp)?;
+    // Stage 3: the atomic rename — COMMIT POINT 1. A failure (or an
+    // injected [`ReplaceStage::Rename`] fault) is a PRE-RENAME `Err`: the
+    // visible target is wholly OLD.
+    if let Some(e) = fault(ReplaceStage::Rename) {
+        return Err(e);
+    }
     std::fs::rename(&tmp, path)
         .map_err(|e| Error::store(format!("rename {}: {e}", path.display())))?;
-    // Durable parent sync, FAIL-CLOSED: a failed open or a failed fsync is
-    // an error — the rename may not survive power loss without it.
-    if let Some(parent) = path.parent() {
-        let dir = std::fs::File::open(parent)
-            .map_err(|e| Error::store(format!("open dir {}: {e}", parent.display())))?;
-        dir.sync_all()
-            .map_err(|e| Error::store(format!("fsync dir {}: {e}", parent.display())))?;
+    // Stage 4: the parent-directory open + fsync — COMMIT POINT 2, AFTER
+    // the rename. FAIL-CLOSED but EXPLICIT: a failed open, a failed sync,
+    // or an injected [`ReplaceStage::DirSync`] fault means the NEW content
+    // is visible but its durability is unconfirmed — returned as
+    // [`ReplaceOutcome::ReplacedDurabilityUnknown`] carrying the original
+    // error, NEVER a bare `Err` (an `Err` would falsely report that the
+    // rename never happened, while the ledger commit visibly stands).
+    if let Some(e) = fault(ReplaceStage::DirSync) {
+        return Ok(ReplaceOutcome::ReplacedDurabilityUnknown { error: e });
     }
-    Ok(())
+    if let Some(parent) = path.parent() {
+        let dir = match std::fs::File::open(parent) {
+            Ok(dir) => dir,
+            Err(e) => {
+                return Ok(ReplaceOutcome::ReplacedDurabilityUnknown {
+                    error: Error::store(format!("open dir {}: {e}", parent.display())),
+                });
+            }
+        };
+        if let Err(e) = dir.sync_all() {
+            return Ok(ReplaceOutcome::ReplacedDurabilityUnknown {
+                error: Error::store(format!("fsync dir {}: {e}", parent.display())),
+            });
+        }
+    }
+    Ok(ReplaceOutcome::ReplacedDurable)
 }
 /// Durable directory sync: fsync the parent directory of `path` so a
 /// rename/removal inside it survives power loss. Errors PROPAGATE (a

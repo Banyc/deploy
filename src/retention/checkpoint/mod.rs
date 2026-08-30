@@ -26,16 +26,24 @@
 //!    physical ledger line from the checkpoint entry's intent line onward.
 //! 2. ATOMICALLY REPLACE the ledger with that suffix
 //!    (`LocalStore::write_ledger_suffix`: temp + fsync + chmod-private +
-//!    rename + parent-dir fsync). THIS is the checkpoint's ONLY logical
-//!    commit: a reader never observes a torn ledger (wholly old or wholly
-//!    new). IF THE REPLACEMENT FAILS, NO DELETION HAPPENS — the checkpoint
-//!    is a plain `Err` and the full history stands untouched. ONCE THE
-//!    REPLACEMENT SUCCEEDS THE CHECKPOINT IS IRREVERSIBLY COMMITTED: that
-//!    moment is the EXPLICIT COMMIT BOUNDARY — from it on, no post-commit
-//!    sweep failure (scan, enumeration, deletion, or the debt-marker write)
-//!    may surface as an `Err`; each is converted into a report with
-//!    `established: true`, `sweep_completed: false`, and a warning (see
-//!    step 3).
+//!    rename + parent-dir fsync). The replace reports its TWO COMMIT
+//!    POINTS explicitly ([`crate::store::atomic::ReplaceOutcome`]): the
+//!    RENAME (the truncated ledger becomes VISIBLE) and the
+//!    PARENT-DIRECTORY FSYNC (it becomes DURABLE across power loss). THIS is
+//!    the checkpoint's ONLY logical commit: a reader never observes a torn
+//!    ledger (wholly old or wholly new). A FAILURE BEFORE THE RENAME (temp
+//!    write/sync/rename) means NO DELETION HAPPENS — the checkpoint is a
+//!    plain `Err` and the full history stands untouched. A FAILURE OF THE
+//!    PARENT-DIRECTORY FSYNC AFTER THE RENAME is NOT a checkpoint `Err`: the
+//!    truncated ledger IS visibly committed, so the checkpoint returns a
+//!    STRUCTURED report (`established: true`) carrying a DURABILITY WARNING
+//!    and DEFERRING the sweep — no deletion is ever attempted against a
+//!    floor whose durability is unconfirmed. ONCE THE REPLACE IS DURABLE
+//!    (or the unknown-durability report is made), the checkpoint cannot
+//!    return `Err` for any post-commit maintenance failure (scan,
+//!    enumeration, deletion, or the debt-marker write): each is converted
+//!    into a report with `established: true`, `sweep_completed: false`, and
+//!    a warning (see step 3).
 //! 3. BEST-EFFORT GLOBAL SWEEP (`LocalStore::run_sweep`) of unreachable
 //!    deployment directories (`deployments/<id>/`), release records
 //!    (`releases/<release-id>/`), and tree objects
@@ -69,9 +77,9 @@
 //! restore/recovery of torn advances, the tri-state marker discovery, and
 //! the `cleanup-pending.json` debt flag with its three report flags — is
 //! GONE: the atomic ledger replacement is the only logical commit, and the
-//! report carries at most the commit status + sweep completed /
-//! retry-required (plus the sweep-debt warning when the marker could not be
-//! persisted).
+//! report carries at most the commit status + durability (confirmed or
+//! unconfirmed) + sweep completed / retry-required (plus the sweep-debt
+//! warning when the marker could not be persisted).
 //!
 //! # Concurrency
 //!
@@ -92,6 +100,7 @@ use crate::deploy::lock::FileLock;
 use crate::error::Result;
 use crate::identity::{DeploymentId, OperationId};
 use crate::retention::reachability::history_floor::{LedgerDiscards, LedgerOverride};
+use crate::store::atomic::ReplaceOutcome;
 use crate::store::local::LocalStore;
 
 /// The outcome of one checkpoint invocation (preview or real).
@@ -128,6 +137,20 @@ pub struct CheckpointReport {
     /// merely-incomplete sweep is reported via `sweep_completed` + the
     /// renderer's retry line, not here).
     pub sweep_warning: Option<String>,
+    /// THE DURABILITY WARNING (the second commit boundary): the ledger
+    /// replacement's RENAME happened — the shortened suffix IS visibly the
+    /// ledger, `established` is `true` — but the PARENT-DIRECTORY FSYNC
+    /// failed (commit point 2), so the commit's DURABILITY IS UNCONFIRMED.
+    /// The checkpoint NEVER deletes against an unconfirmed floor: no
+    /// reachability scan and no sweep ran, the owed sweep is recorded as
+    /// durable sweep-debt (deferred until a repeated checkpoint
+    /// re-establishes durability or the next push), and this field carries
+    /// the reason. DISTINCT from `sweep_warning` — which describes a
+    /// failure AFTER a durable commit — this describes a commit whose
+    /// rename stands but whose durability was never confirmed; the CLI
+    /// surfaces it so an operator knows the ledger IS short while its
+    /// durability is outstanding. `None` when durability was confirmed.
+    pub durability_warning: Option<String>,
     /// Warning about the sweep-debt marker I/O when the sweep did not
     /// complete (the marker could not be persisted). Post-commit
     /// maintenance: a debt write failure is a warning, never an `Err` — the
@@ -192,24 +215,44 @@ pub(crate) fn run_checkpoint_unlocked(
 }
 
 /// The real (locked) checkpoint: compute the retained suffix, ATOMICALLY
-/// replace the ledger with it (the ONLY logical commit — a failure here is a
-/// plain `Err`, nothing was deleted, the full history stands), then run the
-/// best-effort global sweep. A repeated checkpoint of the same deployment
-/// recomputes the SAME suffix (the ledger already IS it — the replacement is
-/// an identical rewrite) and re-runs the sweep to convergence.
+/// replace the ledger with it (the ONLY logical commit — a pre-rename
+/// failure is a plain `Err`, nothing was deleted, the full history stands;
+/// a post-rename parent-dir-fsync failure is a STRUCTURED report with the
+/// commit established and durability unconfirmed), then run the best-effort
+/// global sweep. A repeated checkpoint of the same deployment recomputes
+/// the SAME suffix (the ledger already IS it — the replacement is an
+/// identical rewrite) and re-runs the sweep to convergence.
 ///
-/// # The EXPLICIT COMMIT BOUNDARY
+/// # The TWO COMMIT POINTS — the EXPLICIT COMMIT BOUNDARY
 ///
-/// The moment [`LocalStore::write_ledger_suffix`] returns `Ok`, the
-/// checkpoint is IRREVERSIBLY committed — the pre-checkpoint history is
-/// gone forever. From that exact point on the checkpoint CANNOT return
-/// `Err`: the sweep (the reachable-set scan, the directory enumeration, the
-/// three deletion stages) and the sweep-debt marker are POST-COMMIT
-/// MAINTENANCE, and every failure of theirs is converted into a report with
-/// `established: true`, `sweep_completed: false`, and a warning (see
-/// [`CheckpointReport::sweep_warning`]). Only failures BEFORE the boundary —
-/// the suffix computation and the ledger replacement itself — return `Err`
-/// (nothing was committed).
+/// The ledger replace has TWO commit points and the checkpoint reports them
+/// explicitly ([`crate::store::atomic::ReplaceOutcome`]):
+///
+/// * `Err` — the RENAME never happened (a pre-rename failure): nothing is
+///   committed, the full history stands, no deletion.
+/// * [`crate::store::atomic::ReplaceOutcome::ReplacedDurable`] — the rename
+///   happened AND the parent-directory fsync succeeded: the truncated
+///   ledger is visible and durable, and the checkpoint is IRREVERSIBLY
+///   committed. From this point on it CANNOT return `Err`: the sweep (the
+///   reachable-set scan, the directory enumeration, the three deletion
+///   stages) and the sweep-debt marker are POST-COMMIT MAINTENANCE, and
+///   every failure of theirs is converted into a report with
+///   `established: true`, `sweep_completed: false`, and a warning (see
+///   [`CheckpointReport::sweep_warning`]).
+/// * [`crate::store::atomic::ReplaceOutcome::ReplacedDurabilityUnknown`] —
+///   the rename happened (the truncated ledger IS visibly committed:
+///   `established: true`) but durability is UNCONFIRMED. The checkpoint
+///   NEVER deletes against it (no reachability scan, no sweep — a sweep
+///   against a floor whose durability is unconfirmed could let an
+///   interrupted retry expose history below the floor): it records the owed
+///   sweep as durable sweep-debt and returns a structured report with a
+///   DURABILITY WARNING and `sweep_completed: false`. A repeated checkpoint
+///   of the same deployment rewrites the SAME suffix — on retry it obtains
+///   [`crate::store::atomic::ReplaceOutcome::ReplacedDurable`] and the
+///   sweep runs to convergence.
+///
+/// Only the suffix computation and a PRE-RENAME replacement failure return
+/// `Err` (nothing was committed).
 fn checkpoint_inner(
     store: &LocalStore,
     config: &ProjectConfig,
@@ -247,24 +290,74 @@ fn checkpoint_inner(
     .map_err(|e| crate::error::Error::store(format!("serialize ledger checkpoint: {e}")))?;
     let mut new_ledger = vec![checkpoint_line];
     new_ledger.extend(suffix.iter().cloned());
-    store.write_ledger_suffix(target, &new_ledger)?;
-    // 3. POST-COMMIT MAINTENANCE: the ledger commit is irreversible, so the
-    //    sweep + debt marker run in the non-fallible [`run_post_commit_sweep`]
-    //    — never an `Err` from this point on.
-    let post = run_post_commit_sweep(store, config, deployment_id.as_str(), &ledger_override);
-    Ok(CheckpointReport {
-        target: target.to_string(),
-        deployment_id: deployment_id.clone(),
-        discards: LedgerDiscards {
-            discarded_entries,
-            ..post.discards
-        },
-        established: true,
-        sweep_completed: post.completed,
-        sweep_warning: post.warning,
-        sweep_debt_warning: post.debt_warning,
-        dry_run: false,
-    })
+    // 2. THE LOGICAL COMMIT — the replace reports its TWO COMMIT POINTS
+    //    (the rename → the truncated ledger becomes VISIBLE; the
+    //    parent-directory fsync → it becomes DURABLE) explicitly, so the
+    //    checkpoint can distinguish "the rename never happened" (a plain
+    //    `Err` from [`LocalStore::write_ledger_suffix`] — nothing
+    //    committed, the full history stands) from "the rename happened but
+    //    durability is unconfirmed" (the shortened ledger IS visible, so
+    //    the checkpoint reports the commit as ESTABLISHED with a durability
+    //    warning and DEFERS the sweep — never delete anything against a
+    //    floor whose durability is unconfirmed).
+    match store.write_ledger_suffix(target, &new_ledger)? {
+        // BOTH commit points confirmed: the new ledger is visible AND
+        // durable — run the best-effort post-commit sweep as today.
+        ReplaceOutcome::ReplacedDurable => {
+            // 3. POST-COMMIT MAINTENANCE: the ledger commit is
+            //    irreversible, so the sweep + debt marker run in the
+            //    non-fallible [`run_post_commit_sweep`] — never an `Err`
+            //    from this point on.
+            let post =
+                run_post_commit_sweep(store, config, deployment_id.as_str(), &ledger_override);
+            Ok(CheckpointReport {
+                target: target.to_string(),
+                deployment_id: deployment_id.clone(),
+                discards: LedgerDiscards {
+                    discarded_entries,
+                    ..post.discards
+                },
+                established: true,
+                sweep_completed: post.completed,
+                sweep_warning: post.warning,
+                durability_warning: None,
+                sweep_debt_warning: post.debt_warning,
+                dry_run: false,
+            })
+        }
+        // COMMIT POINT 1 ONLY: the truncated ledger IS visible under its
+        // final name but durability is UNCONFIRMED — NEVER attempt artifact
+        // deletion (no reachability scan, no sweep, no `run_post_commit_sweep`:
+        // a sweep against a floor whose durability is unconfirmed could let
+        // an interrupted retry expose history below the floor). Record the
+        // owed sweep as durable sweep-debt (best-effort — a marker write
+        // failure becomes a warning, never an `Err`) and report the commit
+        // as ESTABLISHED with the durability warning. A repeated checkpoint
+        // recomputes the SAME suffix (an identical rewrite), obtains
+        // `ReplacedDurable`, and runs the sweep to convergence.
+        ReplaceOutcome::ReplacedDurabilityUnknown { error } => {
+            let warning = format!(
+                "ledger replaced for target '{target}' but its durability is unconfirmed \
+                 (the parent-directory fsync failed: {error}); NO sweep ran — the sweep is \
+                 deferred until a repeated checkpoint re-establishes durability or the next push"
+            );
+            let debt_warning = debt::reconcile_sweep_debt(store, false, &Some(warning.clone()));
+            Ok(CheckpointReport {
+                target: target.to_string(),
+                deployment_id: deployment_id.clone(),
+                discards: LedgerDiscards {
+                    discarded_entries,
+                    ..LedgerDiscards::default()
+                },
+                established: true,
+                sweep_completed: false,
+                sweep_warning: None,
+                durability_warning: Some(warning),
+                sweep_debt_warning: debt_warning,
+                dry_run: false,
+            })
+        }
+    }
 }
 
 /// Post-commit maintenance after the irreversible ledger commit: the
@@ -356,6 +449,7 @@ fn preview_checkpoint(
         established: false,
         sweep_completed: false,
         sweep_warning: None,
+        durability_warning: None,
         sweep_debt_warning: None,
         dry_run: true,
     })
@@ -418,6 +512,9 @@ pub fn render_checkpoint_report(report: &CheckpointReport) -> Vec<String> {
         ));
     }
     if let Some(w) = &report.sweep_warning {
+        lines.push(format!("warning: {w}"));
+    }
+    if let Some(w) = &report.durability_warning {
         lines.push(format!("warning: {w}"));
     }
     if let Some(w) = &report.sweep_debt_warning {
@@ -914,7 +1011,9 @@ interval_seconds = 0
     }
 
     /// A failed ledger replacement deletes NOTHING: the checkpoint fails
-    /// cleanly with the full history intact.
+    /// cleanly with the full history intact (the fault is injected at the
+    /// replacement's TEMP-WRITE stage — a PRE-RENAME failure, so the visible
+    /// ledger is wholly OLD).
     #[test]
     fn checkpoint_fails_cleanly_when_replacement_faults() {
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
@@ -922,9 +1021,14 @@ interval_seconds = 0
         let cfg = config_for(&dir);
         let ids = seed_history(&store, TARGET, "deploy", &[true, true, true]);
         let before = store.read_ledger(TARGET).unwrap();
-        store.fault_registry().arm_ledger_replace_before(TARGET);
-        let err = run_checkpoint_unlocked(&store, &cfg, TARGET, &test_deployment_id(&ids[1]))
-            .expect_err("the pre-replace fault fails the checkpoint");
+        store.fault_registry().arm_ledger_replace_write(TARGET);
+        let err = run_checkpoint_unlocked(
+            &store,
+            &cfg,
+            TARGET,
+            &DeploymentId::parse(&ids[1]).expect("canonical checkpoint id"),
+        )
+        .expect_err("the pre-rename fault fails the checkpoint");
         assert!(err.to_string().contains("ledger"));
         assert_eq!(
             store.read_ledger(TARGET).unwrap(),
@@ -1000,26 +1104,32 @@ interval_seconds = 0
     }
 
     // ---------------------------------------------------------------------
-    // THE PROPERTY: inject a failure before/after the ledger replacement and
-    // at every sweep stage; the visible ledger is always WHOLY OLD or WHOLY
-    // NEW (the atomic replace), retained and pinned content survives every
-    // failure, and retries converge (repeating the checkpoint recomputes
-    // reachability fresh and finishes the sweep).
+    // THE PROPERTY: inject a failure at EVERY atomic-replacement stage (the
+    // pre-rename temp write/sync/rename, the post-rename parent-dir sync)
+    // and at every sweep stage; the visible ledger is always WHOLY OLD or
+    // WHOLY NEW (the atomic replace), retained and pinned content survives
+    // every failure, and retries converge (repeating the checkpoint
+    // recomputes reachability fresh and finishes the sweep).
     // ---------------------------------------------------------------------
 
-    /// The fault slots of the property: BEFORE/AFTER the atomic ledger
-    /// replacement (the PRE-COMMIT boundary — these may return `Err`), and
-    /// EVERY POST-COMMIT sweep stage: the reachability read/scan
-    /// ([`FaultKind::SweepScan`]), the directory enumeration
-    /// ([`FaultKind::SweepEnumerate`]), the three deletion stages
-    /// (deployment dirs / release records / tree objects), and the
-    /// sweep-debt marker write. Once the ledger replacement has committed,
-    /// a fault at ANY of these stages must be CONVERTED into an established
-    /// report (never `Err`) — the explicit commit boundary.
+    /// The fault slots of the property: the four atomic-replacement stages
+    /// (the PRE-RENAME temp write/sync/rename — plain `Err`, ledger wholly
+    /// OLD — and the POST-RENAME parent-dir sync — a STRUCTURED report with
+    /// the commit established and durability unconfirmed, ledger wholly NEW,
+    /// NO deletion, sweep deferred), and EVERY POST-COMMIT sweep stage: the
+    /// reachability read/scan ([`FaultKind::SweepScan`]), the directory
+    /// enumeration ([`FaultKind::SweepEnumerate`]), the three deletion
+    /// stages (deployment dirs / release records / tree objects), and the
+    /// sweep-debt marker write. Once the ledger replacement has committed
+    /// (durability confirmed), a fault at ANY of these stages must be
+    /// CONVERTED into an established report (never `Err`) — the explicit
+    /// commit boundary.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum CheckpointFault {
-        LedgerReplaceBefore,
-        LedgerReplaceAfter,
+        LedgerReplaceWrite,
+        LedgerReplaceSync,
+        LedgerReplaceRename,
+        LedgerReplaceDirSync,
         SweepScan,
         SweepEnumerate,
         SweepDeployments,
@@ -1031,8 +1141,10 @@ interval_seconds = 0
     fn arm_fault(store: &LocalStore, fault: CheckpointFault) {
         let reg = store.fault_registry();
         match fault {
-            CheckpointFault::LedgerReplaceBefore => reg.arm_ledger_replace_before(TARGET),
-            CheckpointFault::LedgerReplaceAfter => reg.arm_ledger_replace_after(TARGET),
+            CheckpointFault::LedgerReplaceWrite => reg.arm_ledger_replace_write(TARGET),
+            CheckpointFault::LedgerReplaceSync => reg.arm_ledger_replace_sync(TARGET),
+            CheckpointFault::LedgerReplaceRename => reg.arm_ledger_replace_rename(TARGET),
+            CheckpointFault::LedgerReplaceDirSync => reg.arm_ledger_replace_dir_sync(TARGET),
             CheckpointFault::SweepScan => reg.arm_sweep_scan(),
             CheckpointFault::SweepEnumerate => reg.arm_sweep_enumerate(),
             CheckpointFault::SweepDeployments => reg.arm_sweep_deployments(),
@@ -1053,16 +1165,22 @@ interval_seconds = 0
     /// unreachable + pinned content, inject `fault` at the checkpoint, then
     /// RETRY the checkpoint (no fault) until it converges. Asserts:
     ///
-    /// * THE EXPLICIT COMMIT BOUNDARY: a PRE-commit fault (the replacement
-    ///   itself — `LedgerReplaceBefore` / `LedgerReplaceAfter`) is a plain
-    ///   `Err`; a POST-commit fault (EVERY sweep stage — the reachability
-    ///   scan, the enumeration, the three deletion stages, the debt-marker
-    ///   write) is CONVERTED into an established report with
-    ///   `sweep_completed: false` and a warning — NEVER an `Err`;
+    /// * the ATOMIC-REPLACEMENT stage→outcome mapping: a PRE-RENAME fault
+    ///   (temp write/sync/rename) is a plain `Err` with the ledger wholly
+    ///   OLD and nothing deleted; the POST-RENAME parent-dir-sync fault is
+    ///   a STRUCTURED report (established, durability warning,
+    ///   `sweep_completed: false`) with the wholly-NEW suffix visible and
+    ///   ZERO artifacts deleted (no sweep ran) — never an `Err`;
+    /// * THE EXPLICIT COMMIT BOUNDARY: a POST-commit fault (EVERY sweep
+    ///   stage — the reachability scan, the enumeration, the three deletion
+    ///   stages, the debt-marker write) is CONVERTED into an established
+    ///   report with `sweep_completed: false` and a warning — NEVER an
+    ///   `Err`;
     /// * the visible ledger is always WHOLY OLD or WHOLY NEW — never torn
-    ///   (the atomic replace): wholly OLD only for `LedgerReplaceBefore`
+    ///   (the atomic replace): wholly OLD only for the pre-rename faults
     ///   (nothing committed); wholly NEW — EXACTLY the retained suffix — for
-    ///   every post-replacement fault (the commit stands);
+    ///   the post-rename durability fault and every post-commit fault (the
+    ///   commit stands);
     /// * retained and pinned content survives every failure;
     /// * the retry converges: `sweep_completed: true`, the ledger matches
     ///   the retained suffix, the unreachable content is gone, the sweep
@@ -1121,33 +1239,119 @@ interval_seconds = 0
             .map(|e| e.deployment_id.as_str().to_string())
             .collect();
         match fault {
-            // ---- the PRE-COMMIT boundary: a failed replacement is a plain
-            // `Err` (nothing was committed / the replacement itself did not
-            // return Ok), never a report ----
-            CheckpointFault::LedgerReplaceBefore => {
+            // ---- the PRE-RENAME replacement stages: a failed replacement
+            // is a plain `Err` (the rename never happened — nothing was
+            // committed), never a report, and the visible ledger is wholly
+            // OLD ----
+            CheckpointFault::LedgerReplaceWrite
+            | CheckpointFault::LedgerReplaceSync
+            | CheckpointFault::LedgerReplaceRename => {
                 assert!(
                     faulted.is_err(),
-                    "fault {fault:?}: a pre-replacement fault must fail the checkpoint with Err"
+                    "fault {fault:?}: a pre-rename replacement fault must fail the checkpoint with Err"
                 );
                 assert_eq!(
                     visible, ids,
-                    "fault {fault:?}: a pre-replacement fault leaves the ledger wholly OLD"
+                    "fault {fault:?}: a pre-rename fault leaves the ledger wholly OLD"
+                );
+                assert!(
+                    store
+                        .deployment_dir(test_deployment_id("ghost-deploy").as_str())
+                        .exists(),
+                    "fault {fault:?}: a pre-rename fault must delete nothing"
                 );
             }
-            CheckpointFault::LedgerReplaceAfter => {
+            // ---- the POST-RENAME durability stage: the rename happened —
+            // the wholly-NEW suffix IS visible under its final name — but
+            // durability is unconfirmed, so the checkpoint returns a
+            // STRUCTURED report (established, durability warning, sweep
+            // deferred) — NEVER an `Err` — and deletes NOTHING (a sweep
+            // against a floor whose durability is unconfirmed could let an
+            // interrupted retry expose history below the floor) ----
+            CheckpointFault::LedgerReplaceDirSync => {
+                let rep = faulted.unwrap_or_else(|e| {
+                    panic!(
+                        "fault {fault:?}: a post-rename durability failure must be a structured \
+                         report, never an Err, got {e}"
+                    )
+                });
                 assert!(
-                    faulted.is_err(),
-                    "fault {fault:?}: a failed replacement still returns Err"
+                    rep.established,
+                    "fault {fault:?}: the rename committed the ledger — established"
+                );
+                assert!(
+                    !rep.sweep_completed,
+                    "fault {fault:?}: the sweep is deferred (sweep_completed false)"
+                );
+                assert!(
+                    rep.sweep_warning.is_none(),
+                    "fault {fault:?}: no post-commit sweep ran, so no sweep warning"
+                );
+                assert!(
+                    rep.durability_warning
+                        .as_ref()
+                        .is_some_and(|w| w.contains("durability is unconfirmed")),
+                    "fault {fault:?}: the durability warning must be carried"
+                );
+                assert!(
+                    rep.sweep_debt_warning.is_none(),
+                    "fault {fault:?}: the owed sweep recorded as durable debt cleanly"
                 );
                 assert_eq!(
                     visible, expected_suffix,
-                    "fault {fault:?}: the after-rename durability hook leaves the wholly-NEW suffix durable"
+                    "fault {fault:?}: the committed ledger is EXACTLY the retained suffix, wholly new"
+                );
+                // ZERO ARTIFACTS DELETED: no reachability scan, no sweep ran.
+                assert!(
+                    store
+                        .deployment_dir(test_deployment_id("ghost-deploy").as_str())
+                        .exists(),
+                    "fault {fault:?}: no sweep may run against an unconfirmed floor"
+                );
+                assert!(
+                    store
+                        .release_dir(&crate::identity::test_release_id("rel-sha256-ghost"))
+                        .exists(),
+                    "fault {fault:?}: no sweep may run against an unconfirmed floor"
+                );
+                assert!(
+                    store.object_root(&test_tree_digest("tree-ghost")).exists(),
+                    "fault {fault:?}: no sweep may run against an unconfirmed floor"
+                );
+                // The owed sweep is recorded as durable debt (deferred).
+                assert!(
+                    store.read_sweep_debt().unwrap().is_some(),
+                    "fault {fault:?}: the deferred sweep is recorded as durable debt"
+                );
+                // The report's discards carry step 1's suffix computation
+                // (the entries strictly before the checkpoint); the sweep
+                // candidate/removed sets stay EMPTY since no sweep ran.
+                assert_eq!(
+                    rep.discards.discarded_entries,
+                    ids[..at].to_vec(),
+                    "fault {fault:?}: the report carries the discarded ledger entries"
+                );
+                assert!(
+                    rep.discards.sweep_deployments.is_empty()
+                        && rep.discards.sweep_releases.is_empty()
+                        && rep.discards.sweep_objects.is_empty(),
+                    "fault {fault:?}: no sweep ran, so no sweep candidates"
+                );
+                assert_eq!(
+                    (
+                        rep.discards.removed_deployments,
+                        rep.discards.removed_releases,
+                        rep.discards.removed_objects,
+                    ),
+                    (0, 0, 0),
+                    "fault {fault:?}: zero artifacts removed (no sweep ran)"
                 );
             }
-            // ---- THE POST-COMMIT BOUNDARY: the replacement succeeded, so
-            // EVERY sweep-stage fault is CONVERTED into an established report
-            // (never Err); the retained suffix is preserved (the ledger = the
-            // suffix, wholly new) ----
+            // ---- THE POST-COMMIT BOUNDARY: the replacement succeeded AND
+            // durability was confirmed, so EVERY sweep-stage fault is
+            // CONVERTED into an established report (never Err); the
+            // retained suffix is preserved (the ledger = the suffix, wholly
+            // new) ----
             _ => {
                 let rep = faulted.unwrap_or_else(|e| {
                     panic!(
@@ -1280,9 +1484,13 @@ interval_seconds = 0
             ..ProptestConfig::default()
         })]
 
-        /// THE EXPLICIT COMMIT BOUNDARY PROPERTY: a fault BEFORE the ledger
-        /// replacement (`LedgerReplaceBefore` / `LedgerReplaceAfter`) is a
-        /// plain `Err`; a fault at EVERY POST-REPLACEMENT sweep stage — the
+        /// THE ATOMIC-REPLACEMENT STAGE→OUTCOME + EXPLICIT COMMIT BOUNDARY
+        /// PROPERTY: a fault at EVERY atomic-replacement stage maps to its
+        /// contract — a PRE-RENAME fault (temp write/sync/rename) is a plain
+        /// `Err` (ledger wholly OLD, nothing deleted); the POST-RENAME
+        /// parent-dir-sync fault is a STRUCTURED report (established,
+        /// durability warning, sweep deferred — zero deletions, debt
+        /// recorded); a fault at EVERY POST-COMMIT sweep stage — the
         /// reachability scan, the directory enumeration, the three deletion
         /// stages (deployment dirs / release records / tree objects), and
         /// the sweep-debt write — is CONVERTED into an established report
@@ -1293,8 +1501,10 @@ interval_seconds = 0
         fn checkpoint_faults_never_torn_and_retries_converge(
             at in 0usize..=5,
             fault in prop_oneof![
-                Just(CheckpointFault::LedgerReplaceBefore),
-                Just(CheckpointFault::LedgerReplaceAfter),
+                Just(CheckpointFault::LedgerReplaceWrite),
+                Just(CheckpointFault::LedgerReplaceSync),
+                Just(CheckpointFault::LedgerReplaceRename),
+                Just(CheckpointFault::LedgerReplaceDirSync),
                 Just(CheckpointFault::SweepScan),
                 Just(CheckpointFault::SweepEnumerate),
                 Just(CheckpointFault::SweepDeployments),
@@ -1341,6 +1551,141 @@ interval_seconds = 0
     #[test]
     fn sweep_debt_write_fault_never_fails_the_committed_checkpoint() {
         run_fault_case(2, CheckpointFault::SweepDebtWrite);
+    }
+
+    // ---- the deterministic ATOMIC-REPLACEMENT stage unit tests -----------
+    // One per replacement stage: a PRE-RENAME fault (temp write/sync/rename)
+    // is a plain `Err` with the ledger wholly OLD; the POST-RENAME
+    // parent-dir-sync fault is a STRUCTURED report (established, durability
+    // warning, sweep deferred, no deletion) that converges on the re-run.
+    #[test]
+    fn replacement_write_fault_fails_cleanly_with_the_old_ledger_visible() {
+        run_fault_case(2, CheckpointFault::LedgerReplaceWrite);
+    }
+
+    #[test]
+    fn replacement_sync_fault_fails_cleanly_with_the_old_ledger_visible() {
+        run_fault_case(2, CheckpointFault::LedgerReplaceSync);
+    }
+
+    #[test]
+    fn replacement_rename_fault_fails_cleanly_with_the_old_ledger_visible() {
+        run_fault_case(2, CheckpointFault::LedgerReplaceRename);
+    }
+
+    /// The post-rename parent-dir-sync fault: the checkpoint returns a
+    /// STRUCTURED report (established, durability warning, `sweep_completed:
+    /// false`), the wholly-NEW suffix is visible, zero artifacts are deleted,
+    /// the owed sweep is recorded as durable debt, and the CLI renderer
+    /// surfaces the durability warning DISTINCTLY (a `warning:` line whose
+    /// text names the unconfirmed durability, separate from any sweep
+    /// warning).
+    #[test]
+    fn replacement_dir_sync_fault_reports_established_with_durability_warning() {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        // Three successful deployments, checkpoint at deploy-1.
+        let ids = seed_history(&store, TARGET, "deploy", &[true, true, true]);
+        seed_unreachable(&store, "ghost-deploy", "rel-sha256-ghost", "tree-ghost");
+        let cfg = config_for(&dir);
+        store.fault_registry().arm_ledger_replace_dir_sync(TARGET);
+        let rep = run_checkpoint_unlocked(
+            &store,
+            &cfg,
+            TARGET,
+            &DeploymentId::parse(&ids[1]).expect("canonical checkpoint id"),
+        )
+        .expect("the durability-unconfirmed checkpoint is a structured report, never Err");
+        assert!(rep.established);
+        assert!(!rep.sweep_completed);
+        assert!(rep.sweep_warning.is_none());
+        let dur = rep
+            .durability_warning
+            .as_ref()
+            .expect("the durability warning is set");
+        assert!(
+            dur.contains("durability is unconfirmed") && dur.contains("fsync"),
+            "the warning names the unconfirmed durability and its fsync failure: {dur}"
+        );
+        assert!(rep.sweep_debt_warning.is_none());
+        // The truncation stands (deploy-0 discarded) and no sweep ran.
+        assert_eq!(rep.discards.discarded_entries, vec![ids[0].clone()]);
+        assert!(store.read_sweep_debt().unwrap().is_some());
+        assert!(
+            store
+                .deployment_dir(test_deployment_id("ghost-deploy").as_str())
+                .exists(),
+            "no sweep ran against the unconfirmed floor"
+        );
+        // THE RENDERER: the durability warning surfaces distinctly.
+        let rendered = render_checkpoint_report(&rep);
+        assert!(
+            rendered
+                .iter()
+                .any(|l| { l.starts_with("warning:") && l.contains("durability is unconfirmed") }),
+            "the CLI surfaces the durability warning: {rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|l| l.contains("sweep did not complete")),
+            "the deferred sweep is reported retry-required: {rendered:?}"
+        );
+        // The retry converges: durable suffix + completed sweep, debt cleared.
+        let retry = run_checkpoint_unlocked(
+            &store,
+            &cfg,
+            TARGET,
+            &DeploymentId::parse(&ids[1]).expect("canonical checkpoint id"),
+        )
+        .expect("the retry checkpoint succeeds");
+        assert!(retry.sweep_completed && retry.durability_warning.is_none());
+        assert!(store.read_sweep_debt().unwrap().is_none());
+        assert!(
+            !store
+                .deployment_dir(test_deployment_id("ghost-deploy").as_str())
+                .exists(),
+            "the converged retry sweep deleted the unreachable content"
+        );
+    }
+
+    /// The durability-unconfirmed report plus a sweep-debt WRITE failure:
+    /// the debt record could not be persisted, so the report carries the
+    /// debt warning (never an `Err`) while the durability warning still
+    /// stands and nothing was deleted.
+    #[test]
+    fn replacement_dir_sync_fault_with_debt_write_failure_reports_both_warnings() {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let cfg = config_for(&dir);
+        // THREE successful deployments, checkpoint at deploy-1.
+        let ids = seed_history(&store, TARGET, "deploy", &[true, true, true]);
+        seed_unreachable(&store, "ghost-deploy", "rel-sha256-ghost", "tree-ghost");
+        store.fault_registry().arm_ledger_replace_dir_sync(TARGET);
+        store.fault_registry().arm_write_sweep_debt();
+        let rep = run_checkpoint_unlocked(
+            &store,
+            &cfg,
+            TARGET,
+            &DeploymentId::parse(&ids[1]).expect("canonical checkpoint id"),
+        )
+        .expect("the structured report is never an Err");
+        assert!(rep.established && !rep.sweep_completed);
+        assert!(rep.durability_warning.is_some());
+        assert!(
+            rep.sweep_debt_warning.is_some(),
+            "the failed debt record is a warning, never an Err"
+        );
+        assert!(
+            store.read_sweep_debt().unwrap().is_none(),
+            "the failed debt write leaves no marker on disk"
+        );
+        assert!(
+            store
+                .deployment_dir(test_deployment_id("ghost-deploy").as_str())
+                .exists(),
+            "no sweep ran against the unconfirmed floor"
+        );
     }
 
     // ---------------------------------------------------------------------

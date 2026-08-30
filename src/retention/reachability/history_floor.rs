@@ -31,11 +31,18 @@
 //!    The floor is IMPLICIT: the ledger's first entry is the oldest retained
 //!    rollback state; no separate floor marker exists.
 //! 2. ATOMICALLY REPLACE the ledger with that suffix (`LocalStore::write_ledger_suffix`
-//!    — temp + fsync + chmod-private + rename + parent-directory fsync). This
-//!    is the checkpoint's ONLY logical commit; a reader never observes a torn
-//!    ledger (wholly old or wholly new). IF THE REPLACEMENT FAILS, NO
-//!    DELETION HAPPENS: the checkpoint is a plain `Err` and the full history
-//!    stands untouched.
+//!    — temp + fsync + chmod-private + rename + parent-directory fsync; the
+//!    replace's TWO COMMIT POINTS — the rename (new ledger VISIBLE) and the
+//!    parent-directory fsync (new ledger DURABLE) — are reported explicitly
+//!    as [`ReplaceOutcome`]). This is the checkpoint's ONLY logical commit; a
+//!    reader never observes a torn ledger (wholly old or wholly new). IF THE
+//!    RENAME NEVER SUCCEEDED, NO DELETION HAPPENS: the checkpoint is a plain
+//!    `Err` and the full history stands untouched. IF THE RENAME SUCCEEDED
+//!    BUT THE PARENT-DIRECTORY FSYNC FAILED, the checkpoint is NOT an `Err`
+//!    (the new suffix IS visibly the ledger) — it is a STRUCTURED report
+//!    with the ledger established, the durability unconfirmed (a warning),
+//!    and the sweep DEFERRED (never against an unconfirmed floor): see
+//!    [`crate::retention::checkpoint`].
 //! 3. BEST-EFFORT GLOBAL SWEEP of unreachable deployment directories
 //!    (`deployments/<id>/`), release records (`releases/<release-id>/`), and
 //!    tree objects (`objects/sha256/<digest>/`). The reachability scan
@@ -69,7 +76,11 @@ use crate::error::{Error, Result};
 use super::gc::SweepStageStats;
 use crate::identity::DeploymentId;
 use crate::ledger::{LedgerEntry, ObservedAssignment};
-use crate::store::atomic::{path_state, write_atomic_replace};
+#[cfg(not(test))]
+use crate::store::atomic::write_atomic_replace;
+use crate::store::atomic::{ReplaceOutcome, path_state};
+#[cfg(test)]
+use crate::store::atomic::{ReplaceStage, write_atomic_replace_seam};
 use crate::store::local::LocalStore;
 use std::collections::BTreeSet;
 
@@ -242,42 +253,69 @@ impl LocalStore {
     /// temp file in the same directory, fsync, chmod private BEFORE it can
     /// become visible, rename over the ledger (atomic on POSIX — a reader
     /// sees wholly-old or wholly-new, never torn), then fsync the parent
-    /// directory WITH ERRORS PROPAGATED (the durability commit point).
+    /// directory. The replace's TWO COMMIT POINTS are reported explicitly as
+    /// a [`ReplaceOutcome`] (see [`write_atomic_replace`]): the rename is
+    /// commit point 1 (the new suffix becomes VISIBLE), the parent-directory
+    /// fsync is commit point 2 (the rename becomes DURABLE).
     ///
-    /// FAILURE MODEL: a failure at ANY stage (the injected
-    /// [`FaultKind::LedgerReplaceBefore`] fault, a real temp/sync/rename
-    /// error, the parent-sync failure) returns `Err` and leaves the PREVIOUS
-    /// ledger durable — no deletion, no partial history. The
-    /// [`FaultKind::LedgerReplaceAfter`] fault fires AFTER the commit (the
-    /// new suffix IS durable) so a test can assert the visible ledger is
-    /// wholly new and the sweep is reported retry-required.
-    pub(crate) fn write_ledger_suffix(&self, target: &str, suffix_lines: &[String]) -> Result<()> {
-        #[cfg(test)]
-        if self
-            .fault_registry()
-            .consume(FaultKind::LedgerReplaceBefore, target)
-        {
-            return Err(Error::store(
-                "test fault: ledger suffix replacement forced to fail before the replace",
-            ));
-        }
+    /// FAILURE MODEL (TRI-STATE): a failure at any PRE-RENAME stage — the
+    /// injected [`FaultKind::LedgerReplaceWrite`] / `LedgerReplaceSync` /
+    /// `LedgerReplaceRename` faults, or a real temp/sync/rename error —
+    /// returns `Err` and leaves the PREVIOUS ledger visible — no deletion,
+    /// no partial history. A failure of the PARENT-DIRECTORY open/fsync
+    /// AFTER the rename — the injected [`FaultKind::LedgerReplaceDirSync`]
+    /// fault or a real dir-sync error — returns
+    /// [`ReplaceOutcome::ReplacedDurabilityUnknown`]: the NEW suffix IS
+    /// visible under its final name (the ledger commit stands) but its
+    /// durability is UNCONFIRMED. The caller must NEITHER delete against it
+    /// (the sweep is deferred — a floor whose durability is unconfirmed
+    /// must never be swept) NOR report the checkpoint as a plain `Err`
+    /// (that would falsely claim the rename never happened while the
+    /// shortened ledger visibly stands).
+    pub(crate) fn write_ledger_suffix(
+        &self,
+        target: &str,
+        suffix_lines: &[String],
+    ) -> Result<ReplaceOutcome> {
         let path = self.ledger_path(target);
         let mut buf = String::new();
         for line in suffix_lines {
             buf.push_str(line);
             buf.push('\n');
         }
-        write_atomic_replace(&path, buf.as_bytes())?;
         #[cfg(test)]
-        if self
-            .fault_registry()
-            .consume(FaultKind::LedgerReplaceAfter, target)
         {
-            return Err(Error::store(
-                "test fault: ledger suffix replacement forced to fail after the replace",
-            ));
+            // TEST SEAM: inject a failure at EVERY atomic-replacement stage
+            // (write / sync / rename → `Err`, the ledger wholly OLD;
+            // parent-directory sync → `ReplacedDurabilityUnknown`, the
+            // ledger wholly NEW but durability unconfirmed) from the
+            // FIXTURE'S OWN registry — per-fixture isolation, never
+            // process-global state. The production signature
+            // `(target, &[String]) -> Result<ReplaceOutcome>` is unchanged;
+            // only the free [`write_atomic_replace`] call is swapped for the
+            // aligned seam.
+            let reg = std::sync::Arc::clone(self.fault_registry());
+            let key = target.to_string();
+            write_atomic_replace_seam(&path, buf.as_bytes(), &mut move |stage| {
+                let kind = match stage {
+                    ReplaceStage::Write => FaultKind::LedgerReplaceWrite,
+                    ReplaceStage::Sync => FaultKind::LedgerReplaceSync,
+                    ReplaceStage::Rename => FaultKind::LedgerReplaceRename,
+                    ReplaceStage::DirSync => FaultKind::LedgerReplaceDirSync,
+                };
+                if reg.consume(kind, &key) {
+                    Some(Error::store(format!(
+                        "test fault: ledger suffix replacement faulted at the {stage:?} stage"
+                    )))
+                } else {
+                    None
+                }
+            })
         }
-        Ok(())
+        #[cfg(not(test))]
+        {
+            write_atomic_replace(&path, buf.as_bytes())
+        }
     }
 
     // ---- the global reachability sweep (step 3 — best-effort) -------------
