@@ -6,7 +6,7 @@
 //! DERIVED from the variant, never stored), the WIRE outcome row
 //! ([`SlotResult`] — the raw serde form the ledger's JSONL carries, owned
 //! HERE next to its domain sibling), the wire → domain BIJECTION
-//! ([`SlotOutcome::from_wire`], [`SlotResult::from_outcome`]), the
+//! ([`SlotOutcome::from_wire`], [`SlotOutcomeRowWire::from_outcome`]), the
 //! [`CompensationReport`] alias, and the
 //! [`LedgerTerminal::remaining_changes`],
 //! [`LedgerTerminal::compensation`]) — the derivations implemented on the
@@ -69,19 +69,18 @@ pub enum SlotTransition {
 }
 
 /// The WIRE outcome of one slot during a deployment's mutation loop — the
-/// RAW serde form the ledger's JSONL carries, with the REDUNDANT `slot_id`
-/// next to its map key (the wire keeps the on-disk shape; the wire → domain
-/// conversion verifies the outcome names its own key and then DROPS the
-/// slot into the key — the domain value [`SlotOutcome`] carries no slot).
-/// The post-mutation OBSERVATION rides in its STRICT adjacently-tagged wire
-/// form ([`ObservationWire<ObservedGenerationWire>`], `deny_unknown_fields`)
+/// RAW serde form the ledger's JSONL carries: the slot ROW OWNS ITS SLOT ID
+/// (the row lives in the terminal's `outcomes` ARRAY — there is no object
+/// key for the identity to disagree with). The post-mutation OBSERVATION
+/// rides in its STRICT adjacently-tagged wire form
+/// ([`ObservationWire<ObservedGenerationWire>`], `deny_unknown_fields`)
 /// — the raw document rejects any field beyond the declared ones and any
 /// observation shape that is not EXACTLY one variant (a mixed
 /// generation-plus-error document can never deserialize into a half-known
 /// state).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SlotResult {
+pub struct SlotOutcomeRowWire {
     pub slot_id: SlotId,
     pub outcome: SlotOutcomeKind,
     /// The THREE-STATE OBSERVATION of the slot's post-mutation state, in
@@ -100,8 +99,15 @@ pub struct SlotResult {
     pub error: Option<String>,
 }
 
+/// The PRE-ROW-ARRAY name of the wire outcome row — kept as a re-export
+/// type alias so the in-memory engine result maps (the display/execution
+/// result maps keyed by slot in `deploy/rollout` / `deploy/push/execute` /
+/// the retention history floor) keep compiling: they share the wire's
+/// shape but are NOT wire rows; the JSONL wire row is [`SlotOutcomeRowWire`].
+pub type SlotResult = SlotOutcomeRowWire;
+
 /// The per-slot OUTCOME of one slot during a deployment's mutation loop —
-/// the STRUCTURAL DOMAIN value of the wire's [`SlotResult`] with the
+/// the STRUCTURAL DOMAIN value of the wire's [`SlotOutcomeRowWire`] with the
 /// REDUNDANT `slot_id` DROPPED: the enclosing [`SlotTable`] key owns the
 /// slot identity, so the value stores each fact exactly once. The
 /// classification is the VARIANT ITSELF — one variant per outcome class —
@@ -111,7 +117,7 @@ pub struct SlotResult {
 /// outcome carries the slot + the raw kind/compensated/error fields); the
 /// wire → domain conversion ([`SlotOutcome::from_wire`]) maps the wire's
 /// (kind, compensated, observation, error) to the ONE variant the wire
-/// describes, and [`SlotResult::from_outcome`] encodes the variant back to
+/// describes, and [`SlotOutcomeRowWire::from_outcome`] encodes the variant back to
 /// its CANONICAL wire shape — the conversion is a BIJECTION (variant-
 /// preserving: both `Failed { compensated: true }` and `Compensated`
 /// derive `Restored`, but they are DISTINCT variants that round-trip to
@@ -119,7 +125,7 @@ pub struct SlotResult {
 /// ([`SlotTransition`]) — the fact the remaining-changes derivation is
 /// based on — is DERIVED from the variant ([`SlotOutcome::transition`]),
 /// never stored. The domain carries NO serde (strict wire types only
-/// deserialize; the ledger's JSONL carries [`SlotResult`] and the
+/// deserialize; the ledger's JSONL carries [`SlotOutcomeRowWire`] and the
 /// `ObservationWire` forms).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SlotOutcome {
@@ -176,7 +182,7 @@ impl SlotOutcome {
     /// value that is not representable is refused here (never read as a
     /// half-known state). `error` is the pure OPERATION error — it NEVER
     /// participates in the observation.
-    pub fn from_wire(r: SlotResult) -> Result<SlotOutcome> {
+    pub fn from_wire(r: SlotOutcomeRowWire) -> Result<SlotOutcome> {
         let observation: Observation<ObservedGeneration> = r.observation.try_into()?;
         Ok(match r.outcome {
             SlotOutcomeKind::Activated => SlotOutcome::Activated { observation },
@@ -232,7 +238,7 @@ impl SlotOutcome {
     }
 }
 
-impl SlotResult {
+impl SlotOutcomeRowWire {
     /// Re-attach the table key as the wire outcome's `slot_id` (the wire
     /// keeps the on-disk shape; the domain value carries no slot) and encode
     /// the structural variant back into the wire's CANONICAL shape: the

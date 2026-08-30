@@ -3,47 +3,55 @@
 //! the DOMAIN terminal (owned by the semantic kernel,
 //! [`crate::kernel::terminal`]).
 //!
-//! Schema v9: a successful terminal is PAYLOAD-FREE — it only says "the
+//! Schema v10: a successful terminal is PAYLOAD-FREE — it only says "the
 //! intent's planned result was achieved" — and binds itself to its intent
 //! by `intent_digest` (the sha256 of the intent's canonical wire bytes, a
 //! validated scalar). The old duplicates are GONE: no rollback payload, no
-//! outcomes map on success, no `selected_membership`/`full_membership`.
+//! outcomes object on success (the failed dispositions carry their outcome
+//! ROW ARRAY), no `target` member — the ENCLOSING ENTRY owns target, so the
+//! wire no longer duplicates the entry's identity and the reader's
+//! target-equality check went away with it.
 
 use crate::error::{Error, Result};
-use crate::identity::{DeploymentId, SlotId, TargetName};
+use crate::identity::DeploymentId;
 use crate::kernel;
 use crate::kernel::terminal::{DegradedTerminal, FailedRolledBackTerminal, LedgerTerminal};
 use crate::ledger::records::{
-    DeploymentStatus, NonEmptySlotTable, SlotOutcome, SlotResult, SlotTable,
+    DeploymentStatus, NonEmptySlotTable, SlotOutcome, SlotOutcomeRowWire, SlotTable,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
 /// The WIRE shape of a terminal event — the RAW serde form the ledger's
-/// JSONL carries: the `status` tag + the per-slot `outcomes` payload only.
-/// A SUCCESSFUL terminal carries NO outcomes and NO rollback — its
+/// JSONL carries: the `status` tag + the per-slot `outcomes` ROW ARRAY
+/// only. A SUCCESSFUL terminal carries NO outcomes and NO rollback — its
 /// `intent_digest` binds it to the exact canonical intent whose planned
 /// result was achieved (the resulting snapshot resolves from the intent,
 /// never from the terminal). The failed dispositions own their outcome
-/// tables. `deployment_id`/`target` are the wire's keying members (the
-/// ENTRY owns identity in the domain; the reader verifies them equal to the
-/// enclosing entry's).
+/// tables. `deployment_id` is the wire's keying member (the ENTRY owns
+/// identity in the domain; the reader verifies it equals the enclosing
+/// entry's). The redundant `target` member is GONE: the enclosing entry
+/// owns target. `deny_unknown_fields`: a line with stray/unknown members
+/// is refused on deserialization, never silently accepted.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LedgerTerminalWire {
     pub deployment_id: DeploymentId,
-    pub target: TargetName,
     pub status: DeploymentStatus,
     pub recorded_at: String,
-    /// The INTENT DIGEST — the sha256 of the intent's canonical wire bytes
+    /// THE INTENT DIGEST — the sha256 of the intent's canonical wire bytes
     /// ([`crate::kernel::terminal::intent_digest`]). REQUIRED (no serde
     /// default — an old-shape terminal line fails deserialization fail
     /// closed). The store enforces `terminal.intent_digest ==
     /// digest(entry.intent)` before every append and on every read.
     pub intent_digest: String,
-    /// Per-slot outcomes. `Successful` / `FailedPreflight` carry NONE; the
-    /// failed dispositions carry their own outcome table.
+    /// Per-slot outcomes IN DEPLOYMENT ORDER (a ROW ARRAY — each row
+    /// [`SlotOutcomeRowWire`] OWNS its slot id; the row order preserves the
+    /// domain's insertion order, never sorted by id). `Successful` /
+    /// `FailedPreflight` carry NONE; the failed dispositions carry their
+    /// own outcome table. REQUIRED DUPLICATE-FREE: the wire → domain
+    /// conversion refuses a duplicate slot row explicitly (never last-wins).
     #[serde(default)]
-    pub outcomes: BTreeMap<SlotId, SlotResult>,
+    pub outcomes: Vec<SlotOutcomeRowWire>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
@@ -55,7 +63,10 @@ impl LedgerTerminalWire {
     /// NO outcomes; a `FailedPreflight` carries NO outcomes; the failed
     /// dispositions validate their outcome payloads through the kernel's
     /// validated constructors), and construct the domain terminal through
-    /// the kernel's digest-enforcing constructor. The CROSS-RECORD
+    /// the kernel's digest-enforcing constructor. The outcome ROW ARRAY is
+    /// folded in FILE ORDER (order-preserving) into the ordered domain
+    /// table, REFUSING a duplicate slot row with an integrity error naming
+    /// it (ambiguous JSON is never last-wins). The CROSS-RECORD
     /// `intent_digest` equality + the outcome-coverage agreement with the
     /// entry's intent are enforced by the ledger event state machine
     /// ([`crate::kernel::transition::apply_event`]) where the terminal
@@ -74,22 +85,24 @@ impl LedgerTerminalWire {
                     self.deployment_id, self.intent_digest, e
                 ))
             })?;
-        // OUTCOME OWN-KEY AGREEMENT: each wire outcome's value names ITS OWN
-        // map key (the domain value carries no slot).
-        for (key, result) in &self.outcomes {
-            if &result.slot_id != key {
+        // THE OUTCOME ROW-ARRAY FOLD (order-preserving +
+        // duplicate-rejecting): each row OWNS its slot id (there is no map
+        // key to agree with — the redundant-key agreement is structural
+        // now); rows fold in FILE ORDER into the ordered domain table
+        // (insert APPENDS at the end) and a duplicate slot id is REFUSED
+        // with an integrity-class error naming it.
+        let mut seen = std::collections::BTreeSet::new();
+        let mut outcomes: SlotTable<SlotOutcome> = SlotTable::new();
+        for row in self.outcomes {
+            if !seen.insert(row.slot_id.clone()) {
                 return Err(Error::integrity(format!(
-                    "terminal {}: outcome for slot '{key}' names placement '{}'",
-                    self.deployment_id, result.slot_id
+                    "terminal {}: duplicate outcome for slot '{}' in the wire rows — the outcome table must be duplicate-free (the wire never last-wins ambiguous JSON)",
+                    self.deployment_id, row.slot_id
                 )));
             }
+            let slot_id = row.slot_id.clone();
+            outcomes.insert(slot_id, SlotOutcome::from_wire(row)?);
         }
-        let outcomes: SlotTable<SlotOutcome> = SlotTable::from_map(
-            self.outcomes
-                .into_iter()
-                .map(|(key, result)| Ok((key, SlotOutcome::from_wire(result)?)))
-                .collect::<Result<BTreeMap<SlotId, SlotOutcome>>>()?,
-        );
         // STATUS → DISPOSITION: each status maps to exactly one disposition,
         // and a status whose payload does not match its disposition is a
         // conversion error (fail closed).
@@ -143,20 +156,21 @@ impl LedgerTerminalWire {
             .map_err(|e| Error::integrity(format!("terminal wire refused: {e}")))
     }
 
-    /// Build the WIRE form of a domain terminal for a given (deployment,
-    /// target) identity — the enclosing entry owns the identity, so the
-    /// wire's `deployment_id`/`target` come from the CALLER (the append
-    /// path), never from the domain terminal. The domain is already
-    /// validated by construction, so this is infallible.
-    pub fn to_wire(deployment_id: &DeploymentId, target: &TargetName, t: &LedgerTerminal) -> Self {
-        let outcomes: BTreeMap<SlotId, SlotResult> = t
+    /// Build the WIRE form of a domain terminal for a given deployment
+    /// identity — the ENCLOSING ENTRY owns the identity, so the wire's
+    /// `deployment_id` comes from the CALLER (the append path); the
+    /// redundant `target` member is GONE. The domain is already validated
+    /// by construction, so this is infallible. The outcome rows are emitted
+    /// in the DOMAIN's insertion order (`outcomes().iter()` — deployment
+    /// order, never sorted by id), each row owning its slot id.
+    pub fn to_wire(deployment_id: &DeploymentId, t: &LedgerTerminal) -> Self {
+        let outcomes: Vec<SlotOutcomeRowWire> = t
             .outcomes()
             .iter()
-            .map(|(k, o)| (k.clone(), SlotResult::from_outcome(k, o)))
+            .map(|(k, o)| SlotOutcomeRowWire::from_outcome(k, o))
             .collect();
         LedgerTerminalWire {
             deployment_id: deployment_id.clone(),
-            target: target.clone(),
             status: t.status(),
             recorded_at: t.recorded_at().to_string(),
             intent_digest: t.intent_digest().as_str().to_string(),

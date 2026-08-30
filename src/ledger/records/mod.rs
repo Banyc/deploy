@@ -27,7 +27,9 @@
 //!   kinds — terminal" half);
 //! * **outcomes** — the per-slot outcomes ([`SlotOutcome`] /
 //!   [`SlotOutcomeKind`] / [`SlotTransition`], the WIRE outcome row
-//!   [`SlotResult`]) + the remaining-changes / compensation derivations;
+//!   [`SlotOutcomeRowWire`] — the pre-row-array name [`SlotResult`] stays
+//!   as a re-export alias) + the remaining-changes / compensation
+//!   derivations;
 //! * **observation** — the three-state observations ([`Observation`] and
 //!   friends);
 //! * **entries / merge** — the merged deployment entry ([`LedgerEntry`]):
@@ -141,8 +143,8 @@ pub use validation::{FrozenSlotTopology, RebindingPlan, VerifiedReleaseRebinding
 pub(crate) use validation::{LEDGER_SCHEMA_VERSION, PINS_SCHEMA_VERSION};
 pub use wire::{
     CompensationReport, LedgerEntry, LedgerIntentReport, LedgerIntentWire, LedgerTerminalWire,
-    PlannedSlotWire, PreviousGenerationWire, SlotActionWire, SlotOutcome, SlotOutcomeKind,
-    SlotResult, SlotTransition, SnapshotSlotWire,
+    PlannedSlotRowWire, PlannedSlotWire, PreviousGenerationWire, SlotActionWire, SlotOutcome,
+    SlotOutcomeKind, SlotOutcomeRowWire, SlotResult, SlotTransition, SnapshotSlotWire,
 };
 
 /// THE PHYSICAL LEDGER EVENT LINE — the WIRE enum the append-only JSONL
@@ -796,8 +798,12 @@ impl<'de> Deserialize<'de> for DeploymentPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::{SlotId, TargetName, Timestamp, test_deployment_id, test_generation_id};
+    use crate::identity::{
+        ArtifactRef, SlotId, TargetName, Timestamp, VariantName, test_deployment_id,
+        test_generation_id, test_release_id, test_tree_digest,
+    };
     use crate::kernel;
+    use crate::kernel::snapshot::PreviousGeneration;
     use crate::ledger::records::{
         DeploymentStatus, LedgerIntentWire, LedgerTerminalWire, SlotActionWire,
     };
@@ -837,7 +843,7 @@ mod tests {
             DeploymentStatus::FailedRolledBack => fixtures::rolled_back_terminal(&intent, keys),
             DeploymentStatus::Degraded => fixtures::degraded_terminal(&intent, keys),
         };
-        LedgerTerminalWire::to_wire(intent.deployment_id(), intent.target(), &terminal)
+        LedgerTerminalWire::to_wire(intent.deployment_id(), &terminal)
     }
 
     /// Write a two-line ledger through the REAL consumer path and read it
@@ -902,6 +908,326 @@ mod tests {
         }
     }
 
+    // ---- THE ORDER-CARRYING / DUPLICATE-REJECTING / STRICT WIRE PROPERTIES
+    // (the spec's acceptance gate: order preserved, order-sensitive digest,
+    // duplicates refused at every position, deny_unknown_fields at every
+    // level, exact round trips over every intent/terminal class) -----------
+
+    fn slots_permutation() -> impl Strategy<Value = Vec<SlotId>> {
+        prop::collection::btree_set((0u32..6).prop_map(slot), 1..=4).prop_flat_map(|set| {
+            let ids: Vec<SlotId> = set.into_iter().collect();
+            let n = ids.len();
+            // Shuffle the selected ids by sorting random keys: every order is
+            // reachable (with n ≤ 4 the key space is collision-free in
+            // practice), and the strategy shrinks naturally.
+            prop::collection::vec(0u32..1000, n).prop_map(move |keys| {
+                let mut order: Vec<usize> = (0..n).collect();
+                order.sort_by_key(|&i| keys[i]);
+                order.into_iter().map(|i| ids[i].clone()).collect()
+            })
+        })
+    }
+
+    /// THE TERMINAL ROUND TRIP for one disposition: `to_wire` → serde_json
+    /// → `into_domain` must reproduce the distinguishing domain terminal
+    /// EXACTLY (status, digest, reason, outcome table INCLUDING its
+    /// deployment order).
+    fn assert_terminal_wire_round_trip_exact(domain: &crate::kernel::terminal::LedgerTerminal) {
+        let wire =
+            LedgerTerminalWire::to_wire(&crate::identity::test_deployment_id("deploy-rt"), domain);
+        let json = serde_json::to_string(&wire).unwrap();
+        let wire2: LedgerTerminalWire = serde_json::from_str(&json).unwrap();
+        let back = wire2.into_domain().unwrap();
+        assert_eq!(
+            &back, domain,
+            "the wire ↔ domain round trip must reproduce the domain terminal EXACTLY (order included)"
+        );
+        // The WIRE rows own their slot ids IN the domain's deployment order.
+        assert_eq!(
+            wire.outcomes
+                .iter()
+                .map(|r| r.slot_id.clone())
+                .collect::<Vec<_>>(),
+            domain.outcomes().keys().cloned().collect::<Vec<_>>(),
+            "the wire outcome rows emit the domain's insertion order, each owning its slot id"
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: crate::testutil::proptest_cases(32),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        /// SPEC 6.1 — ORDER PRESERVED THROUGH THE ROUND TRIP: build the
+        /// domain intent from a NON-SORTED slot permutation (the kernel
+        /// `plan` builds the table in selection order) and assert
+        /// `domain → to_wire → into_domain` yields a domain whose
+        /// `slots()`/`keys()` sequence `eq` the ORIGINAL permutation —
+        /// never silently re-sorted by id.
+        #[test]
+        fn wire_round_trip_preserves_non_sorted_slot_order(keys in slots_permutation()) {
+            let domain = valid_intent(&keys, "deploy-o");
+            // The DOMAIN itself iterates in the exact permutation (plan
+            // preserves selection order).
+            assert_eq!(
+                domain.slots().keys().cloned().collect::<Vec<_>>(),
+                keys,
+                "the domain intent iterates in the deployment order"
+            );
+            // domain → wire: the rows emit the domain's insertion order.
+            let wire = LedgerIntentWire::from(&domain);
+            assert_eq!(
+                wire.slots.iter().map(|r| r.slot_id.clone()).collect::<Vec<_>>(),
+                keys,
+                "the wire rows emit the domain's deployment order"
+            );
+            // wire → domain: the fold keeps the file order exactly.
+            let back = wire.clone().into_domain().expect("the wire converts");
+            assert_eq!(
+                back.slots().keys().cloned().collect::<Vec<_>>(),
+                keys,
+                "the round-tripped domain iterates in the EXACT deployment order"
+            );
+            // AND the full domain equality is EXACT (order is part of it).
+            prop_assert_eq!(back, domain);
+            // The full JSON round trip preserves the row order too.
+            let json = serde_json::to_string(&wire).unwrap();
+            let wire2: LedgerIntentWire = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(wire2.slots, wire.slots);
+        }
+
+        /// SPEC 6.2 — THE INTENT DIGEST IS ORDER-SENSITIVE: two
+        /// permutations of IDENTICAL slots (same deployment id, same
+        /// per-slot values — the fixtures derive them deterministically
+        /// from the slot id) have DIFFERENT `intent_digest`s. Under the old
+        /// sorted-map wire they were identical — the digest could not see
+        /// deployment order.
+        #[test]
+        fn permutations_of_identical_slots_hash_differently(keys in slots_permutation()) {
+            // A different permutation of the SAME slot universe (reversal;
+            // unique keys → reverse differs whenever n ≥ 2).
+            let mut reversed = keys.clone();
+            reversed.reverse();
+            if keys == reversed {
+                return Ok(()); // n == 1: no distinct permutation exists
+            }
+            let a = valid_intent(&keys, "deploy-o");
+            let b = valid_intent(&reversed, "deploy-o");
+            // Identical slot VALUES (derived from the slot ids), different
+            // ORDER — the domain tables differ only in sequence.
+            prop_assert_ne!(
+                kernel::terminal::intent_digest(&a),
+                kernel::terminal::intent_digest(&b),
+                "the intent digest must be ORDER-SENSITIVE (two intents differing only in deployment order hash differently)"
+            );
+        }
+    }
+
+    /// SPEC 6.3 — DUPLICATE ROW AT EVERY POSITION IS REFUSED: insert a
+    /// duplicate row at EVERY position of the intent's `slots` rows (and of
+    /// a Degraded terminal's `outcomes` rows) and assert the conversion
+    /// returns the DuplicateSlot-class integrity error naming the slot —
+    /// never last-wins, never a silent accept.
+    #[test]
+    fn duplicate_row_at_every_position_is_refused() {
+        let keys = vec![slot(0), slot(1), slot(2)];
+        let base = valid_intent_wire(&keys, "deploy-dup");
+        let dup_key = slot(1);
+        for pos in 0..=base.slots.len() {
+            let mut wire = base.clone();
+            let dup_row = wire
+                .slots
+                .iter()
+                .find(|r| r.slot_id == dup_key)
+                .expect("the duplicated row's slot is in the wire")
+                .clone();
+            wire.slots.insert(pos, dup_row);
+            let err = wire.into_domain().unwrap_err();
+            assert!(
+                matches!(err, crate::error::Error::Integrity(_)),
+                "a duplicate slot row is an INTEGRITY-class refusal"
+            );
+            assert!(
+                err.to_string().contains("duplicate slot") && err.to_string().contains("slot-1"),
+                "the refusal must name the duplicated slot, got: {err}"
+            );
+        }
+        // The same property holds for the terminal's outcome rows.
+        let base_t = valid_terminal_wire(&keys, "deploy-dup", DeploymentStatus::Degraded);
+        for pos in 0..=base_t.outcomes.len() {
+            let mut wire_t = base_t.clone();
+            let dup_row = wire_t
+                .outcomes
+                .iter()
+                .find(|r| r.slot_id == dup_key)
+                .expect("the duplicated row's slot is in the outcomes")
+                .clone();
+            wire_t.outcomes.insert(pos, dup_row);
+            let err = wire_t.into_domain().unwrap_err();
+            assert!(
+                matches!(err, crate::error::Error::Integrity(_)),
+                "a duplicate outcome row is an INTEGRITY-class refusal"
+            );
+            assert!(
+                err.to_string().contains("duplicate outcome") && err.to_string().contains("slot-1"),
+                "the refusal must name the duplicated slot, got: {err}"
+            );
+        }
+    }
+
+    /// SPEC 6.4 — ONE UNKNOWN FIELD AT EVERY WIRE NESTING LEVEL FAILS
+    /// DESERIALIZATION (`deny_unknown_fields` is honored at every level):
+    /// the intent struct, an intent slot row, `SnapshotSlotWire` (the
+    /// row's result), `SlotActionWire::Deploy`'s payload
+    /// (`PreviousGenerationWire`), `ObservationWire`, the terminal struct,
+    /// and an outcome row.
+    #[test]
+    fn unknown_field_at_every_wire_level_fails_deserialization() {
+        // A full-push intent with a KNOWN pre-push observation on slot-0
+        // (so the Deploy payload carries a `PreviousGenerationWire` value).
+        let keys = vec![slot(0), slot(1)];
+        let prev = PreviousGeneration {
+            generation: test_generation_id("prev"),
+            artifact: ArtifactRef {
+                release: test_release_id("r"),
+                variant: VariantName::parse("standard").unwrap(),
+                tree: test_tree_digest("t"),
+            },
+        };
+        let domain = crate::testutil::fixtures::full_intent(
+            "deploy-unk",
+            "t1",
+            &keys,
+            &[(slot(0), crate::ledger::Observation::Known(prev))],
+        );
+        let wire = LedgerIntentWire::from(&domain);
+        let json = serde_json::to_string(&wire).unwrap();
+        let reject = |value: &serde_json::Value, level: &str, error: &mut Vec<String>| {
+            if serde_json::from_str::<LedgerIntentWire>(&serde_json::to_string(value).unwrap())
+                .is_ok()
+            {
+                error.push(level.to_string());
+            }
+        };
+        let mut failed_levels: Vec<String> = Vec::new();
+        // (1) the intent struct level.
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v.as_object_mut()
+            .unwrap()
+            .insert("stray".to_string(), serde_json::json!(1));
+        reject(&v, "the intent struct", &mut failed_levels);
+        // (2) an intent slot ROW level.
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v["slots"][0]["stray"] = serde_json::json!(1);
+        reject(&v, "a slot row", &mut failed_levels);
+        // (3) SnapshotSlotWire (the row's result).
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v["slots"][0]["result"]["stray"] = serde_json::json!(1);
+        reject(&v, "SnapshotSlotWire", &mut failed_levels);
+        // (4) SlotActionWire::Deploy's payload (PreviousGenerationWire).
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v["slots"][0]["action"]["pre_push"]["value"]["stray"] = serde_json::json!(1);
+        reject(&v, "SlotActionWire::Deploy's payload", &mut failed_levels);
+        // (5) ObservationWire (adjacently tagged — a stray sibling of
+        // state/value).
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v["slots"][0]["action"]["pre_push"]["stray"] = serde_json::json!(1);
+        reject(&v, "ObservationWire", &mut failed_levels);
+        assert!(
+            failed_levels.is_empty(),
+            "an unknown field at the following wire level(s) was silently accepted: {:?}",
+            failed_levels
+        );
+
+        // The TERMINAL struct + an outcome row (a Degraded terminal so the
+        // outcomes rows exist).
+        let tw = valid_terminal_wire(&keys, "deploy-unk", DeploymentStatus::Degraded);
+        let json_t = serde_json::to_string(&tw).unwrap();
+        let mut failed_terminal: Vec<String> = Vec::new();
+        let reject_t = |value: &serde_json::Value, level: &str, error: &mut Vec<String>| {
+            if serde_json::from_str::<LedgerTerminalWire>(&serde_json::to_string(value).unwrap())
+                .is_ok()
+            {
+                error.push(level.to_string());
+            }
+        };
+        // (6) the terminal struct level.
+        let mut v: serde_json::Value = serde_json::from_str(&json_t).unwrap();
+        v.as_object_mut()
+            .unwrap()
+            .insert("stray".to_string(), serde_json::json!(1));
+        reject_t(&v, "the terminal struct", &mut failed_terminal);
+        // (7) an outcome ROW level.
+        let mut v: serde_json::Value = serde_json::from_str(&json_t).unwrap();
+        v["outcomes"][0]["stray"] = serde_json::json!(1);
+        reject_t(&v, "an outcome row", &mut failed_terminal);
+        assert!(
+            failed_terminal.is_empty(),
+            "an unknown field at the following terminal wire level(s) was silently accepted: {:?}",
+            failed_terminal
+        );
+    }
+
+    /// SPEC 6.5 + the exact-equality gate — EVERY valid domain intent
+    /// (first full push, group push, all terminal dispositions) serializes
+    /// to the wire, reads back, and yields EXACT domain equality INCLUDING
+    /// slot order.
+    #[test]
+    fn valid_intents_and_terminals_round_trip_exactly() {
+        let keys = vec![slot(2), slot(0), slot(3), slot(1)]; // deliberately non-sorted
+        // FIRST INTENT: a full push (group None, parent None).
+        let first = valid_intent(&keys, "deploy-rt");
+        let wire_i = LedgerIntentWire::from(&first);
+        let json_i = serde_json::to_string(&wire_i).unwrap();
+        let back_i: LedgerIntentWire = serde_json::from_str(&json_i).unwrap();
+        let domain_i = back_i.into_domain().expect("the first intent converts");
+        assert_eq!(
+            domain_i, first,
+            "the first intent round-trips exactly (order included)"
+        );
+        // All four terminal dispositions over the first intent.
+        assert_terminal_wire_round_trip_exact(&fixtures::successful_terminal(&first));
+        assert_terminal_wire_round_trip_exact(&fixtures::failed_preflight_terminal(&first));
+        assert_terminal_wire_round_trip_exact(&fixtures::rolled_back_terminal(&first, &keys));
+        assert_terminal_wire_round_trip_exact(&fixtures::degraded_terminal(&first, &keys));
+        // GROUP PUSH over the first's snapshot (parent == the first).
+        let group = fixtures::group_intent(
+            "deploy-rtg",
+            "t1",
+            "g",
+            first.deployment_id(),
+            &first.resulting_snapshot(),
+            &keys,
+            &keys,
+        );
+        let wire_g = LedgerIntentWire::from(&group);
+        let back_g = {
+            let json = serde_json::to_string(&wire_g).unwrap();
+            let wire2: LedgerIntentWire = serde_json::from_str(&json).unwrap();
+            wire2.into_domain().expect("the group intent converts")
+        };
+        assert_eq!(
+            back_g, group,
+            "the group intent round-trips exactly (order included)"
+        );
+        assert_eq!(
+            wire_g
+                .slots
+                .iter()
+                .map(|r| r.slot_id.clone())
+                .collect::<Vec<_>>(),
+            keys,
+            "the group intent's rows emit the domain's deployment order"
+        );
+        assert_terminal_wire_round_trip_exact(&fixtures::successful_terminal(&group));
+        assert_terminal_wire_round_trip_exact(&fixtures::failed_preflight_terminal(&group));
+        assert_terminal_wire_round_trip_exact(&fixtures::rolled_back_terminal(&group, &keys));
+        assert_terminal_wire_round_trip_exact(&fixtures::degraded_terminal(&group, &keys));
+    }
+
     // ---- THE SELF-CONTAINED TAMPER MATRIX (the new projections) ----------
 
     /// Mutate one wire projection at a time and assert the wire → domain
@@ -914,37 +1240,26 @@ mod tests {
     #[test]
     fn intent_wire_tamper_matrix_fails_closed() {
         let keys = vec![slot(0), slot(1), slot(2)];
-        // 1. Duplicate slot key in the JSON (ambiguous map) is refused by
-        // the strict reader (a map-visitor deserializer rejects the
-        // duplicate — the last-wins collapse could never be read).
-        let wire = valid_intent_wire(&keys, "deploy-tamper");
+        // 1. A duplicate slot ROW in the wire's `slots` ARRAY is refused by
+        // the CONVERSION with an integrity-class error naming the slot (the
+        // row fold detects the duplicate explicitly — ambiguous JSON is
+        // never last-wins on the wire boundary; the array shape needs no
+        // deserialization-level visitor).
+        let mut wire = valid_intent_wire(&keys, "deploy-tamper");
+        wire.slots.push(wire.slots[0].clone());
+        let err = wire.clone().into_domain().unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate slot") && err.to_string().contains("slot-0"),
+            "a duplicated slot row must be refused naming the slot, got: {err}"
+        );
+        assert!(
+            matches!(err, crate::error::Error::Integrity(_)),
+            "a duplicate slot row is an INTEGRITY-class refusal"
+        );
+        // The duplicate shape still DESERIALIZES (the wire keeps the raw
+        // rows; the verifying conversion is the refusal point).
         let json = serde_json::to_string(&wire).unwrap();
-        {
-            let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
-            let slots = value.get_mut("slots").unwrap().as_object_mut().unwrap();
-            let first = slots.keys().next().unwrap().clone();
-            // TEXT-LEVEL duplication of ONE entry: insert a second copy of the
-            // first slot right after it (serde_json maps cannot hold two
-            // identical keys, so the duplicate must be injected into the raw
-            // JSON text).
-            let first_start = json.find(&format!("\"{first}\":")).unwrap();
-            let first_end = json.find(&format!("\"{}\":", "slot-1")).unwrap();
-            let dup_entry_text = &json[first_start..first_end]; // includes its trailing comma
-            let dup_json = format!(
-                "{}{},{}",
-                &json[..first_start],
-                dup_entry_text,
-                &json[first_start..]
-            );
-            assert_ne!(
-                dup_json, json,
-                "the duplicate entry must actually be injected"
-            );
-            assert!(
-                serde_json::from_str::<LedgerIntentWire>(&dup_json).is_err(),
-                "a duplicate slot key must be refused by the strict reader"
-            );
-        }
+        assert!(serde_json::from_str::<LedgerIntentWire>(&json).is_ok());
 
         // 2. Empty slots table.
         let mut wire = valid_intent_wire(&keys, "deploy-tamper");
@@ -953,8 +1268,8 @@ mod tests {
 
         // 3. No Deploy slot.
         let mut wire = valid_intent_wire(&keys, "deploy-tamper");
-        for p in wire.slots.values_mut() {
-            p.action = SlotActionWire::Inherit;
+        for row in &mut wire.slots {
+            row.action = SlotActionWire::Inherit;
         }
         assert!(
             wire.clone().into_domain().is_err(),
@@ -966,7 +1281,11 @@ mod tests {
         // push (group None) an Inherit slot must be refused.
         let mut wire = valid_intent_wire(&keys, "deploy-tamper");
         let first_key = keys[0].clone();
-        wire.slots.get_mut(&first_key).unwrap().action = SlotActionWire::Inherit;
+        wire.slots
+            .iter_mut()
+            .find(|r| r.slot_id == first_key)
+            .unwrap()
+            .action = SlotActionWire::Inherit;
         assert!(
             wire.clone().into_domain().is_err(),
             "group None with an Inherit slot refused (a full push requires every slot Deploy)"
@@ -1010,36 +1329,30 @@ mod tests {
         let keys = vec![slot(0)];
         // Successful with outcomes is refused (payload-free).
         let mut wire = valid_terminal_wire(&keys, "deploy-t", DeploymentStatus::Successful);
-        wire.outcomes.insert(
-            keys[0].clone(),
-            SlotResult {
-                slot_id: keys[0].clone(),
-                outcome: SlotOutcomeKind::Activated,
-                observation: ObservationWire::Known(ObservedGenerationWire {
-                    generation: test_generation_id("g"),
-                }),
-                compensated: false,
-                error: None,
-            },
-        );
+        wire.outcomes.push(SlotResult {
+            slot_id: keys[0].clone(),
+            outcome: SlotOutcomeKind::Activated,
+            observation: ObservationWire::Known(ObservedGenerationWire {
+                generation: test_generation_id("g"),
+            }),
+            compensated: false,
+            error: None,
+        });
         assert!(
             wire.clone().into_domain().is_err(),
             "a Successful terminal must carry NO outcomes"
         );
         // FailedPreflight with outcomes is refused.
         let mut wire = valid_terminal_wire(&keys, "deploy-t", DeploymentStatus::FailedPreflight);
-        wire.outcomes.insert(
-            keys[0].clone(),
-            SlotResult {
-                slot_id: keys[0].clone(),
-                outcome: SlotOutcomeKind::Failed,
-                observation: ObservationWire::Known(ObservedGenerationWire {
-                    generation: test_generation_id("g"),
-                }),
-                compensated: false,
-                error: Some("boom".to_string()),
-            },
-        );
+        wire.outcomes.push(SlotResult {
+            slot_id: keys[0].clone(),
+            outcome: SlotOutcomeKind::Failed,
+            observation: ObservationWire::Known(ObservedGenerationWire {
+                generation: test_generation_id("g"),
+            }),
+            compensated: false,
+            error: Some("boom".to_string()),
+        });
         assert!(
             wire.clone().into_domain().is_err(),
             "FailedPreflight must carry NO outcomes"
@@ -1215,7 +1528,7 @@ mod tests {
         // A Degraded terminal covering only ONE of the two selected slots is
         // refused (the outcomes must EXACTLY cover the selected membership).
         let mut t = valid_terminal_wire(&keys, "deploy-cov", DeploymentStatus::Degraded);
-        t.outcomes.remove(&keys[0]);
+        t.outcomes.retain(|row| row.slot_id != keys[0]);
         let lines = format!(
             "{}\n{}\n",
             serde_json::to_string(&LedgerLine::Intent(valid_intent_wire(&keys, "deploy-cov")))
@@ -1282,17 +1595,12 @@ mod tests {
             disposition,
             None,
         );
-        let wire = LedgerTerminalWire::to_wire(
-            group_intent.deployment_id(),
-            group_intent.target(),
-            &terminal,
-        );
+        let wire = LedgerTerminalWire::to_wire(group_intent.deployment_id(), &terminal);
         let lines = format!(
             "{}\n{}\n{}\n{}\n",
             serde_json::to_string(&LedgerLine::Intent(LedgerIntentWire::from(&head))).unwrap(),
             serde_json::to_string(&LedgerLine::Terminal(LedgerTerminalWire::to_wire(
                 head.deployment_id(),
-                head.target(),
                 &fixtures::successful_terminal(&head),
             )))
             .unwrap(),

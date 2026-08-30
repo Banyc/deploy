@@ -294,7 +294,7 @@ impl LocalStore {
         // A terminal the strict reader would reject is NEVER written (the
         // append is atomic; the ledger bytes stay unchanged on rejection).
         validate_terminal_append(target, &entries, entry, terminal)?;
-        let wire = LedgerTerminalWire::to_wire(deployment_id, &entry.target, terminal);
+        let wire = LedgerTerminalWire::to_wire(deployment_id, terminal);
         let line = serde_json::to_string(&LedgerEventWire::Terminal(wire))
             .map_err(|e| Error::store(format!("serialize ledger terminal: {e}")))?;
         self.append_ledger_atomic(target, deployment_id.as_str(), &line)
@@ -781,7 +781,7 @@ mod tests {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         let i = intent("deploy-orphan", target);
         let t = fixtures::successful_terminal(&i);
-        let wire = crate::ledger::LedgerTerminalWire::to_wire(i.deployment_id(), i.target(), &t);
+        let wire = crate::ledger::LedgerTerminalWire::to_wire(i.deployment_id(), &t);
         let line = serde_json::to_string(&LedgerLine::Terminal(wire)).unwrap();
         std::fs::write(&p, format!("{line}\n")).unwrap();
         let err = store.read_ledger(target).unwrap_err();

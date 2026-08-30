@@ -38,10 +38,11 @@ use std::ops::Index;
 //
 // THE TABLE IS ORDERED: iteration (`keys` / `values` / `iter`) is in
 // INSERTION order — the DEPLOYMENT order — never sorted by slot id. The
-// wire's `slot_ids` is the authoritative deployment order (the same set the
-// commit marker `slots` payload records), and the wire → domain conversion
-// builds the table from that SEQUENCE, so the round trip preserves the
-// exact `slot_ids` order instead of silently re-sorting it.
+// wire's `slots`/`outcomes` ROW ARRAYS carry the authoritative deployment
+// order (the same set the commit marker `slots` payload records), and the
+// wire → domain conversions fold the rows IN ORDER into the table, so the
+// round trip preserves the exact row order instead of silently re-sorting
+// it.
 
 /// A PRIVATE ordered slot→value map: a `Vec<(SlotId, T)>` keeps the
 /// INSERTION SEQUENCE (the deployment order) and a `BTreeMap<SlotId, usize>`
@@ -333,15 +334,15 @@ mod tests {
     }
 
     /// A valid base intent wire over the given membership (the ordering
-    /// property's agreeing base — the wire's slot table carries the full
-    /// result once).
+    /// property's agreeing base — the wire's slot ROW ARRAY carries the
+    /// full result once, in row order).
     fn agreeing_intent(keys: &[SlotId]) -> LedgerIntentWire {
         let domain = crate::testutil::fixtures::full_intent("deploy-w", "t1", keys, &[]);
         LedgerIntentWire::from(&domain)
     }
 
     /// UNIQUE slot ids in an ARBITRARY PERMUTATION: a shuffled non-empty
-    /// subset of the slot universe — the wire's `slot_ids` is the
+    /// subset of the slot universe — the wire's `slots` ROW ORDER is the
     /// authoritative deployment order, so the ordering property must cover
     /// orders that are NOT sorted by id.
     fn slot_ids_permutation() -> impl Strategy<Value = Vec<SlotId>> {
@@ -432,11 +433,11 @@ mod tests {
 
     proptest! {
         // THE ORDERING PROPERTY (the user's requirement): the wire's
-        // `slot_ids` is the AUTHORITATIVE deployment order, and the domain
-        // table must PRESERVE it exactly — never silently re-sort by slot
-        // id. Over UNIQUE slot ids in ARBITRARY PERMUTATIONS, the wire →
-        // domain → wire round trip must reproduce the EXACT `slot_ids`
-        // sequence (not the sorted order): the domain table iterates in the
+        // `slots` ROW ARRAY is the AUTHORITATIVE deployment order, and the
+        // domain table must PRESERVE it exactly — never silently re-sort by
+        // slot id. Over UNIQUE slot ids in ARBITRARY PERMUTATIONS, the wire
+        // → domain → wire round trip must reproduce the EXACT `slots` row
+        // order (not the sorted order): the domain table iterates in the
         // wire's sequence, the domain → wire re-expansion emits the same
         // sequence, and the full JSON round trip preserves it. Bounded 16
         // cases, fixed seed 0x5EED_5EED (house style), no persistence.
@@ -458,8 +459,16 @@ mod tests {
             let expected: std::collections::BTreeSet<SlotId> = keys.iter().cloned().collect();
             assert_eq!(domain.full_membership(), expected);
             assert_eq!(domain.selected_membership(), expected);
-            // The domain → wire re-expansion emits the SAME full slot table
-            // (the complete result is stored once; the map round-trips).
+            // THE DOMAIN KEEPS THE EXACT DEPLOYMENT ORDER (keys() iterates
+            // in the wire's row order, never sorted by id).
+            assert_eq!(
+                domain.slots().keys().cloned().collect::<Vec<_>>(),
+                keys,
+                "the round-tripped domain iterates in the EXACT deployment order"
+            );
+            // The domain → wire re-expansion emits the SAME row-ordered
+            // slots (the complete result is stored once; the array
+            // round-trips).
             let wire2 = LedgerIntentWire::from(&domain);
             assert_eq!(wire2.slots, wire.slots);
             // The full WIRE JSON round trip (serialize → deserialize) too.

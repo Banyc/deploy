@@ -4725,15 +4725,11 @@ fn integrity_incoming_record_field_deletion_fails_closed() {
     }
     // The TERMINAL line: every required field rejected individually. The
     // optional members (`outcomes` on a Successful terminal, `reason`)
-    // carry serde defaults — deleting them stays valid.
+    // carry serde defaults — deleting them stays valid. The redundant
+    // `target` member is GONE from the v10 wire (the enclosing entry owns
+    // target).
     let terminal_line = lines[1].clone();
-    for field in [
-        "deployment_id",
-        "target",
-        "status",
-        "recorded_at",
-        "intent_digest",
-    ] {
+    for field in ["deployment_id", "status", "recorded_at", "intent_digest"] {
         let mut v: serde_json::Value = serde_json::from_str(terminal_line.trim()).unwrap();
         v.as_object_mut().unwrap().remove(field);
         let tampered = serde_json::to_string(&v).unwrap();

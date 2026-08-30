@@ -14,17 +14,22 @@
 /// version themselves separately from the configuration format, so bumping
 /// one never invalidates the other.
 ///
-/// The current format is version 8 (the ONLY version writers emit and
-/// readers accept): the intent freezes the COMPLETE resulting snapshot
-/// (`resulting_snapshot` — every target slot's generation+artifact+binding,
-/// keys = full membership) plus the selected slots' pre-push states;
-/// the intent wire drops `selected_membership`/`full_membership`/`desired`/
-/// `bindings`; the terminal wire drops `full_membership`. The deployment
-/// records still use the canonical placement-slot-keyed shape
-/// (`BTreeMap<SlotId, _>` maps, nested artifact/generation refs), carry
-/// the exclusive owning target + the optional rollout group, and the
-/// STRICT WIRE OBSERVATIONS — the pre-push assignments' artifact and the
-/// per-slot outcomes' post-mutation observation serialize as the
+/// The current format is version 10 (the ONLY version writers emit and
+/// readers accept): the intent freezes the COMPLETE resulting snapshot as
+/// an ORDERED ROW ARRAY (`slots` — each row OWNS its slot id and its
+/// plan-minted result + Deploy/Inherit action, in DEPLOYMENT ORDER, never
+/// sorted by id), the terminal's per-slot outcomes are the SAME row-array
+/// shape (`outcomes` — each row owns its slot id, in deployment order),
+/// and the terminal wire NO LONGER carries the redundant `target` member
+/// (the enclosing entry owns target). The row arrays make the WIRE
+/// ORDER-CARRYING (a JSON object sorts its keys — order could never
+/// survive a round trip) and slot-identity-owning (the key and any
+/// row-internal id can never disagree); the wire → domain conversions
+/// REFUSE a duplicate row explicitly (ambiguous JSON is never last-wins)
+/// and fold the rows in FILE ORDER into the domain's ordered tables. The
+/// deployment records still use the canonical placement-slot-keyed identity
+/// and the STRICT WIRE OBSERVATIONS — the pre-push assignments' artifact
+/// and the per-slot outcomes' post-mutation observation serialize as the
 /// ADJACENTLY-TAGGED [`crate::ledger::records::ObservationWire`]
 /// (`state` + `value`, `deny_unknown_fields`) with the STRICT payload
 /// structs [`crate::ledger::records::ArtifactRefWire`] /
@@ -37,7 +42,24 @@
 /// current one is REJECTED on read (no compatibility fallback), so a
 /// record is interpreted only under exactly the schema that wrote it:
 ///
-/// * version 9 (CURRENT): the INTENT record FREEZES the COMPLETE resulting
+/// * version 10 (CURRENT): the INTENT record FREEZES the COMPLETE result
+///   as an ORDERED ROW ARRAY — `slots: [PlannedSlotRowWire]` (each row
+///   owns its slot id + plan-minted result + action, in DEPLOYMENT
+///   ORDER — the exact order the user recorded, never re-sorted), the
+///   TERMINAL record carries its per-slot outcomes as the SAME ROW-ARRAY
+///   shape (`outcomes: [SlotOutcomeRowWire]`, each row owning its slot
+///   id), the redundant `target` member of the terminal wire is REMOVED
+///   (the enclosing entry owns target), and both wire structs carry
+///   `deny_unknown_fields` (a stray/unknown member is refused on
+///   deserialization). The wire → domain conversions fold the rows in
+///   FILE ORDER and REFUSE a duplicate slot row with an integrity error
+///   naming it — the wire is order-carrying AND duplicate-rejecting, and
+///   the intent digest (the sha256 of the canonical wire bytes) is
+///   order-sensitive (two intents differing only in deployment order now
+///   hash differently). REJECTED on read: a version 9 record's intent
+///   carries `slots` as an object-keyed MAP (its order was lost) and its
+///   terminal still carries `target`, so it never loads under v10.
+/// * version 9: the INTENT record FREEZES the COMPLETE resulting
 ///   snapshot (`resulting_snapshot: TargetSnapshotWire` — every target slot's
 ///   generation+artifact+binding, keys = full membership) plus the selected
 ///   slots' pre-push states (`selected` table); the intent wire DROPS the
@@ -103,7 +125,7 @@
 /// frozen bindings are REQUIRED, no serde default). A hypothetical
 /// pre-rekeying shape that keyed these maps by server ID with flat
 /// artifact fields is NOT the current schema and never loads.
-pub(crate) const LEDGER_SCHEMA_VERSION: u32 = 9;
+pub(crate) const LEDGER_SCHEMA_VERSION: u32 = 10;
 
 /// The `pins.json` record format version (`Pins.schema_version`). Pins are
 /// durable, store-global retention anchors for artifact CONTENT ONLY (see

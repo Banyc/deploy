@@ -1465,7 +1465,6 @@ interval_seconds = 0
         // resolves it (the digest is the ONE binding — no payload to drift).
         let terminal_wire = crate::ledger::LedgerTerminalWire::to_wire(
             intent.deployment_id(),
-            intent.target(),
             &crate::testutil::fixtures::successful_terminal(&intent),
         );
         let mut tampered = terminal_wire.clone();

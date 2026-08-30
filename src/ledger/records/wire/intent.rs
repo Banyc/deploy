@@ -2,25 +2,33 @@
 //! kinds — intent"): the durable intent WIRE shape ([`LedgerIntentWire`])
 //! and the in-memory push report ([`LedgerIntentReport`]).
 //!
-//! Since schema v9 the intent FREEZES the COMPLETE RESULT in ONE full slot
-//! table: `slots` carries every slot the resulting snapshot covers, each
-//! with its plan-minted RESULT ([`PlannedSlotWire`]) and its ACTION
-//! ([`SlotActionWire`] — `Deploy` with the observed pre-push state, or
-//! `Inherit`). The full membership = `slots.keys()`, the selected
-//! membership = the `Deploy` slots, and the resulting snapshot = each
-//! slot's `result` — the DOMAIN derives all of them
-//! ([`crate::kernel::intent::DeploymentIntent`]); the wire carries NO
+//! Since schema v10 the intent FREEZES the COMPLETE RESULT in ONE full slot
+//! ROW ARRAY: `slots` carries every slot the resulting snapshot covers as
+//! an ORDERED ARRAY OF ROWS ([`PlannedSlotRowWire`]), each row OWNING its
+//! slot id and carrying its plan-minted RESULT ([`PlannedSlotWire`]) and
+//! its ACTION ([`SlotActionWire`] — `Deploy` with the observed pre-push
+//! state, or `Inherit`). The ROW ORDER is the DEPLOYMENT ORDER (the
+//! domain's insertion order — never sorted by slot id), so the wire can
+//! carry the exact order the user recorded. The full membership = the
+//! rows' slot ids, the selected membership = the `Deploy` slots, and the
+//! resulting snapshot = each row's `result` — the DOMAIN derives all of
+//! them ([`crate::kernel::intent::DeploymentIntent`]); the wire carries NO
 //! duplicated projection (no `desired`/`bindings`/`selected_membership`/
-//! `full_membership`/`resulting_snapshot`).
+//! `full_membership`/`resulting_snapshot`) and NO object-keyed map (a JSON
+//! object sorts its keys — order could never survive a round trip).
 //!
 //! The VERIFYING CONVERSION ([`LedgerIntentWire::into_domain`]) scalar-gates
-//! every field and enforces the self-contained construction rules (at least
-//! one `Deploy` slot; `group: None` → every slot `Deploy`) through the
-//! kernel's validated domain constructor
-//! ([`crate::kernel::intent::from_wire`]); the parent-congruence rules
-//! (inherited slots reproduce the parent's snapshot entries) are validated
-//! at plan time and best-effort at read where the parent entry is still
-//! resolvable.
+//! every field, REFUSES A DUPLICATE SLOT ROW explicitly (the row fold
+//! names the duplicate slot — ambiguous JSON is never last-wins), and
+//! enforces the self-contained construction rules (at least one `Deploy`
+//! slot; `group: None` → every slot `Deploy`) through the kernel's
+//! validated domain constructor ([`crate::kernel::intent::from_wire`]);
+//! the parent-congruence rules (inherited slots reproduce the parent's
+//! snapshot entries) are validated at plan time and best-effort at read
+//! where the parent entry is still resolvable. The row fold inserts each
+//! row in FILE ORDER into the ordered domain table, so the round trip
+//! `valid domain → wire → domain` is EXACTLY the original domain, order
+//! included.
 
 use crate::error::{Error, Result};
 use crate::identity::{
@@ -33,7 +41,7 @@ use crate::kernel::snapshot::{PreviousGeneration, SnapshotSlot};
 use crate::ledger::records::NonEmptySlotTable;
 use crate::ledger::{ArtifactRefWire, ObservationWire, PhysicalBinding};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// THE STRICT WIRE PAYLOAD of one slot's plan-minted RESULT: generation +
 /// artifact + physical binding, `deny_unknown_fields`.
@@ -106,12 +114,30 @@ impl From<&PlannedSlot> for PlannedSlotWire {
     }
 }
 
-/// The WIRE shape of a durable intent line — the RAW serde form the
-/// ledger's JSONL carries. Schema v9: THE COMPLETE RESULT IS STORED ONCE in
-/// the ONE full slot table (`slots`); every membership and the resulting
-/// snapshot are DERIVED views of it (the domain derives them; the wire
-/// carries no duplicated projection).
+/// The WIRE ROW of one planned slot INSIDE the intent's `slots` ARRAY: the
+/// ROW OWNS ITS SLOT ID (the slot identity lives in the row, never in an
+/// object key — the key and any row-internal id can never disagree). The
+/// ROW ORDER inside the array IS the deployment order (the wire carries
+/// the domain's insertion order — never sorted by slot id).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlannedSlotRowWire {
+    pub slot_id: SlotId,
+    pub result: SnapshotSlotWire,
+    pub action: SlotActionWire,
+}
+
+/// The WIRE shape of a durable intent line — the RAW serde form the
+/// ledger's JSONL carries. Schema v10: THE COMPLETE RESULT IS STORED ONCE in
+/// the ONE full slot ROW ARRAY (`slots`); every membership and the
+/// resulting snapshot are DERIVED views of it (the domain derives them;
+/// the wire carries no duplicated projection). The ROW ORDER IS THE
+/// DEPLOYMENT ORDER — a JSON object (whose keys sort) could never carry
+/// it; the row array preserves the exact order the user recorded through
+/// the round trip. `deny_unknown_fields`: a line with stray/unknown
+/// members is refused on deserialization, never silently accepted.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LedgerIntentWire {
     pub deployment_schema_version: u32,
     pub deployment_id: DeploymentId,
@@ -125,46 +151,19 @@ pub struct LedgerIntentWire {
     /// slot of the target (a full push — every slot must be `Deploy`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
-    /// THE FULL SLOT TABLE: every slot the resulting snapshot covers, each
-    /// with its plan-minted result and its action (Deploy / Inherit). Its
-    /// keys ARE the full membership — there is no separate
+    /// THE FULL SLOT ROW ARRAY: every slot the resulting snapshot covers in
+    /// DEPLOYMENT ORDER, each row owning its slot id and carrying its
+    /// plan-minted result and its action (Deploy / Inherit). The rows' slot
+    /// ids ARE the full membership — there is no separate
     /// full_membership/selected_membership/resulting_snapshot projection.
-    /// REQUIRED and DUPLICATE-FREE (a map-visitor deserializer refuses a
-    /// duplicate — ambiguous JSON can never read as a valid intent).
-    #[serde(deserialize_with = "deserialize_unique_slots")]
-    pub slots: BTreeMap<SlotId, PlannedSlotWire>,
+    /// REQUIRED, DUPLICATE-FREE, and ORDER-PRESERVING: the wire → domain
+    /// conversion REFUSES a duplicate slot row explicitly (the row fold
+    /// names the duplicate — ambiguous JSON can never read as a valid
+    /// intent) and inserts the rows in file order into the ordered domain
+    /// table.
+    pub slots: Vec<PlannedSlotRowWire>,
     pub behavior_sha256: String,
     pub attempted_at: String,
-}
-
-fn deserialize_unique_slots<'de, D>(
-    deserializer: D,
-) -> std::result::Result<BTreeMap<SlotId, PlannedSlotWire>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    struct UniqueSlotsVisitor;
-    impl<'de> serde::de::Visitor<'de> for UniqueSlotsVisitor {
-        type Value = BTreeMap<SlotId, PlannedSlotWire>;
-        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            f.write_str("a map with unique slot keys")
-        }
-        fn visit_map<M>(self, mut access: M) -> std::result::Result<Self::Value, M::Error>
-        where
-            M: serde::de::MapAccess<'de>,
-        {
-            let mut entries = BTreeMap::new();
-            while let Some((slot, entry)) = access.next_entry::<SlotId, PlannedSlotWire>()? {
-                if entries.insert(slot.clone(), entry).is_some() {
-                    return Err(serde::de::Error::custom(format!(
-                        "duplicate intent slot '{slot}'"
-                    )));
-                }
-            }
-            Ok(entries)
-        }
-    }
-    deserializer.deserialize_map(UniqueSlotsVisitor)
 }
 
 impl LedgerIntentWire {
@@ -213,20 +212,32 @@ impl LedgerIntentWire {
                 self.deployment_id
             )));
         }
-        // Build the domain planned-slot table, converting the wire actions
-        // (the strict pre-push observation → the domain observation).
+        // THE ROW-ARRAY FOLD (order-preserving + duplicate-rejecting): each
+        // row is folded IN FILE ORDER into the ordered domain table (insert
+        // APPENDS at the end), so the round-tripped domain's keys == the
+        // wire's row order — the deployment order — never a re-sort. A row
+        // whose slot id was already seen is REFUSED with an integrity-class
+        // error naming the duplicate (ambiguous JSON is never last-wins on
+        // the wire boundary).
+        let mut seen: BTreeSet<SlotId> = BTreeSet::new();
         let mut entries: Vec<(SlotId, PlannedSlot)> = Vec::with_capacity(self.slots.len());
-        for (key, wire) in &self.slots {
-            let result: SnapshotSlot = wire.result.clone().into();
-            let action = match &wire.action {
+        for row in self.slots {
+            if !seen.insert(row.slot_id.clone()) {
+                return Err(Error::integrity(format!(
+                    "intent {}: duplicate slot '{}' in the wire rows — the slot table must be duplicate-free (the wire never last-wins ambiguous JSON)",
+                    self.deployment_id, row.slot_id
+                )));
+            }
+            let result: SnapshotSlot = row.result.into();
+            let action = match row.action {
                 SlotActionWire::Inherit => SlotAction::Inherit,
                 SlotActionWire::Deploy { pre_push } => {
                     let obs: crate::ledger::Observation<PreviousGeneration> =
-                        convert_pre_push(key, pre_push.clone())?;
+                        convert_pre_push(&row.slot_id, pre_push)?;
                     SlotAction::Deploy { pre_push: obs }
                 }
             };
-            entries.push((key.clone(), PlannedSlot::new(result, action)));
+            entries.push((row.slot_id, PlannedSlot::new(result, action)));
         }
         let slots = NonEmptySlotTable::build(entries)
             .map_err(|e| Error::integrity(format!("intent {}: {e}", self.deployment_id)))?;
@@ -283,10 +294,26 @@ impl From<crate::ledger::Observation<PreviousGeneration>>
 
 impl From<&DeploymentIntent> for LedgerIntentWire {
     fn from(i: &DeploymentIntent) -> Self {
-        let mut slots: BTreeMap<SlotId, PlannedSlotWire> = BTreeMap::new();
-        for (key, p) in i.slots().iter() {
-            slots.insert(key.clone(), PlannedSlotWire::from(p));
-        }
+        // THE ROW ARRAY EMITS THE DOMAIN'S INSERTION ORDER: iterate the
+        // ordered slot table (`keys()`/`iter()` — deployment order, never
+        // sorted by id), each row embedding its OWN slot id. The wire's
+        // row order is exactly the domain's deployment order, so the round
+        // trip `valid domain → wire → domain` reproduces the original
+        // domain exactly.
+        let slots: Vec<PlannedSlotRowWire> = i
+            .slots()
+            .iter()
+            .map(|(slot_id, p)| PlannedSlotRowWire {
+                slot_id: slot_id.clone(),
+                result: SnapshotSlotWire::from(p.result()),
+                action: match p.action() {
+                    SlotAction::Inherit => SlotActionWire::Inherit,
+                    SlotAction::Deploy { pre_push } => SlotActionWire::Deploy {
+                        pre_push: ObservationWire::from(pre_push.clone()),
+                    },
+                },
+            })
+            .collect();
         LedgerIntentWire {
             deployment_schema_version: crate::ledger::LEDGER_SCHEMA_VERSION,
             deployment_id: i.deployment_id().clone(),

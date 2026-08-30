@@ -91,9 +91,11 @@ generation      = one placement slot's durable activation record on a server
 ledger line     = one physical JSONL line of `targets/<target>/ledger.jsonl`.
                   Exactly two kinds exist: the INTENT (appended BEFORE any
                   remote mutation: deployment id, target, group, the ONE full
-                  slot table — every slot's plan-minted result and its
-                  Deploy/Inherit action — the behavior digest, and the
-                  pre-push states — no status, no outcomes) and the TERMINAL
+                  slot ROW ARRAY — every slot's plan-minted result and its
+                  Deploy/Inherit action, each row OWNING its slot id, in
+                  DEPLOYMENT ORDER (never sorted by id) — the behavior
+                  digest, and the pre-push states — no status, no outcomes)
+                  and the TERMINAL
                   EVENT (appended once at completion: the status; a
                   SUCCESSFUL terminal is PAYLOAD-FREE, bound to its intent by
                   the canonical `intent_digest`). A merged entry (intent +
@@ -878,7 +880,7 @@ excluded: it is per-server live configuration, not a release property.
    *Guarantee*: the marker is write-once: `helper.write_commit_marker` installs it by exclusive create, and if a marker already exists it must match byte-for-byte (the payload is deterministic in the deployment ID, generation, and participating placement-slot set) or the rewrite fails integrity. A retried or concurrent commit can therefore never alter a recorded fact; a `pending_commit` recovery reusing the original deployment ID either creates the missing marker or confirms the recorded one byte-for-byte.
 6. **Deployment plan** — local `deployments/<id>/plan.json`.
    *Semantic*: what an attempt intended is fixed once recorded.
-   *Guarantee*: written once per unique deployment ID through `write_atomic_cas`; a same-ID conflicting rewrite fails instead of silently rewriting history (`store.write_plan`). The deployment's status is NOT part of this record and has NO separate transition stream: it is carried by the ledger's TERMINAL EVENT line, appended once per deployment — the terminal IS the status record, so there is no `results.json` and no `transitions.jsonl`. The attempt INTENT (the ledger's intent line, step 14) is persisted BEFORE any server mutation; the per-slot OUTCOMES live in the terminal event's `outcomes` map, never in a separate outcomes file.
+   *Guarantee*: written once per unique deployment ID through `write_atomic_cas`; a same-ID conflicting rewrite fails instead of silently rewriting history (`store.write_plan`). The deployment's status is NOT part of this record and has NO separate transition stream: it is carried by the ledger's TERMINAL EVENT line, appended once per deployment — the terminal IS the status record, so there is no `results.json` and no `transitions.jsonl`. The attempt INTENT (the ledger's intent line, step 14) is persisted BEFORE any server mutation; the per-slot OUTCOMES live in the terminal event's `outcomes` ROW ARRAY (each row owning its slot id, in deployment order — never a JSON object whose keys sort), never in a separate outcomes file.
 7. **Deployment history and rollback snapshots** — `targets/<target>/ledger.jsonl`.
    *Semantic*: recorded attempts (immutable intent lines, no status, no outcomes) and terminal events (the status, the per-slot outcomes, and — when successful — the complete rollback snapshot) are append-only facts; entries are never edited or reordered.
    *Guarantee*: crash-atomic whole-ledger appends under the target lock (`store.append_intent`, `store.append_terminal` — one atomic line per deployment, temp + fsync + rename). The terminal event carries the deployment's status (there is no separate status-transition stream); the LATEST status is the terminal's status (`store.latest_status`, DERIVED from the ledger — never a mutable marker file). Snapshots are KEYED BY DEPLOYMENT ID: a successful terminal's rollback payload IS the snapshot, and `deploy push <target> <deployment-id>` resolves it from the ledger. There is no `refs/last-successful` (the latest successful entry is DERIVED from the ledger) and no separate snapshot log.
@@ -921,7 +923,7 @@ content never suppresses required remote repair.
 `--dry-run` materializes and inspects local content and performs read-only remote status queries in disposable staging. It does not publish local objects, recover remote transactions, upload, publish remotely, activate, execute application verification, write history, or rotate. Instead, it reports any recovery that a real push would have to perform.
 
 ## Snapshot history and rollback
-Every deployment attempt records TWO lines in the target's ONE ledger: its immutable INTENT (target, the ONE full slot table — each slot's plan-minted result and its Deploy/Inherit action — the behavior contract, and the pre-push states — carrying NO status and NO outcomes) and its TERMINAL EVENT (the status; the per-slot outcomes for failed/rolled-back/degraded attempts; a SUCCESSFUL terminal is PAYLOAD-FREE — the deployment's snapshot resolves from the intent's own slot table). The status lives in the terminal event, not in a separate transition stream: there is no `transitions.jsonl` and no mutable progress marker file. Assignment relationships are expressed through the canonical model types (`ArtifactRef` = release+variant+tree, `GenerationRef` = generation + placement-slot assignment); every per-location map is keyed by the deployment slot ID. Every INTENT line carries `deployment_schema_version = LEDGER_SCHEMA_VERSION` and readers accept ONLY that version: an intent line with any other `deployment_schema_version` is refused at read time with an error naming the version (fail closed — a record from a different schema is never silently interpreted; a terminal line whose status/rollback shape cannot be converted is refused the same way). The wire examples below are RENDERED from the real wire records by the doc-example generator (`src/ledger/records/example.rs`) — they are byte-equal to the generator's output (pinned by `tests::docs_examples_match_generated_wire`), so they can never drift from the current wire: the intent's `deployment_schema_version` IS the current `LEDGER_SCHEMA_VERSION`, the strict wire observations are adjacently tagged (`state` + `value`, `deny_unknown_fields`), the complete result is stored ONCE in the intent's full slot table (`slots`, no duplicated membership/rollback projections), and the successful terminal is payload-free, bound to its intent by `intent_digest` (the snapshot resolves from the intent — keyed by the deployment id).
+Every deployment attempt records TWO lines in the target's ONE ledger: its immutable INTENT (target, the ONE full slot ROW ARRAY — each slot's plan-minted result and its Deploy/Inherit action, each row OWNING its slot id, in DEPLOYMENT ORDER — the behavior contract, and the pre-push states — carrying NO status and NO outcomes) and its TERMINAL EVENT (the status; the per-slot outcomes ROW ARRAY for failed/rolled-back/degraded attempts; a SUCCESSFUL terminal is PAYLOAD-FREE — the deployment's snapshot resolves from the intent's own slot table). The status lives in the terminal event, not in a separate transition stream: there is no `transitions.jsonl` and no mutable progress marker file. Assignment relationships are expressed through the canonical model types (`ArtifactRef` = release+variant+tree, `GenerationRef` = generation + placement-slot assignment); every per-location map is keyed by the deployment slot ID. Every INTENT line carries `deployment_schema_version = LEDGER_SCHEMA_VERSION` and readers accept ONLY that version: an intent line with any other `deployment_schema_version` is refused at read time with an error naming the version (fail closed — a record from a different schema is never silently interpreted; a terminal line whose status/rollback shape cannot be converted is refused the same way). The wire examples below are RENDERED from the real wire records by the doc-example generator (`src/ledger/records/example.rs`) — they are byte-equal to the generator's output (pinned by `tests::docs_examples_match_generated_wire`), so they can never drift from the current wire: the intent's `deployment_schema_version` IS the current `LEDGER_SCHEMA_VERSION`, the strict wire observations are adjacently tagged (`state` + `value`, `deny_unknown_fields`), the complete result is stored ONCE in the intent's full slot ROW ARRAY (`slots`, each row owning its slot id, in DEPLOYMENT ORDER — the terminal's outcomes use the same row-array shape, and the terminal wire carries NO `target` member: the enclosing entry owns target), and the successful terminal is payload-free, bound to its intent by `intent_digest` (the snapshot resolves from the intent — keyed by the deployment id).
 
 <!-- LEDGER WIRE EXAMPLES: generated by src/ledger/records/example.rs (the
      docs-match test byte-compares these blocks against the generator — do
@@ -930,11 +932,12 @@ Every deployment attempt records TWO lines in the target's ONE ledger: its immut
 ```json
 {
   "kind": "intent",
-  "deployment_schema_version": 9,
+  "deployment_schema_version": 10,
   "deployment_id": "deploy-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b",
   "target": "production",
-  "slots": {
-    "p1": {
+  "slots": [
+    {
+      "slot_id": "p1",
       "result": {
         "generation": "gen-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b",
         "artifact": {
@@ -954,7 +957,8 @@ Every deployment attempt records TWO lines in the target's ONE ledger: its immut
         }
       }
     },
-    "p2": {
+    {
+      "slot_id": "p2",
       "result": {
         "generation": "gen-0290a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b",
         "artifact": {
@@ -974,7 +978,8 @@ Every deployment attempt records TWO lines in the target's ONE ledger: its immut
         }
       }
     },
-    "p3": {
+    {
+      "slot_id": "p3",
       "result": {
         "generation": "gen-0390a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b",
         "artifact": {
@@ -994,7 +999,7 @@ Every deployment attempt records TWO lines in the target's ONE ledger: its immut
         }
       }
     }
-  },
+  ],
   "behavior_sha256": "70e91105dab5197be955fb4a57416e3c70e91105dab5197be955fb4a57416e3c",
   "attempted_at": "2026-08-21T10:20:00Z"
 }
@@ -1004,18 +1009,17 @@ Every deployment attempt records TWO lines in the target's ONE ledger: its immut
 {
   "kind": "terminal",
   "deployment_id": "deploy-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b",
-  "target": "production",
   "status": "successful",
   "recorded_at": "2026-08-21T10:25:00Z",
-  "intent_digest": "7a7a754f030ed5542f2d1af621f44e2d2076ad6ed1ecbca89cd3a32dc3d3118d",
-  "outcomes": {},
+  "intent_digest": "92594bd379f377e0b64e740c51f0b5cdbb551ae5a4753f693928c709ae59b8f5",
+  "outcomes": [],
   "reason": "push completed"
 }
 ```
 
 <!-- END LEDGER WIRE EXAMPLES -->
 
-The successful chain contains only fully successful terminal events, KEYED BY THE DEPLOYMENT ID that produced them (`deploy push production <deployment-id>` restores exactly that deployment's stored state). Failed and degraded attempts remain visible through `deploy log production` (their ledger entries carry their terminals), but are not valid rollback sources (a failed deployment id never resolves). Each successful deployment's snapshot — RESOLVED from its intent's slot table (never stored in the terminal) — records every slot's generation AND the complete physical binding it had (`slots`, keyed by slot ID — each entry's `{generation, artifact, binding}`): exact rollback maps generations to slots by slot ID, so the recorded binding is what proves a slot still lives at the exact on-host location it was deployed onto.
+The successful chain contains only fully successful terminal events, KEYED BY THE DEPLOYMENT ID that produced them (`deploy push production <deployment-id>` restores exactly that deployment's stored state). Failed and degraded attempts remain visible through `deploy log production` (their ledger entries carry their terminals), but are not valid rollback sources (a failed deployment id never resolves). Each successful deployment's snapshot — RESOLVED from its intent's slot table (never stored in the terminal) — records every slot's generation AND the complete physical binding it had (the intent's `slots` row array — each row's `{slot_id, result: {generation, artifact, binding}}`, in deployment order): exact rollback maps generations to slots by slot ID, so the recorded binding is what proves a slot still lives at the exact on-host location it was deployed onto.
 
 A commit is authoritative only when the same deployment ID and placement-slot set are committed on every member. This lets a fresh or repaired local store re-verify its snapshot history against the servers instead of trusting an unverified local ledger.
 

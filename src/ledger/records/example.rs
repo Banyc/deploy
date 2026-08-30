@@ -154,7 +154,7 @@ pub(crate) fn canonical_doc_pair() -> (LedgerIntentWire, LedgerTerminalWire) {
         crate::kernel::terminal::TerminalDisposition::Successful,
         Some("push completed".to_string()),
     );
-    let terminal = LedgerTerminalWire::to_wire(&deployment_id, &target, &terminal_domain);
+    let terminal = LedgerTerminalWire::to_wire(&deployment_id, &terminal_domain);
     (intent, terminal)
 }
 
