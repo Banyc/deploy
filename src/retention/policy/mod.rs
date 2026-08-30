@@ -43,8 +43,8 @@ struct GenRecord {
 /// Compute the set of retained tree digests for one server under the slot's
 /// ONE policy: `retention` is the retention policy of the slot's OWNING
 /// VARIANT, resolved by the caller from the current configuration
-/// (`ProjectConfig::slot_retention`) — a single source, never a union across the
-/// slot's member targets, so membership changes cannot change retention. The
+/// (`ProjectConfig::slot_retention`) — a single source, never a union across
+/// targets, so membership changes cannot change retention. The
 /// durable pins declared in `deploy.toml` protect whole releases as before.
 /// Capacity headroom, by contrast, is a per-server policy declared on the
 /// server entry (`ServerDef.capacity`) and likewise resolved from the
@@ -163,7 +163,7 @@ pub fn compute_retained(
 /// Apply the slot's ONE retention policy (owned by its declaring variant) to
 /// every generation record on the server. The caller already resolved the
 /// policy from the slot's owning variant — there is no per-target policy and
-/// no union across member targets. The current generation's prior is
+/// no union across targets. The current generation's prior is
 /// protected whenever the policy sets `protect_previous`: it is the
 /// immediate rollback target, and the slot's single policy decides.
 fn retained_for_policy(

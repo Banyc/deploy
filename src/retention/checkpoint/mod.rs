@@ -1037,6 +1037,53 @@ interval_seconds = 0
         );
     }
 
+    /// A checkpoint on ONE target compacts ONLY that target's OWN ledger:
+    /// `checkpoint(t).affected_history == history_of(t)` — the per-target
+    /// ledger of every OTHER target is byte-for-byte untouched.
+    #[test]
+    fn checkpoint_affects_only_the_targets_own_ledger() {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let cfg = config_for(&dir);
+        // Two targets, each with its OWN per-target history (t1: deploy-0..2,
+        // t2: dep2-0..2).
+        let t1_ids = seed_history(&store, TARGET, "deploy", &[true, true, true]);
+        seed_history(&store, "t2", "dep2", &[true, true, true]);
+        let t2_before = store.read_ledger("t2").unwrap();
+
+        // Checkpoint t1 at its MIDDLE successful deployment (deploy-1): only
+        // t1's history is compacted to the suffix at/after that floor.
+        let checkpoint = &t1_ids[1];
+        let rep = run_checkpoint_unlocked(
+            &store,
+            &cfg,
+            TARGET,
+            &DeploymentId::parse(checkpoint).expect("canonical checkpoint id"),
+        )
+        .expect("checkpoint succeeds");
+        assert!(rep.established);
+        let t1_after = store.read_ledger(TARGET).unwrap();
+        assert_eq!(
+            t1_after.len(),
+            2,
+            "t1's ledger is compacted to the retained suffix"
+        );
+        assert_eq!(
+            t1_after[0].deployment_id.as_str(),
+            DeploymentId::parse(checkpoint)
+                .expect("canonical checkpoint id")
+                .as_str(),
+            "the retained suffix begins at the checkpoint deployment"
+        );
+        // t2's ledger is EXACTLY as before: a checkpoint on t1 never touches
+        // another target's history (affected history == the target's own).
+        assert_eq!(
+            store.read_ledger("t2").unwrap(),
+            t2_before,
+            "a checkpoint on t1 must leave t2's ledger untouched"
+        );
+    }
+
     /// The sweep keeps everything reachable from another target or a pin:
     /// only the unreachable content is swept.
     #[test]

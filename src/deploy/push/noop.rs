@@ -191,12 +191,12 @@ pub(crate) fn check_up_to_date(
             // remote advanced but BEFORE the observed refresh (e.g. a
             // faulted `write_results`) — was finalized by the reconcile
             // above and now matches here as "Everything up to date";
-            // without this refresh the shared slot's observed projection
-            // would stay stale/absent in every member target. The
+            // without this refresh the slot's observed projection
+            // would stay stale/absent in its OWNING target's view. The
             // projections are rebuilt from the EXISTING generation's
             // assignment (the no-op creates no records), so after ANY
-            // completed or recovered mutation every member target's
-            // observed projection equals the remote assignment. Best-effort
+            // completed or recovered mutation each target's observed
+            // projection equals the remote assignment for its own slots. Best-effort
             // per the post-commit lifecycle: a refresh failure warns but
             // never converts the no-op into an error — the report below
             // stays "Everything up to date".

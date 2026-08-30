@@ -66,11 +66,19 @@ pub use shapes::mapping::{
 };
 pub(crate) use shapes::raw;
 
-/// The DOMAIN target: ROLLOUT behavior only (batch_size, stop_on_failure,
-/// failure_policy). Retention is NOT a target surface: a slot's retention
-/// comes from its owning variant (see [`VariantConfig::retention`]), so a
-/// target that shares a slot with other targets can never change that slot's
-/// policy. Built ONLY by the raw -> domain conversion; the raw serialization
+/// The DOMAIN target: ROLLOUT behavior only — `TargetConfig` is EXACTLY
+/// `{ rollout: RolloutConfig }`. It MUST NOT (and does not) contain slots,
+/// retention, history, deploy directories, or storage policy: a slot carries
+/// its own `target`, deploy_dir, and groups; retention is slot-owned (the
+/// slot's OWNING VARIANT's policy, see [`VariantConfig::retention`]); the
+/// ledger files (`targets/<target>/ledger.jsonl`) live on disk, never in the
+/// config. A target's member slots are DERIVED from the slots' `target`
+/// fields at query time ([`ProjectConfig::target_slots`] /
+/// [`ProjectConfig::target_group_slots`]), never stored here — the raw
+/// `[targets.<name>]` shape (`deny_unknown_fields`) refuses a target that
+/// tries to carry `slots`/`retention`/`storage` (see the config test
+/// `targets_carry_rollout_only_and_refuse_slot_policy_members`). Built ONLY
+/// by the raw -> domain conversion; the raw serialization
 /// shape is `raw::RawTargetConfig` (bare integer batch size).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TargetConfig {
@@ -826,9 +834,9 @@ impl ProjectConfig {
 
     /// The slot's ONE retention policy: the retention config of the slot's
     /// OWNING VARIANT (the file that declares the slot). Retention is
-    /// slot-owned — a shared slot's policy is resolved here, from a single
-    /// source, regardless of how many targets the slot is a member of, so
-    /// membership changes never change retention.
+    /// slot-owned — a slot's policy is resolved here, from a single source,
+    /// regardless of which rollout group (or owning target) a push selects it
+    /// under, so membership changes never change retention.
     pub fn slot_retention(&self, slot_id: &str) -> Result<&RetentionConfig> {
         let variant_name = self.slot_variant(slot_id)?;
         Ok(&self.variant(variant_name)?.retention)

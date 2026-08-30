@@ -350,9 +350,9 @@ pub(crate) fn refresh_observed_from_live(
 /// Refresh `observed.json` for `target_name`'s member slots from a
 /// caller-supplied per-slot projection: each slot's ONE physical record
 /// (`slots/<slot-id>/observed.json`) is written EXACTLY ONCE, never once per
-/// member target — targets are selection views over the global slot map, so a
-/// shared slot's single record serves every member target's `read_observed`
-/// view. Every store fault is WARNING-ONLY (pushed into `observed_warnings`,
+/// target — targets are selection views over the global slot map, so a
+/// slot's single record serves its OWNING target's `read_observed` view.
+/// Every store fault is WARNING-ONLY (pushed into `observed_warnings`,
 /// merged into the report's `maintenance` channel): the refresh runs after
 /// the deployment durably committed, so it must never change the push's
 /// reported outcome — this function NEVER returns `Err`.
@@ -361,7 +361,7 @@ pub(crate) fn refresh_observed_from_live(
 /// (which feeds the actual post-mutation state via
 /// [`refresh_observed_from_live`]) and the NO-OP path (which feeds the
 /// EXISTING generation's assignment, since an up-to-date push creates no
-/// records) both run this exact block, so a shared slot's physical record is
+/// records) both run this exact block, so a slot's physical record is
 /// refreshed identically by whichever path last touched it. A member slot
 /// with no entry in `observed_servers` keeps its prior physical record
 /// untouched.
@@ -394,13 +394,12 @@ pub(crate) fn refresh_observed(
             ));
         }
         // ONE physical write per slot — the slot's own observed record. A
-        // shared slot is written ONCE regardless of how many targets it is a
-        // member of: every member target's view (a filter over the global
-        // slot map) sees the same physical record, so no per-target
+        // slot belongs to EXACTLY ONE owning target, so the slot's record and
+        // its owning target's view agree by construction — no per-target
         // propagation is needed (or possible) anymore.
         if let Err(e) = store.write_slot_observed(&slot_id, observed_server) {
-            // A fault leaves only THIS slot's physical record stale — every
-            // member target's view of it lags together. The next real push
+            // A fault leaves only THIS slot's physical record stale — its
+            // OWNING target's view of it lags. The next real push
             // re-projects from durable facts, so convergence needs no marker.
             observed_warnings.push(format!(
                 "observed refresh deferred for slot '{}': {e}",

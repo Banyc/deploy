@@ -275,9 +275,9 @@ releases/<name>/artifacts/    # artifact sources referenced by variant mappings
   slots are DERIVED from the slots' `target` fields — targets do not list
   their slots.
 - Retention belongs to the SLOT, not the target: the variant
-  file that declares the slot owns its one retention policy, so a slot shared
-  across several targets keeps exactly one policy and membership changes never
-  change retention.
+  file that declares the slot owns its one retention policy, so each slot
+  (which has exactly one owning target) keeps exactly one policy and
+  membership changes never change retention.
 
 ## Config reference (condensed)
 

@@ -297,7 +297,7 @@ rollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = "rollback_
 
 /// Set up a single-slot project (deploy.toml + variant file + artifact inputs),
 /// return the loaded config and the config path. The slot is declared inside
-/// the variant file and binds itself to `production` with its `targets` list.
+/// the variant file and binds itself to `production` with its `target` field.
 fn setup_project(proj: &Path, address: &str, deploy_dir: &str) -> (ProjectConfig, PathBuf) {
     write_file(&proj.join("deploy.toml"), &single_target_toml(address));
     let release_dir = proj.join("releases").join("v1");

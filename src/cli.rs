@@ -1549,6 +1549,104 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         );
     }
 
+    /// THE SINGLE-OWNER DOC GUARD: the migration to EXACTLY ONE owning target
+    /// per slot is complete only while no legacy PLURAL-membership claim
+    /// remains anywhere in the repo (source under `src/`, integration tests
+    /// under `tests/`, and the docs `README.md` / `requirement.md` — there is
+    /// no `docs/` directory in this repo, so those two prose files plus the
+    /// sources are the complete corpus). It fails if any NARROW legacy
+    /// phrase survives:
+    ///
+    /// * "slot may be a member of several targets" (the multi-owner claim);
+    /// * "slot shared across targets" (plural sharing between targets);
+    /// * "multi-target slot membership";
+    /// * "member of several targets" and "shared between several targets"
+    ///   (the shaping variants present in the pre-migration repo).
+    ///
+    /// The match is CASE-INSENSITIVE (the repo spells "SEVERAL targets" in
+    /// places), the equivalent of one regex over the same semantic. It does
+    /// NOT ban general "shared" language: artifacts legitimately remain
+    /// content-addressed and shared across slots, so phrases like "shared
+    /// across slots" / "content-addressed and shared" cannot match by
+    /// construction (the banned patterns are the exact plural-membership
+    /// claims only). The test EXEMPTS its own source file (`src/cli.rs`),
+    /// which necessarily spells the banned phrases in the pattern list.
+    #[test]
+    fn no_plural_slot_membership_claims_remain() {
+        use std::path::{Path, PathBuf};
+
+        // The banned phrases, lowercased (the case-insensitive semantic of
+        // the spec's regex: "member of SEVERAL targets" / "member of several
+        // targets" / "shared between several targets" are the shaping
+        // variants).
+        const BANNED: [&str; 5] = [
+            "slot may be a member of several targets",
+            "slot shared across targets",
+            "multi-target slot membership",
+            "member of several targets",
+            "shared between several targets",
+        ];
+
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let mut files: Vec<(String, PathBuf)> = Vec::new();
+        for dir in ["src", "tests"] {
+            let root = Path::new(manifest).join(dir);
+            for entry in walkdir::WalkDir::new(&root)
+                .follow_links(false)
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
+                if entry.file_type().is_file()
+                    && entry.path().extension().map(|x| x == "rs").unwrap_or(false)
+                {
+                    let path = entry.path().to_path_buf();
+                    if path == Path::new(manifest).join("src/cli.rs") {
+                        continue; // this test's own file spells the phrases
+                    }
+                    files.push((dir.to_string(), path));
+                }
+            }
+        }
+        for doc in ["README.md", "requirement.md"] {
+            files.push((doc.to_string(), Path::new(manifest).join(doc)));
+        }
+        // A floor on the corpus so the audit can never silently shrink to
+        // nothing (mirrors the placeholder-examples guard above).
+        assert!(
+            files.len() >= 30,
+            "the doc-guard corpus must cover the sources and prose docs, got {} files",
+            files.len()
+        );
+
+        let mut violations: Vec<String> = Vec::new();
+        for (label, path) in &files {
+            let text = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()));
+            for (line_no, raw) in text.lines().enumerate() {
+                let line = raw.to_lowercase();
+                for banned in BANNED {
+                    if line.contains(banned) {
+                        violations.push(format!(
+                            "{label}:{}: legacy plural-membership claim {banned:?}: {raw}",
+                            line_no + 1
+                        ));
+                    }
+                }
+                // The "several targets" comma/adjacent shaping variants are
+                // covered by the exact phrases; an unbroken NARROW scan that
+                // bans every "several targets" would false-positive on legit
+                // prose ("several targets with guaranteed memberships"), so
+                // only the exact plural-membership claims are banned.
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "legacy PLURAL-slot-membership claims must not remain:\n{}\nA slot belongs to \
+             EXACTLY ONE owning target; rewrite the claim to the single-owner statement.",
+            violations.join("\n")
+        );
+    }
+
     // -------------------------------------------------------------------
     // HARDENING: ReleaseId exact form + CLI bare-digest parser + no Default
     // + the Unknown observation half (deterministic + property, 16 cases

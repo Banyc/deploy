@@ -125,7 +125,7 @@ rollout = { batch_size = 2, stop_on_failure = true, failure_policy = "rollback_c
 
 /// Slots declared inside the `standard` variant file: p1/p2 on server-01/02,
 /// both bound to target `production` (a target's members are derived from the
-/// slots' `targets` lists).
+/// slots' `target` fields).
 const STANDARD_SLOTS: &str = r#"
 [[slots]]
 id = "p1"
@@ -1656,8 +1656,8 @@ interval_seconds = 0
 
 /// Minimal deploy.toml body with a single `standard` variant and
 /// `activation: none`. Retention is a top-level setting of `deploy.toml`;
-/// targets carry rollout + retention only (their members are derived from the
-/// slots' `targets` lists).
+/// targets carry rollout only (their members are derived from the slots'
+/// `target` fields).
 fn single_target_toml(stop_on_failure: bool, batch_size: u32) -> String {
     format!(
         r#"
@@ -4490,11 +4490,12 @@ interval_seconds = 0
     Ok(())
 }
 
-/// A slot may be a member of SEVERAL targets: pushing each target deploys the
-/// slot independently, with per-target attempts/snapshots/observed, and `s0`
-/// rollback works on each target's own snapshot.
+/// Two DISTINCT slots, each owned by EXACTLY ONE target: pushing each target
+/// deploys its OWN slot independently, with per-target attempts/snapshots/
+/// observed records, and rollback works on each target's own snapshot — a
+/// push to one target never touches the other target's slot or records.
 #[test]
-fn slot_in_two_targets_deploys_per_target_and_rolls_back_each() -> Result<()> {
+fn distinct_target_owned_slots_deploy_and_rollback_independently() -> Result<()> {
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join("proj");
     std::fs::create_dir_all(&proj).unwrap();
@@ -4602,7 +4603,23 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &push_opt("production"),
     )?;
     assert_eq!(rp.status, Some(DeploymentStatus::Successful));
-    let prod_slot = &rp.attempt.expect("attempt recorded").slots[&SlotId::parse("p1").unwrap()];
+    let rp_attempt = rp.attempt.expect("attempt recorded");
+    let prod_slot = &rp_attempt.slots[&SlotId::parse("p1").unwrap()];
+
+    // A push changes ONLY the slots it owns: the recorded attempt's slot set
+    // equals the target's OWN membership (`changed ⊆ owned` — the attempt
+    // never mentions the other target's slot).
+    let owned: std::collections::BTreeSet<String> =
+        config.target_slot_ids("production")?.into_iter().collect();
+    let changed: std::collections::BTreeSet<String> = rp_attempt
+        .slots
+        .keys()
+        .map(|s| s.as_str().to_string())
+        .collect();
+    assert_eq!(
+        changed, owned,
+        "the production push must change exactly the slots it owns"
+    );
 
     let prod_v1 = known_artifact(prod_slot).tree.clone();
     let prod_gen = known_generation(prod_slot).clone();

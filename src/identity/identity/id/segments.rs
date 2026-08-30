@@ -7,11 +7,12 @@
 //! slot→assignment relationship (plans, attempts, observed state, snapshots,
 //! commit markers). [`ServerId`] is the ACTUAL SERVER identity used for
 //! transport addressing (user@host lives on `ServerDef`). They are distinct
-//! concepts: a server can host slots in multiple targets, and a slot may be
-//! a member of several targets (each carrying its own `deploy_dir`). Today
-//! one target runs at most one slot per server, so the two ID spaces are
-//! interchangeable within a target, but the model keys assignments by
-//! [`SlotId`] and addresses transports by [`ServerId`].
+//! concepts: a SERVER (a physical host) can host slots in multiple targets
+//! — each slot carries its own `deploy_dir` — while each SLOT belongs to
+//! EXACTLY ONE owning target (its single `target` field). One target runs at
+//! most one slot per server, so the two ID spaces are interchangeable within
+//! a target, but the model keys assignments by [`SlotId`] and addresses
+//! transports by [`ServerId`].
 
 use super::id_newtype;
 use crate::error::{Error, Result};

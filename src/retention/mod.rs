@@ -12,12 +12,12 @@
 //!
 //! A slot has EXACTLY ONE retention policy, owned by the slot itself: the
 //! policy of the slot's OWNING VARIANT (the variant file whose `[[slots]]`
-//! entry declares the slot). A slot may be a member of SEVERAL targets (the
-//! multi-target feature) but its state is shared — one physical observed
-//! record, one retention policy — and targets are only selection views over
-//! that slot state. There is NO per-target policy and NO union across member
-//! targets: the caller resolves the slot's single policy from its owning
-//! variant (`ProjectConfig::slot_retention`) and passes it here; every generation
+//! entry declares the slot). Each slot belongs to EXACTLY ONE owning target
+//! (its single `target` field) and stores its state once physically — one
+//! observed record, one retention policy — and targets are only selection
+//! views over that slot state. There is NO per-target policy and NO union
+//! across targets: the caller resolves the slot's single policy from its
+//! owning variant (`ProjectConfig::slot_retention`) and passes it here; every generation
 //! record on the server is evaluated under that one policy, so changing a
 //! slot's target membership never changes what is retained.
 //!

@@ -33,8 +33,8 @@ use std::path::Path;
 /// pushes alike. Servers have no per-release history, so capacity is never
 /// part of the release snapshot: the release identity covers mappings,
 /// behavior, and trees only. Retention (used for the protected pre-retention) is
-/// target-level configuration from `deploy.toml`; a shared slot's retained set
-/// is the union of every member target's policy.
+/// slot-owned configuration: a slot's retained set is computed under its
+/// OWNING VARIANT's single policy — never a per-target union.
 pub(crate) fn capacity_preflight(
     store: &LocalStore,
     assignments: &[PlannedAssignment],

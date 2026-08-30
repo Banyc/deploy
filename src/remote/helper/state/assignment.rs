@@ -23,10 +23,11 @@ pub struct GenerationAssignment {
     #[serde(default)]
     pub prior_generation: Option<GenerationId>,
     pub created_at: String,
-    /// The target whose push created this generation record. Retention on a
-    /// slot shared between several targets is attributed per originating
-    /// target; `None` marks a LEGACY record written before this field existed
-    /// (retained conservatively under every member policy).
+    /// The target whose push created this generation record: a generation is
+    /// attributed to the target whose push created it (each slot belongs to
+    /// exactly one owning target, so that target is also the slot's owner);
+    /// `None` marks a LEGACY record written before this field existed
+    /// (retained conservatively).
     #[serde(default)]
     pub target: Option<TargetName>,
 }

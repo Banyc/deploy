@@ -1036,7 +1036,7 @@ mod tests {
     /// behavior digest, the `variant -> tree digest` bindings, and the raw
     /// per-variant slot declarations. The shapes are adversarial: slot ids
     /// come from a small pool (slots SHARE ids across variants, and may
-    /// collide within a variant), `targets` lists are generated unsorted with
+    /// collide within a variant), `groups` lists are generated unsorted with
     /// duplicates, `deploy_dir`s include `..`/`//`/trailing-slash/relative
     /// spellings, and variant names include empty and odd strings.
     #[derive(Clone, Debug)]
@@ -1415,9 +1415,9 @@ mod tests {
         // (3) CANONICAL ORDER-INDEPENDENCE: the same LOGICAL release written
         // differently canonicalizes to the SAME digest.
         //
-        // B: each variant's slot declarations reversed, each slot's `targets`
+        // B: each variant's slot declarations reversed, each slot's `groups`
         // reversed, and each `deploy_dir` respelled textually-differently but
-        // lexically-equivalently. C: each slot's `targets` list gets its first
+        // lexically-equivalently. C: each slot's `groups` list gets its first
         // name appended again (a duplicate — deduplicated away by the
         // canonical form).
         let b_slots: BTreeMap<String, Vec<SlotConfig>> = c

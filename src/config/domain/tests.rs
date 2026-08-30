@@ -16,7 +16,7 @@ use crate::store::local::LocalStore;
 use proptest::prelude::*;
 #[cfg(test)]
 use proptest::test_runner::RngSeed;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -503,9 +503,67 @@ fn slot_target_must_reference_declared_target() {
     );
 }
 
-/// A slot may be a member of SEVERAL targets: membership is a `targets`
-/// list, and each target's members are DERIVED by scanning the slots for
-/// its name. A slot in two targets is valid and both targets derive it;
+/// A target carries ROLLOUT behavior ONLY: the domain `TargetConfig` is
+/// EXACTLY `{ rollout }` — no slots, no retention, no history, no deploy
+/// directories, no storage policy (membership is derived from the slots'
+/// `target` fields; retention is slot-owned; the ledger lives on disk, never
+/// in the config). The raw `[targets.<name>]` shape
+/// (`RawTargetConfig`, `deny_unknown_fields`) refuses ANY extra member as an
+/// unknown field at parse, so a target can never come to own slot state
+/// through the config.
+#[test]
+fn targets_carry_rollout_only_and_refuse_slot_policy_members() {
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+    let project = dir.path().join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+    write_standard_release(&project, "v1");
+    let p = project.join("deploy.toml");
+
+    // The control: a rollout-only target loads.
+    std::fs::write(&p, deploy_toml("v1")).unwrap();
+    ProjectConfig::load(&p).expect("a rollout-only target is valid");
+
+    // A target trying to carry SLOTS / RETENTION / STORAGE is refused at
+    // parse: membership is derived from the slots' `target` fields, never
+    // stored on the target.
+    for extra in [
+        "slots = [{ id = \"p1\", server = \"s1\", target = \"t1\", deploy_dir = \"/srv/x\" }]",
+        "retention = { per_server = { keep_distinct_artifacts = 1 } }",
+        "storage = { root = \"/srv/store\" }",
+    ] {
+        let bad = format!(
+            "schema_version = 2\napplication = \"forced\"\nrelease = \"v1\"\n\n\
+             [[servers]]\nid = \"s1\"\naddress = \"a\"\nuser = \"u\"\nhost_key_fingerprint = \"SHA256:test\"\n\n\
+             [targets.t1]\nrollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }}\n{extra}\n"
+        );
+        std::fs::write(&p, bad).unwrap();
+        let err =
+            ProjectConfig::load(&p).expect_err("a target member beyond rollout must be refused");
+        assert!(
+            err.to_string().contains("unknown field"),
+            "the refusal must be the unknown-field parse error, got: {err}"
+        );
+    }
+
+    // The legacy PLURAL-membership shape is impossible the same way: a slot
+    // declaring a `targets` LIST (instead of its single `target`) is refused
+    // by the slot's own `deny_unknown_fields`.
+    let bad_slot = format!(
+        "{MINIMAL_VARIANT}\n[[slots]]\nid = \"p1\"\nserver = \"s1\"\ntarget = \"t1\"\ntargets = [\"t2\"]\ndeploy_dir = \"/srv/forced\"\n"
+    );
+    std::fs::write(project.join("releases/v1/standard.toml"), bad_slot).unwrap();
+    std::fs::write(&p, deploy_toml("v1")).unwrap();
+    let err = ProjectConfig::load(&p).expect_err("a slot `targets` list must be refused");
+    assert!(
+        err.to_string().contains("unknown field"),
+        "the slot-level refusal must be the unknown-field parse error, got: {err}"
+    );
+}
+
+/// Each slot declares its EXACTLY ONE owning target (a single `target`
+/// field, never a list): membership is DERIVED by scanning the slots for
+/// that name, and a slot is a member of exactly one target. Distinct slots
+/// spread across targets are valid and each target derives its own members;
 /// a target with no member slot is still rejected.
 #[test]
 fn slots_declare_their_target_membership() {
@@ -3585,5 +3643,354 @@ fn every_documented_toml_block_parses_under_the_strict_loader() {
                 });
             }
         }
+    }
+}
+
+// =====================================================================
+// THE SINGLE-OWNER MEMBERSHIP MODEL — pure derivations + invariants
+// =====================================================================
+
+/// The PURE membership model: the extraction of the on-demand derivations
+/// [`ProjectConfig::target_slots`] / [`ProjectConfig::target_group_slots`] —
+/// membership is DERIVED by filtering the slots on their single `target`
+/// field, never stored on targets. Input slot order is the deterministic
+/// order (variants in name order, then each variant's slots in file order —
+/// the model takes the aggregated `slot_defs` list as-is). Every slot has
+/// EXACTLY ONE owning target, so each slot appears in exactly one target's
+/// membership and the memberships are pairwise disjoint.
+fn membership_of<'a>(
+    slots: &[&'a SlotConfig],
+    targets: &[String],
+) -> BTreeMap<String, Vec<&'a SlotConfig>> {
+    targets
+        .iter()
+        .map(|t| {
+            (
+                t.clone(),
+                slots.iter().filter(|s| s.target == *t).copied().collect(),
+            )
+        })
+        .collect()
+}
+
+proptest! {
+    // THE MEMBERSHIP INVARIANTS PROPERTY (pure, over the derived model):
+    // arbitrary declared targets and arbitrary slots — each slot with EXACTLY
+    // ONE owning target and a possibly-empty rollout `groups` list — driven
+    // through `membership_of`, the pure extraction of
+    // `ProjectConfig::target_slots`/`target_group_slots`. Bounded
+    // `proptest_cases(16)` (full 16 with `DEPLOY_FULL_TESTS=1`, fast
+    // default) + fixed seed 0x5EED_5EED + no failure persistence (house
+    // style) keep the deterministic floor fast.
+    #![proptest_config(ProptestConfig {
+        cases: crate::testutil::proptest_cases(16),
+        rng_seed: RngSeed::Fixed(0x5EED_5EED),
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
+
+    #[test]
+    fn membership_invariants_over_derived_membership(
+        target_ids in prop::collection::vec(
+            prop::sample::select(&["t1", "t2", "t3", "t4"]),
+            1..4,
+        )
+        .prop_filter("target ids must be distinct", |v| {
+            let mut s = v.clone();
+            s.sort();
+            s.dedup();
+            s.len() == v.len()
+        })
+        .prop_map(|v: Vec<&str>| v.into_iter().map(str::to_string).collect::<Vec<String>>()),
+        slot_descs in prop::collection::vec(
+            (
+                0usize..4,
+                prop::collection::vec(
+                    prop::sample::select(&["canary", "wave-1", "wave-2"]),
+                    0..3,
+                ),
+            ),
+            0..10,
+        ),
+    ) {
+        let targets: Vec<String> = target_ids;
+        // Each slot: a distinct id, one server, one deploy_dir, EXACTLY ONE
+        // target (by generated index), and a possibly-empty groups list.
+        let slots: Vec<SlotConfig> = slot_descs
+            .iter()
+            .enumerate()
+            .map(|(i, (ti, groups))| {
+                SlotConfig::new(
+                    format!("p{i}"),
+                    format!("s{i}"),
+                    format!("/srv/p{i}"),
+                    targets[ti % targets.len()].clone(),
+                    groups.iter().map(|g| (*g).to_string()).collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        let slot_refs: Vec<&SlotConfig> = slots.iter().collect();
+        let membership = membership_of(&slot_refs, &targets);
+
+        // (a) UNION: every slot appears in EXACTLY ONE target membership —
+        // the union of the memberships is the complete slot set.
+        let mut union: Vec<&SlotConfig> = membership.values().flatten().copied().collect();
+        union.sort_by_key(|s| s.id.clone());
+        let mut all: Vec<&SlotConfig> = slots.iter().collect();
+        all.sort_by_key(|s| s.id.clone());
+        assert_eq!(
+            union, all,
+            "the union of target memberships must be the complete slot set (no slot lost, \
+             no slot duplicated)"
+        );
+        let union_count = membership.values().map(|v| v.len()).sum::<usize>();
+        assert_eq!(
+            union_count,
+            slots.len(),
+            "each slot appears in exactly one target membership"
+        );
+
+        // (b) PAIRWISE DISJOINT: no slot is a member of two targets.
+        let memberships: Vec<&Vec<&SlotConfig>> = membership.values().collect();
+        for (i, a) in memberships.iter().enumerate() {
+            for b in memberships.iter().skip(i + 1) {
+                let a_ids: HashSet<&str> = a.iter().map(|s| s.id.as_str()).collect();
+                let b_ids: HashSet<&str> = b.iter().map(|s| s.id.as_str()).collect();
+                assert!(
+                    a_ids.is_disjoint(&b_ids),
+                    "target memberships must be pairwise disjoint"
+                );
+            }
+        }
+
+        // (c) EXACTNESS: a target's membership is LITERALLY the slots whose
+        // `target` field names it — the derived relation, nothing else.
+        for t in &targets {
+            let want: Vec<&SlotConfig> = slots.iter().filter(|s| s.target == *t).collect();
+            assert_eq!(
+                membership.get(t).unwrap(),
+                &want,
+                "target '{t}': membership must be exactly the slot-owned relation \
+                 (slots.filter(|s| s.target == t))"
+            );
+        }
+
+        // (d) GROUPS ARE SUBSETS: a rollout group selects only a subset of
+        // its owning target's slots (`group_slots(t, g) ⊆ target_slots(t)`).
+        let all_groups: BTreeSet<String> =
+            slots.iter().flat_map(|s| s.groups.iter().cloned()).collect();
+        for t in &targets {
+            let owned = &membership[t];
+            for g in &all_groups {
+                for s in owned {
+                    if s.groups.iter().any(|x| x == g) {
+                        assert_eq!(
+                            s.target, *t,
+                            "group '{g}' selects only slots owned by target '{t}'"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The PURE model and the REAL derivation agree on a loaded config:
+/// `membership_of` over the same aggregated slot declarations produces
+/// exactly [`ProjectConfig::target_slots`], and a group's selection
+/// (`target_group_slots`) is a subset of it.
+#[test]
+fn membership_model_agrees_with_derived_target_slots() {
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+    let project = dir.path().join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+    write_standard_release(&project, "v1");
+    let p = project.join("deploy.toml");
+    let standard_toml = format!(
+        "{MINIMAL_VARIANT}\n{STANDARD_SLOTS}\n[[slots]]\nid = \"p2\"\nserver = \"s1\"\ntarget = \"t2\"\ngroups = [\"canary\"]\ndeploy_dir = \"/srv/forced-2\"\n"
+    );
+    std::fs::write(project.join("releases/v1/standard.toml"), standard_toml).unwrap();
+    let t2 = "\n[targets.t2]\nrollout = { batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }\n";
+    std::fs::write(&p, format!("{}{}", deploy_toml("v1"), t2)).unwrap();
+    let cfg = ProjectConfig::load(&p).expect("the two-target project is valid");
+
+    let targets: Vec<String> = cfg.targets().map(|(n, _)| n.to_string()).collect();
+    let model = membership_of(&cfg.slot_defs(), &targets);
+    for t in &targets {
+        let derived: Vec<&SlotConfig> = cfg
+            .target_slots(t)
+            .unwrap()
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
+        assert_eq!(
+            model.get(t).unwrap(),
+            &derived,
+            "the pure model must agree with the derived target_slots for '{t}'"
+        );
+    }
+    // A group's selection is a subset of the owning target's slots.
+    let grouped: Vec<&SlotConfig> = cfg
+        .target_group_slots("t2", "canary")
+        .unwrap()
+        .into_iter()
+        .map(|(s, _)| s)
+        .collect();
+    assert_eq!(
+        grouped,
+        cfg.target_slots("t2")
+            .unwrap()
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect::<Vec<_>>()
+    );
+    assert!(grouped.len() == 1);
+}
+
+// =====================================================================
+// Operations respect ownership — the push SELECTION never leaves the
+// target's own slots
+// =====================================================================
+
+/// THE OWNERSHIP-RESPECT SELECTION PROPERTY: the push entry points in
+/// [`crate::deploy::plan::selection`] resolve every selection from
+/// [`ProjectConfig::target_slots`] / [`ProjectConfig::target_group_slots`]
+/// — both DERIVED from the slots' single `target` field — so for ANY target
+/// `t` and ANY rollout group `g`, the resolved selection is always a SUBSET
+/// of `target_slots(t)`: a push can never select (and therefore never
+/// change) a slot it does not own. Generates an arbitrary 3-target /
+/// 3-slot project (each slot with exactly one owning target and a
+/// possibly-empty groups list), loads it through the REAL `ProjectConfig::load`,
+/// and asserts the selection-subset relation for every target and every
+/// declared group.
+fn run_selection_ownership_case(owners: Vec<usize>, group_lists: Vec<Vec<&str>>) {
+    const TARGETS: [&str; 3] = ["t1", "t2", "t3"];
+    // A generated owner may leave a target with zero slots; the config
+    // loader rejects an empty target, so fix up: reassign a DUPLICATED
+    // owner's slot to the left-out target (a slot has exactly one owner;
+    // with 3 slots and 3 targets a duplicated owner always exists when a
+    // target is left out).
+    let mut owners: Vec<usize> = owners;
+    for ti in 0..3 {
+        if !owners.iter().any(|&o| o % 3 == ti) {
+            // Find a slot whose owner is duplicated and move it to target
+            // `ti`.
+            let mut counts = [0usize; 3];
+            for &o in &owners {
+                counts[o % 3] += 1;
+            }
+            let dup = counts
+                .iter()
+                .position(|&c| c > 1)
+                .expect("3 slots over 3 targets with a left-out target always duplicate an owner");
+            let slot = owners
+                .iter()
+                .position(|&o| o % 3 == dup)
+                .expect("dup owner exists");
+            owners[slot] = ti;
+        }
+    }
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+    let project = dir.path().join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+    let release_dir = project.join("releases").join("v1");
+    std::fs::create_dir_all(&release_dir).unwrap();
+
+    let mut variant = String::new();
+    for (si, (owner, groups)) in owners.iter().zip(group_lists.iter()).enumerate() {
+        let t = TARGETS[owner % 3];
+        let groups = groups
+            .iter()
+            .map(|g| format!("\"{g}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        variant.push_str(&format!(
+            "[[slots]]\nid = \"s{}\"\nserver = \"h{}\"\ntarget = \"{}\"\ngroups = [{groups}]\ndeploy_dir = \"/srv/s{}\"\n\n",
+            si + 1,
+            si + 1,
+            t,
+            si + 1,
+        ));
+    }
+    variant.push_str(
+        "[[artifact.mappings]]\nfrom = \"artifacts/build/output/\"\nto = \"app/\"\nrecursive = true\n\n\
+         [activation]\nadapter = \"none\"\n\n\
+         [verification]\nadapter = \"command\"\nargv = [\"true\"]\ntimeout_seconds = 5\nattempts = 1\ninterval_seconds = 0\n",
+    );
+    std::fs::write(release_dir.join("standard.toml"), variant).unwrap();
+    let mut deploy_toml =
+        String::from("schema_version = 2\napplication = \"own\"\nrelease = \"v1\"\n\n");
+    for s in 1..=3 {
+        deploy_toml.push_str(&format!(
+            "[[servers]]\nid = \"h{s}\"\naddress = \"a\"\nuser = \"u\"\nhost_key_fingerprint = \"SHA256:test\"\n\n"
+        ));
+    }
+    for t in TARGETS {
+        deploy_toml.push_str(&format!(
+            "[targets.{t}]\nrollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }}\n"
+        ));
+    }
+    let cfg_path = project.join("deploy.toml");
+    std::fs::write(&cfg_path, deploy_toml).unwrap();
+    let config = ProjectConfig::load(&cfg_path)
+        .unwrap_or_else(|e| panic!("generated project must load: {e}"));
+
+    let all_groups: HashSet<&str> = group_lists.iter().flatten().copied().collect();
+    for t in TARGETS {
+        let owned = config.target_slots(t).unwrap();
+        // The FULL selection (`push t`) equals the target's own slots.
+        let full = crate::deploy::plan::SlotSelection::normalize(&config, t, None)
+            .unwrap()
+            .current_members(&config)
+            .unwrap();
+        assert!(
+            full.iter()
+                .all(|(s, _)| owned.iter().any(|(os, _)| os.id == s.id)),
+            "the full push selection for '{t}' must be a subset of its OWN slots"
+        );
+        // Every GROUP selection (`push t --group g`) is a subset too.
+        for g in &all_groups {
+            if let Ok(selection) =
+                crate::deploy::plan::SlotSelection::normalize(&config, t, Some(g))
+                && let Ok(members) = selection.current_members(&config)
+            {
+                assert!(
+                    members
+                        .iter()
+                        .all(|(s, _)| owned.iter().any(|(os, _)| os.id == s.id)),
+                    "group '{g}' of '{t}' must select only the target's OWN slots"
+                );
+                assert!(
+                    !members.is_empty(),
+                    "a resolvable group selection must be non-empty"
+                );
+            }
+        }
+    }
+}
+
+proptest! {
+    // Bounded `proptest_cases(16)` (full 16 with `DEPLOY_FULL_TESTS=1`, fast
+    // default), fixed seed 0x5EED_5EED (house style), no failure
+    // persistence — deterministic for CI.
+    #![proptest_config(ProptestConfig {
+        cases: crate::testutil::proptest_cases(16),
+        rng_seed: RngSeed::Fixed(0x5EED_5EED),
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
+
+    #[test]
+    fn every_push_selection_is_a_subset_of_the_slots_it_owns(
+        owners in prop::collection::vec(0usize..3, 3),
+        group_lists in prop::collection::vec(
+            prop::collection::vec(
+                prop::sample::select(&["g1", "g2", "g3"]),
+                0..2,
+            ),
+            3,
+        ),
+    ) {
+        run_selection_ownership_case(owners, group_lists);
     }
 }
