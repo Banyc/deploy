@@ -266,7 +266,19 @@ impl LocalStore {
     }
 }
 
-/// Sanitize a name for use as a directory/file component.
+/// Sanitize a name for use as a directory/file component — retained ONLY
+/// for the raw-name entry points that can receive UNVALIDATED strings
+/// ([`LocalStore::target_dir`]'s raw target argument, the GC's raw-name
+/// entry). On the VALIDATED identity grammar (the rule behind
+/// [`crate::identity::SlotId`], [`crate::identity::ServerId`],
+/// [`crate::identity::TargetName`], [`crate::identity::VariantName`],
+/// [`crate::identity::ApplicationStoreKey`], ...) this
+/// function is the IDENTITY: every valid name is already ASCII-safe and
+/// passes through unchanged, so the validated-ID store paths are built
+/// VERBATIM (no re-encoding) and two distinct valid names always map to two
+/// distinct paths. The re-encoding here only ever applies to junk outside
+/// the grammar, where confinement (never an escape, never a separator)
+/// matters more than injectivity.
 ///
 /// The character filter is not enough on its own: `.` and `..` pass through
 /// unchanged (dots are legal in ids), and a component named `..` would make
@@ -291,15 +303,43 @@ pub fn sanitize(name: &str) -> String {
 mod tests {
     use super::*;
     use crate::identity::{
-        ArtifactRef, SlotId, VariantName, test_deployment_id, test_generation_id, test_tree_digest,
+        ApplicationStoreKey, ArtifactRef, ServerId, SlotId, TargetName, VariantName,
+        test_deployment_id, test_generation_id, test_tree_digest,
     };
     use crate::ledger::{ObservedAssignment, ObservedSlot};
+    use proptest::prelude::*;
+    use proptest::test_runner::RngSeed;
+
+    /// A valid name in the filesystem-safe ASCII grammar
+    /// ([`crate::identity::valid_name`]): `[a-zA-Z0-9._-]`+ (non-empty, not
+    /// `.`/`..`, never a leading dash).
+    fn valid_segment() -> impl Strategy<Value = String> {
+        prop::collection::vec(
+            prop_oneof![
+                prop::char::range('a', 'z'),
+                prop::char::range('A', 'Z'),
+                prop::char::range('0', '9'),
+                Just('-'),
+                Just('_'),
+                Just('.'),
+            ],
+            1..16,
+        )
+        .prop_filter("not a traversal component, no leading dash", |s| {
+            s.first() != Some(&'-') && s.as_slice() != ['.'] && s.as_slice() != ['.', '.']
+        })
+        .prop_map(|v| v.into_iter().collect())
+    }
     /// `sanitize` must neutralize path-traversal components. `.` and `..` are
     /// the one case the character filter lets through untouched (dots are
     /// legal in ids), and an unsuffixed component named `..` would make
-    /// `slots/..` resolve to the STORE ROOT — the `..`/`.` names are
-    /// reachable via the CLI (`deploy status ..`) or a quoted TOML target key
-    /// (`[targets.".."]`), so escaping the layout must be impossible.
+    /// `slots/..` resolve to the STORE ROOT. THE TRAVERSAL CLASS IS NOW
+    /// UNCONSTRUCTIBLE AT THE TYPE LEVEL: the identity grammar
+    /// ([`crate::identity::valid_name`]) rejects `.`/`..`/separators before a
+    /// value of the id type can exist, and the validated-ID store paths
+    /// store the name VERBATIM — so the `sanitize` confinement shown here
+    /// applies only to RAW string entry points (`target_dir`,
+    /// `release_dir_named`), never to validated identities.
     #[test]
     fn sanitize_neutralizes_path_traversal_components() {
         assert_eq!(sanitize(".."), "_");
@@ -309,23 +349,41 @@ mod tests {
         assert_eq!(sanitize("../evil"), ".._evil");
         assert_eq!(sanitize("a/b"), "a_b");
         assert_eq!(sanitize("a\\b"), "a_b");
-        // Ordinary ids pass through unchanged.
+        // Ordinary valid names pass through unchanged (identity on the
+        // valid grammar — the store stores them verbatim).
         assert_eq!(sanitize("normal-name_1.x"), "normal-name_1.x");
 
-        // End-to-end: a SLOT id named `..` must stay inside the slot tree,
-        // never resolve to the store root (the slot's ONE physical observed
-        // record lives at `slots/<slot-id>/observed.json`).
+        // End-to-end: the traversal class can never reach the store path —
+        // `..` is rejected at the ID parse, so a slot id named `..` is
+        // unconstructible through the validated constructor (only the
+        // test-only unchecked `new` can build it, and the raw-path
+        // confinement above shows what a raw string would do).
+        assert!(
+            SlotId::parse("..").is_err(),
+            "a '..' slot id must be rejected"
+        );
+        assert!(
+            SlotId::parse(".").is_err(),
+            "a '.' slot id must be rejected"
+        );
+        assert!(
+            SlotId::parse("a/b").is_err(),
+            "a '/' slot id must be rejected"
+        );
+
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
-        let evil = SlotId::new("..".to_string());
+        // A VALID slot's record lives at `slots/<slot-id>/observed.json`
+        // with the id stored VERBATIM.
+        let ok_slot = SlotId::parse("ok-slot").unwrap();
         assert_eq!(
-            store.slot_observed_path(&evil),
+            store.slot_observed_path(&ok_slot),
             dir.path()
                 .join("store")
                 .join("slots")
-                .join("_")
+                .join("ok-slot")
                 .join("observed.json"),
-            "a '..' slot must be confined to its own slot dir, not the store root"
+            "a valid slot id is stored verbatim under its own slot dir"
         );
         let observed = ObservedSlot {
             assignment: ObservedAssignment::Known {
@@ -338,25 +396,147 @@ mod tests {
                 last_deployment: test_deployment_id("evil"),
             },
         };
-        store.write_slot_observed(&evil, &observed).unwrap();
+        store.write_slot_observed(&ok_slot, &observed).unwrap();
         assert!(
             !dir.path().join("store").join("observed.json").exists(),
-            "observed state for a '..' slot must never land at the store root"
+            "observed state for a slot must never land at the store root"
         );
         assert_eq!(
-            store.read_slot_observed(&evil).unwrap(),
+            store.read_slot_observed(&ok_slot).unwrap(),
             Some(observed.clone()),
-            "the sanitized path must not corrupt the recorded slot identity"
+            "the verbatim path must not corrupt the recorded slot identity"
         );
         let global = store.read_global_observed().unwrap();
         assert_eq!(
-            global.get(&SlotId::parse("_").unwrap()),
+            global.get(&ok_slot),
             Some(&observed),
-            "the global slot map keys by the SANITIZED slot directory name"
+            "the global slot map keys by the stored (verbatim) slot id"
         );
-        assert!(
-            !global.contains_key(&evil),
-            "an unsanitized '..' id never appears as a global key"
+        // The RAW target-dir entry point still confines traversal junk.
+        assert_eq!(
+            store.target_dir("../evil"),
+            dir.path().join("store").join("targets").join(".._evil"),
+            "a raw traversal name must be confined inside the targets namespace"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // THE INJECTIVITY PROPERTY (the review's acceptance): over pairs of
+    // ARBITRARY VALID resource keys (applications, slots, servers,
+    // targets, deployments, releases), every pair of DISTINCT keys maps to
+    // DISTINCT local store paths — the filesystem identifiers are injective
+    // (valid names are stored verbatim; `sanitize` is the identity on the
+    // valid grammar, so no two valid names can ever collide onto one
+    // encoded name). Bounded 64 cases (16 fast, 64 with
+    // DEPLOY_FULL_TESTS=1), fixed seed 0x5EED_5EED per house style.
+    // -------------------------------------------------------------------
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: crate::testutil::proptest_cases(64),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn distinct_valid_keys_map_to_distinct_store_paths(
+            a in valid_segment(),
+            b in valid_segment(),
+        ) {
+            // `sanitize` is the IDENTITY on the valid grammar: the store
+            // stores valid names verbatim (the re-encoding never fires).
+            assert_eq!(sanitize(&a), a, "sanitize must be the identity on valid names");
+            assert_eq!(sanitize(&b), b, "sanitize must be the identity on valid names");
+
+            let slot_a = SlotId::parse(&a).expect("valid segment parses as slot id");
+            let slot_b = SlotId::parse(&b).expect("valid segment parses as slot id");
+            let app_a = ApplicationStoreKey::parse(&a).expect("valid segment parses as store key");
+            let app_b = ApplicationStoreKey::parse(&b).expect("valid segment parses as store key");
+            let server_a = ServerId::parse(&a).expect("valid segment parses as server id");
+            let server_b = ServerId::parse(&b).expect("valid segment parses as server id");
+            let target_a = TargetName::parse(&a).expect("valid segment parses as target name");
+            let target_b = TargetName::parse(&b).expect("valid segment parses as target name");
+
+            let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+            let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+            if a != b {
+                // Distinct valid keys => distinct store paths, on EVERY
+                // store path family (slots, servers, targets).
+                assert_ne!(
+                    store.slot_observed_path(&slot_a),
+                    store.slot_observed_path(&slot_b),
+                    "distinct slot ids must map to distinct slot dirs: {a:?} vs {b:?}"
+                );
+                assert_ne!(
+                    store.target_dir(target_a.as_str()),
+                    store.target_dir(target_b.as_str()),
+                    "distinct target names must map to distinct target dirs: {a:?} vs {b:?}"
+                );
+                assert_ne!(
+                    store.base.join("servers").join(format!("{}.json", server_a.as_str())),
+                    store.base.join("servers").join(format!("{}.json", server_b.as_str())),
+                    "distinct server ids must map to distinct server records: {a:?} vs {b:?}"
+                );
+                // The same name under DIFFERENT path families is never a
+                // cross-family collision (each family has its own directory).
+                assert_ne!(
+                    store.slot_observed_path(&slot_a),
+                    store.target_dir(target_a.as_str()),
+                    "slot and target namespaces must not alias"
+                );
+                // Distinct application keys => distinct store bases.
+                assert_ne!(
+                    app_a.as_str(),
+                    app_b.as_str(),
+                    "distinct application keys must be distinct strings"
+                );
+            } else {
+                // The same valid name maps to the SAME path (determinism).
+                assert_eq!(
+                    store.slot_observed_path(&slot_a),
+                    store.slot_observed_path(&slot_b)
+                );
+                assert_eq!(app_a, app_b);
+            }
+        }
+
+        #[test]
+        fn distinct_deployment_and_release_ids_map_to_distinct_dirs(
+            tag_a in "[a-z0-9]{1,12}",
+            tag_b in "[a-z0-9]{1,12}",
+        ) {
+            let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+            let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+            let dep_a = test_deployment_id(&tag_a);
+            let dep_b = test_deployment_id(&tag_b);
+            let rel_a = crate::identity::test_release_id(&tag_a);
+            let rel_b = crate::identity::test_release_id(&tag_b);
+            if dep_a != dep_b {
+                assert_ne!(
+                    store.deployment_dir(dep_a.as_str()),
+                    store.deployment_dir(dep_b.as_str()),
+                    "distinct deployment ids must map to distinct dirs"
+                );
+            } else {
+                assert_eq!(
+                    store.deployment_dir(dep_a.as_str()),
+                    store.deployment_dir(dep_b.as_str()),
+                    "the same deployment id must map to the same dir (determinism)"
+                );
+            }
+            if rel_a != rel_b {
+                assert_ne!(
+                    store.release_dir(&rel_a),
+                    store.release_dir(&rel_b),
+                    "distinct release ids must map to distinct dirs"
+                );
+            } else {
+                assert_eq!(
+                    store.release_dir(&rel_a),
+                    store.release_dir(&rel_b),
+                    "the same release id must map to the same dir (determinism)"
+                );
+            }
+        }
     }
 }

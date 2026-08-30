@@ -222,13 +222,14 @@ pub(crate) fn process_server(
     op_id: &OperationId,
     deployment_id: &DeploymentId,
     target_name: &str,
+    slot: &crate::identity::SlotId,
     artifact: &ArtifactRef,
     new_gen: &GenerationId,
     expected_gen: Option<&GenerationId>,
     behavior: &BehaviorContract,
     behavior_sha256: &str,
     template_vars: &crate::remote::canonical::TemplateVars,
-    _config: &ProjectConfig,
+    config: &ProjectConfig,
 ) -> Result<ServerProc> {
     // Acquire the slot's mutation lock via an RAII guard so every return path
     // (including errors) releases it. Held in a named binding so in-process
@@ -242,8 +243,14 @@ pub(crate) fn process_server(
         }
     };
 
+    // The expected OWNER of this remote's generations: this application, this
+    // slot. Every status read and generation write carries it — a remote
+    // whose state was transplanted from another application/slot is refused.
+    let owner =
+        crate::remote::helper::GenerationOwner::new(config.application().clone(), slot.clone());
+
     // Compare-and-swap precondition on current generation.
-    let status = match helper.status() {
+    let status = match helper.status(&owner) {
         Ok(s) => s,
         Err(e) => {
             return Ok(ServerProc::failed_before(format!("status failed: {e}")));
@@ -321,6 +328,11 @@ pub(crate) fn process_server(
         behavior_sha256: behavior_sha256.to_string(),
         prior_generation: expected_gen.cloned(),
         created_at: crate::remote::helper::now_rfc3339(),
+        // THE OWNER MARKER: the generation record carries this application +
+        // slot, and every later read verifies it matches (fail closed on
+        // transplanted/copied state).
+        application: config.application().clone(),
+        slot: slot.clone(),
         target: Some(TargetName::parse(target_name).expect("target name is a safe segment")),
     };
     if let Err(e) = held.create_generation(&assignment) {
@@ -391,6 +403,7 @@ pub(crate) fn process_server(
                     prior_gen: expected_gen.cloned(),
                     advanced_gen: new_gen.clone(),
                     template_vars: template_vars.clone(),
+                    owner: owner.clone(),
                 };
                 return Ok(ServerProc::compensate_after_activation_failure(
                     &held,
@@ -414,6 +427,7 @@ pub(crate) fn process_server(
                     prior_gen: expected_gen.cloned(),
                     advanced_gen: new_gen.clone(),
                     template_vars: template_vars.clone(),
+                    owner: owner.clone(),
                 };
                 return Ok(ServerProc::restore_after_activation_failure(
                     &held,
@@ -442,6 +456,7 @@ pub(crate) fn process_server(
             prior_gen: expected_gen.cloned(),
             advanced_gen: new_gen.clone(),
             template_vars: template_vars.clone(),
+            owner: owner.clone(),
         };
         if let (Some(txn), Some(applied)) = (&mut activation_txn, &applied) {
             return Ok(ServerProc::restore_after_activation_failure(
@@ -850,6 +865,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &op_id,
                 &deployment_id,
                 "t1",
+                &crate::identity::SlotId::parse(slot.id.as_str())
+                    .expect("validated slot id is a safe segment"),
                 &artifact,
                 new_gen,
                 expected_gen,

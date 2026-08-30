@@ -42,6 +42,10 @@ pub(crate) struct CompensationRequest {
     pub prior_gen: Option<GenerationId>,
     pub advanced_gen: GenerationId,
     pub template_vars: crate::remote::canonical::TemplateVars,
+    /// The expected OWNER of this slot's remote generations: compensation
+    /// reads the prior generation's assignment and must verify its owner
+    /// marker (fail closed on transplanted state).
+    pub owner: crate::remote::helper::GenerationOwner,
 }
 
 /// THE COMPENSATION OUTCOME: either the slot was FULLY restored — the
@@ -72,8 +76,9 @@ pub(crate) enum CompensationOutcome {
 fn load_generation_behavior(
     helper: &crate::remote::helper::RemoteHelper,
     gid: &str,
+    owner: &crate::remote::helper::GenerationOwner,
 ) -> Result<crate::identity::BehaviorContract> {
-    let assignment = helper.read_assignment(gid).map_err(|e| {
+    let assignment = helper.read_assignment(gid, owner).map_err(|e| {
         Error::remote(format!(
             "compensation: read assignment of '{gid}' failed: {e}"
         ))
@@ -109,7 +114,10 @@ pub(crate) fn compensate_server_locked(
     match &request.prior_gen {
         Some(prior) => {
             // Load the prior generation's behavior contract from the remote.
-            let prior_assignment = match helper.read_assignment(prior.as_str()) {
+            // The read VERIFIES the generation's OWNER MARKER against the
+            // expected owner: a prior generation transplanted from another
+            // application/slot is refused (never compensated onto).
+            let prior_assignment = match helper.read_assignment(prior.as_str(), &request.owner) {
                 Ok(a) => a,
                 Err(_) => return Ok(CompensationOutcome::Refused),
             };
@@ -161,7 +169,7 @@ pub(crate) fn compensate_server_locked(
             // sealed proof a `Restored` execution must carry. The unit-file
             // restore runs BEFORE the prior verification health check.
             let advanced_behavior =
-                load_generation_behavior(helper, request.advanced_gen.as_str())?;
+                load_generation_behavior(helper, request.advanced_gen.as_str(), &request.owner)?;
             let advanced_units =
                 crate::verify::systemd::declared_user_units(&advanced_behavior.activation);
             let prior_units =
@@ -208,7 +216,7 @@ pub(crate) fn compensate_server_locked(
             // first deploy is ABSENT — the advanced contract's installed units
             // are removed and their absence VERIFIED by reading the remote.
             let advanced_behavior =
-                load_generation_behavior(helper, request.advanced_gen.as_str())?;
+                load_generation_behavior(helper, request.advanced_gen.as_str(), &request.owner)?;
             let advanced_units =
                 crate::verify::systemd::declared_user_units(&advanced_behavior.activation);
             crate::verify::systemd::restore_adapter_to(
@@ -324,7 +332,13 @@ mod compensation_tests {
             // The prior generation's assignment is the source of truth for the
             // five values compensation must render: read it back from the
             // remote record (generations/<gen>/assignment.json).
-            let prior_assignment = h.helper().read_assignment(first_gen.as_str()).unwrap();
+            let prior_assignment = h
+                .helper()
+                .read_assignment(
+                    first_gen.as_str(),
+                    &crate::remote::helper::test_owner("eng", "p1"),
+                )
+                .unwrap();
 
             // A subsequent (desired) push fails activation and the engine
             // compensates back to the prior generation. Drive the same
@@ -375,6 +389,7 @@ mod compensation_tests {
                 prior_gen: Some(first_gen.clone()),
                 advanced_gen: first_gen.clone(),
                 template_vars: desired_vars,
+                owner: crate::remote::helper::test_owner("eng", "p1"),
             };
             let outcome = compensate_server(&helper, &request).map_err(|e| e.to_string())?;
             let CompensationOutcome::Restored { .. } = outcome else {
@@ -480,6 +495,8 @@ mod compensation_tests {
                 behavior_sha256: "b".into(),
                 prior_generation: Some(first_gen.clone()),
                 created_at: crate::remote::helper::now_rfc3339(),
+                application: crate::identity::ApplicationStoreKey::parse("eng").unwrap(),
+                slot: crate::identity::SlotId::parse("p1").unwrap(),
                 target: Some(crate::identity::TargetName::new("t1")),
             })
             .unwrap();
@@ -509,6 +526,8 @@ mod compensation_tests {
                 behavior_sha256: "b".into(),
                 prior_generation: Some(g2.clone()),
                 created_at: crate::remote::helper::now_rfc3339(),
+                application: crate::identity::ApplicationStoreKey::parse("eng").unwrap(),
+                slot: crate::identity::SlotId::parse("p1").unwrap(),
                 target: Some(crate::identity::TargetName::new("t1")),
             })
             .unwrap();
@@ -556,6 +575,7 @@ mod compensation_tests {
             prior_gen: Some(first_gen.clone()),
             advanced_gen: g2.clone(),
             template_vars: vars,
+            owner: crate::remote::helper::test_owner("eng", "p1"),
         };
         let outcome = compensate_server(&helper, &request).unwrap();
         assert!(
@@ -563,7 +583,12 @@ mod compensation_tests {
             "compensation must refuse when current no longer names the advanced generation"
         );
         // The foreign current (g3) survives untouched.
-        let current = h.helper().status().unwrap().current_generation.unwrap();
+        let current = h
+            .helper()
+            .status(&crate::remote::helper::test_owner("eng", "p1"))
+            .unwrap()
+            .current_generation
+            .unwrap();
         assert_eq!(
             current.as_str(),
             g3.as_str(),

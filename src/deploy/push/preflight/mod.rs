@@ -584,15 +584,24 @@ pub(crate) fn run_preflight(
         pre_push.insert(
             slot_id.clone(),
             match expected {
-                Some(g) => match helpers[slot_id].read_assignment(g.as_str()) {
-                    Ok(asn) => Observation::Known(PreviousGeneration {
-                        generation: g,
-                        artifact: asn.artifact,
-                    }),
-                    Err(e) => Observation::Unknown(ObservationError {
-                        message: format!("assignment read failed: {e}"),
-                    }),
-                },
+                Some(g) => {
+                    // The assignment read verifies the generation's OWNER
+                    // MARKER against this application + slot (fail closed on
+                    // a transplanted record).
+                    let owner = crate::remote::helper::GenerationOwner::new(
+                        config.application().clone(),
+                        slot_id.clone(),
+                    );
+                    match helpers[slot_id].read_assignment(g.as_str(), &owner) {
+                        Ok(asn) => Observation::Known(PreviousGeneration {
+                            generation: g,
+                            artifact: asn.artifact,
+                        }),
+                        Err(e) => Observation::Unknown(ObservationError {
+                            message: format!("assignment read failed: {e}"),
+                        }),
+                    }
+                }
                 None => Observation::KnownAbsent,
             },
         );
@@ -1063,10 +1072,15 @@ pub(crate) mod preflight_tests {
         assert_eq!(members2.len(), 1);
         assert_eq!(members2[0].0.id, "p2", "current membership is now p2");
 
-        // The exact rollback must be refused with the membership error
-        // and must not mutate ANY deployment state. The refusal fires in
-        // `plan_assignments` (before the remote phase opens a connection);
-        // `push()`'s advisory lock files are the only bytes created.
+        // The exact rollback must be refused (fail closed) and must not
+        // mutate ANY deployment state. The refusal now fires at the
+        // READ-ONLY remote phase: the rebind (p1 -> p2 on the same physical
+        // location) makes the remote's generations owner-mismatched, so the
+        // first status verification refuses the transplanted state with an
+        // integrity error — before any plan/attempt record, before the
+        // membership gate in `plan_assignments` is even reached, and before
+        // any remote byte changes. `push()`'s advisory lock files are the
+        // only bytes created.
         let remotes_before = snapshot_files(&h.remotes_base);
         let observed_before = h.store.read_observed("t1", &h.config).unwrap();
         let rf = h.remotes_base.clone();
@@ -1097,14 +1111,23 @@ pub(crate) mod preflight_tests {
             },
         )
         .expect_err("membership change must refuse exact rollback");
+        // THE OWNER-MARKER REFUSAL (the review's fail-closed contract): the
+        // rebind renames the slot p1 -> p2 on the SAME physical location, so
+        // the remote's generations now carry an owner marker that does not
+        // match the current slot identity — the first status verification
+        // (a read, never a mutation) refuses the remote as transplanted
+        // state, before any plan/attempt record and before any remote byte
+        // changes. The membership-change gate in `plan_assignments` would
+        // ALSO refuse (the snapshot's slot set differs from the current
+        // one), but the owner-marker check fires first, at the read-only
+        // remote phase.
         assert!(
-            err.to_string().contains("target membership changed"),
-            "error must state the membership-change refusal, got: {err}"
+            err.to_string().contains("owner marker mismatch"),
+            "error must state the owner-marker refusal (fail closed), got: {err}"
         );
         assert!(
-            err.to_string()
-                .contains("identical stable placement-slot set"),
-            "error must state the identical-slot-set requirement, got: {err}"
+            err.to_string().contains("integrity") || err.to_string().contains("digest"),
+            "error must be an integrity-class refusal, got: {err}"
         );
 
         // Nothing mutated: no attempt, no snapshot, no observed change, and
@@ -1210,7 +1233,9 @@ pub(crate) mod preflight_tests {
         let remote =
             LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1"))
                 .unwrap();
-        let status = RemoteHelper::new(&remote).status().unwrap();
+        let status = RemoteHelper::new(&remote)
+            .status(&crate::remote::helper::test_owner("eng", "p1"))
+            .unwrap();
         assert_eq!(
             status.current_generation.as_ref().map(|g| g.as_str()),
             Some(s0_gen.as_str()),

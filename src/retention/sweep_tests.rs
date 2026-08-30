@@ -181,6 +181,8 @@ fn make_gen(
             behavior_sha256: "b".into(),
             prior_generation: prior_generation.map(test_generation_id),
             created_at: created.into(),
+            application: crate::identity::ApplicationStoreKey::parse("sw").unwrap(),
+            slot: crate::identity::SlotId::parse("p1").unwrap(),
             target: None,
         })
         .unwrap();
@@ -445,7 +447,14 @@ fn run_no_leak_case(
 
     // ---- receiver sweep: retention -----------------------------------------
     let retention = &cfg.variant("standard").unwrap().retention;
-    let retained = compute_retained(&helper, cfg.pins(), &store, retention).unwrap();
+    let retained = compute_retained(
+        &helper,
+        cfg.pins(),
+        &store,
+        retention,
+        &crate::remote::helper::test_owner("sw", "p1"),
+    )
+    .unwrap();
     helper.rotate(&retained, &HashSet::new()).unwrap();
     // The receiver retains EXACTLY the policy-retained trees: stale ones are
     // gone, retained + pinned content survives.

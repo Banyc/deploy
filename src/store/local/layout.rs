@@ -29,6 +29,12 @@ impl LocalStore {
     // ---- targets ----------------------------------------------------------
 
     pub fn target_dir(&self, target: &str) -> PathBuf {
+        // RAW-string entry point: the caller holds a validated target name
+        // (the config/CLI target — the valid grammar is ASCII-safe and
+        // `sanitize` is the identity on it), but the value arrives as a
+        // plain string here, so the sanitize confinement stays for any
+        // non-grammar input (a valid name passes through UNCHANGED — the
+        // store stores valid names verbatim).
         self.base.join("targets").join(sanitize(target))
     }
 

@@ -180,6 +180,23 @@ impl ServerDef {
             ServerConnection::Ssh { identity, .. } => identity,
         }
     }
+
+    /// The server's PHYSICAL HOST ENDPOINT: `user@address` for an SSH
+    /// server (the address + deployment account — NOT the ServerId, so two
+    /// ServerIds naming the same physical host collapse to the same
+    /// endpoint), or the constant `local` marker for the pathless local
+    /// connection kind (whose SOLE physical root is the referencing slot's
+    /// deploy_dir). The endpoint is the PHYSICAL half of a
+    /// [`crate::identity::PhysicalSlotKey`]: a duplicate (endpoint,
+    /// deploy_dir) pair is ONE physical location, never two authorities.
+    pub fn endpoint(&self) -> String {
+        match &self.connection {
+            ServerConnection::Local { .. } => crate::identity::LOCAL_ENDPOINT_MARKER.to_string(),
+            ServerConnection::Ssh { address, user, .. } => {
+                format!("{}@{}", user.as_str(), address.as_str())
+            }
+        }
+    }
 }
 
 /// The raw `address` marker of a LOCAL server: a pathless connection kind.

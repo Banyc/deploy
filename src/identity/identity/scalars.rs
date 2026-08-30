@@ -30,6 +30,8 @@ use std::str::FromStr;
 
 use jiff::Timestamp as JiffTimestamp;
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::{Error, Result};
 
 /// A valid 64-lowercase-hex sha256 digest, shared by test fixtures that need
@@ -40,27 +42,32 @@ pub(crate) const DIGEST_TEST_HEX_1: &str =
 
 /// The name rule shared by the identifier-like scalars AND the identity
 /// newtypes in [`crate::identity::segments`] (ServerId, SlotId, TargetName,
-/// VariantName): non-empty after trimming, no surrounding
-/// whitespace (a name is exactly what was written, never silently trimmed),
-/// no control characters, and no path separators or traversal components — a
-/// name is a SINGLE safe path segment. Names become directory components on a
-/// server (the per-server remote directory is named by the server id), so a
-/// name must never smuggle a separator (`/`, `\`) or a `.`/`..` traversal
-/// component out of the forced namespace.
+/// VariantName): a SINGLE FILESYSTEM-SAFE ASCII path segment — non-empty,
+/// only `[a-zA-Z0-9._-]`, not a `.`/`..` traversal component, and never a
+/// leading dash. A name becomes a directory/file component UNCHANGED
+/// (the store stores validated names VERBATIM), so the rule must make the
+/// valid set INJECTIVE into the filesystem: every excluded class is exactly
+/// a class that could collide under an encoding or escape the forced
+/// namespace — separators (`/`, `\`) would nest, whitespace/control/unicode
+/// would have to be re-encoded (two distinct names collapsing onto one
+/// encoded name), `.`/`..` escape the namespace, and a leading dash invites
+/// option-parser confusion. No re-encoding is needed: the valid set is
+/// already filesystem-safe, so two distinct valid names ALWAYS map to two
+/// distinct path components.
 pub(crate) fn valid_name(s: &str) -> bool {
-    !s.trim().is_empty()
-        && s.trim() == s
-        && !s.chars().any(|c| c.is_control())
-        && !s.contains('/')
-        && !s.contains('\\')
+    !s.is_empty()
+        && !s.starts_with('-')
         && s != "."
         && s != ".."
+        && s.bytes()
+            .all(|b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.'))
 }
 
 macro_rules! name_scalar {
     ($name:ident, $doc:expr, $rule:expr) => {
         #[doc = $doc]
-        #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+        #[serde(transparent)]
         pub struct $name(String);
 
         impl $name {
@@ -96,6 +103,20 @@ macro_rules! name_scalar {
                 $name::parse(s)
             }
         }
+
+        /// Wire strings go through the validated parse (mirrors the
+        /// identity-newtype contract): an invalid wire value fails
+        /// deserialization (fail closed — a record that carries a malformed
+        /// name is never silently accepted).
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let s = String::deserialize(deserializer)?;
+                $name::parse(&s).map_err(serde::de::Error::custom)
+            }
+        }
     };
 }
 
@@ -120,22 +141,21 @@ name_scalar!(
 
 name_scalar!(
     Host,
-    "A validated SSH host: the address of an SSH server. Non-empty, no \
-    surrounding whitespace, no control characters, and no path separators or \
-    traversal components — a host is a single safe token (a DNS name, an IP, \
-    or a bracketed IPv6 literal), never a path. The pathless local marker \
-    (the separate [`crate::config::ServerConnection::Local`] connection kind, \
-    whose root is the slot's deploy_dir) is NOT a host: a host can never \
-    smuggle a path out of the SSH namespace.",
+    "A validated SSH host: the address of an SSH server. A single \
+    filesystem-safe ASCII token (a DNS name or an IP — letters, digits, \
+    dots, hyphens, underscores; never a leading dash), never a path: a host \
+    can never smuggle a separator or traversal component out of the SSH \
+    namespace. The pathless local marker (the separate \
+    [`crate::config::ServerConnection::Local`] connection kind, whose root is \
+    the slot's deploy_dir) is NOT a host.",
     valid_name
 );
 
 name_scalar!(
     SshUser,
     "A validated SSH deployment account: the `user` of an SSH connection. \
-    Non-empty, no surrounding whitespace, no control characters, and no path \
-    separators or traversal components — a user is a single safe token, never \
-    a path.",
+    A single filesystem-safe ASCII token (letters, digits, dots, hyphens, \
+    underscores; never a leading dash), never a path.",
     valid_name
 );
 
@@ -145,12 +165,14 @@ name_scalar!(
     `application` field, used for BOTH display (messages and rendering) and \
     storage (the single filesystem component that names the application's \
     local store directory, `<data>/simple-deploy/<key>`). EXACTLY ONE \
-    NORMAL FILESYSTEM COMPONENT: non-empty, no `/` or `\\`, not `.`/`..`, \
-    no surrounding whitespace or control characters — the same \
-    single-safe-segment rule as the other path-segment scalars. The store \
-    path is built ONLY from a validated key ([`crate::store::local::LocalStore::new`] \
-    takes the key, never a raw string), so an application name can never \
-    escape the store base.",
+    NORMAL FILESYSTEM COMPONENT: a single filesystem-safe ASCII segment \
+    (only `[a-zA-Z0-9._-]`, not `.`/`..`, never a leading dash) — the same \
+    single-safe-segment rule as the other path-segment scalars, so the store \
+    stores the key VERBATIM and two distinct keys always map to two \
+    distinct store directories. The store path is built ONLY from a \
+    validated key ([`crate::store::local::LocalStore::new`] takes the key, \
+    never a raw string), so an application name can never escape the store \
+    base.",
     valid_name
 );
 
@@ -428,14 +450,15 @@ mod tests {
 
     #[test]
     fn identifier_accepts_valid_rejects_invalid() {
-        for ok in ["s1", "production", "wave-1", "α", "x y", "a", "a..b", "a.b"] {
+        for ok in ["s1", "production", "wave-1", "a", "a..b", "a.b", "a_b-c.d"] {
             let id = Identifier::parse(ok).expect("valid identifier parses");
             assert_eq!(id.as_str(), ok);
             assert_eq!(id.to_string(), ok);
             assert_eq!(ok.parse::<Identifier>().expect("from_str"), id);
         }
         for bad in [
-            "", "   ", " x", "x ", "\u{0}", "a\nb", "a/b", "a\\b", ".", "..", "../x", "x/..",
+            "", "   ", " x", "x ", "\u{0}", "a\nb", "a/b", "a\\b", ".", "..", "../x", "x/..", "α",
+            "x y", "-lead", "a b", "a\u{1f}",
         ] {
             Identifier::parse(bad).expect_err("invalid identifier must be rejected");
             assert!(bad.parse::<Identifier>().is_err(), "{bad:?}");
@@ -444,12 +467,12 @@ mod tests {
 
     #[test]
     fn application_store_key_requires_safe_single_segment() {
-        for ok in ["app", "my app", "α", "a..b"] {
+        for ok in ["app", "my-app", "my_app.1", "a..b"] {
             let name = ApplicationStoreKey::parse(ok).expect("safe name parses");
             assert_eq!(name.as_str(), ok);
         }
         for bad in [
-            "", "   ", "\n", " x", "x ", "a/b", "a\\b", ".", "..", "\u{0}",
+            "", "   ", "\n", " x", "x ", "a/b", "a\\b", ".", "..", "\u{0}", "my app", "α", "-lead",
         ] {
             ApplicationStoreKey::parse(bad).expect_err("unsafe application store key rejected");
         }
@@ -457,12 +480,12 @@ mod tests {
 
     #[test]
     fn rollout_group_name_accepts_valid_rejects_invalid() {
-        for ok in ["canary", "wave-1", "α", "a..b"] {
+        for ok in ["canary", "wave-1", "a..b", "a.b"] {
             let g = RolloutGroupName::parse(ok).expect("valid group parses");
             assert_eq!(g.as_str(), ok);
         }
         for bad in [
-            "", "   ", " x", "x ", "\u{0}", "a/b", "a\\b", ".", "..", "../x",
+            "", "   ", " x", "x ", "\u{0}", "a/b", "a\\b", ".", "..", "../x", "α", "x y", "-lead",
         ] {
             RolloutGroupName::parse(bad).expect_err("invalid group name rejected");
         }
@@ -594,21 +617,25 @@ mod tests {
     // -------------------------------------------------------------------
 
     /// The independent characterization of the name rule: a value is a safe
-    /// single path segment iff it is non-empty, unpadded, control-free, has
-    /// no path separator, and is not a `.`/`..` traversal component.
+    /// filesystem ASCII single path segment iff it is non-empty, uses only
+    /// `[a-zA-Z0-9._-]`, is not a `.`/`..` traversal component, and never
+    /// starts with `-` (a leading dash invites option-parser confusion).
     fn is_safe_segment(s: &str) -> bool {
         !s.is_empty()
-            && s.trim() == s
-            && !s.chars().any(|c| c.is_control())
-            && !s.contains('/')
-            && !s.contains('\\')
+            && !s.starts_with('-')
             && s != "."
             && s != ".."
+            && s.bytes().all(|b| {
+                matches!(
+                    b,
+                    b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.'
+                )
+            })
     }
 
     /// Arbitrary name/path-segment values covering every traversal class:
     /// `..`, `.`, `/`, `\`, empty, whitespace, control characters, unicode,
-    /// and clean single segments.
+    /// leading dashes, and clean single segments.
     fn arbitrary_segment_text() -> impl Strategy<Value = String> {
         prop_oneof![
             prop::sample::select(vec![
@@ -630,10 +657,13 @@ mod tests {
                 "\u{0}".to_string(),
                 "a\nb".to_string(),
                 "α".to_string(),
+                "-lead".to_string(),
+                "-x".to_string(),
                 "s1".to_string(),
                 "wave-1".to_string(),
                 "a..b".to_string(),
                 "a.b".to_string(),
+                "a_b-c.d9".to_string(),
             ]),
             prop::collection::vec(prop::char::any(), 0..12).prop_map(|v| v.into_iter().collect()),
         ]

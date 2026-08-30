@@ -142,6 +142,7 @@ pub(crate) fn pair_actual_state(
 pub(crate) fn observe_actual_servers(
     assignments: &[PlannedAssignment],
     helpers: &HashMap<SlotId, RemoteHelper>,
+    application: &crate::identity::ApplicationStoreKey,
 ) -> (
     BTreeMap<SlotId, ActualSlotState>,
     BTreeMap<SlotId, Observation<ObservedGeneration>>,
@@ -152,10 +153,14 @@ pub(crate) fn observe_actual_servers(
     for a in assignments {
         let sid = &a.placement_slot;
         let helper = &helpers[sid];
-        let status = helper.status();
+        // Every status/assignment read verifies the generation's OWNER MARKER
+        // against this application + slot: a transplanted record is refused
+        // (fail closed — never observed as a valid deployment).
+        let owner = crate::remote::helper::GenerationOwner::new(application.clone(), sid.clone());
+        let status = helper.status(&owner);
         let case = match status {
             Ok(s) => match s.current_generation {
-                Some(g) => match helper.read_assignment(g.as_str()) {
+                Some(g) => match helper.read_assignment(g.as_str(), &owner) {
                     Ok(asn) => LiveObservationCase::Observed {
                         generation: g.clone(),
                         artifact: asn.artifact,

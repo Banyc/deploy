@@ -9,7 +9,7 @@ use crate::identity::GenerationId;
 use crate::remote::layout;
 use std::path::Path;
 
-use super::super::{LockRecord, RemoteHelper, RemoteStatus};
+use super::super::{GenerationOwner, LockRecord, RemoteHelper, RemoteStatus};
 
 /// The ACTUAL resolved state of the top-level `current` link: genuine absence
 /// or the exact canonical generation it points at. Produced ONLY by
@@ -48,8 +48,11 @@ impl<'a> RemoteHelper<'a> {
     /// closed with an integrity error — never a panic:
     ///
     /// * the generation directory `generations/<gen>/` exists;
-    /// * `generations/<gen>/assignment.json` exists, parses, and its
-    ///   generation id matches the directory;
+    /// * `generations/<gen>/assignment.json` exists, parses, its
+    ///   generation id matches the directory, AND its OWNER MARKER
+    ///   (`application`/`slot`) matches the expected `owner` — a generation
+    ///   transplanted from another application/slot is refused (fail
+    ///   closed);
     /// * the generation's `root` symlink exists, is a symlink, and its target
     ///   is byte-exactly the canonical `../../objects/sha256/<tree>/root` for
     ///   the assignment's tree (the exact form `create_generation` writes);
@@ -57,7 +60,7 @@ impl<'a> RemoteHelper<'a> {
     ///
     /// On full success `current_generation`/`current_tree` carry the
     /// validated generation id and tree.
-    pub fn status(&self) -> Result<RemoteStatus> {
+    pub fn status(&self, owner: &GenerationOwner) -> Result<RemoteStatus> {
         let mut status = RemoteStatus::default();
 
         // Current generation via the top-level `current` symlink. The ONLY
@@ -82,9 +85,9 @@ impl<'a> RemoteHelper<'a> {
                     gen_dir.display()
                 )));
             }
-            let a = self.read_assignment(gid.as_str()).map_err(|e| {
+            let a = self.read_assignment(gid.as_str(), owner).map_err(|e| {
                 Error::integrity(format!(
-                    "current generation {gid} has a malformed assignment: {e}"
+                    "current generation {gid} has a malformed, ownerless, or owner-mismatched assignment: {e}"
                 ))
             })?;
             if a.generation_id != gid {
@@ -334,7 +337,7 @@ mod tests_current {
     use super::*;
     use crate::identity::{ArtifactRef, TargetName};
     use crate::identity::{test_deployment_id, test_generation_id, test_tree_digest};
-    use crate::remote::helper::GenerationAssignment;
+    use crate::remote::helper::{GenerationAssignment, GenerationOwner};
     use crate::remote::transport::LocalTransport;
     #[cfg(test)]
     use proptest::prelude::*;
@@ -353,8 +356,16 @@ mod tests_current {
             behavior_sha256: "b".to_string(),
             prior_generation: None,
             created_at: "2020-01-01T00:00:00Z".to_string(),
+            application: crate::identity::ApplicationStoreKey::parse("test-app").unwrap(),
+            slot: crate::identity::SlotId::parse("s1").unwrap(),
             target: Some(TargetName::new("t1")),
         }
+    }
+
+    /// The expected owner the fixture assignments carry: the same owner the
+    /// status reads below verify against (application `test-app`, slot `s1`).
+    fn owner() -> GenerationOwner {
+        super::super::super::test_owner("test-app", "s1")
     }
 
     // ---- status() validates the complete symlink layout -------------------
@@ -480,7 +491,7 @@ mod tests_current {
     #[test]
     fn status_reports_none_when_current_link_absent() {
         let spec = LayoutSpec::default();
-        let st = run_on_layout(&spec, |h| h.status()).expect("absence is not an error");
+        let st = run_on_layout(&spec, |h| h.status(&owner())).expect("absence is not an error");
         assert!(st.current_generation.is_none());
         assert!(st.current_tree.is_none());
     }
@@ -493,7 +504,7 @@ mod tests_current {
             current: Some(CurrentLink::PlainFile),
             ..LayoutSpec::default()
         };
-        let err = run_on_layout(&spec, |h| h.status())
+        let err = run_on_layout(&spec, |h| h.status(&owner()))
             .expect_err("a plain-file current must fail closed");
         assert!(
             err.to_string().contains("integrity"),
@@ -512,7 +523,7 @@ mod tests_current {
                 current: Some(CurrentLink::Symlink(target.to_string())),
                 ..LayoutSpec::default()
             };
-            let err = run_on_layout(&spec, |h| h.status())
+            let err = run_on_layout(&spec, |h| h.status(&owner()))
                 .expect_err("a non-canonical current target must fail closed");
             assert!(
                 err.to_string().contains("integrity"),
@@ -551,7 +562,7 @@ mod tests_current {
                 current: Some(CurrentLink::Symlink(target.clone())),
                 ..LayoutSpec::default()
             };
-            let err = run_on_layout(&spec, |h| h.status())
+            let err = run_on_layout(&spec, |h| h.status(&owner()))
                 .expect_err("a malformed current target must fail closed");
             assert!(
                 err.to_string().contains("integrity"),
@@ -573,7 +584,7 @@ mod tests_current {
             ))),
             ..LayoutSpec::default()
         };
-        let err = run_on_layout(&spec, |h| h.status())
+        let err = run_on_layout(&spec, |h| h.status(&owner()))
             .expect_err("a dangling current link must fail closed");
         assert!(
             err.to_string().contains("integrity"),
@@ -596,7 +607,7 @@ mod tests_current {
             gen_id: Some(gid.as_str().to_string()),
             ..LayoutSpec::default()
         };
-        let err = run_on_layout(&spec, |h| h.status())
+        let err = run_on_layout(&spec, |h| h.status(&owner()))
             .expect_err("a generation without an assignment must fail closed");
         assert!(
             err.to_string().contains("integrity"),
@@ -620,7 +631,7 @@ mod tests_current {
             assignment: Some(b"{ corrupt json !".to_vec()),
             ..LayoutSpec::default()
         };
-        let err = run_on_layout(&spec, |h| h.status())
+        let err = run_on_layout(&spec, |h| h.status(&owner()))
             .expect_err("a corrupt assignment must fail closed");
         assert!(
             err.to_string().contains("integrity"),
@@ -644,7 +655,7 @@ mod tests_current {
             assignment: Some(assignment_json("gen-other", "tree-a")),
             ..LayoutSpec::default()
         };
-        let err = run_on_layout(&spec, |h| h.status())
+        let err = run_on_layout(&spec, |h| h.status(&owner()))
             .expect_err("an assignment naming a different generation must fail closed");
         assert!(
             err.to_string().contains("integrity"),
@@ -658,7 +669,7 @@ mod tests_current {
     fn status_fails_integrity_for_missing_root_link() {
         let spec = LayoutSpec::canonical("gen-no-root", "tree-a");
         let spec = LayoutSpec { root: None, ..spec };
-        let err = run_on_layout(&spec, |h| h.status())
+        let err = run_on_layout(&spec, |h| h.status(&owner()))
             .expect_err("a generation without its root symlink must fail closed");
         assert!(
             err.to_string().contains("integrity"),
@@ -689,7 +700,7 @@ mod tests_current {
                 root: Some(RootLink::Symlink(wrong.clone())),
                 ..spec
             };
-            let err = run_on_layout(&spec, |h| h.status())
+            let err = run_on_layout(&spec, |h| h.status(&owner()))
                 .expect_err("a wrong generation root target must fail closed");
             assert!(
                 err.to_string().contains("integrity"),
@@ -707,7 +718,7 @@ mod tests_current {
             root: Some(RootLink::PlainFile),
             ..spec
         };
-        let err = run_on_layout(&spec, |h| h.status())
+        let err = run_on_layout(&spec, |h| h.status(&owner()))
             .expect_err("a plain-file generation root must fail closed");
         assert!(
             err.to_string().contains("integrity"),
@@ -721,7 +732,7 @@ mod tests_current {
     fn status_fails_integrity_for_missing_tree_object() {
         let spec = LayoutSpec::canonical("gen-no-tree", "tree-a");
         let spec = LayoutSpec { tree: None, ..spec };
-        let err = run_on_layout(&spec, |h| h.status())
+        let err = run_on_layout(&spec, |h| h.status(&owner()))
             .expect_err("a generation without its tree object must fail closed");
         assert!(
             err.to_string().contains("integrity"),
@@ -737,7 +748,7 @@ mod tests_current {
     fn status_reports_validated_generation_and_tree() {
         let gid = test_generation_id("gen-ok");
         let spec = LayoutSpec::canonical("gen-ok", "tree-a");
-        let st = run_on_layout(&spec, |h| h.status())
+        let st = run_on_layout(&spec, |h| h.status(&owner()))
             .expect("a fully consistent chain must report the validated generation");
         assert_eq!(st.current_generation, Some(gid));
         assert_eq!(
@@ -1018,7 +1029,9 @@ mod tests_current {
                         "variant": "standard",
                         "tree": tree},
                     "behavior_sha256": "0".repeat(64),
-                    "created_at": "2020-01-01T00:00:00Z"}))
+                    "created_at": "2020-01-01T00:00:00Z",
+                    "application": "test-app",
+                    "slot": "s1"}))
                 .expect("the generated record serializes")
             }),
             // Corrupt JSON.
@@ -1273,7 +1286,7 @@ mod tests_current {
                 _ => false};
 
             // ---- status() ----
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| helper.status()))
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| helper.status(&owner())))
                 .expect("status must never panic on arbitrary symlink layouts");
             match result {
                 Ok(st) => {

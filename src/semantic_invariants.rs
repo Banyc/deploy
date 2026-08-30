@@ -1065,10 +1065,11 @@ impl Fixture {
 
     /// The current generation's stored assignment for the single slot, if any.
     fn current_assignment(&self) -> Option<GenerationAssignment> {
+        let owner = crate::remote::helper::test_owner("si", "p1");
         self.with_helper(|helper| {
-            let status = helper.status().ok()?;
+            let status = helper.status(&owner).ok()?;
             let g = status.current_generation?;
-            helper.read_assignment(g.as_str()).ok()
+            helper.read_assignment(g.as_str(), &owner).ok()
         })
     }
 
@@ -1081,10 +1082,11 @@ impl Fixture {
     fn current_assignments(&self) -> BTreeMap<SlotId, GenerationAssignment> {
         let mut out = BTreeMap::new();
         for slot in ["p1", "p2", "p3"] {
+            let owner = crate::remote::helper::test_owner("si", slot);
             let asn = self.with_slot_helper(slot, |helper| {
-                let status = helper.status().ok()?;
+                let status = helper.status(&owner).ok()?;
                 let g = status.current_generation?;
-                helper.read_assignment(g.as_str()).ok()
+                helper.read_assignment(g.as_str(), &owner).ok()
             });
             if let Some(a) = asn {
                 out.insert(SlotId::new(slot.to_string()), a);
@@ -1786,11 +1788,17 @@ impl Fixture {
     fn rotate_slot_policy(&self) -> Result<()> {
         let retention = &self.config.variant("standard").unwrap().retention;
         for server in ["s1", "s2", "s3"] {
+            let slot = match server {
+                "s1" => "p1",
+                "s2" => "p2",
+                _ => "p3",
+            };
+            let owner = crate::remote::helper::test_owner("si", slot);
             self.with_helper_for(server, |helper| {
                 let op = OperationId::generate();
                 let _guard = helper.acquire_lock_guard(&op)?;
                 let retained =
-                    compute_retained(&helper, self.config.pins(), &self.store, retention)?;
+                    compute_retained(&helper, self.config.pins(), &self.store, retention, &owner)?;
                 helper.rotate(&retained, &HashSet::new())
             })?;
         }
@@ -2007,12 +2015,18 @@ impl Fixture {
             );
         }
         for server in ["s1", "s2", "s3"] {
+            let slot = match server {
+                "s1" => "p1",
+                "s2" => "p2",
+                _ => "p3",
+            };
+            let owner = crate::remote::helper::test_owner("si", slot);
             let retained = self.with_helper_for(server, |helper| {
                 // The slot's ONE policy, resolved from its OWNING VARIANT
                 // (`standard` declares every slot) — never a per-target
                 // union.
                 let retention = &self.config.variant("standard").unwrap().retention;
-                compute_retained(&helper, self.config.pins(), &self.store, retention)
+                compute_retained(&helper, self.config.pins(), &self.store, retention, &owner)
                     .expect("retained under the slot's owning-variant policy")
             });
             // Every tree the single policy retains must actually survive the
@@ -2154,12 +2168,14 @@ impl Fixture {
     /// (content-address verified by path), on EVERY slot's server.
     fn check_integrity(&self) {
         for server in ["s1", "s2"] {
+            let slot = if server == "s1" { "p1" } else { "p2" };
+            let owner = crate::remote::helper::test_owner("si", slot);
             self.with_helper_for(server, |helper| {
-                if let Ok(status) = helper.status()
+                if let Ok(status) = helper.status(&owner)
                     && let Some(g) = &status.current_generation
                 {
                     let asn = helper
-                        .read_assignment(g.as_str())
+                        .read_assignment(g.as_str(), &owner)
                         .expect("current generation assignment must parse");
                     assert!(
                         helper
@@ -3768,12 +3784,14 @@ fn scope_retained_is_the_owning_variants_single_policy() {
         f.apply(Action::Build(v));
         f.apply(Action::Push(t));
     }
+    let owner = crate::remote::helper::test_owner("si", "p1");
     let via_p1 = f.with_helper(|helper| {
         compute_retained(
             &helper,
             f.config.pins(),
             &f.store,
             f.config.slot_retention("p1").unwrap(),
+            &owner,
         )
         .unwrap()
     });
@@ -3783,6 +3801,7 @@ fn scope_retained_is_the_owning_variants_single_policy() {
             f.config.pins(),
             &f.store,
             f.config.slot_retention("p2").unwrap(),
+            &owner,
         )
         .unwrap()
     });
@@ -3810,12 +3829,14 @@ fn scope_strengthening_policy_never_reduces_retained() {
         f.apply(Action::Push(t));
     }
     let baseline = |cfg: &ProjectConfig| -> HashSet<String> {
+        let owner = crate::remote::helper::test_owner("si", "p1");
         f.with_helper(|helper| {
             compute_retained(
                 &helper,
                 cfg.pins(),
                 &f.store,
                 cfg.slot_retention("p1").unwrap(),
+                &owner,
             )
             .unwrap()
         })
@@ -7156,11 +7177,16 @@ fn assert_membership_never_changes_retention(
         let remote =
             LocalTransport::new(&crate::testutil::fixture_env(), remotes_base.join("h1")).unwrap();
         let helper = RemoteHelper::new(&remote);
+        let owner = crate::remote::helper::GenerationOwner::new(
+            cfg.application().clone(),
+            crate::identity::SlotId::parse(slot_id).expect("validated slot id is a safe segment"),
+        );
         compute_retained(
             &helper,
             cfg.pins(),
             store,
             cfg.slot_retention(slot_id).unwrap(),
+            &owner,
         )
         .unwrap()
     };

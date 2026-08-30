@@ -738,7 +738,7 @@ fn slots_on_the_same_server_never_share_a_deploy_dir() {
     let err = ProjectConfig::load(&p).expect_err("shared server+deploy_dir must fail");
     let msg = err.to_string();
     assert!(
-        msg.contains("same location") && msg.contains("p1") && msg.contains("p2"),
+        msg.contains("same physical location") && msg.contains("p1") && msg.contains("p2"),
         "error must name the colliding slots, got: {msg}"
     );
 
@@ -761,12 +761,15 @@ fn slots_on_the_same_server_never_share_a_deploy_dir() {
     assert_eq!(cfg.slot_defs().len(), 2);
 }
 
-/// INJECTIVE LOCAL EFFECTIVE ROOTS: two LOCAL slots must never operate on
-/// the same directory — even on DIFFERENT server ids, because every local
-/// transport shares the HOST FILESYSTEM (the server id does not separate
-/// local roots the way a remote host does). The injection rule keys local
-/// roots on the deploy_dir ALONE, and on the NORMALIZED canonical form:
-/// messy spellings (`/srv/p1//`, `/srv/p1/`) are the SAME effective root.
+/// INJECTIVE PHYSICAL LOCATIONS: two slots must never operate on the same
+/// PHYSICAL location — the (endpoint, deploy_dir) pair, where the endpoint
+/// is the server's `user@address` (or the `local` marker), NOT the ServerId.
+/// Two LOCAL slots on the same directory collide even on DIFFERENT server
+/// ids (every local transport shares the HOST FILESYSTEM), and two SSH
+/// slots on DIFFERENT ServerIds that name the SAME host+dir collide too (a
+/// duplicate physical location is a config error, never two silent
+/// authorities). The rule compares NORMALIZED canonical roots: messy
+/// spellings (`/srv/p1//`, `/srv/p1/`) are the SAME effective root.
 #[test]
 fn two_local_slots_never_share_a_deploy_dir_even_across_servers() {
     // Two local servers; the second slot binds a DIFFERENT server but the
@@ -796,8 +799,8 @@ fn two_local_slots_never_share_a_deploy_dir_even_across_servers() {
     let err = ProjectConfig::from_raw_parts(p.manifest, p.variants)
         .expect_err("two local slots on one directory must fail");
     assert!(
-        err.to_string().contains("same local deploy_dir"),
-        "error must name the local injection rule, got: {err}"
+        err.to_string().contains("same physical location"),
+        "error must name the physical-location rule, got: {err}"
     );
 
     // MESSY but normalized-equal spellings are the SAME effective root: the
@@ -818,10 +821,91 @@ fn two_local_slots_never_share_a_deploy_dir_even_across_servers() {
     let err = ProjectConfig::from_raw_parts(p.manifest, p.variants)
         .expect_err("normalized-equal local roots must fail");
     assert!(
-        err.to_string().contains("same local deploy_dir")
-            || err.to_string().contains("same location"),
-        "error must name the location rule, got: {err}"
+        err.to_string().contains("same physical location"),
+        "error must name the physical-location rule, got: {err}"
     );
+}
+
+/// THE REVIEW'S P1 FIX: two SSH slots on DIFFERENT ServerIds that point at
+/// the SAME physical host (same `user@address`) with the SAME deploy_dir
+/// are ONE physical location — REFUSED at config validation, never two
+/// silent authorities. Distinct host/address endpoints (or distinct
+/// deploy_dirs) stay valid.
+#[test]
+fn two_ssh_servers_on_the_same_endpoint_and_deploy_dir_are_refused() {
+    // Two servers with DIFFERENT ids naming the SAME user@address; the
+    // first slot's server is switched to the same SSH endpoint too, so the
+    // two slots share the PHYSICAL location (endpoint 'u@a', deploy_dir
+    // '/srv/p1') even though their ServerIds differ.
+    let mut p = minimal_raw_project();
+    p.manifest.servers[0].address = "a".to_string();
+    p.manifest.servers[0].host_key_fingerprint = Some("SHA256:test".to_string());
+    p.manifest.servers.push(raw::RawServer {
+        id: "s2".to_string(),
+        address: "a".to_string(),
+        user: "u".to_string(),
+        port: 22,
+        known_hosts: None,
+        host_key_fingerprint: Some("SHA256:test".to_string()),
+        capacity: raw::RawCapacityConfig::default(),
+    });
+    p.variants
+        .get_mut("standard")
+        .unwrap()
+        .slots
+        .push(SlotConfig::new(
+            "p2",
+            "s2",
+            PathBuf::from("/srv/p1"),
+            "t2",
+            Vec::new(),
+        ));
+    p.manifest.targets.insert(
+        "t2".to_string(),
+        raw::RawTargetConfig {
+            rollout: raw::RawRolloutConfig::default(),
+        },
+    );
+    let err = ProjectConfig::from_raw_parts(p.manifest, p.variants)
+        .expect_err("two server ids on the same endpoint+deploy_dir must fail");
+    assert!(
+        err.to_string().contains("same physical location"),
+        "error must name the physical-location rule, got: {err}"
+    );
+
+    // The SAME deploy_dir on DIFFERENT physical hosts is valid: distinct
+    // endpoints, so distinct physical locations.
+    let mut p = minimal_raw_project();
+    p.manifest.servers[0].address = "a".to_string();
+    p.manifest.servers[0].host_key_fingerprint = Some("SHA256:test".to_string());
+    p.manifest.servers.push(raw::RawServer {
+        id: "s2".to_string(),
+        address: "other.example.com".to_string(),
+        user: "u".to_string(),
+        port: 22,
+        known_hosts: None,
+        host_key_fingerprint: Some("SHA256:test".to_string()),
+        capacity: raw::RawCapacityConfig::default(),
+    });
+    p.variants
+        .get_mut("standard")
+        .unwrap()
+        .slots
+        .push(SlotConfig::new(
+            "p2",
+            "s2",
+            PathBuf::from("/srv/p1"),
+            "t2",
+            Vec::new(),
+        ));
+    p.manifest.targets.insert(
+        "t2".to_string(),
+        raw::RawTargetConfig {
+            rollout: raw::RawRolloutConfig::default(),
+        },
+    );
+    ProjectConfig::from_raw_parts(p.manifest, p.variants)
+        .expect("the same deploy_dir on two distinct hosts is two physical locations");
 }
 
 /// The canonical deploy_dir is stored in the VALIDATED graph: a messy but
@@ -4085,5 +4169,118 @@ proptest! {
         ),
     ) {
         run_selection_ownership_case(owners, group_lists);
+    }
+}
+
+// =====================================================================
+// THE PHYSICAL-COLLISION PROPERTY (the review's acceptance): over pairs of
+// ARBITRARY VALID server declarations and deploy dirs, two slots whose
+// (endpoint, deploy_dir) pair collides — the endpoint is the server's
+// `user@address`, NOT the ServerId — are REFUSED at config validation (a
+// duplicate physical location is a config error, never two silent
+// authorities); two slots with distinct physical halves are accepted.
+// =====================================================================
+
+/// A valid server-id/slot-id segment (no leading dash, not `.`/`..`).
+pub(crate) fn physical_test_segment() -> impl Strategy<Value = String> {
+    prop::collection::vec(
+        prop_oneof![
+            prop::char::range('a', 'z'),
+            prop::char::range('0', '9'),
+            Just('-'),
+        ],
+        1..8,
+    )
+    .prop_filter("valid segment", |s| s.first() != Some(&'-'))
+    .prop_map(|v| v.into_iter().collect())
+}
+
+/// Build the two-slot raw project: two servers `s_a`/`s_b` (SSH, sharing or
+/// splitting the endpoint parts) and two slots `p_a`/`p_b` on distinct
+/// targets with the given deploy dirs. Every non-location rule is satisfied
+/// (distinct ids, resolvable references, distinct servers per target), so
+/// the conversion outcome is the location rule's outcome exactly.
+fn two_slot_raw_project(
+    s_a: &str,
+    s_b: &str,
+    user: &str,
+    host: &str,
+    dir_a: &str,
+    dir_b: &str,
+) -> RawProject {
+    let mut p = minimal_raw_project();
+    p.manifest.servers = vec![
+        raw::RawServer {
+            id: s_a.to_string(),
+            address: host.to_string(),
+            user: user.to_string(),
+            port: 22,
+            known_hosts: None,
+            host_key_fingerprint: Some("SHA256:test".to_string()),
+            capacity: raw::RawCapacityConfig::default(),
+        },
+        raw::RawServer {
+            id: s_b.to_string(),
+            address: host.to_string(),
+            user: user.to_string(),
+            port: 22,
+            known_hosts: None,
+            host_key_fingerprint: Some("SHA256:test".to_string()),
+            capacity: raw::RawCapacityConfig::default(),
+        },
+    ];
+    p.manifest.targets.insert(
+        "t2".to_string(),
+        raw::RawTargetConfig {
+            rollout: raw::RawRolloutConfig::default(),
+        },
+    );
+    p.variants.get_mut("standard").unwrap().slots = vec![
+        SlotConfig::new("p_a", s_a, PathBuf::from(dir_a), "t1", Vec::new()),
+        SlotConfig::new("p_b", s_b, PathBuf::from(dir_b), "t2", Vec::new()),
+    ];
+    p
+}
+
+proptest! {
+    // Bounded `proptest_cases(16)` (full 16 with `DEPLOY_FULL_TESTS=1`, fast
+    // default), fixed seed 0x5EED_5EED (house style), no failure persistence.
+    #![proptest_config(ProptestConfig {
+        cases: crate::testutil::proptest_cases(16),
+        rng_seed: RngSeed::Fixed(0x5EED_5EED),
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
+
+    #[test]
+    fn same_physical_location_is_refused_distinct_physical_halves_are_accepted(
+        s_a in physical_test_segment(),
+        s_b in physical_test_segment(),
+        user in physical_test_segment(),
+        host in physical_test_segment(),
+        dir_a in "/[a-z0-9-]{1,12}",
+        dir_b in "/[a-z0-9-]{1,12}",
+    ) {
+        let s_a = if s_a.is_empty() { "sa".to_string() } else { s_a };
+        let s_b = if s_b.is_empty() { "sb".to_string() } else { s_b };
+        let user = if user.is_empty() { "u".to_string() } else { user };
+        let host = if host.is_empty() { "h".to_string() } else { host };
+        // Two DIFFERENT server ids on the SAME endpoint + SAME deploy_dir:
+        // ONE physical location — REFUSED (fail closed).
+        let p = two_slot_raw_project(&s_a, &s_b, &user, &host, &dir_a, &dir_a);
+        let err = ProjectConfig::from_raw_parts(p.manifest, p.variants)
+            .expect_err("two server ids on the same endpoint+deploy_dir must be refused");
+        assert!(
+            err.to_string().contains("same physical location"),
+            "the refusal must name the physical-location rule, got: {err}"
+        );
+
+        // Distinct deploy_dirs on the SAME endpoint: two physical locations —
+        // accepted.
+        if dir_a != dir_b {
+            let p = two_slot_raw_project(&s_a, &s_b, &user, &host, &dir_a, &dir_b);
+            ProjectConfig::from_raw_parts(p.manifest, p.variants)
+                .expect("distinct deploy_dirs on one host are distinct physical locations");
+        }
     }
 }

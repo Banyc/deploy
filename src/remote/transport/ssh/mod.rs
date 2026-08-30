@@ -3286,7 +3286,9 @@ exec /bin/mv "$@"
         );
         // A status request now succeeds (the fake remote is empty).
         let helper = RemoteHelper::new(&t);
-        let status = helper.status().unwrap();
+        let status = helper
+            .status(&crate::remote::helper::test_owner("test-app", "s1"))
+            .unwrap();
         assert!(status.current_generation.is_none());
         assert!(status.inventory.is_empty());
         assert!(status.lock.is_none());
@@ -3837,6 +3839,8 @@ exec /bin/mv "$@"
             behavior_sha256: "b".into(),
             prior_generation: None,
             created_at: created.to_string(),
+            application: crate::identity::ApplicationStoreKey::parse("test-app").unwrap(),
+            slot: crate::identity::SlotId::parse("s1").unwrap(),
             target: None,
         };
         helper
@@ -3889,7 +3893,14 @@ exec /bin/mv "$@"
             },
         };
         let before = snapshot_tree(&remote_deploy);
-        let err = compute_retained(&helper, &[], &store, &policy).unwrap_err();
+        let err = compute_retained(
+            &helper,
+            &[],
+            &store,
+            &policy,
+            &crate::remote::helper::test_owner("test-app", "s1"),
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("errno 13"),
             "EACCES on the generations root must abort retention naming the errno, got: {err}"

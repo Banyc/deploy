@@ -13,14 +13,21 @@ use std::path::PathBuf;
 impl LocalStore {
     // ---- releases ---------------------------------------------------------
 
+    /// The on-disk directory for a release id (`releases/<release-id>/`).
+    /// The id is a validated [`ReleaseId`] (`rel-sha256-<64 lowercase hex>` —
+    /// a filesystem-safe ASCII string by the fixed grammar), stored VERBATIM:
+    /// two distinct release ids always map to two distinct directories
+    /// (injective by construction).
     pub fn release_dir(&self, id: &ReleaseId) -> PathBuf {
-        self.base.join(layout::RELEASES).join(sanitize(id.as_str()))
+        self.base.join(layout::RELEASES).join(id.as_str())
     }
 
     /// The on-disk directory for a release dir NAME (an arbitrary store dir
     /// name). The GC computes deletion paths for candidate dirs that may not
     /// be valid release ids (junk-named dirs are still candidates), so this
-    /// takes the raw name — never a validated [`ReleaseId`].
+    /// takes the raw name — never a validated [`ReleaseId`] — and keeps the
+    /// [`sanitize`](crate::store::local::sanitize) confinement for
+    /// non-grammar junk (a valid name passes through unchanged).
     pub(crate) fn release_dir_named(&self, name: &str) -> PathBuf {
         self.base.join(layout::RELEASES).join(sanitize(name))
     }

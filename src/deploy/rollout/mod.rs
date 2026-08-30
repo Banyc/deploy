@@ -307,6 +307,7 @@ pub(crate) fn run_batches(
                 op_id,
                 deployment_id,
                 target_name,
+                sid,
                 &a.artifact,
                 &new_gen[sid],
                 plan_servers[sid].expected_generation.as_ref(),

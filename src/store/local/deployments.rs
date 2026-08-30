@@ -3,15 +3,20 @@
 
 use crate::error::{Error, Result};
 use crate::store::atomic::ensure_private_dir;
-use crate::store::local::{LocalStore, sanitize, write_atomic_cas};
+use crate::store::local::{LocalStore, write_atomic_cas};
 use serde::Serialize;
 use std::path::PathBuf;
 
 impl LocalStore {
     // ---- deployments ------------------------------------------------------
 
+    /// The deployment plan directory (`deployments/<id>/`). The id is a
+    /// validated deployment id (`deploy-<uuid-v7>` — a filesystem-safe ASCII
+    /// string by the fixed grammar), stored VERBATIM: two distinct
+    /// deployment ids always map to two distinct directories (injective by
+    /// construction; no re-encoding, so no collision class).
     pub fn deployment_dir(&self, id: &str) -> PathBuf {
-        self.base.join("deployments").join(sanitize(id))
+        self.base.join("deployments").join(id)
     }
 
     /// Write the recorded deployment plan (`deployments/<id>/plan.json`). The

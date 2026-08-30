@@ -139,6 +139,7 @@ pub(crate) fn run_commit(
                     target_name,
                     members,
                     helpers,
+                    config.application(),
                 );
             let mut maintenance: Vec<String> = Vec::new();
             maintenance.extend(observed_warnings);
@@ -168,6 +169,7 @@ pub(crate) fn run_commit(
             &ledger::FinalizeSettings {
                 reason: "push completed",
                 op_id,
+                application: config.application(),
                 // Finalization (recovery included) goes through the PURE
                 // STATE MACHINE's one-parent gate inside the append: a plan
                 // whose parent is no longer the successful head is refused
@@ -202,6 +204,7 @@ pub(crate) fn run_commit(
                         target_name,
                         members,
                         helpers,
+                        config.application(),
                     );
                 let mut maintenance: Vec<String> = Vec::new();
                 maintenance.extend(observed_warnings);
@@ -280,6 +283,7 @@ pub(crate) fn run_commit(
         target_name,
         members,
         helpers,
+        config.application(),
     );
 
     let mut maintenance: Vec<String> = Vec::new();
@@ -728,7 +732,7 @@ pub(crate) mod commit_tests {
                 .unwrap();
         assert_eq!(
             RemoteHelper::new(&remote)
-                .status()
+                .status(&crate::remote::helper::test_owner("eng", "p1"))
                 .unwrap()
                 .current_generation
                 .as_ref()
@@ -1436,7 +1440,9 @@ pub(crate) mod commit_tests {
                 LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join(server))
                     .unwrap();
             let helper = RemoteHelper::new(&remote);
-            let status = helper.status().unwrap();
+            let status = helper
+                .status(&crate::remote::helper::test_owner("eng", slot.as_str()))
+                .unwrap();
             let cur = status
                 .current_generation
                 .expect("the rollback must advance the slot");
@@ -1941,7 +1947,14 @@ pub(crate) mod commit_tests {
                 let desired_gen = intent_snapshot.get(sid).map(|e| e.generation());
                 helpers
                     .get(sid)
-                    .and_then(|helper| helper.status().ok())
+                    .and_then(|helper| {
+                        helper
+                            .status(&crate::remote::helper::GenerationOwner::new(
+                                live.application().clone(),
+                                sid.clone(),
+                            ))
+                            .ok()
+                    })
                     .is_some_and(|st| {
                         st.current_generation.as_ref() == desired_gen
                     })
@@ -2065,6 +2078,9 @@ pub(crate) mod commit_tests {
                 behavior_sha256: crate::identity::DIGEST_TEST_HEX_1.to_string(),
                 prior_generation: None,
                 created_at: "2026-01-01T00:00:00Z".to_string(),
+                application: crate::identity::ApplicationStoreKey::parse("eng").unwrap(),
+                slot: crate::identity::SlotId::parse(if server == "s1" { "p1" } else { "p2" })
+                    .expect("validated slot id is a safe segment"),
                 target: Some(TargetName::parse("t1").unwrap()),
             })
             .unwrap();
@@ -2102,6 +2118,9 @@ pub(crate) mod commit_tests {
                 behavior_sha256: "b".to_string(),
                 prior_generation: None,
                 created_at: "2026-01-01T00:00:00Z".to_string(),
+                application: crate::identity::ApplicationStoreKey::parse("eng").unwrap(),
+                slot: crate::identity::SlotId::parse(if server == "s1" { "p1" } else { "p2" })
+                    .expect("validated slot id is a safe segment"),
                 target: Some(TargetName::parse("t1").unwrap()),
             })
             .unwrap();
@@ -2503,6 +2522,8 @@ pub(crate) mod commit_tests {
                 &ledger::FinalizeSettings {
                     reason: "push completed",
                     op_id: &op_id,
+                    application: &crate::identity::ApplicationStoreKey::parse("eng")
+                        .expect("test app is a valid store key"),
                 },
             )
             .unwrap();
@@ -2761,6 +2782,8 @@ pub(crate) mod commit_tests {
                 &ledger::FinalizeSettings {
                     reason: "push completed",
                     op_id: &op_id,
+                    application: &crate::identity::ApplicationStoreKey::parse("eng")
+                        .expect("test app is a valid store key"),
                 },
             ) {
                 // ANY SUCCESSFUL APPEND IS IMMEDIATELY READABLE: the

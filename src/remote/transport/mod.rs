@@ -40,7 +40,17 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+/// The remote-state protocol version. Bumped 1 -> 2 when the remote
+/// generation record (`generations/<gen>/assignment.json`) gained the OWNER
+/// MARKER (`application`/`slot`): a protocol-1 client would parse a
+/// protocol-2 record WITHOUT the owner fields (serde ignores unknown
+/// fields) and drive state whose ownership it cannot verify, so the
+/// handshake must refuse a version mismatch in either direction (an old
+/// client can never drive a state directory written by a newer one, and
+/// vice versa). The protocol-2 read path additionally fails closed on a
+/// record WITHOUT the owner marker (a required-field parse failure — a
+/// legacy/transplanted record is never read as a valid deployment).
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Clone, Debug)]
 pub struct RemoteEntry {

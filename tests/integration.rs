@@ -1954,7 +1954,10 @@ fn historical_rollback_uses_historical_behavior() -> Result<()> {
         remotes_base.join("server-01"),
     )?;
     let helper = RemoteHelper::new(&remote);
-    let status = helper.status()?;
+    let status = helper.status(&deploy::remote::helper::GenerationOwner::new(
+        deploy::identity::ApplicationStoreKey::parse("example").unwrap(),
+        deploy::identity::SlotId::parse("p1").unwrap(),
+    ))?;
     let gen_id = status
         .current_generation
         .expect("rollback produced a current generation");
@@ -3255,6 +3258,8 @@ fn pending_commit_diverged_generation_is_degraded_not_successful() -> Result<()>
             behavior_sha256: "b".to_string(),
             prior_generation: None,
             created_at: "2020-01-01T00:00:00Z".to_string(),
+            application: deploy::identity::ApplicationStoreKey::parse("example").unwrap(),
+            slot: deploy::identity::SlotId::parse("p1").unwrap(),
             target: None,
         })?;
     foreign_helper

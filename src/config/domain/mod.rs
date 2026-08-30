@@ -583,17 +583,6 @@ impl TryFrom<RawProject> for ProjectConfig {
             ));
         }
 
-        // A LOCAL connection operates on the HOST FILESYSTEM: two local slots
-        // with the same deploy_dir — even on DIFFERENT server ids — operate on
-        // the SAME local directory (the server id does not separate local
-        // roots the way a remote host does). The injection rule below keys
-        // local effective roots on the deploy_dir ALONE.
-        let local_server_ids: HashSet<&str> = domain_servers
-            .iter()
-            .filter(|s| matches!(s.connection(), ServerConnection::Local { .. }))
-            .map(|s| s.id.as_str())
-            .collect();
-
         // Slots are declared INSIDE each variant's file (the declaring file
         // is the slot's variant binding), so they are aggregated across every
         // variant: IDs are unique across ALL variants, each slot's server must
@@ -601,11 +590,21 @@ impl TryFrom<RawProject> for ProjectConfig {
         // owning `target` must exist among the top-level `[targets.<name>]`
         // keys, each group name must be non-empty and not repeated (a
         // duplicate adds no membership yet would change release identity),
-        // and a (server, deploy_dir) pair names one on-server deployment
+        // and a (ENDPOINT, deploy_dir) pair names one on-host deployment
         // location that exactly one slot may own.
+        //
+        // THE PHYSICAL-LOCATION INJECTION RULE (the review's point 2): the
+        // location key is the PHYSICAL (endpoint, deploy_dir) pair — the
+        // endpoint is the server's `user@address` (or the `local` marker),
+        // NOT the ServerId, so two slots whose servers are DIFFERENT
+        // ServerIds but name the SAME physical host+dir are REFUSED: a
+        // duplicate physical location is a config error, never two silent
+        // authorities. This subsumes the old per-server (server, deploy_dir)
+        // rule AND the local-root rule (every local server shares the `local`
+        // endpoint, so two local slots on the same directory collide
+        // regardless of their server ids).
         let mut slot_ids = HashSet::new();
-        let mut bound_locations: BTreeMap<(&str, &Path), &str> = BTreeMap::new();
-        let mut local_roots: BTreeMap<&Path, &str> = BTreeMap::new();
+        let mut bound_locations: BTreeMap<(String, &Path), &str> = BTreeMap::new();
         for (vname, variant) in &domain_variants {
             for p in &variant.slots {
                 // The slot's id-bearing fields are parsed into the validated
@@ -679,32 +678,28 @@ impl TryFrom<RawProject> for ProjectConfig {
                         p.id
                     ))
                 })?;
-                // INJECTIVE LOCAL EFFECTIVE ROOTS: no two local slots may
-                // operate on the same directory. Every local transport shares
-                // the host filesystem, so the same deploy_dir on two local
-                // servers is ONE directory two slots would operate on —
-                // rejected here (fail closed), independent of server id.
-                if local_server_ids.contains(p.server.as_str())
-                    && let Some(existing) = local_roots.get(p.deploy_dir())
-                {
+                // INJECTIVE PHYSICAL LOCATIONS: the location key is the
+                // server's PHYSICAL ENDPOINT (`user@address` — not the
+                // ServerId) plus the effective deploy_dir. Two slots whose
+                // servers name the SAME host with the SAME directory — even
+                // under DIFFERENT ServerIds — are ONE physical location and
+                // are refused here (fail closed): the two would otherwise be
+                // silent authorities over the same deployment state. Local
+                // servers all share the `local` endpoint, so two local slots
+                // on the same directory collide regardless of server id.
+                let server = domain_servers
+                    .iter()
+                    .find(|s| s.id.as_str() == p.server.as_str())
+                    .expect("slot server existence was validated above");
+                let endpoint = server.endpoint();
+                if let Some(existing) = bound_locations.get(&(endpoint.clone(), p.deploy_dir())) {
                     return Err(Error::config(format!(
-                        "slots '{existing}' and '{}' bind the same local deploy_dir '{}'; two local slots must not operate on the same directory",
+                        "slots '{existing}' and '{}' bind the same physical location (endpoint '{endpoint}', deploy_dir '{}'); each physical host+deploy_dir pair must belong to exactly one slot",
                         p.id,
                         p.deploy_dir().display()
                     )));
                 }
-                if local_server_ids.contains(p.server.as_str()) {
-                    local_roots.insert(p.deploy_dir(), &p.id);
-                }
-                if let Some(existing) = bound_locations.get(&(p.server.as_str(), p.deploy_dir())) {
-                    return Err(Error::config(format!(
-                        "slots '{existing}' and '{}' bind the same location (server '{}', deploy_dir '{}'); each server+deploy_dir pair must belong to exactly one slot",
-                        p.id,
-                        p.server,
-                        p.deploy_dir().display()
-                    )));
-                }
-                bound_locations.insert((p.server.as_str(), p.deploy_dir()), &p.id);
+                bound_locations.insert((endpoint, p.deploy_dir()), &p.id);
             }
         }
 

@@ -54,9 +54,14 @@ pub fn compute_retained(
     pins: &[Pin],
     store: &LocalStore,
     retention: &RetentionConfig,
+    owner: &crate::remote::helper::GenerationOwner,
 ) -> Result<HashSet<String>> {
     let mut retained: HashSet<String> = HashSet::new();
-    let status = helper.status()?;
+    // Every status/assignment read verifies each generation record's OWNER
+    // MARKER against the slot's expected owner: a generation transplanted
+    // from another application/slot aborts retention (fail closed — it is
+    // never swept as if it were ours, and never trusted as evidence).
+    let status = helper.status(owner)?;
 
     // Current generation's tree — the live artifact is ALWAYS in the retained
     // set. `status()` validates the complete symlink layout, so a missing or
@@ -94,7 +99,7 @@ pub fn compute_retained(
             // more `continue`): a generation that cannot be read must not
             // silently disappear from the inventory — its tree would look
             // unprotected and be deleted.
-            let a = helper.read_assignment(&e.name)?;
+            let a = helper.read_assignment(&e.name, owner)?;
             // Identity: the record must agree with the directory it lives
             // under. A tampered/mismatched record fails closed — it is never
             // trusted as evidence about the generation's tree.
@@ -353,6 +358,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &c.variant("standard").unwrap().retention
     }
 
+    /// The expected owner of the fixture remote's generations (application
+    /// `rot`, slot `p1` — the `cfg()` fixture's app + its single slot); the
+    /// fixture assignments carry the same owner, so the owner-verified reads
+    /// match.
+    fn owner() -> crate::remote::helper::GenerationOwner {
+        crate::remote::helper::test_owner("rot", "p1")
+    }
+
     #[test]
     fn retains_current_and_previous() {
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
@@ -382,6 +395,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 behavior_sha256: "b".into(),
                 prior_generation: None,
                 created_at: "2020-01-01T00:00:00Z".into(),
+                application: crate::identity::ApplicationStoreKey::parse("rot").unwrap(),
+                slot: crate::identity::SlotId::parse("p1").unwrap(),
                 target: None,
             })
             .unwrap();
@@ -399,6 +414,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 behavior_sha256: "b".into(),
                 prior_generation: Some(test_generation_id("g1")),
                 created_at: "2020-01-02T00:00:00Z".into(),
+                application: crate::identity::ApplicationStoreKey::parse("rot").unwrap(),
+                slot: crate::identity::SlotId::parse("p1").unwrap(),
                 target: None,
             })
             .unwrap();
@@ -413,7 +430,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let c = cfg();
-        let retained = compute_retained(&helper, c.pins(), &store, ret(&c)).unwrap();
+        let retained = compute_retained(&helper, c.pins(), &store, ret(&c), &owner()).unwrap();
         assert!(
             retained.contains(test_tree_digest("t2").as_str()),
             "current tree retained"
@@ -486,11 +503,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         }];
 
         // Without the pin the server has no history, so nothing is retained.
-        let bare = compute_retained(&helper, &[], &store, ret(&c)).unwrap();
+        let bare = compute_retained(&helper, &[], &store, ret(&c), &owner()).unwrap();
         assert!(bare.is_empty(), "no history and no pins retains nothing");
 
         // With the pin, BOTH variants' trees are protected.
-        let retained = compute_retained(&helper, &pinned, &store, ret(&c)).unwrap();
+        let retained = compute_retained(&helper, &pinned, &store, ret(&c), &owner()).unwrap();
         assert!(
             retained.contains(test_tree_digest("tree-a").as_str()),
             "variant a protected by the pin"
@@ -537,6 +554,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 behavior_sha256: "b".into(),
                 prior_generation: prior_generation.map(test_generation_id),
                 created_at: created.into(),
+                application: crate::identity::ApplicationStoreKey::parse("rot").unwrap(),
+                slot: crate::identity::SlotId::parse("p1").unwrap(),
                 target: target.map(|t| crate::identity::TargetName::new(t.to_string())),
             })
             .unwrap();
@@ -613,7 +632,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .per_server
             .protect_previous = false;
 
-        let retained = compute_retained(&helper, c.pins(), &store, ret(&c)).unwrap();
+        let retained = compute_retained(&helper, c.pins(), &store, ret(&c), &owner()).unwrap();
         assert!(
             retained.contains(test_tree_digest("t3").as_str()),
             "current tree retained"
@@ -674,7 +693,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .deployment
             .protect_deployments = 0;
 
-        let retained = compute_retained(&helper, c.pins(), &store, ret(&c)).unwrap();
+        let retained = compute_retained(&helper, c.pins(), &store, ret(&c), &owner()).unwrap();
         assert!(retained.contains(test_tree_digest("t-recent").as_str()));
         assert!(
             !retained.contains(test_tree_digest("t-old").as_str()),
@@ -687,7 +706,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .retention
             .per_server
             .keep_days = 90;
-        let retained = compute_retained(&helper, c.pins(), &store, ret(&c)).unwrap();
+        let retained = compute_retained(&helper, c.pins(), &store, ret(&c), &owner()).unwrap();
         assert!(
             retained.contains(test_tree_digest("t-old").as_str()),
             "artifact inside keep_days must be retained"
@@ -764,7 +783,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .deployment
             .protect_deployments = 2;
 
-        let retained = compute_retained(&helper, c.pins(), &store, ret(&c)).unwrap();
+        let retained = compute_retained(&helper, c.pins(), &store, ret(&c), &owner()).unwrap();
         assert!(
             retained.contains(test_tree_digest("t3").as_str()),
             "current deployment retained"
@@ -840,7 +859,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .deployment
             .protect_deployments = 0;
 
-        let retained = compute_retained(&helper, c.pins(), &store, ret(&c)).unwrap();
+        let retained = compute_retained(&helper, c.pins(), &store, ret(&c), &owner()).unwrap();
         assert!(
             retained.contains(test_tree_digest("t2").as_str()),
             "current tree is never swept"
@@ -897,7 +916,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         .unwrap();
         assert!(
             helper
-                .read_assignment(test_generation_id("g1").as_str())
+                .read_assignment(test_generation_id("g1").as_str(), &owner())
                 .is_err(),
             "the live assignment must be unreadable after corruption"
         );
@@ -929,7 +948,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // Retention fails closed with an integrity error: the corrupt live
         // assignment is caught by `status()`'s layout validation, so no sweep
         // decision is ever made and nothing is deleted.
-        let err = compute_retained(&helper, c.pins(), &store, ret(&c))
+        let err = compute_retained(&helper, c.pins(), &store, ret(&c), &owner())
             .expect_err("retention must fail closed on a corrupt live assignment");
         assert!(
             err.to_string().contains("integrity"),
@@ -1049,7 +1068,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 "#;
         std::fs::write(proj.join("deploy.toml"), deploy_toml).unwrap();
         let c = ProjectConfig::load(&proj.join("deploy.toml")).unwrap();
-        let before = compute_retained(&helper, c.pins(), &store, ret(&c)).unwrap();
+        let before = compute_retained(&helper, c.pins(), &store, ret(&c), &owner()).unwrap();
 
         // The config-level group change: ADD a new rollout group (`wave-1`)
         // to slot `p1`'s `groups` list, then reload. Groups are selection-only
@@ -1066,7 +1085,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "standard",
             "the owning variant is unchanged by group edits"
         );
-        let after = compute_retained(&helper, c2.pins(), &store, ret(&c2)).unwrap();
+        let after = compute_retained(&helper, c2.pins(), &store, ret(&c2), &owner()).unwrap();
         assert_eq!(
             before, after,
             "changing a slot's group membership must never change its retained set"
@@ -1149,7 +1168,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .deployment
             .protect_deployments = 0;
 
-        let retained = compute_retained(&helper, c.pins(), &store, ret(&c)).unwrap();
+        let retained = compute_retained(&helper, c.pins(), &store, ret(&c), &owner()).unwrap();
         assert!(
             retained.contains(test_tree_digest("t3").as_str()),
             "current live tree retained"
@@ -1317,7 +1336,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
         // Sanity with the VALID record: the pin protects both variant trees
         // and the garbage object is unretained (sweepable).
-        let retained = compute_retained(&helper, c.pins(), &store, ret(&c)).unwrap();
+        let retained = compute_retained(&helper, c.pins(), &store, ret(&c), &owner()).unwrap();
         assert!(
             retained.contains(test_tree_digest("tree-pin-a").as_str()),
             "variant tree protected by the pin"
@@ -1342,7 +1361,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // ABORT: an un-honorable pin is an integrity error — the pin is never
         // treated as absent (a silently-skipped pin would drop its trees from
         // the retained set and let retention delete them).
-        let err = compute_retained(&helper, c.pins(), &store, ret(&c)).unwrap_err();
+        let err = compute_retained(&helper, c.pins(), &store, ret(&c), &owner()).unwrap_err();
         assert!(
             matches!(err, Error::Integrity(_)),
             "an un-honorable pin aborts retention with an integrity error, got: {err}"
@@ -1371,7 +1390,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
         // REPAIR the record, then RETRY the retention.
         repair_pin_record(&store, &rec);
-        let retained = compute_retained(&helper, c.pins(), &store, ret(&c)).unwrap();
+        let retained = compute_retained(&helper, c.pins(), &store, ret(&c), &owner()).unwrap();
         assert!(
             retained.contains(test_tree_digest("tree-pin-a").as_str())
                 && retained.contains(test_tree_digest("tree-pin-b").as_str()),
@@ -1466,7 +1485,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
             // Sanity: the valid record pins every variant tree; every garbage
             // object is unretained.
-            let retained = compute_retained(&helper, c.pins(), &store, ret(&c)).unwrap();
+            let retained = compute_retained(&helper, c.pins(), &store, ret(&c), &owner()).unwrap();
             for t in &pin_trees {
                 assert!(
                     retained.contains(test_tree_digest(t).as_str()),
@@ -1488,7 +1507,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
             // ABORT before any deletion: an integrity error, never an absent
             // pin.
-            let err = compute_retained(&helper, c.pins(), &store, ret(&c)).unwrap_err();
+            let err = compute_retained(&helper, c.pins(), &store, ret(&c), &owner()).unwrap_err();
             assert!(matches!(err, Error::Integrity(_)));
             assert!(err.to_string().contains("pin names release"));
 
@@ -1516,7 +1535,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             // REPAIR + RETRY: exact deletions — pin trees and live trees
             // survive, the true garbage is removed — and the marker clears.
             repair_pin_record(&store, &rec);
-            let retained = compute_retained(&helper, c.pins(), &store, ret(&c)).unwrap();
+            let retained = compute_retained(&helper, c.pins(), &store, ret(&c), &owner()).unwrap();
             helper.rotate(&retained, &HashSet::new()).unwrap();
             for t in &pin_trees {
                 assert!(
@@ -1818,6 +1837,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     behavior_sha256: "b".into(),
                     prior_generation: g.prior.as_ref().map(|p| GenerationId::parse(p).unwrap()),
                     created_at: g.created_at.to_string(),
+                    application: crate::identity::ApplicationStoreKey::parse("rot").unwrap(),
+                    slot: crate::identity::SlotId::parse("p1").unwrap(),
                     target: None,
                 };
                 helper.acquire_lock_guard(&crate::identity::OperationId::new("op".to_string())).unwrap().create_generation( &asn).unwrap();
@@ -1852,7 +1873,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             // reference model — this pins behavior-identical-for-healthy-
             // remotes for every generated history + policy.
             assert_eq!(
-                compute_retained(&helper, &[], &store, &policy).unwrap(),
+                compute_retained(&helper, &[], &store, &policy, &owner()).unwrap(),
                 expected,
                 "the healthy retained set must match the reference model"
             );
@@ -1907,9 +1928,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             let err = match &fault_remote {
                 Some(fr) => {
                     let fh = RemoteHelper::new(fr);
-                    compute_retained(&fh, &[], &store, &policy).unwrap_err()
+                    compute_retained(&fh, &[], &store, &policy, &owner()).unwrap_err()
                 }
-                None => compute_retained(&helper, &[], &store, &policy).unwrap_err()};
+                None => compute_retained(&helper, &[], &store, &policy, &owner()).unwrap_err()};
             let err_text = err.to_string();
             let expected_marker = match fault {
                 0 => "injected fault: generations metadata",
@@ -1973,9 +1994,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             let retained = match &fault_remote {
                 Some(fr) => {
                     let fh = RemoteHelper::new(fr);
-                    compute_retained(&fh, &[], &store, &policy).unwrap()
+                    compute_retained(&fh, &[], &store, &policy, &owner()).unwrap()
                 }
-                None => compute_retained(&helper, &[], &store, &policy).unwrap()};
+                None => compute_retained(&helper, &[], &store, &policy, &owner()).unwrap()};
             assert_eq!(
                 retained, expected,
                 "the retried retention must retain exactly the reference-model set"
@@ -2391,6 +2412,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     behavior_sha256: "b".into(),
                     prior_generation: g.prior.as_ref().map(|p| GenerationId::parse(p).unwrap()),
                     created_at: g.created_at.to_string(),
+                    application: crate::identity::ApplicationStoreKey::parse("rot").unwrap(),
+                    slot: crate::identity::SlotId::parse("p1").unwrap(),
                     target: None,
                 };
                 helper.acquire_lock_guard(&crate::identity::OperationId::new("op".to_string())).unwrap().create_generation( &asn).unwrap();
@@ -2422,7 +2445,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             // reference model (the prior is protected through the ONE
             // inventory — no second read).
             assert_eq!(
-                compute_retained(&helper, &[], &store, &policy).unwrap(),
+                compute_retained(&helper, &[], &store, &policy, &owner()).unwrap(),
                 expected,
                 "the healthy retained set must match the reference model"
             );
@@ -2536,11 +2559,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             let (abort, retained) = match &wrapper {
                 Some(w) => {
                     let fh = RemoteHelper::new(w);
-                    match compute_retained(&fh, &[], &store, &policy) {
+                    match compute_retained(&fh, &[], &store, &policy, &owner()) {
                         Ok(r) => (None, Some(r)),
                         Err(e) => (Some(e.to_string()), None)}
                 }
-                None => match compute_retained(&helper, &[], &store, &policy) {
+                None => match compute_retained(&helper, &[], &store, &policy, &owner()) {
                     Ok(r) => (None, Some(r)),
                     Err(e) => (Some(e.to_string()), None)}};
 
@@ -2644,7 +2667,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
             // RETRY: the retained set is EXACTLY the reference-model set, and
             // the mark-and-sweep deletes exactly the trees outside it.
-            let retained = compute_retained(&helper, &[], &store, &policy).unwrap();
+            let retained = compute_retained(&helper, &[], &store, &policy, &owner()).unwrap();
             assert_eq!(
                 retained, expected,
                 "the retried retention must retain exactly the reference-model set"

@@ -147,8 +147,13 @@ pub(crate) fn reconcile_pending_commits(
             // is never converted into an observed fact). A lock-acquisition
             // failure -> `StillPending` (a truthful terminal cannot be
             // built without the backend read).
-            let Some(evidence) =
-                collect_recovery_evidence(&attempt, helpers, &live_bindings, op_id)?
+            let Some(evidence) = collect_recovery_evidence(
+                &attempt,
+                helpers,
+                &live_bindings,
+                op_id,
+                config.application(),
+            )?
             else {
                 outcome = Some(RecoveryOutcome::StillPending);
                 continue;
@@ -176,15 +181,13 @@ pub(crate) fn reconcile_pending_commits(
             // the intent's frozen binding): the binding check stays a
             // pre-finalizer check, but when it fails recovery acquires the
             // selected slots' guards, re-reads each slot's LIVE state, and
-            // finalizes through the SHARED decision
-            // ([`crate::kernel::transition::decide_terminal`]) with the
-            // truthful per-slot evidence (the binding the evidence records
-            // is the slot's CURRENT configured binding — a config fact —
-            // never the intent's frozen snapshot binding). A lock-
-            // acquisition failure -> `StillPending` (a truthful terminal
-            // cannot be built without the backend read).
-            let Some(evidence) =
-                collect_recovery_evidence(&attempt, helpers, &live_bindings, op_id)?
+            let Some(evidence) = collect_recovery_evidence(
+                &attempt,
+                helpers,
+                &live_bindings,
+                op_id,
+                config.application(),
+            )?
             else {
                 outcome = Some(RecoveryOutcome::StillPending);
                 continue;
@@ -211,6 +214,7 @@ pub(crate) fn reconcile_pending_commits(
             &FinalizeSettings {
                 reason: "recovery finalized",
                 op_id,
+                application: config.application(),
             },
         )? {
             FinalizeOutcome::Finalized => {
@@ -222,18 +226,13 @@ pub(crate) fn reconcile_pending_commits(
             FinalizeOutcome::Refused { reason, .. } => {
                 // The finalizer ran and dropped its guards; recovery then
                 // ACQUIRES the selected slots' guards, re-reads each slot's
-                // live state, and finalizes through the SHARED decision
-                // ([`crate::kernel::transition::decide_terminal`]) with the
-                // TRUTHFUL backend observations. A slot whose live state
-                // sits at the desired generation keeps `Known(desired)` —
-                // because the BACKEND READ confirmed it, never because the
-                // plan desired it; a slot whose live state is exactly its
-                // pre-push state settles `FailedRolledBack`, never
-                // `Degraded` (the review's fix). A lock-acquisition failure
-                // -> `StillPending` (a truthful terminal cannot be built
-                // without the backend read).
-                let Some(evidence) =
-                    collect_recovery_evidence(&attempt, helpers, &live_bindings, op_id)?
+                let Some(evidence) = collect_recovery_evidence(
+                    &attempt,
+                    helpers,
+                    &live_bindings,
+                    op_id,
+                    config.application(),
+                )?
                 else {
                     outcome = Some(RecoveryOutcome::StillPending);
                     continue;
@@ -386,12 +385,16 @@ pub(crate) enum BackendObservation {
 fn observe_recovery_slot(
     helper: &HeldSlotLock<'_>,
     configured_binding: Option<&PhysicalBinding>,
+    owner: &crate::remote::helper::GenerationOwner,
 ) -> RecoverySlotEvidence {
-    let backend = match helper.helper().status() {
+    // Every backend read verifies the generation's OWNER MARKER against the
+    // expected application + slot: a transplanted generation is refused
+    // (fail closed — never observed as this slot's live state).
+    let backend = match helper.helper().status(owner) {
         Err(e) => BackendObservation::Failed(e.to_string()),
         Ok(status) => match status.current_generation {
             None => BackendObservation::Absent,
-            Some(generation) => match helper.helper().read_assignment(generation.as_str()) {
+            Some(generation) => match helper.helper().read_assignment(generation.as_str(), owner) {
                 Ok(_) => BackendObservation::Live(generation),
                 Err(e) => BackendObservation::Failed(e.to_string()),
             },
@@ -472,6 +475,7 @@ fn collect_recovery_evidence(
     helpers: &HashMap<SlotId, RemoteHelper>,
     live_bindings: &BTreeMap<SlotId, PhysicalBinding>,
     op_id: &OperationId,
+    application: &crate::identity::ApplicationStoreKey,
 ) -> Result<Option<BTreeMap<SlotId, RecoverySlotEvidence>>> {
     let mut evidence: BTreeMap<SlotId, RecoverySlotEvidence> = BTreeMap::new();
     let mut selected: Vec<SlotId> = attempt.selected_membership().into_iter().collect();
@@ -500,9 +504,11 @@ fn collect_recovery_evidence(
             Err(_) => return Ok(None),
             Ok(guard) => {
                 let configured_binding = live_bindings.get(&sid);
+                let owner =
+                    crate::remote::helper::GenerationOwner::new(application.clone(), sid.clone());
                 evidence.insert(
                     sid.clone(),
-                    observe_recovery_slot(&guard, configured_binding),
+                    observe_recovery_slot(&guard, configured_binding, &owner),
                 );
             }
         }
@@ -831,6 +837,8 @@ mod tests {
                 behavior_sha256: crate::identity::DIGEST_TEST_HEX_1.to_string(),
                 prior_generation: Some(prior.clone()),
                 created_at: "2026-01-01T00:00:00Z".to_string(),
+                application: crate::identity::ApplicationStoreKey::parse("eng").unwrap(),
+                slot: crate::identity::SlotId::parse("p1").unwrap(),
                 target: Some(TargetName::parse("t1").unwrap()),
             })
             .unwrap();

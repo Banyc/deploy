@@ -6,7 +6,7 @@
 use crate::deploy::push::PushContext;
 use crate::error::Result;
 use crate::identity::SlotId;
-use crate::remote::helper::RemoteHelper;
+use crate::remote::helper::{GenerationOwner, RemoteHelper};
 use crate::remote::transport::Remote;
 use std::collections::HashMap;
 
@@ -61,7 +61,12 @@ pub(crate) fn inspect_remotes<'a>(
         // status. Pinning writes only to a LOCAL cache, never the remote
         // layout, so the dry-run "mutates nothing remotely" guarantee holds.
         r.prepare_identity()?;
-        let status = helper.status()?;
+        // Every status read verifies the generation's OWNER MARKER against
+        // the expected owner (this application, this slot): a remote whose
+        // current generation was transplanted from another application/slot
+        // is refused here, fail closed.
+        let owner = GenerationOwner::new(config.application().clone(), slot_id.clone());
+        let status = helper.status(&owner)?;
         helpers.insert(slot_id.clone(), helper);
         statuses.insert(slot_id.clone(), status);
     }

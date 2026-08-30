@@ -128,7 +128,7 @@ pub(crate) fn retain_slot_post_commit(
     #[cfg(test)]
     store.step17_hook_barrier(deployment_id, HookPhase::FreshStep17);
     if let Ok(_guard) = helper.acquire_lock_guard(op_id) {
-        match rotate_slot_locked(helper, store, config, slot_retention, deployment_id) {
+        match rotate_slot_locked(helper, store, config, sid, slot_retention, deployment_id) {
             Ok(()) => {
                 maintenance.extend(clear_retention_deferred(store, target_name, sid));
             }
@@ -174,10 +174,16 @@ fn rotate_slot_locked(
     helper: &RemoteHelper,
     store: &LocalStore,
     config: &ProjectConfig,
+    slot: &SlotId,
     retention: &RetentionConfig,
     deployment_id: &DeploymentId,
 ) -> Result<()> {
-    let retained = compute_retained(helper, config.pins(), store, retention)?;
+    // The retained-set computation reads every generation record and must
+    // verify each record's OWNER MARKER against this application + slot (a
+    // transplanted generation is refused — never swept as if it were ours).
+    let owner =
+        crate::remote::helper::GenerationOwner::new(config.application().clone(), slot.clone());
+    let retained = compute_retained(helper, config.pins(), store, retention, &owner)?;
     let active_incoming = HashSet::from([deployment_id.as_str().to_string()]);
     helper.rotate(&retained, &active_incoming)?;
     Ok(())
@@ -260,6 +266,7 @@ pub(crate) fn refresh_observed_from_live(
     target_name: &str,
     members: &[(&crate::config::SlotConfig, &crate::config::ServerDef)],
     helpers: &HashMap<SlotId, RemoteHelper>,
+    application: &crate::identity::ApplicationStoreKey,
 ) -> (BTreeMap<SlotId, ObservedSlot>, Vec<String>) {
     let mut observed_servers: BTreeMap<SlotId, ObservedSlot> = BTreeMap::new();
     for (slot, _sdef) in members {
@@ -269,11 +276,16 @@ pub(crate) fn refresh_observed_from_live(
         // one-shot pre-swap arm it has already fired and been consumed inside
         // `process_server`, so this read reflects the true post-mutation
         // state: the new generation for an advanced slot, the PRIOR
-        // generation for a skipped/unreachable one.
-        let status = helpers[&slot_id].status();
+        // generation for a skipped/unreachable one. Every read verifies the
+        // generation's OWNER MARKER against this application + slot (fail
+        // closed on a transplanted record — a foreign generation is never
+        // refreshed into this slot's observed state).
+        let owner =
+            crate::remote::helper::GenerationOwner::new(application.clone(), slot_id.clone());
+        let status = helpers[&slot_id].status(&owner);
         match status {
             Ok(s) => match s.current_generation {
-                Some(g) => match helpers[&slot_id].read_assignment(g.as_str()) {
+                Some(g) => match helpers[&slot_id].read_assignment(g.as_str(), &owner) {
                     Ok(asn) => {
                         observed_servers.insert(
                             slot_id.clone(),
@@ -491,7 +503,14 @@ pub(crate) fn retry_deferred_retentions(
                     continue;
                 }
             };
-            match rotate_slot_locked(helper, store, config, slot_retention, deployment_id) {
+            match rotate_slot_locked(
+                helper,
+                store,
+                config,
+                &SlotId::parse(slot_str.as_str()).expect("validated slot id is a safe segment"),
+                slot_retention,
+                deployment_id,
+            ) {
                 Ok(()) => serviced.push(slot_str.clone()),
                 Err(e) => {
                     // Keep the marker with the fresh reason.
@@ -860,7 +879,8 @@ mod tests {
 
         // ZERO DELETIONS: every pre-existing object survives push 2 (the
         // only inventory delta is the push's own new tree object).
-        let inventory_after = helper.status().unwrap().inventory;
+        let owner = crate::remote::helper::test_owner("eng", "p1");
+        let inventory_after = helper.status(&owner).unwrap().inventory;
         for t in ["tree-pin-a", "tree-pin-b", "tree-garbage"] {
             assert!(
                 inventory_after.contains(&t.to_string()),
@@ -887,7 +907,7 @@ mod tests {
             h.store.read_retention_debt("t1").unwrap().is_empty(),
             "the debt marker is cleared once the retry succeeds"
         );
-        let inventory = helper.status().unwrap().inventory;
+        let inventory = helper.status(&owner).unwrap().inventory;
         for t in ["tree-pin-a", "tree-pin-b"] {
             assert!(
                 inventory.contains(&t.to_string()),
@@ -899,12 +919,12 @@ mod tests {
             "the true garbage is removed by the retry"
         );
         let cur = helper
-            .status()
+            .status(&owner)
             .unwrap()
             .current_generation
             .expect("a current generation exists");
         let live = helper
-            .read_assignment(cur.as_str())
+            .read_assignment(cur.as_str(), &owner)
             .unwrap()
             .artifact
             .tree

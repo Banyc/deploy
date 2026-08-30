@@ -734,7 +734,14 @@ fn sanitize_name(raw: &str) -> String {
             out.push('-');
         }
     }
-    if out.is_empty() {
+    // The generated name must satisfy the application-store-key grammar
+    // ([`crate::identity::ApplicationStoreKey`] — the config load rejects
+    // anything else): strip a leading dash (a name starting with '-' would
+    // be refused) and fall back to the default for empty/traversal names.
+    while out.starts_with('-') {
+        out.remove(0);
+    }
+    if out.is_empty() || out == "." || out == ".." {
         "deploy".to_string()
     } else {
         out

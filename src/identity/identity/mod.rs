@@ -38,10 +38,12 @@
 //! (an invalid wire identity fails deserialization — fail closed).
 
 pub mod id;
+pub mod physical;
 pub mod release_id;
 pub mod scalars;
 
 pub use id::*;
+pub use physical::*;
 pub use release_id::*;
 pub use scalars::*;
 

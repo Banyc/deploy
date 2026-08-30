@@ -96,8 +96,15 @@ pub(crate) fn check_up_to_date(
             .current_generation
             .as_ref()
             .map(|g| {
+                // The assignment read verifies the generation's OWNER MARKER
+                // against this application + slot: a transplanted record is
+                // refused (never counted as the slot's own up-to-date state).
+                let owner = crate::remote::helper::GenerationOwner::new(
+                    config.application().clone(),
+                    a.placement_slot.clone(),
+                );
                 helpers[&a.placement_slot]
-                    .read_assignment(g.as_str())
+                    .read_assignment(g.as_str(), &owner)
                     .map(|asn| {
                         // COMPLETE ArtifactRef equality (release + variant
                         // + tree). Two variants can share a release AND the
@@ -404,7 +411,9 @@ interval_seconds = 0
         let remote =
             LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1"))
                 .unwrap();
-        let status = RemoteHelper::new(&remote).status().unwrap();
+        let status = RemoteHelper::new(&remote)
+            .status(&crate::remote::helper::test_owner("eng", "p1"))
+            .unwrap();
         let cur = status
             .current_generation
             .expect("first push must leave a current generation");
@@ -764,7 +773,9 @@ interval_seconds = 0
         assert_eq!(store.read_snapshots("t1").unwrap().len(), 2);
         let remote =
             LocalTransport::new(&crate::testutil::fixture_env(), remotes_base.join("s1")).unwrap();
-        let status = RemoteHelper::new(&remote).status().unwrap();
+        let status = RemoteHelper::new(&remote)
+            .status(&crate::remote::helper::test_owner("eng", "p1"))
+            .unwrap();
         let cur = status
             .current_generation
             .expect("push 2 must advance the remote");

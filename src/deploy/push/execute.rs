@@ -253,8 +253,11 @@ pub(crate) fn run_execution(
     // observation-less executions (never-started / pre-swap failures /
     // indeterminate) — the old `record_never_advanced_outcomes` wire-row
     // fix-up is GONE (its role moved into [`ExecutionOutcome::failure_outcomes`]).
-    let (actual_servers, actual_observations) =
-        crate::deploy::rollout::observe_actual_servers(&outcome.assignments, helpers);
+    let (actual_servers, actual_observations) = crate::deploy::rollout::observe_actual_servers(
+        &outcome.assignments,
+        helpers,
+        config.application(),
+    );
     // `desired` (each slot's minted generation for its planned artifact, as a
     // complete [`GenerationRef`]) was computed BEFORE the mutation loop and
     // persisted as part of the immutable intent (`attempt_intent`); it is not
@@ -519,7 +522,9 @@ pub(crate) mod execute_tests {
         let remote =
             LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1"))
                 .unwrap();
-        let status = RemoteHelper::new(&remote).status().unwrap();
+        let status = RemoteHelper::new(&remote)
+            .status(&crate::remote::helper::test_owner("eng", "p1"))
+            .unwrap();
         let cur = status
             .current_generation
             .expect("compensation must restore current");
@@ -1230,7 +1235,9 @@ interval_seconds = 0
         let remote =
             LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1"))
                 .unwrap();
-        let status = RemoteHelper::new(&remote).status().unwrap();
+        let status = RemoteHelper::new(&remote)
+            .status(&crate::remote::helper::test_owner("eng", "p1"))
+            .unwrap();
         let cur = status
             .current_generation
             .expect("compensation must restore current");
@@ -1425,7 +1432,9 @@ interval_seconds = 0
         let remote =
             LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1"))
                 .unwrap();
-        let status = RemoteHelper::new(&remote).status().unwrap();
+        let status = RemoteHelper::new(&remote)
+            .status(&crate::remote::helper::test_owner("eng", "p1"))
+            .unwrap();
         assert_eq!(
             status.current_generation.as_ref().map(|g| g.as_str()),
             Some(prior_gen.as_str()),
@@ -1491,7 +1500,9 @@ interval_seconds = 0
             !remote.exists(crate::remote::layout::current()),
             "first-deploy compensation must remove `current`"
         );
-        let status = RemoteHelper::new(&remote).status().unwrap();
+        let status = RemoteHelper::new(&remote)
+            .status(&crate::remote::helper::test_owner("eng", "p1"))
+            .unwrap();
         assert!(
             status.current_generation.is_none(),
             "no current generation may remain after first-deploy compensation"
@@ -1560,7 +1571,10 @@ interval_seconds = 0
         remote.write(&asn_path, b"{ corrupt json !", 0o600).unwrap();
         assert!(
             RemoteHelper::new(&remote)
-                .read_assignment(gen1.as_str())
+                .read_assignment(
+                    gen1.as_str(),
+                    &crate::remote::helper::test_owner("eng", "p1")
+                )
                 .is_err(),
             "the assignment must be unreadable after corruption"
         );
@@ -1570,7 +1584,7 @@ interval_seconds = 0
         // and fails closed with an integrity error — never a panic, never a
         // `None` that would let a caller proceed on an unverifiable current.
         let err = RemoteHelper::new(&remote)
-            .status()
+            .status(&crate::remote::helper::test_owner("eng", "p1"))
             .expect_err("a corrupt current assignment must fail status closed");
         assert!(
             err.to_string().contains("integrity"),

@@ -60,9 +60,9 @@ mod tests {
             "standard",
             "production",
             "wave-1",
-            "α",
             "a..b",
             "a.b",
+            "a_b-c.d9",
         ] {
             assert!(ServerId::parse(ok).is_ok(), "{ok:?}");
             assert!(SlotId::parse(ok).is_ok(), "{ok:?}");
@@ -71,7 +71,8 @@ mod tests {
             assert!(VariantName::parse(ok).is_ok(), "{ok:?}");
         }
         for bad in [
-            "", "   ", " x", "x ", "\u{0}", "a\nb", "a/b", "a\\b", ".", "..", "../x", "x/..",
+            "", "   ", " x", "x ", "\u{0}", "a\nb", "a/b", "a\\b", ".", "..", "../x", "x/..", "α",
+            "x y", "-lead",
         ] {
             ServerId::parse(bad).expect_err("invalid server id rejected");
             SlotId::parse(bad).expect_err("invalid slot id rejected");

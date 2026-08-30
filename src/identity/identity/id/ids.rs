@@ -265,12 +265,15 @@ mod tests {
 
     fn is_safe_segment(s: &str) -> bool {
         !s.is_empty()
-            && s.trim() == s
-            && !s.chars().any(|c| c.is_control())
-            && !s.contains('/')
-            && !s.contains('\\')
+            && !s.starts_with('-')
             && s != "."
             && s != ".."
+            && s.bytes().all(|b| {
+                matches!(
+                    b,
+                    b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.'
+                )
+            })
     }
 
     /// Arbitrary identity strings covering every invalid class: empty,

@@ -6,7 +6,7 @@ use crate::error::{Error, Result};
 use crate::identity::SlotId;
 use crate::ledger::{ObservedSlot, ObservedTarget, ServerState};
 use crate::store::atomic::{ensure_private_dir, path_state, read_json};
-use crate::store::local::{LocalStore, sanitize, write_json};
+use crate::store::local::{LocalStore, write_json};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -23,10 +23,15 @@ impl LocalStore {
     /// ONCE per placement slot — never replicated per target: targets are
     /// selection views over the global slot map (see
     /// [`LocalStore::read_observed`]).
+    ///
+    /// THE SLOT ID IS STORED VERBATIM: the validated `SlotId` grammar is a
+    /// single filesystem-safe ASCII segment (the shared identity-name rule),
+    /// so no re-encoding is needed and two distinct slot ids ALWAYS map to
+    /// two distinct slot directories (injective by construction).
     pub fn slot_observed_path(&self, slot: &SlotId) -> PathBuf {
         self.base
             .join("slots")
-            .join(sanitize(slot.as_str()))
+            .join(slot.as_str())
             .join("observed.json")
     }
 
@@ -165,22 +170,22 @@ impl LocalStore {
         let p = self
             .base
             .join("servers")
-            .join(format!("{}.json", sanitize(state.id.as_str())));
+            .join(format!("{}.json", state.id.as_str()));
         write_json(&p, state)
     }
 
     pub fn read_server(&self, id: &str) -> Result<ServerState> {
-        let p = self
-            .base
-            .join("servers")
-            .join(format!("{id}.json", id = sanitize(id)));
+        // The id is a validated server id ([`ServerId`] — the caller holds
+        // the typed value), stored VERBATIM: distinct server ids always map
+        // to distinct `servers/<id>.json` files.
+        let p = self.base.join("servers").join(format!("{id}.json"));
         read_json(&p)
     }
 
     pub fn server_exists(&self, id: &str) -> bool {
         self.base
             .join("servers")
-            .join(format!("{}.json", sanitize(id)))
+            .join(format!("{id}.json"))
             .exists()
     }
 }

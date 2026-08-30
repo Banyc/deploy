@@ -52,7 +52,11 @@ pub fn finalize_successful_locked(
     helpers: &HashMap<SlotId, RemoteHelper>,
     settings: &FinalizeSettings<'_>,
 ) -> Result<FinalizeOutcome> {
-    let FinalizeSettings { reason, op_id } = settings;
+    let FinalizeSettings {
+        reason,
+        op_id,
+        application,
+    } = settings;
     let entries = store.read_ledger(attempt.target().as_str())?;
     if let Some(e) = entries
         .iter()
@@ -108,7 +112,7 @@ pub fn finalize_successful_locked(
             Err(_) => return Ok(FinalizeOutcome::Pending),
         }
     }
-    match verify_selected_locked(helpers, attempt)? {
+    match verify_selected_locked(helpers, attempt, application)? {
         LockedObservation::Diverged(slot) => {
             return Ok(FinalizeOutcome::Refused {
                 reason: state_diverged_reason(&slot),
@@ -138,7 +142,7 @@ pub fn finalize_successful_locked(
             Ok(_) => {}
         }
     }
-    let observed = match verify_selected_locked(helpers, attempt)? {
+    let observed = match verify_selected_locked(helpers, attempt, application)? {
         LockedObservation::Verified(o) => o,
         LockedObservation::Diverged(slot) => {
             return Ok(FinalizeOutcome::Refused {
@@ -197,6 +201,11 @@ pub fn finalize_successful_locked(
 pub struct FinalizeSettings<'a> {
     pub reason: &'a str,
     pub op_id: &'a OperationId,
+    /// The application whose store this finalization verifies: the
+    /// lock-verified evidence gathering reads each selected slot's live
+    /// generation assignment and must verify its OWNER MARKER against this
+    /// application + the slot (fail closed on transplanted state).
+    pub application: &'a crate::identity::ApplicationStoreKey,
     // DELIBERATELY NO `enforce_parent` FLAG (spec item 1): the strictly-
     // linear head check (`intent.parent == current successful head`) is
     // ALWAYS required, in the explicit pre-check AND in the store's atomic
@@ -224,6 +233,7 @@ fn state_diverged_reason(slot: &SlotId) -> String {
 fn verify_selected_locked(
     helpers: &HashMap<SlotId, RemoteHelper>,
     attempt: &DeploymentIntent,
+    application: &crate::identity::ApplicationStoreKey,
 ) -> Result<LockedObservation> {
     let mut observed: BTreeMap<SlotId, GenerationRef> = BTreeMap::new();
     let mut selected: Vec<SlotId> = attempt.selected_membership().into_iter().collect();
@@ -234,12 +244,16 @@ fn verify_selected_locked(
         let Some(helper) = helpers.get(&sid) else {
             return Ok(LockedObservation::Diverged(sid.clone()));
         };
-        let st1 = helper.status()?;
+        // Every read verifies the generation's OWNER MARKER against this
+        // application + slot: a transplanted record is a diverged slot
+        // (fail closed — never verified as the intent's planned result).
+        let owner = crate::remote::helper::GenerationOwner::new(application.clone(), sid.clone());
+        let st1 = helper.status(&owner)?;
         let Some(live_gen) = st1.current_generation else {
             return Ok(LockedObservation::Diverged(sid.clone()));
         };
-        let asn = helper.read_assignment(live_gen.as_str())?;
-        let st2 = helper.status()?;
+        let asn = helper.read_assignment(live_gen.as_str(), &owner)?;
+        let st2 = helper.status(&owner)?;
         if st2.current_generation.as_ref() != Some(&live_gen)
             || live_gen != *entry.generation()
             || asn.artifact != *entry.artifact()

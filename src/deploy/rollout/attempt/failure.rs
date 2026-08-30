@@ -97,6 +97,10 @@ pub(crate) fn apply_failure_policy(
                         prior_gen: prior.cloned(),
                         advanced_gen: new_gen[sid].clone(),
                         template_vars: vars.clone(),
+                        owner: crate::remote::helper::GenerationOwner::new(
+                            config.application().clone(),
+                            sid.clone(),
+                        ),
                     };
                     let comp = compensate_server(&helpers[sid], &request)
                         .unwrap_or(CompensationOutcome::Refused);

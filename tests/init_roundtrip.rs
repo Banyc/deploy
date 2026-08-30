@@ -214,7 +214,10 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
         proj.join(".deploy-remote"),
     )?;
     let helper = RemoteHelper::new(&endpoint);
-    let status = helper.status()?;
+    let status = helper.status(&deploy::remote::helper::GenerationOwner::new(
+        deploy::identity::ApplicationStoreKey::parse("roundtrip-app").unwrap(),
+        deploy::identity::SlotId::parse("app-1").unwrap(),
+    ))?;
     assert_eq!(
         status.current_generation.as_ref().map(|g| g.as_str()),
         Some(generation.as_str()),

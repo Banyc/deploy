@@ -2095,6 +2095,8 @@ mod tests_materialize {
             behavior_sha256: "b".to_string(),
             prior_generation: None,
             created_at: "2020-01-01T00:00:00Z".to_string(),
+            application: crate::identity::ApplicationStoreKey::parse("app").unwrap(),
+            slot: crate::identity::SlotId::parse("s1").unwrap(),
             target: Some(crate::identity::TargetName::new("prod")),
         });
         // All five move TOGETHER from the one assignment: never a torn

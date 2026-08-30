@@ -131,11 +131,43 @@ pub use state::current::{CurrentState, ExpectedCurrent};
 use crate::deploy::lock::AdministrativeRecoveryGuard;
 use crate::error::{Error, Result};
 use crate::identity::{
-    AcquisitionId, BehaviorContract, GenerationId, OperationId, ReleaseId, ReleaseRecord,
+    AcquisitionId, ApplicationStoreKey, BehaviorContract, GenerationId, OperationId, ReleaseId,
+    ReleaseRecord, SlotId,
 };
 use crate::remote::layout;
 use crate::remote::transport::{CreateNewVerdict, Remote, RemoveIfVerdict, VerifiedExisting};
 use serde::{Deserialize, Serialize};
+
+/// The EXPECTED OWNER of a remote generation: the application + placement
+/// slot every assignment read ([`RemoteHelper::status`],
+/// [`RemoteHelper::read_assignment`]) verifies a generation record's OWNER
+/// MARKER against. A generation whose record carries a different
+/// application/slot — transplanted/copied state — is refused (fail closed),
+/// never read as a valid deployment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenerationOwner {
+    pub application: ApplicationStoreKey,
+    pub slot: SlotId,
+}
+
+impl GenerationOwner {
+    /// Build the owner for a placement slot of `application`.
+    pub fn new(application: ApplicationStoreKey, slot: SlotId) -> GenerationOwner {
+        GenerationOwner { application, slot }
+    }
+}
+
+/// A default owner for tests that poke at a scratch remote without a real
+/// application/slot (the record fixtures and the status/read calls in the
+/// same test must agree on the owner).
+#[cfg(test)]
+pub(crate) fn test_owner(application: &str, slot: &str) -> GenerationOwner {
+    GenerationOwner {
+        application: ApplicationStoreKey::parse(application)
+            .expect("test application is a valid store key"),
+        slot: SlotId::parse(slot).expect("test slot is a valid slot id"),
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct RemoteStatus {
@@ -1584,6 +1616,8 @@ mod cross_remote_guard_mutation {
             behavior_sha256: "b".to_string(),
             prior_generation: None,
             created_at: "2020-01-01T00:00:00Z".to_string(),
+            application: crate::identity::ApplicationStoreKey::parse("test-app").unwrap(),
+            slot: crate::identity::SlotId::parse("s1").unwrap(),
             target: Some(TargetName::new("t1")),
         };
         let gen_dir = remote
@@ -1761,6 +1795,9 @@ mod cross_remote_guard_mutation {
                         behavior_sha256: "b".to_string(),
                         prior_generation: None,
                         created_at: "2020-01-01T00:00:00Z".to_string(),
+                        application: crate::identity::ApplicationStoreKey::parse("test-app")
+                            .unwrap(),
+                        slot: crate::identity::SlotId::parse("s1").unwrap(),
                         target: Some(TargetName::new("t1")),
                     };
                     guard_a.create_generation(&asn)
@@ -1827,6 +1864,9 @@ mod cross_remote_guard_mutation {
                         behavior_sha256: "b".to_string(),
                         prior_generation: None,
                         created_at: "2020-01-01T00:00:00Z".to_string(),
+                        application: crate::identity::ApplicationStoreKey::parse("test-app")
+                            .unwrap(),
+                        slot: crate::identity::SlotId::parse("s1").unwrap(),
                         target: Some(TargetName::new("t1")),
                     };
                     guard_b.create_generation(&asn)

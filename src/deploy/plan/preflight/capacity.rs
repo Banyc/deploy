@@ -115,7 +115,11 @@ fn retain_best_effort_for_capacity(
         let retention = config
             .slot_retention(&slot.id)
             .expect("the assignment's slot is declared by its owning variant");
-        if let Ok(retained) = compute_retained(helper, config.pins(), store, retention) {
+        let owner = crate::remote::helper::GenerationOwner::new(
+            config.application().clone(),
+            crate::identity::SlotId::parse(&slot.id).expect("validated slot id is a safe segment"),
+        );
+        if let Ok(retained) = compute_retained(helper, config.pins(), store, retention, &owner) {
             let active = HashSet::from([deployment_id.as_str().to_string()]);
             helper.rotate(&retained, &active).ok();
         }
