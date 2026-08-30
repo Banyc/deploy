@@ -11,7 +11,7 @@
 //! the slot free.
 
 use crate::config::ProjectConfig;
-use crate::deploy::lock::FileLock;
+use crate::deploy::lock::AdministrativeRecoveryGuard;
 use crate::deploy::push::RemoteFactory;
 use crate::error::{Error, Result};
 use crate::identity::{AcquisitionId, OperationId, SlotId};
@@ -114,8 +114,15 @@ pub(crate) fn run_unlock(
             // newer record as the confirmed premise.
             let supplied = acquisition.expect("--yes requires --acquisition (validated above)");
             let op_id = OperationId::generate();
-            let _local_guard =
-                FileLock::acquire(&store.base().join("operation.lock"), op_id.as_str())?;
+            // The ADMINISTRATIVE recovery capability: `recover_lock` accepts
+            // ONLY an `&AdministrativeRecoveryGuard` — the typed capability
+            // that OWNS the local application-store `operation.lock` for the
+            // recovery's duration. There is no free constructor, so a
+            // recovery without holding the local lock is unrepresentable.
+            let _admin_guard = AdministrativeRecoveryGuard::acquire(
+                &store.base().join("operation.lock"),
+                op_id.as_str(),
+            )?;
 
             // Re-read under local lock as observed premise.
             let observed_opt = read_lock_record(helper.remote(), &layout::operation_lock())?;
@@ -141,12 +148,16 @@ pub(crate) fn run_unlock(
                 )));
             }
 
-            // Explicit recovery: fresh acquisition id, then explicit release leaving slot free.
-            let successor = helper.recover_lock(&observed, &op_id)?;
-            helper.release_lock(&successor)?;
+            // Explicit recovery under the local administrative lock: a
+            // FRESH acquisition id installed as the successor capability (a
+            // [`HeldSlotLock`] this command now holds). Release happens ONLY
+            // through the guard — releasing it leaves the slot free.
+            let successor_guard = helper.recover_lock(&_admin_guard, &observed, &op_id)?;
+            let successor = successor_guard.record().clone();
+            successor_guard.release()?;
 
-            // Local guard drops here.
-            drop(_local_guard);
+            // The administrative local lock drops here.
+            drop(_admin_guard);
 
             Ok(UnlockReport {
                 target: target_name.to_string(),
@@ -411,7 +422,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             !rec.acquisition_id.as_str().is_empty(),
             "fresh lock after free carries an acquisition id"
         );
-        helper.release_lock(&rec).unwrap();
+        helper.release_lock_record_for_test(&rec).unwrap();
     }
 
     #[test]
@@ -528,7 +539,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let rec_a = acquire_via_guard(&helper, "op-A");
         let acq_a = rec_a.acquisition_id.clone();
         // Release A -> acquire B (newer record installed after inspection).
-        helper.release_lock(&rec_a).unwrap();
+        // (The raw-record release goes through the test-only seam —
+        // production release happens only through the `HeldSlotLock` guard.)
+        helper.release_lock_record_for_test(&rec_a).unwrap();
         let rec_b = acquire_via_guard(&helper, "op-B");
         assert_ne!(
             rec_b.acquisition_id, acq_a,
@@ -615,7 +628,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             let helper = RemoteHelper::new(&remote);
             let rec_a = acquire_via_guard(&helper, &format!("op-{tag_a}"));
             let acq_a = rec_a.acquisition_id.clone();
-            helper.release_lock(&rec_a).unwrap();
+            helper.release_lock_record_for_test(&rec_a).unwrap();
             let rec_b = acquire_via_guard(&helper, &format!("op-{tag_b}"));
             prop_assert_ne!(rec_b.acquisition_id.clone(), acq_a.clone());
             let before_b = remote.read(&layout::operation_lock()).unwrap();

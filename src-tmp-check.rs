@@ -1272,11 +1272,7 @@ impl Fixture {
     fn release_contention_lock(&self, record: &LockRecord, server: &str) {
         let remote = self.remote_for(server);
         let helper = RemoteHelper::new(remote.as_ref());
-        // The raw-record release goes through the test-only seam (production
-        // release happens only through the `HeldSlotLock` guard); the
-        // state-machine fixture models raw records, so a record-based
-        // release is the faithful action.
-        let _ = helper.release_lock_record_for_test(record);
+        let _ = helper.release_lock(record);
     }
 
     /// Simulate STEP-17 lock contention (the post-commit retention the action
@@ -7493,16 +7489,6 @@ fn run_three_controller_case(
         RemoteHelper::new(&remote),
         RemoteHelper::new(&remote),
     ];
-    // The ADMINISTRATIVE recovery capability: `recover_lock` requires the
-    // typed local application lock, so the state machine runs under the REAL
-    // administrative path (an `AdministrativeRecoveryGuard` on a local
-    // store's `operation.lock`), held for the whole case — a recovery without
-    // the local lock is unrepresentable.
-    let admin = crate::deploy::lock::AdministrativeRecoveryGuard::acquire(
-        &dir.path().join("store").join("operation.lock"),
-        "si-recovery",
-    )
-    .expect("the authoritative local lock must be acquirable");
     // Per-controller state: `held` is the record the controller believes it
     // holds (its live claim / recovery result); `observed` is the last record
     // it READ — the premise a later explicit recovery takes.
@@ -7635,7 +7621,7 @@ fn run_three_controller_case(
                     if let Some(rec) = stale[idx].clone() {
                         let before = read_lock_record(&remote)
                             .expect("a restore's pre-read cannot be faulted (no read fault armed)");
-                        match helper.release_lock_record_for_test(&rec) {
+                        match helper.release_lock(&rec) {
                             Ok(()) => {
                                 // Should not happen for stale (mismatch) but if slot free it could be idempotent?
                                 trace.push(format!("restore:{c}:ok-stale"));
@@ -7666,7 +7652,7 @@ fn run_three_controller_case(
                 if let Some(rec) = held.take() {
                     let before = read_lock_record(&remote)
                         .expect("a restore's pre-read cannot be faulted (no read fault armed)");
-                    match helper.release_lock_record_for_test(&rec) {
+                    match helper.release_lock(&rec) {
                         Ok(()) => {
                             observed[idx] = None;
                             trace.push(format!("restore:{c}:ok"));
@@ -7755,17 +7741,10 @@ fn run_three_controller_case(
                 let before = read_lock_record(&remote)
                     .expect("a recover's pre-read cannot be faulted (no read fault armed)");
                 match helper.recover_lock(
-                    &admin,
                     &obs,
                     &crate::identity::OperationId::new(controller_op(c).to_string()),
                 ) {
-                    Ok(rec_guard) => {
-                        // The successor capability is now this controller's; the
-                        // state machine tracks acquisitions as raw records, so
-                        // the guard (which would release on drop) is forgotten —
-                        // the acquired lock stays held until an explicit restore.
-                        let rec = rec_guard.record().clone();
-                        std::mem::forget(rec_guard);
+                    Ok(rec) => {
                         // Fresh unique acquisition id, never equal to observed's id.
                         prop_assert!(
                             rec.acquisition_id != obs.acquisition_id,

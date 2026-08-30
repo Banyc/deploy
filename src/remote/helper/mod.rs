@@ -24,7 +24,7 @@
 //! create-if-absent and removed only by atomic compare-and-delete. The
 //! record is created exactly once — a different holder's record FAILS a
 //! contender — and is removed either by its OPERATION's release or by EXPLICIT
-//! RECOVERY ([`RemoteHelper::recover_lock`]) after the controller's death is
+//! RECOVERY (`RemoteHelper::recover_lock`) after the controller's death is
 //! CONFIRMED. There is NO automatic takeover and NO time anywhere in the
 //! protocol: no lease, no expiry, no clock is consulted (the protocol is
 //! immune to clock skew by construction), and a held lock never becomes
@@ -85,11 +85,13 @@
 //!   slot) FAILS explicitly and NEVER deletes the successor's lock; byte-
 //!   identical refused releases leave the live lock untouched.
 //! * **Recovery is explicit, evidence-requiring, and acquisition-unique**:
-//!   recovery ([`RemoteHelper::recover_lock`]) is a named ADMINISTRATIVE
+//!   recovery (`RemoteHelper::recover_lock`) is a named ADMINISTRATIVE
 //!   operation invoked ONLY after the operator CONFIRMS the holding
 //!   controller died, performed WHILE HOLDING the authoritative local
-//!   application-store lock (a live controller always holds it while
-//!   operating, so recovery under it cannot race a live controller). It
+//!   application-store lock — the caller must present an
+//!   `AdministrativeRecoveryGuard` capability. A live controller always
+//!   holds that lock while operating, so a recovery under it cannot race a
+//!   live controller). It
 //!   takes the observed record as its premise (read → verify → remove —
 //!   never a blind overwrite), removes it via compare-and-delete (a lock
 //!   that changed between the read and the remove is NEVER removed), and
@@ -126,6 +128,7 @@ pub use observed::{
 pub use state::GenerationAssignment;
 pub use state::current::{CurrentState, ExpectedCurrent};
 
+use crate::deploy::lock::AdministrativeRecoveryGuard;
 use crate::error::{Error, Result};
 use crate::identity::{
     AcquisitionId, BehaviorContract, GenerationId, OperationId, ReleaseId, ReleaseRecord,
@@ -216,7 +219,8 @@ impl<'a> RemoteHelper<'a> {
     /// becomes breakable on its own. On ANY different existing record the
     /// call FAILS immediately with contention; the ONLY takeover path is
     /// [`Self::recover_lock`], which requires the exact previously observed
-    /// record and performs compare-and-delete.
+    /// record AND an [`AdministrativeRecoveryGuard`] (the typed local
+    /// application-lock capability) and performs compare-and-delete.
     ///
     /// RAW RECORD ACQUISITION IS PRIVATE: production callers can only ever
     /// acquire the lock through [`Self::acquire_lock_guard`] (the
@@ -293,7 +297,15 @@ impl<'a> RemoteHelper<'a> {
     /// swallow it silently. There is NO lease backstop: a failed release
     /// leaves the lock HELD until an explicit recovery (the only removal
     /// besides the owner's own release).
-    pub fn release_lock(&self, record: &LockRecord) -> Result<()> {
+    ///
+    /// PRIVATE BY DESIGN: release happens ONLY through the [`HeldSlotLock`]
+    /// guard ([`HeldSlotLock::release`] / drop) — a caller must HOLD the
+    /// guard to release, so no library caller can free a lock it does not
+    /// possess. (`HeldSlotLock` is the ONLY lever on the remote lock; the
+    /// guard's record is its own acquisition.) The raw record release is
+    /// exercised only by in-module record-protocol tests and by the
+    /// `#[cfg(test)]` seams that preserve their raw-record coverage.
+    fn release_lock(&self, record: &LockRecord) -> Result<()> {
         let p = &layout::operation_lock();
         let bytes = serde_json::to_vec(record)
             .map_err(|e| Error::remote(format!("serialize lock record: {e}")))?;
@@ -340,13 +352,27 @@ impl<'a> RemoteHelper<'a> {
     ///   concurrent fresh acquire in the tiny remove/install window loses the
     ///   race (the recovery FAILS explicitly rather than overwriting).
     ///
-    /// Returns the successor record the recovering controller now holds (its
-    /// acquisition — the slot is never left free after a recovery).
-    pub fn recover_lock(
+    /// Returns the successor capability the recovering controller now holds
+    /// (a [`HeldSlotLock`] carrying the successor record — the slot is never
+    /// left free after a recovery; releasing the returned guard frees it).
+    ///
+    /// # The required LOCAL capability (type-enforced)
+    ///
+    /// `guard` is an [`AdministrativeRecoveryGuard`] — a typed capability
+    /// that OWNS the local application-store lock (`FileLock` on the store's
+    /// `operation.lock`) for the recovery's duration. `recover_lock` is NOT
+    /// callable with free authority: `&AdministrativeRecoveryGuard` exists
+    /// only while its constructor holds the real local lock, so a library
+    /// caller cannot perform a recovery without first holding the local
+    /// lock (the administrative path, the CLI's recovery invocation, is the
+    /// only construction site).
+    pub(crate) fn recover_lock(
         &self,
+        guard: &AdministrativeRecoveryGuard,
         observed: &LockRecord,
         new_operation_id: &OperationId,
-    ) -> Result<LockRecord> {
+    ) -> Result<HeldSlotLock<'_>> {
+        let _ = guard; // the capability is the type+ownership enforcement
         let p = &layout::operation_lock();
         // First try the transport's atomic recover (SSH: one remote exec under
         // the sidecar flock, so the whole read→verify→remove→install is
@@ -360,7 +386,11 @@ impl<'a> RemoteHelper<'a> {
         let new_bytes = serde_json::to_vec(&new_record)
             .map_err(|e| Error::remote(format!("serialize lock record: {e}")))?;
         if let Some(()) = self.remote.atomic_recover(p, &observed_bytes, &new_bytes)? {
-            return Ok(new_record);
+            return Ok(HeldSlotLock {
+                helper: self,
+                record: new_record,
+                active: true,
+            });
         }
         // Local fallback: hold the sidecar flock for the entire
         // read→verify→remove→install sequence, so the compare-then-delete
@@ -399,9 +429,11 @@ impl<'a> RemoteHelper<'a> {
             }
             // INSTALL under the same sidecar.
             match self.remote.try_write_new(p, &new_bytes)? {
-                CreateNewVerdict::Created | CreateNewVerdict::AlreadyPresent => {
-                    Ok(new_record.clone())
-                }
+                CreateNewVerdict::Created | CreateNewVerdict::AlreadyPresent => Ok(HeldSlotLock {
+                    helper: self,
+                    record: new_record.clone(),
+                    active: true,
+                }),
                 CreateNewVerdict::Conflict(reason) => Err(Error::remote(format!(
                     "recovery install contended (a concurrent acquire won the freed slot: {reason:?});                      re-read and re-confirm"
                 ))),
@@ -443,6 +475,20 @@ impl<'a> RemoteHelper<'a> {
         self.acquire_lock_record(op_id)
     }
 
+    /// TEST-ONLY SEAM (the mirror of [`Self::acquire_lock_record_for_test`]):
+    /// release a raw lock record WITHOUT a guard, so the crate-internal
+    /// lock-record state machines (which model RAW records — including
+    /// DELIBERATELY STALE records that no held guard can carry) can exercise
+    /// the compare-and-delete release semantics. A stale release is
+    /// unrepresentable through [`HeldSlotLock`] (a guard can only release its
+    /// own acquisition), and the state machines test exactly that property.
+    /// Exists only in test builds — production release happens ONLY through
+    /// the [`HeldSlotLock`] guard.
+    #[cfg(test)]
+    pub(crate) fn release_lock_record_for_test(&self, record: &LockRecord) -> Result<()> {
+        self.release_lock(record)
+    }
+
     /// Recompute and write `state/inventory.json`. This is NOT a slot
     /// mutation under the lock — it is inventory bookkeeping and does not
     /// require the slot-mutation capability.
@@ -470,7 +516,7 @@ impl<'a> RemoteHelper<'a> {
 /// as a `Result`); the drop path cannot return errors, so a drop-time release
 /// failure is never destructive but — with NO LEASE in the protocol — it is
 /// also no longer self-healing: a failed drop-time release leaves the lock
-/// HELD until an EXPLICIT RECOVERY ([`RemoteHelper::recover_lock`]) removes
+/// HELD until an EXPLICIT RECOVERY (`RemoteHelper::recover_lock`) removes
 /// it. The recovery path is the only removal besides the owner's own
 /// release. Callers that need the release outcome call [`HeldSlotLock::release`]
 /// explicitly.
@@ -490,6 +536,13 @@ impl<'a> RemoteHelper<'a> {
 /// which a guard from server A can authorize a mutation on server B.
 /// The guard is OPAQUE — the held [`LockRecord`] is private and cannot be
 /// forged.
+///
+/// The guard is also the ONLY LEVER on the remote lock's release: the raw
+/// `RemoteHelper::release_lock` is private, so a release happens only by
+/// dropping this guard (best-effort) or by calling [`HeldSlotLock::release`]
+/// (surfacing the outcome) — a caller must HOLD the guard to release, and
+/// the guard can only ever release ITS OWN acquisition (the record it was
+/// created with, compare-and-delete).
 pub struct HeldSlotLock<'a> {
     helper: &'a RemoteHelper<'a>,
     /// The authoritative lock record (owner + unique acquisition id)
@@ -501,6 +554,15 @@ pub struct HeldSlotLock<'a> {
 impl<'a> HeldSlotLock<'a> {
     pub(crate) fn helper(&self) -> &'a RemoteHelper<'a> {
         self.helper
+    }
+
+    /// The authoritative record this guard holds (its own acquisition).
+    /// Crate-internal: the guard stays opaque to library callers — the
+    /// record is needed only by crate-internal administrative/trace paths
+    /// (e.g. [`crate::deploy::unlock`]'s recovery report and the lock
+    /// state-machine tests).
+    pub(crate) fn record(&self) -> &LockRecord {
+        &self.record
     }
 
     /// Release the lock now, surfacing the outcome: `Ok` when the lock was
@@ -566,7 +628,8 @@ pub fn now_rfc3339_ts() -> crate::identity::Timestamp {
 /// installed by atomic create-if-absent (a different holder's record fails a
 /// contender — no automatic takeover, no time anywhere) and removed only by
 /// its OPERATION's release or by EXPLICIT ADMINISTRATIVE recovery
-/// ([`RemoteHelper::recover_lock`]) after confirming the holder died.
+/// (`recover_lock`, behind the `AdministrativeRecoveryGuard`) after
+/// confirming the holder died.
 ///
 /// * `acquisition_id` — the UNIQUE ACQUISITION ID: a freshly minted
 ///   uuid-v7 per acquisition (fresh claim or recovery successor), never a
@@ -602,10 +665,43 @@ pub(crate) fn read_lock_record(
     Ok(Some(rec))
 }
 
+/// TEST-ONLY helper: construct the REAL administrative recovery capability
+/// — a [`crate::deploy::lock::AdministrativeRecoveryGuard`] on a local
+/// store's `operation.lock` acquired via the real administrative path — so
+/// the lock-protocol test modules run recoveries under the authoritative
+/// local lock exactly as production does, held for the whole test.
+#[cfg(test)]
+pub(crate) fn admin_guard_for_test(
+    dir: &tempfile::TempDir,
+    op: &str,
+) -> crate::deploy::lock::AdministrativeRecoveryGuard {
+    let store_dir = dir.path().join("store");
+    crate::deploy::lock::AdministrativeRecoveryGuard::acquire(&store_dir.join("operation.lock"), op)
+        .expect("the authoritative local lock must be acquirable")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::remote::transport::LocalTransport;
+
+    /// Construct the real administrative recovery capability: the local
+    /// store lock beside the remote root is acquired via the REAL
+    /// administrative path ([`crate::deploy::lock::AdministrativeRecoveryGuard::acquire`])
+    /// — recovery always runs under the authoritative local
+    /// application-store lock, exactly as production does, and the guard is
+    /// held for the whole test.
+    fn admin_guard(
+        dir: &tempfile::TempDir,
+        op: &str,
+    ) -> crate::deploy::lock::AdministrativeRecoveryGuard {
+        let store_dir = dir.path().join("store");
+        crate::deploy::lock::AdministrativeRecoveryGuard::acquire(
+            &store_dir.join("operation.lock"),
+            op,
+        )
+        .expect("the authoritative local lock must be acquirable")
+    }
 
     /// The RAII lock guard releases the server mutation lock on drop, even
     /// when the guarded block exits through an error path (no explicit
@@ -742,19 +838,20 @@ mod tests {
             "a crashed owner's lock is held until explicit recovery"
         );
         // EXPLICIT RECOVERY under the authoritative local application-store
-        // lock (a live controller always holds it while operating, so a
-        // recovery under it cannot race a live controller): the operator
-        // confirms A died and calls the named recovery with A's OBSERVED
-        // record as the premise. The successor record carries a fresh acquisition id.
-        let store_dir = dir.path().join("store");
-        let _local_guard = crate::deploy::lock::FileLock::acquire(
-            &store_dir.join("operation.lock"),
-            "recovery-op",
-        )
-        .expect("the authoritative local lock must be acquirable");
-        let b = helper_b
-            .recover_lock(&a, &crate::identity::OperationId::new("B".to_string()))
+        // lock — REQUIRES the typed local capability
+        // ([`crate::deploy::lock::AdministrativeRecoveryGuard`], which OWNS
+        // the local lock for the recovery's duration): the operator confirms
+        // A died and calls the named recovery with A's OBSERVED record as
+        // the premise. The successor record carries a fresh acquisition id.
+        let admin = admin_guard(&dir, "recovery-op");
+        let b_guard = helper_b
+            .recover_lock(
+                &admin,
+                &a,
+                &crate::identity::OperationId::new("B".to_string()),
+            )
             .expect("explicit recovery of the confirmed-dead controller succeeds");
+        let b = b_guard.record().clone();
         assert_ne!(
             b.acquisition_id, a.acquisition_id,
             "a recovery must install a fresh unique acquisition id"
@@ -812,17 +909,29 @@ mod tests {
         let a = helper_a
             .acquire_lock_record(&crate::identity::OperationId::new("A".to_string()))
             .unwrap();
-        // B recovers the slot: fresh acquisition id.
-        let b = helper_b
-            .recover_lock(&a, &crate::identity::OperationId::new("B".to_string()))
+        // B recovers the slot: fresh acquisition id (under the typed local
+        // administrative capability).
+        let admin = admin_guard(&dir, "recovery-op");
+        let b_guard = helper_b
+            .recover_lock(
+                &admin,
+                &a,
+                &crate::identity::OperationId::new("B".to_string()),
+            )
             .unwrap();
+        let b = b_guard.record().clone();
         assert_ne!(b.acquisition_id, a.acquisition_id);
         // C tries to recover the slot with A's OLD observed record (stale —
         // the slot now carries B's record): REFUSED, and B's lock
         // survives byte-for-byte.
-        let err = helper_c
-            .recover_lock(&a, &crate::identity::OperationId::new("C".to_string()))
-            .expect_err("a recovery with a stale observed record must be refused");
+        let err = match helper_c.recover_lock(
+            &admin,
+            &a,
+            &crate::identity::OperationId::new("C".to_string()),
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("a recovery with a stale observed record must be refused"),
+        };
         assert!(
             err.to_string().contains("recovery refused"),
             "the failure must name the refusal, got: {err}"
@@ -834,9 +943,14 @@ mod tests {
             "the successor's lock must survive a refused recovery byte-for-byte"
         );
         // Recovery with the CURRENT observed record succeeds: fresh unique id.
-        let c = helper_c
-            .recover_lock(&b, &crate::identity::OperationId::new("C".to_string()))
+        let c_guard = helper_c
+            .recover_lock(
+                &admin,
+                &b,
+                &crate::identity::OperationId::new("C".to_string()),
+            )
             .unwrap();
+        let c = c_guard.record().clone();
         assert_ne!(
             c.acquisition_id, b.acquisition_id,
             "recoveries install fresh unique ids"
@@ -860,12 +974,15 @@ mod tests {
             .acquire_lock_record(&crate::identity::OperationId::new("op-1".to_string()))
             .unwrap();
         helper.release_lock(&record).unwrap();
-        let err = helper
-            .recover_lock(
-                &record,
-                &crate::identity::OperationId::new("op-2".to_string()),
-            )
-            .expect_err("recovering a free slot must be refused");
+        let admin = admin_guard(&dir, "recovery-op");
+        let err = match helper.recover_lock(
+            &admin,
+            &record,
+            &crate::identity::OperationId::new("op-2".to_string()),
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("recovering a free slot must be refused"),
+        };
         assert!(err.to_string().contains("already free"));
         // A fresh acquire proceeds directly (create-once on the free slot).
         assert!(
@@ -2171,8 +2288,10 @@ mod guard_release_retry {
                 LocalTransport::new(&crate::testutil::fixture_env(), remote_root.clone()).unwrap();
             let helper_b = RemoteHelper::new(&direct);
             let predecessor_rec: LockRecord = serde_json::from_slice(&predecessor_bytes).unwrap();
+            let admin = admin_guard_for_test(&dir, "guard-fault-recovery");
             let _successor = helper_b
                 .recover_lock(
+                    &admin,
                     &predecessor_rec,
                     &crate::identity::OperationId::new("op-successor".to_string()),
                 )
@@ -2282,6 +2401,7 @@ mod ordinary_acquisition_never_takes_over {
             LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
                 .unwrap();
         let helper = RemoteHelper::new(&remote);
+        let admin = admin_guard_for_test(&dir, "recovery-op");
         let holder_op = crate::identity::OperationId::new(format!("holder-{holder_tag}"));
         let guard = helper
             .acquire_lock_guard(&holder_op)
@@ -2329,6 +2449,7 @@ mod ordinary_acquisition_never_takes_over {
         // Ensure wrong is not equal to observed
         prop_assert_ne!(&wrong_record, &observed);
         let wrong_res = helper.recover_lock(
+            &admin,
             &wrong_record,
             &crate::identity::OperationId::new(format!("successor-wrong-{wrong_tag}")),
         );
@@ -2342,9 +2463,10 @@ mod ordinary_acquisition_never_takes_over {
 
         // Exact observed must succeed and install fresh acquisition
         let successor_op = crate::identity::OperationId::new(format!("successor-{holder_tag}"));
-        let successor = helper
-            .recover_lock(&observed, &successor_op)
+        let successor_guard = helper
+            .recover_lock(&admin, &observed, &successor_op)
             .expect("recover with exact observed must succeed");
+        let successor = successor_guard.record().clone();
         prop_assert_ne!(
             &successor.acquisition_id,
             &observed.acquisition_id,

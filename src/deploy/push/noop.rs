@@ -265,6 +265,21 @@ mod noop_tests {
     use std::sync::Arc;
     use std::sync::Mutex;
 
+    /// The per-target store files a no-op push must leave byte-for-byte
+    /// untouched — EXCLUDING the `operation.lock` advisory-lock scaffold.
+    /// The lock file is now a STABLE-INODE file that persists for the whole
+    /// store/session lifetime and legitimately carries the LAST holder's
+    /// operation id (see [`crate::deploy::lock`]), so its content changes
+    /// between pushes by design; the no-op contract is about the STORE
+    /// RECORDS (attempts, transitions, observed, refs), not the lock
+    /// scaffold.
+    fn store_files_without_lock(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+        snapshot_files(dir)
+            .into_iter()
+            .filter(|(rel, _)| rel != "operation.lock")
+            .collect()
+    }
+
     /// The no-op must leave the ENTIRE per-target store byte-for-byte
     /// untouched: no attempt, no transition, no snapshot, `observed.json`
     /// unchanged — the up-to-date detection runs before any record is
@@ -277,7 +292,7 @@ mod noop_tests {
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
 
         let target_dir = h.store.target_dir("t1");
-        let before = snapshot_files(&target_dir);
+        let before = store_files_without_lock(&target_dir);
 
         let r2 = push_clean(&h).unwrap();
         assert_eq!(r2.status, None, "no-op push creates no attempt");
@@ -293,7 +308,7 @@ mod noop_tests {
             "no new snapshot may be appended by the no-op"
         );
 
-        let after = snapshot_files(&target_dir);
+        let after = store_files_without_lock(&target_dir);
         assert_eq!(
             before, after,
             "the no-op push must not touch any store file (attempts, transitions, observed, refs)"
@@ -415,7 +430,7 @@ interval_seconds = 0
 
         // Push 2: the no-op. Capture ONLY the no-op's verification argv.
         let target_dir = h.store.target_dir("t1");
-        let before = snapshot_files(&target_dir);
+        let before = store_files_without_lock(&target_dir);
         executed.lock().unwrap().clear();
         let r2 = push(
             &h.cfg_path,
@@ -462,7 +477,7 @@ interval_seconds = 0
         // The no-op creates NO records: no new attempt, no new transition, no
         // new snapshot, `refs/last-successful` unchanged, observed.json
         // unchanged (the whole per-target store is byte-for-byte identical).
-        let after = snapshot_files(&target_dir);
+        let after = store_files_without_lock(&target_dir);
         assert_eq!(
             before, after,
             "the no-op push must not touch any store file (attempts, transitions, observed, refs)"
