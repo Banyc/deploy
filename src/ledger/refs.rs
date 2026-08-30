@@ -341,9 +341,9 @@ mod tests {
             let id = format!("deploy-{n}");
             let canonical = test_deployment_id(&id);
             let i = intent_over(&id, head.as_ref());
-            store.append_intent("production", &i).unwrap();
+            store.test_append_intent("production", &i).unwrap();
             store
-                .append_terminal(
+                .test_append_terminal(
                     "production",
                     &canonical,
                     &crate::testutil::fixtures::successful_terminal(&i),
@@ -719,7 +719,7 @@ mod tests {
         let mut head: Option<DeploymentIntent> = None;
         for (id, ok) in &history {
             let it = intent_entry_over(id, head.as_ref());
-            store.append_intent("production", &it).unwrap();
+            store.test_append_intent("production", &it).unwrap();
             if *ok {
                 // Each successful deployment is a rollback payload keyed by
                 // its id, with a deterministic payload derived from the id
@@ -729,7 +729,7 @@ mod tests {
                 // would carry a different canonical digest).
                 let it = intent_entry_over(id, head.as_ref());
                 store
-                    .append_terminal(
+                    .test_append_terminal(
                         "production",
                         it.deployment_id(),
                         &crate::testutil::fixtures::successful_terminal(&it),
@@ -739,7 +739,7 @@ mod tests {
             } else {
                 let it = intent_entry_over(id, head.as_ref());
                 store
-                    .append_terminal(
+                    .test_append_terminal(
                         "production",
                         it.deployment_id(),
                         &crate::testutil::fixtures::rolled_back_terminal(

@@ -791,10 +791,10 @@ interval_seconds = 0
             attempted_at: crate::identity::Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
         })
         .expect("a seeded plan intent is valid");
-        store.append_intent("t1", &intent).unwrap();
+        store.test_append_intent("t1", &intent).unwrap();
         let terminal = crate::testutil::fixtures::successful_terminal(&intent);
         store
-            .append_terminal("t1", &tdi(deployment_id), &terminal)
+            .test_append_terminal("t1", &tdi(deployment_id), &terminal)
             .unwrap();
     }
 
@@ -1447,9 +1447,9 @@ interval_seconds = 0
 
         // A valid successful deployment resolves.
         let intent = crate::testutil::fixtures::full_intent("deploy-good", "t1", &[slot_p1], &[]);
-        store.append_intent("t1", &intent).unwrap();
+        store.test_append_intent("t1", &intent).unwrap();
         store
-            .append_terminal(
+            .test_append_terminal(
                 "t1",
                 intent.deployment_id(),
                 &crate::testutil::fixtures::successful_terminal(&intent),

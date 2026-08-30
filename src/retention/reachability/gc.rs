@@ -776,9 +776,9 @@ interval_seconds = 0
                 crate::ledger::Observation::KnownAbsent,
                 head.as_ref(),
             );
-            store.append_intent(TARGET, &matching_intent).unwrap();
+            store.test_append_intent(TARGET, &matching_intent).unwrap();
             store
-                .append_terminal(TARGET, &canonical, &terminal_for(&matching_intent))
+                .test_append_terminal(TARGET, &canonical, &terminal_for(&matching_intent))
                 .unwrap();
             retained_deployments.push(canonical.as_str().to_string());
             head = Some(matching_intent);
@@ -1132,7 +1132,7 @@ interval_seconds = 0
         let config = config_with_pin(tmp.path(), None);
         let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
         let intent = intent_with_pre_push(pre_push.clone());
-        store.append_intent(TARGET, &intent).unwrap();
+        store.test_append_intent(TARGET, &intent).unwrap();
 
         // ---- 1. The pre-push state round-trips EXACTLY through the wire —
         // the observation is the frozen fact (Known prior state,
@@ -1255,7 +1255,7 @@ interval_seconds = 0
         let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let config = config_with_pin(tmp.path(), None);
         let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
-        store.append_intent(TARGET, &intent).unwrap();
+        store.test_append_intent(TARGET, &intent).unwrap();
         let entries = store.read_ledger(TARGET).unwrap();
         let read_back = entries[0].intent.pre_push(&SlotId::new(SLOT.to_string()));
         assert!(

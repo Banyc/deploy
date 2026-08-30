@@ -88,12 +88,12 @@ mod tests_entry {
             &[p1()],
             &[p1()],
         );
-        store.append_intent(target, &i1).unwrap();
+        store.test_append_intent(target, &i1).unwrap();
         let tx = fixtures::successful_terminal(&i1);
         store
-            .append_terminal(target, i1.deployment_id(), &tx)
+            .test_append_terminal(target, i1.deployment_id(), &tx)
             .unwrap();
-        store.append_intent(target, &i2).unwrap();
+        store.test_append_intent(target, &i2).unwrap();
 
         // The reference machine's accepted sequence: intent x, terminal x
         // (Successful), intent y (parent == the head).

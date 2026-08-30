@@ -1,0 +1,40 @@
+error[E0599]: no method named `append_intent` found for struct `LocalStore` in the current scope
+  --> /kache/home/code/deploy/tests/ui/append_outside_txn.rs:17:11
+   |
+17 |     store.append_intent("t1", &todo!());
+   |           ^^^^^^^^^^^^^ method not found in `LocalStore`
+
+warning: unreachable expression
+  --> /kache/home/code/deploy/tests/ui/append_outside_txn.rs:17:31
+   |
+17 |     store.append_intent("t1", &todo!());
+   |                               ^-------
+   |                               ||
+   |                               |any code following this expression is unreachable
+   |                               unreachable expression
+   |
+   = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+error[E0599]: no method named `append_terminal` found for struct `LocalStore` in the current scope
+  --> /kache/home/code/deploy/tests/ui/append_outside_txn.rs:18:11
+   |
+18 |     store.append_terminal("t1", &todo!(), &todo!());
+   |           ^^^^^^^^^^^^^^^ method not found in `LocalStore`
+
+warning: unreachable expression
+  --> /kache/home/code/deploy/tests/ui/append_outside_txn.rs:18:33
+   |
+18 |     store.append_terminal("t1", &todo!(), &todo!());
+   |                                 ^-------
+   |                                 ||
+   |                                 |any code following this expression is unreachable
+   |                                 unreachable expression
+
+warning: unreachable expression
+  --> /kache/home/code/deploy/tests/ui/append_outside_txn.rs:18:43
+   |
+18 |     store.append_terminal("t1", &todo!(), &todo!());
+   |                                           ^-------
+   |                                           ||
+   |                                           |any code following this expression is unreachable
+   |                                           unreachable expression

@@ -135,7 +135,7 @@ pub struct CheckpointEvent {
 /// and only a `Successful` terminal advances the head. The checkpoint
 /// anchor of a checkpointed ledger is the model's one exception (see
 /// [`apply_event`]).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DeploymentState {
     target: TargetName,
     entries: Vec<LedgerEntry>,
@@ -1790,7 +1790,7 @@ mod tests {
             let terminal = LedgerTerminal::new(
                 crate::identity::Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
                 crate::kernel::terminal::intent_digest(&intent),
-                d.clone(),
+                crate::kernel::terminal::NonSuccessfulDisposition::from_decision(d.clone()),
                 None,
             );
             match &d {

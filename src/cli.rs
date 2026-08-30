@@ -663,9 +663,7 @@ mod tests {
         ReleaseId, SlotId, VariantName, test_deployment_id, test_generation_id, test_release_id,
         test_tree_digest,
     };
-    use crate::ledger::{
-        DeploymentIntent, DeploymentStatus, LedgerTerminal, ObservedSlot, TerminalDisposition,
-    };
+    use crate::ledger::{DeploymentIntent, DeploymentStatus, LedgerTerminal, ObservedSlot};
 
     /// A valid full-push intent for the ONE-slot (p1) `production` fixture
     /// target, built through the kernel's validated constructor.
@@ -725,9 +723,9 @@ mod tests {
             attempted_at: crate::identity::Timestamp::parse(attempted_at).unwrap(),
         })
         .expect("a seeded parented intent plans");
-        store.append_intent("production", &it).unwrap();
+        store.test_append_intent("production", &it).unwrap();
         store
-            .append_terminal(
+            .test_append_terminal(
                 "production",
                 it.deployment_id(),
                 &successful_terminal(&it, "deployed"),
@@ -737,12 +735,13 @@ mod tests {
 
     /// A `Successful` terminal BOUND to the given intent, with the given
     /// reason (payload-free — the disposition only says the intent's planned
-    /// result was achieved).
+    /// result was achieved). The SEALED verified-execution proof is the TEST
+    /// mint (the fixtures have no real verification evidence).
     fn successful_terminal(intent: &DeploymentIntent, reason: &str) -> LedgerTerminal {
-        LedgerTerminal::new(
+        LedgerTerminal::successful(
+            crate::kernel::terminal::VerifiedExecution::for_tests(),
             crate::identity::Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
             crate::kernel::terminal::intent_digest(intent),
-            TerminalDisposition::Successful,
             Some(reason.to_string()),
         )
     }
@@ -755,7 +754,7 @@ mod tests {
 
         // No terminal event yet: an intent-only entry is treated as the
         // recoverable pending state.
-        store.append_intent("production", &a).unwrap();
+        store.test_append_intent("production", &a).unwrap();
         let entries = store.read_ledger("production").unwrap();
         assert_eq!(
             crate::ledger::log::effective_status(&entries[0]),
@@ -766,7 +765,7 @@ mod tests {
         // A terminal event carries the status + reason. A `Successful`
         // terminal is PAYLOAD-FREE (the snapshot resolves from the intent).
         store
-            .append_terminal(
+            .test_append_terminal(
                 "production",
                 a.deployment_id(),
                 &successful_terminal(&a, "recovery finalization"),
@@ -842,15 +841,15 @@ mod tests {
             })
             .expect("a seeded parented intent plans")
         };
-        store.append_intent("production", &a_failed).unwrap();
+        store.test_append_intent("production", &a_failed).unwrap();
         store
-            .append_terminal(
+            .test_append_terminal(
                 "production",
                 a_failed.deployment_id(),
                 &LedgerTerminal::new(
                     crate::identity::Timestamp::parse("2026-01-02T00:00:00Z").unwrap(),
                     crate::kernel::terminal::intent_digest(&a_failed),
-                    TerminalDisposition::FailedPreflight,
+                    crate::kernel::terminal::NonSuccessfulDisposition::FailedPreflight,
                     Some("preflight failed".to_string()),
                 ),
             )

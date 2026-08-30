@@ -10,6 +10,7 @@
 //! machine ([`crate::kernel::transition::apply_event`]) — the store never
 //! independently decides deployment semantics.
 
+use crate::deploy::lock::FileLock;
 use crate::error::{Error, Result};
 use crate::identity::{DeploymentId, TargetName};
 use crate::kernel::error::{ConflictError, IntegrityError, KernelError};
@@ -21,7 +22,9 @@ use crate::ledger::{
     CheckpointWire, DeploymentIntent, DeploymentStatus, LEDGER_SCHEMA_VERSION, LedgerEntry,
     LedgerEventWire, LedgerIntentWire, LedgerTerminal, LedgerTerminalWire,
 };
-use crate::store::atomic::{path_state, set_private, sync_parent_dir, temp_name_for};
+use crate::store::atomic::{
+    ReplaceOutcome, path_state, set_private, sync_parent_dir, temp_name_for,
+};
 use crate::store::local::LocalStore;
 use std::io::Write;
 use std::path::PathBuf;
@@ -225,53 +228,21 @@ impl LocalStore {
     /// lose the deployment (the intent is already durable and the next push
     /// reconciles it). The append is a CRASH-ATOMIC whole-ledger rewrite
     /// (temp + fsync + chmod + rename + parent-dir fsync, see
-    /// `LocalStore::append_ledger_atomic`). Fail-closed keying: the
-    /// deployment id keys the entry, so a second intent for the same id (a
-    /// corrupted duplicate) is refused rather than silently merged. The
-    /// duplicate guard scans EVERY parsed ledger entry (`read_ledger`), not
-    /// just the first one.
-    pub fn append_intent(&self, target: &str, intent: &DeploymentIntent) -> Result<()> {
-        #[cfg(test)]
-        if self
-            .fault_registry
-            .consume(FaultKind::AppendAttempt, intent.deployment_id().as_str())
-        {
-            return Err(Error::store(
-                "test fault: append_attempt (ledger intent) forced to fail once",
-            ));
-        }
-        self.ensure_target_dir_durable(target)?;
-        let entries = self.read_ledger(target)?;
-        // The intent is the entry's durable key: a duplicate intent for the
-        // same deployment id is corruption (deployment ids are unique per
-        // push) and must fail closed rather than append a second entry. The
-        // guard scans EVERY parsed entry (`read_ledger` is the source of
-        // truth and fails closed on malformed lines) — a duplicate at any
-        // position, not just the first entry, is refused.
-        if entries
-            .iter()
-            .any(|e| e.deployment_id == *intent.deployment_id())
-        {
-            return Err(Error::store(format!(
-                "refusing to append a second intent for deployment '{}' (the ledger is keyed by deployment id)",
-                intent.deployment_id()
-            )));
-        }
-        // THE PRE-WRITE STRICT-LINEAR LINEAGE VALIDATION (fail closed — item
-        // 6 of the spec): the new intent is verified against the SAME lineage
-        // gates the read path's state machine applies BEFORE any write (at
-        // most one pending attempt — a push that cannot finish the previous
-        // pending attempt is REFUSED with a Conflict and never plans a second
-        // intent; the parent must equal the current successful head; the
-        // inherited slots must match the head's snapshot). An intent the
-        // strict reader would reject is NEVER written (the append is atomic;
-        // the ledger bytes stay unchanged on rejection).
-        validate_intent_append(target, &entries, intent)?;
-        let line = serde_json::to_string(&LedgerEventWire::Intent(LedgerIntentWire::from(intent)))
-            .map_err(|e| Error::store(format!("serialize ledger intent: {e}")))?;
-        self.append_ledger_atomic(target, intent.deployment_id().as_str(), &line)
-    }
-
+    /// `TargetLedgerTxn::write_state`). Fail-closed keying: the deployment
+    /// id keys the entry, so a second intent for the same id (a corrupted
+    /// duplicate) is refused rather than silently merged. The duplicate
+    /// guard scans EVERY folded entry, not just the first one.
+    //
+    // THE WRITE SURFACE IS THE TXN: this method was the raw unlocked
+    // `append_intent`; it is GONE from the store surface — an intent is
+    // appended only through [`TargetLedgerTxn::append_intent`] (which owns
+    // the target lock + the folded state). See the txn section below.
+    //
+    // (The append itself moved verbatim into [`TargetLedgerTxn`]: the
+    // duplicate guard, the pre-write lineage validation with its
+    // write-boundary Conflict classes, the kernel fold, and the atomic
+    // whole-ledger rewrite.)
+    ///
     /// Append the TERMINAL EVENT of one deployment to the target's ledger
     /// ("`{"kind":"terminal", ...}`" JSON line), after the mutation loop.
     /// The terminal binds its intent by `intent_digest` and carries its
@@ -284,84 +255,43 @@ impl LocalStore {
     /// carries no `deployment_id` / `target`; the caller supplies the
     /// deployment id (the wire keeps the on-disk identity members; the
     /// reader verifies them equal to the enclosing entry's).
-    pub fn append_terminal(
-        &self,
-        target: &str,
-        deployment_id: &DeploymentId,
-        terminal: &LedgerTerminal,
-    ) -> Result<()> {
-        #[cfg(test)]
-        if self
-            .fault_registry
-            .consume(FaultKind::AppendTerminal, deployment_id.as_str())
-        {
-            return Err(Error::store(
-                "test fault: append_terminal forced to fail once",
-            ));
-        }
-        self.ensure_target_dir_durable(target)?;
-        let entries = self.read_ledger(target)?;
-        let entry = entries
-            .iter()
-            .find(|e| e.deployment_id == *deployment_id)
-            .ok_or_else(|| {
-                Error::integrity(format!(
-                    "append_terminal for deployment '{deployment_id}': no ledger intent exists for it — a terminal event requires its durable intent (a terminal without an intent is corruption)"
-                ))
-            })?;
-        if entry.terminal.is_some() {
-            return Err(Error::integrity(format!(
-                "append_terminal for deployment '{deployment_id}': the entry already carries a terminal event (a terminal is written exactly once)"
-            )));
-        }
-        // THE PRE-WRITE VALIDATION (fail closed): the intent/terminal pair is
-        // verified against the SAME checks the read path's state machine
-        // applies BEFORE any write — the intent_digest binding, the
-        // disposition-vs-intent agreement, and the one-parent gate on a
-        // `Successful` disposition (the kernel's Conflict/StalePlan source).
-        // A terminal the strict reader would reject is NEVER written (the
-        // append is atomic; the ledger bytes stay unchanged on rejection).
-        validate_terminal_append(target, &entries, entry, terminal)?;
-        let wire = LedgerTerminalWire::to_wire(deployment_id, terminal);
-        let line = serde_json::to_string(&LedgerEventWire::Terminal(wire))
-            .map_err(|e| Error::store(format!("serialize ledger terminal: {e}")))?;
-        self.append_ledger_atomic(target, deployment_id.as_str(), &line)
-    }
-
-    /// Append a CHECKPOINT event as a NEW ledger's first line — the atomic
-    /// suffix replacement's record of the discarded prefix. Validated by the
-    /// same kernel state machine as every other event (a checkpoint is
-    /// accepted only as the first event of a ledger).
-    pub fn append_checkpoint(&self, target: &str, checkpoint: &CheckpointEvent) -> Result<()> {
-        self.ensure_target_dir_durable(target)?;
-        let wire = CheckpointWire::new(
-            &checkpoint.retained_from,
-            checkpoint.discarded,
-            &checkpoint.recorded_at.to_string(),
-        );
-        let line = serde_json::to_string(&LedgerEventWire::Checkpoint(wire))
-            .map_err(|e| Error::store(format!("serialize ledger checkpoint: {e}")))?;
-        self.append_ledger_atomic(target, checkpoint.retained_from.as_str(), &line)
-    }
-
-    /// Read the FULL deployment ledger of a target: every merged
-    /// [`LedgerEntry`] (intent + optional terminal), in append order. This is
-    /// the SINGLE history read. Every parsed wire line is converted through
-    /// its VERIFYING CONVERSION and folded into the KERNEL's pure state
-    /// machine ([`crate::kernel::transition::apply_event`]) — the event-store
-    /// rules (one intent per deployment, at-most-one terminal, terminal
-    /// `intent_digest` equality, event ordering) AND the semantic
-    /// transitions (outcome coverage by disposition) are refused fail
-    /// closed. Fail closed on malformed lines, foreign
+    //
+    // THE WRITE SURFACE IS THE TXN: this method was the raw unlocked
+    // `append_terminal`; it is GONE from the store surface — a terminal is
+    // appended only through [`TargetLedgerTxn::append_terminal`] (which owns
+    // the target lock + the folded state), and a `Successful` terminal is
+    // additionally gated by the sealed [`crate::kernel::terminal::
+    // VerifiedExecution`] proof (see [`crate::kernel::terminal::
+    // LedgerTerminal::successful`]) — a library caller cannot fabricate
+    // success.
+    //
+    // (The append itself moved verbatim into [`TargetLedgerTxn`]: the
+    // key contract, the pre-write validation with its write-boundary
+    // classes, the kernel fold, and the atomic whole-ledger rewrite.)
+    //
+    // THERE IS NO GENERAL `append_checkpoint` ANYWHERE: a CHECKPOINT event
+    // enters a ledger ONLY through the validated suffix replacement
+    // ([`TargetLedgerTxn::write_suffix`] → `LocalStore::write_ledger_suffix`,
+    // the checkpoint flow's atomic replacement) — a bare checkpoint-event
+    // append would let a corrupted invocation write a checkpoint mid-ledger
+    // (the reader requires it FIRST), so no such append exists.
+    ///
+    /// Fold the target's ledger into the KERNEL's pure state
+    /// ([`DeploymentState`]) — the SINGLE authoritative fold every read
+    /// ([`LocalStore::read_ledger`]) and every [`TargetLedgerTxn`] append
+    /// validates against (fail closed on malformed lines, foreign
     /// `deployment_schema_version`, an intent-less terminal, a duplicate
-    /// intent, a duplicate terminal, or a disagreeing record.
-    pub fn read_ledger(&self, target: &str) -> Result<Vec<LedgerEntry>> {
+    /// intent, a duplicate terminal, or a disagreeing record). The txn
+    /// calls this at open and after a validated suffix replacement, so its
+    /// in-memory state is always exactly what the reader would produce.
+    fn read_ledger_state(&self, target: &str) -> Result<DeploymentState> {
         let p = self.ledger_path(target);
         // Tri-state: only a genuine NotFound is "no ledger" (the empty
-        // vector); a stat failure propagates as a Store error (an unreadable
+        // state); a stat failure propagates as a Store error (an unreadable
         // ledger must not read as "no history").
         if !path_state(&p)? {
-            return Ok(vec![]);
+            let target_name = TargetName::parse(target).expect("ledger target is a safe segment");
+            return Ok(DeploymentState::new(target_name));
         }
         let text =
             std::fs::read_to_string(&p).map_err(|e| Error::store(format!("read ledger: {e}")))?;
@@ -441,15 +371,24 @@ impl LocalStore {
             // store-side "rejects line N" flattening.
             state = crate::kernel::transition::apply_event(state, event).map_err(Error::Kernel)?;
         }
-        // THE STRUCTURAL COMPLETENESS GATE (item 8 of the spec): after the
-        // full fold, a checkpointed ledger must carry its SUCCESSFUL ANCHOR
-        // (the checkpoint's `retained_from` entry present and finalized
-        // `Successful`); a non-checkpointed ledger passes trivially. A
-        // structurally incomplete checkpoint prefix (a checkpoint with no
-        // following anchor, or an anchor that never reached its `Successful`
-        // terminal) is corruption — the typed
-        // [`IntegrityError::CheckpointAnchorMismatch`], preserved through the
-        // facade.
+        Ok(state)
+    }
+
+    /// Read the FULL deployment ledger of a target: every merged
+    /// [`LedgerEntry`] (intent + optional terminal), in append order. This is
+    /// the SINGLE history read: a fold of the kernel state (the same fold
+    /// `TargetLedgerTxn::open` performs, with `finish()` appended) plus the
+    /// STRUCTURAL COMPLETENESS GATE (item 8 of the spec). After the full
+    /// fold, a checkpointed ledger must carry its SUCCESSFUL ANCHOR
+    /// (the checkpoint's `retained_from` entry present and finalized
+    /// `Successful`); a non-checkpointed ledger passes trivially. A
+    /// structurally incomplete checkpoint prefix (a checkpoint with no
+    /// following anchor, or an anchor that never reached its `Successful`
+    /// terminal) is corruption — the typed
+    /// [`IntegrityError::CheckpointAnchorMismatch`], preserved through the
+    /// facade.
+    pub fn read_ledger(&self, target: &str) -> Result<Vec<LedgerEntry>> {
+        let state = self.read_ledger_state(target)?;
         state.finish().map_err(Error::Kernel)?;
         Ok(state.into_entries())
     }
@@ -499,32 +438,38 @@ impl LocalStore {
         }
         Ok(None)
     }
-    /// The ledger APPEND's durability protocol: atomically rewrite the WHOLE
-    /// ledger (read-modify-write) through the same four-stage sequence as
-    /// [`crate::store::atomic::write_atomic_replace`] — a UNIQUE temp file in
-    /// the same directory, chmod-private BEFORE it can become visible, temp
-    /// fsync, atomic rename (a reader sees wholly OLD or wholly NEW, never a
-    /// torn line), then a FAIL-CLOSED parent-directory fsync (the durability
-    /// commit point: the new ledger must survive power loss before the append
-    /// reports success).
+    /// THE LEDGER WRITE's durability protocol: atomically rewrite the WHOLE
+    /// ledger from the given canonical lines through the same four-stage
+    /// sequence as the generic [`crate::store::atomic::write_atomic_replace`]:
+    /// a UNIQUE temp file in the same directory, chmod-private BEFORE it can
+    /// become visible, temp fsync, atomic rename (a reader sees wholly OLD or
+    /// wholly NEW, never a torn line), then a FAIL-CLOSED parent-directory
+    /// fsync (the durability commit point: the new ledger must survive power
+    /// loss before the write reports success).
     ///
     /// The stages are materialized here — rather than a single
     /// `write_atomic_replace` call — so the per-fixture test registry can
     /// fault each one ([`FaultKind::AppendWrite`] / [`FaultKind::AppendSync`]
     /// / [`FaultKind::AppendRename`] / [`FaultKind::AppendDirSync`]), keyed
-    /// by the deployment id being appended. The first three fault stages
+    /// by the deployment id being written. The first three fault stages
     /// abort BEFORE the rename: the visible ledger is wholly OLD (a leftover
     /// dot-prefixed temp is invisible to every read). The dir-sync fault
     /// fires AFTER the rename: the ledger is wholly NEW — only the directory
-    /// entry is unsynced — and the append returns `Err` (the same
+    /// entry is unsynced — and the write returns `Err` (the same
     /// post-commit window the checkpoint's [`FaultKind::LedgerReplaceDirSync`]
     /// models).
     ///
-    /// Appends are serialized by the caller's target lock (push and
-    /// checkpoint both acquire the application-store lock then the target
-    /// lock before any ledger write), so the read-modify-write cannot
-    /// interleave with a concurrent rewrite.
-    fn append_ledger_atomic(&self, target: &str, _deployment_id: &str, line: &str) -> Result<()> {
+    /// The caller is ALWAYS a [`TargetLedgerTxn`] holding the target
+    /// `operation.lock` (the whole-ledger rewrite cannot interleave with a
+    /// concurrent rewrite), and the lines are the txn's FOLDED STATE
+    /// serialized — the bytes written are exactly the state (never a
+    /// read-modify-append that could disagree with the fold).
+    fn write_ledger_lines(
+        &self,
+        target: &str,
+        _deployment_id: &str,
+        lines: &[String],
+    ) -> Result<()> {
         let p = self.ledger_path(target);
         // Durable target-dir creation (the FIRST append's reported bug): the
         // `targets/<target>/` — and `targets/` — directory entries must be
@@ -532,22 +477,15 @@ impl LocalStore {
         // target's dir is the helper's fast path (created nothing, syncs
         // nothing).
         self.ensure_target_dir_durable(target)?;
-        // Read-modify-write: the whole current ledger + the new line.
+        // The WHOLE new ledger, from the caller's canonical lines. There is
+        // no read of the current file: the rewrite IS the folded state, so
+        // the write can never disagree with the fold (and a ledger that
+        // failed to fold could not have opened the txn in the first place).
         let mut buf = String::new();
-        if path_state(&p)? {
-            buf = std::fs::read_to_string(&p)
-                .map_err(|e| Error::store(format!("read ledger: {e}")))?;
-            // A legacy in-place append (pre-durability-fix) may have crashed
-            // WITHOUT a trailing newline; give that tail its own newline so
-            // the new line is never FUSED into it (the pre-existing torn
-            // tail still fails closed on read — this append neither drops
-            // nor amplifies it).
-            if !buf.is_empty() && !buf.ends_with('\n') {
-                buf.push('\n');
-            }
+        for line in lines {
+            buf.push_str(line);
+            buf.push('\n');
         }
-        buf.push_str(line);
-        buf.push('\n');
 
         // Stage 1: the temp write.
         #[cfg(test)]
@@ -613,6 +551,316 @@ impl LocalStore {
         }
         sync_parent_dir(&p)?;
         Ok(())
+    }
+}
+
+// =====================================================================
+// THE TARGET LEDGER TRANSACTION — the ONLY write surface of a target's
+// ledger ---------------------------------------------------------------
+//
+// A write to a target's ledger happens ONLY through a [`TargetLedgerTxn`]:
+// the txn OWNS the target's `operation.lock` ([`FileLock`] — the
+// stable-inode advisory lock the push and checkpoint already hold) for its
+// whole lifetime AND the folded [`DeploymentState`] (read once at open,
+// updated in memory by the txn's own appends). Two concurrent txns on one
+// target cannot both be open (the flock serializes them), so the old
+// read-modify-write race — two writers racing a whole-ledger rewrite and
+// losing each other's updates — is structurally gone: every append is a
+// read of the txn's OWN state, folded, then written under the held lock.
+//
+// THE FOLD IS THE WRITE: each append updates the in-memory state through
+// the kernel's pure [`crate::kernel::transition::apply_event`] FIRST and
+// then rewrites the WHOLE ledger as the state's serialization
+// ([`state_to_lines`]) — the fold and the bytes cannot disagree (single
+// source). A refused event (the state machine's refusal, or the
+// write-boundary validators' Conflict classes) is NEVER written.
+//
+// The raw store-level append methods are GONE from the public surface: a
+// library caller has no way to append a ledger line (intent, terminal, or
+// checkpoint) outside a locked txn, and a `Successful` terminal is
+// additionally gated by the sealed [`crate::kernel::terminal::
+// VerifiedExecution`] proof (see [`crate::kernel::terminal::
+// LedgerTerminal::successful`]).
+pub(crate) struct TargetLedgerTxn<'a> {
+    store: &'a LocalStore,
+    target: String,
+    /// THE TARGET LOCK (`targets/<target>/operation.lock`) — held for the
+    /// txn's whole lifetime; the field is otherwise unused (its Drop is the
+    /// release).
+    _lock: FileLock,
+    /// THE FOLDED DEPLOYMENT STATE — the txn's concurrency authority AND
+    /// its write source: every append folds the new event into this state
+    /// and persists exactly the state.
+    state: DeploymentState,
+}
+
+impl<'a> TargetLedgerTxn<'a> {
+    /// Open the write transaction on ONE target: durably pre-create the
+    /// target directory, ACQUIRE the target `operation.lock` (fail fast —
+    /// a concurrent holder is refused with the lock's "held by" error, so
+    /// two txns can never be open on one target), and FOLD the current
+    /// ledger into the kernel state (fail closed: a ledger the strict
+    /// reader would refuse — including a structurally incomplete
+    /// checkpoint prefix — refuses to open the txn). The lock is held for
+    /// the txn's whole lifetime (released on Drop, never before).
+    pub(crate) fn open(store: &'a LocalStore, target: &str, op_id: &str) -> Result<Self> {
+        // Durable target-directory pre-creation BEFORE the lock, mirroring
+        // [`crate::deploy::push`]: the lock path must never create the
+        // target dir with an unsynced mkdir (the reported durability bug).
+        store.ensure_target_dir_durable(target)?;
+        let _lock = FileLock::acquire(&store.target_dir(target).join("operation.lock"), op_id)?;
+        let state = store.read_ledger_state(target)?;
+        // THE STRUCTURAL COMPLETENESS GATE: a checkpointed ledger must
+        // carry its SUCCESSFUL anchor — the same gate the read path
+        // applies; a broken ledger refuses to open the txn.
+        state.finish().map_err(Error::Kernel)?;
+        Ok(TargetLedgerTxn {
+            store,
+            target: target.to_string(),
+            _lock,
+            state,
+        })
+    }
+
+    /// The txn's target name.
+    pub(crate) fn target(&self) -> &str {
+        &self.target
+    }
+
+    /// The FOLDED STATE — the txn's authoritative view of the ledger (the
+    /// same fold the reader produces; the txn IS the pure state machine,
+    /// it never diverges). Read-only accessor: consumers read the pending
+    /// attempt / successful head / entries for their pre-checks; only the
+    /// txn's own appends mutate it.
+    pub(crate) fn state(&self) -> &DeploymentState {
+        &self.state
+    }
+
+    /// Append the DURABLE INTENT of one deployment (one
+    /// `{"kind":"intent", ...}` JSON line), BEFORE any remote mutation.
+    /// Fail-closed keying: the deployment id keys the entry, so a second
+    /// intent for the same id is refused rather than silently merged (the
+    /// duplicate guard scans EVERY folded entry, not just the first one).
+    ///
+    /// THE PRE-WRITE LINEAGE VALIDATION runs against the txn's OWN
+    /// in-memory entries (no re-read — the fold and the write share one
+    /// source) with the write-boundary Conflict classification, and the
+    /// kernel's pure state machine ([`crate::kernel::transition::
+    /// apply_event`]) is the single authority: the event is folded into
+    /// the in-memory state FIRST (a refusal writes nothing), then the
+    /// whole ledger is atomically rewritten as the state.
+    pub(crate) fn append_intent(&mut self, intent: &DeploymentIntent) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .store
+            .fault_registry
+            .consume(FaultKind::AppendAttempt, intent.deployment_id().as_str())
+        {
+            return Err(Error::store(
+                "test fault: append_attempt (ledger intent) forced to fail once",
+            ));
+        }
+        // The intent is the entry's durable key: a duplicate intent for
+        // the same deployment id is corruption (deployment ids are unique
+        // per push) and must fail closed rather than append a second entry.
+        if self
+            .state
+            .entries()
+            .iter()
+            .any(|e| e.deployment_id == *intent.deployment_id())
+        {
+            return Err(Error::store(format!(
+                "refusing to append a second intent for deployment '{}' (the ledger is keyed by deployment id)",
+                intent.deployment_id()
+            )));
+        }
+        // THE PRE-WRITE STRICT-LINEAR LINEAGE VALIDATION (fail closed —
+        // item 6 of the spec): the new intent is verified against the SAME
+        // lineage gates the read path's state machine applies, BEFORE any
+        // write (at most one pending attempt — a push that cannot finish
+        // the previous pending attempt is REFUSED with a Conflict and never
+        // plans a second intent; the parent must equal the current
+        // successful head; the inherited slots must match the head's
+        // snapshot). An intent the strict reader would reject is NEVER
+        // written (the append is atomic; the ledger bytes stay unchanged on
+        // rejection).
+        validate_intent_append(&self.target, self.state.entries(), intent)?;
+        // THE FOLD — the state machine is the single authority: accept the
+        // event into the in-memory state FIRST (a refusal writes nothing),
+        // then persist the state.
+        let event = LedgerEvent::Intent(IntentEvent {
+            intent: intent.clone(),
+        });
+        let next = crate::kernel::transition::apply_event(self.state.clone(), event)
+            .map_err(Error::Kernel)?;
+        self.state = next;
+        self.write_state(intent.deployment_id().as_str())
+    }
+
+    /// Append the TERMINAL EVENT of one deployment ("`{"kind":"terminal",
+    /// ...}`" JSON line), after the mutation loop. Fail-closed key
+    /// contract: the deployment's intent must already be in the ledger (a
+    /// terminal for an unknown deployment is corruption) and the entry must
+    /// not already have a terminal (a terminal is written exactly once).
+    ///
+    /// THE PRE-WRITE VALIDATION runs against the txn's OWN in-memory
+    /// entries with the write-boundary classes (the intent_digest binding,
+    /// the disposition-vs-intent agreement, the strictly-linear pending
+    /// gate, and the one-parent gate on a `Successful` disposition — the
+    /// kernel's Conflict/StalePlan source), and the kernel's pure state
+    /// machine is the single authority: the event is folded into the
+    /// in-memory state FIRST (a refusal writes nothing), then the whole
+    /// ledger is atomically rewritten as the state.
+    ///
+    /// A `Successful` terminal REQUIRES the sealed
+    /// [`crate::kernel::terminal::VerifiedExecution`] proof at
+    /// construction ([`crate::kernel::terminal::LedgerTerminal::successful`])
+    /// — the txn itself never decides a disposition; it only persists the
+    /// terminal it is given.
+    pub(crate) fn append_terminal(
+        &mut self,
+        deployment_id: &DeploymentId,
+        terminal: &LedgerTerminal,
+    ) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .store
+            .fault_registry
+            .consume(FaultKind::AppendTerminal, deployment_id.as_str())
+        {
+            return Err(Error::store(
+                "test fault: append_terminal forced to fail once",
+            ));
+        }
+        let entry = self
+            .state
+            .entries()
+            .iter()
+            .find(|e| e.deployment_id == *deployment_id)
+            .ok_or_else(|| {
+                Error::integrity(format!(
+                    "append_terminal for deployment '{deployment_id}': no ledger intent exists for it — a terminal event requires its durable intent (a terminal without an intent is corruption)"
+                ))
+            })?;
+        if entry.terminal.is_some() {
+            return Err(Error::integrity(format!(
+                "append_terminal for deployment '{deployment_id}': the entry already carries a terminal event (a terminal is written exactly once)"
+            )));
+        }
+        // THE PRE-WRITE VALIDATION (fail closed): the intent/terminal pair
+        // is verified against the SAME checks the read path's state machine
+        // applies BEFORE any write — the intent_digest binding, the
+        // disposition-vs-intent agreement, and the one-parent gate on a
+        // `Successful` disposition (the kernel's Conflict/StalePlan source).
+        // A terminal the strict reader would reject is NEVER written (the
+        // append is atomic; the ledger bytes stay unchanged on rejection).
+        validate_terminal_append(&self.target, self.state.entries(), entry, terminal)?;
+        // THE FOLD — the state machine is the single authority.
+        let event = LedgerEvent::Terminal(TerminalEvent {
+            deployment_id: deployment_id.clone(),
+            terminal: terminal.clone(),
+        });
+        let next = crate::kernel::transition::apply_event(self.state.clone(), event)
+            .map_err(Error::Kernel)?;
+        self.state = next;
+        self.write_state(deployment_id.as_str())
+    }
+
+    /// THE VALIDATED SUFFIX REPLACEMENT — the ONLY way a CHECKPOINT event
+    /// enters a ledger (there is no general checkpoint append anywhere).
+    /// The checkpoint flow's atomic whole-ledger replacement
+    /// ([`LocalStore::write_ledger_suffix`], the temp + fsync + chmod +
+    /// rename + parent-dir fsync writer that reports its TWO COMMIT POINTS
+    /// via [`ReplaceOutcome`]) runs THROUGH the txn — under its target
+    /// lock — with the new ledger's first line being the checkpoint event
+    /// (the reader requires a checkpoint FIRST, so a mid-ledger checkpoint
+    /// is unrepresentable: only this validated replacement, which recomputes
+    /// the retained suffix from a SUCCESSFUL deployment, produces one).
+    ///
+    /// After a committed replacement (durability confirmed or unconfirmed —
+    /// either way the new ledger IS visible) the txn RE-FOLDS its state
+    /// from the committed bytes, so the txn stays the single source; a
+    /// pre-rename `Err` left the old ledger standing (state unchanged).
+    pub(crate) fn write_suffix(&mut self, new_ledger: &[String]) -> Result<ReplaceOutcome> {
+        let outcome = self.store.write_ledger_suffix(&self.target, new_ledger)?;
+        match outcome {
+            ReplaceOutcome::ReplacedDurable | ReplaceOutcome::ReplacedDurabilityUnknown { .. } => {
+                self.state = self.store.read_ledger_state(&self.target)?;
+                self.state.finish().map_err(Error::Kernel)?;
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Persist the folded state: serialize it to its canonical wire lines
+    /// (checkpoint event first when present, then each entry's intent line
+    /// and terminal line in append order) and atomically rewrite the WHOLE
+    /// ledger. THE WRITE IS THE STATE — the fold and the bytes cannot
+    /// disagree.
+    fn write_state(&self, deployment_id: &str) -> Result<()> {
+        let lines = state_to_lines(&self.state)?;
+        self.store
+            .write_ledger_lines(&self.target, deployment_id, &lines)
+    }
+}
+
+/// THE CANONICAL WIRE-LINE PROJECTION of a folded state: the checkpoint
+/// event (when the ledger began with one), then per accepted entry its
+/// intent line and — once the entry reached its terminal — its terminal
+/// line, in append order. The projection is exactly what the reader folds
+/// back into the same state (the wire conversions are order- and
+/// content-preserving), so a whole-ledger rewrite from the state always
+/// reproduces the ledger the reader would accept.
+fn state_to_lines(state: &DeploymentState) -> Result<Vec<String>> {
+    let mut lines = Vec::new();
+    if let Some(cp) = state.checkpoint() {
+        let wire =
+            CheckpointWire::new(&cp.retained_from, cp.discarded, &cp.recorded_at.to_string());
+        lines.push(
+            serde_json::to_string(&LedgerEventWire::Checkpoint(wire))
+                .map_err(|e| Error::store(format!("serialize ledger checkpoint: {e}")))?,
+        );
+    }
+    for e in state.entries() {
+        lines.push(
+            serde_json::to_string(&LedgerEventWire::Intent(LedgerIntentWire::from(&e.intent)))
+                .map_err(|e| Error::store(format!("serialize ledger intent: {e}")))?,
+        );
+        if let Some(terminal) = &e.terminal {
+            let wire = LedgerTerminalWire::to_wire(&e.deployment_id, terminal);
+            lines.push(
+                serde_json::to_string(&LedgerEventWire::Terminal(wire))
+                    .map_err(|e| Error::store(format!("serialize ledger terminal: {e}")))?,
+            );
+        }
+    }
+    Ok(lines)
+}
+
+#[cfg(test)]
+impl LocalStore {
+    /// TEST-ONLY: append an intent through a freshly opened (and dropped)
+    /// [`TargetLedgerTxn`]: every test append goes through the SAME locked
+    /// txn surface production uses; there is no unlocked append anywhere
+    /// (the raw store-level appends are GONE). The txn's lock acquisition,
+    /// fold, append, and release run under the fixture's per-store
+    /// registry, so the one-shot `Append*` faults armed by the tests fire
+    /// exactly as before.
+    pub(crate) fn test_append_intent(&self, target: &str, intent: &DeploymentIntent) -> Result<()> {
+        let mut txn = TargetLedgerTxn::open(self, target, "test-append")?;
+        txn.append_intent(intent)
+    }
+
+    /// TEST-ONLY: append a terminal through a freshly opened (and dropped)
+    /// [`TargetLedgerTxn`] — see [`LocalStore::test_append_intent`].
+    pub(crate) fn test_append_terminal(
+        &self,
+        target: &str,
+        deployment_id: &DeploymentId,
+        terminal: &LedgerTerminal,
+    ) -> Result<()> {
+        let mut txn = TargetLedgerTxn::open(self, target, "test-append")?;
+        txn.append_terminal(deployment_id, terminal)
     }
 }
 
@@ -741,9 +989,9 @@ mod tests {
             attempted_at: crate::identity::Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
         })
         .expect("a seeded parented intent plans");
-        store.append_intent(target, &i).unwrap();
+        store.test_append_intent(target, &i).unwrap();
         store
-            .append_terminal(target, i.deployment_id(), &successful_terminal(&i))
+            .test_append_terminal(target, i.deployment_id(), &successful_terminal(&i))
             .unwrap();
     }
 
@@ -785,13 +1033,13 @@ mod tests {
         assert_eq!(snapshot.len(), 1);
         // A duplicate intent is refused (the deployment id keys the entry).
         let err = store
-            .append_intent(target, &intent("deploy-a", target))
+            .test_append_intent(target, &intent("deploy-a", target))
             .unwrap_err();
         assert!(err.to_string().contains("second intent"));
         // A duplicate terminal is refused.
         let i = intent("deploy-a", target);
         let err = store
-            .append_terminal(
+            .test_append_terminal(
                 target,
                 &test_deployment_id("deploy-a"),
                 &successful_terminal(&i),
@@ -835,7 +1083,7 @@ mod tests {
         seed_successful(&store, target, "deploy-last");
         for id in ["deploy-first", "deploy-mid", "deploy-last"] {
             let err = store
-                .append_intent(target, &intent(id, target))
+                .test_append_intent(target, &intent(id, target))
                 .unwrap_err();
             assert!(
                 err.to_string().contains("second intent"),
@@ -888,7 +1136,7 @@ mod tests {
         // A pending intent OVER the head: an intent-only entry IS the
         // pending state.
         let pending = intent_over_head("deploy-pending", target, &ok_head);
-        store.append_intent(target, &pending).unwrap();
+        store.test_append_intent(target, &pending).unwrap();
         assert_eq!(
             store
                 .latest_status(test_deployment_id("deploy-pending").as_str())
@@ -899,16 +1147,16 @@ mod tests {
         // The pending attempt reaches its Successful terminal (the head
         // advances to it), then a Degraded entry descends from the NEW head.
         store
-            .append_terminal(
+            .test_append_terminal(
                 target,
                 pending.deployment_id(),
                 &successful_terminal(&pending),
             )
             .unwrap();
         let deg_i = intent_over_head("deploy-deg", target, &pending);
-        store.append_intent(target, &deg_i).unwrap();
+        store.test_append_intent(target, &deg_i).unwrap();
         store
-            .append_terminal(
+            .test_append_terminal(
                 target,
                 deg_i.deployment_id(),
                 &fixtures::degraded_terminal(&deg_i, &[slot_p1()]),
@@ -954,7 +1202,7 @@ mod tests {
         // A pending (intent-only) intent over the head: it is NOT successful,
         // so the derived read still names deploy-ok.
         let fail_i = intent_over_head("deploy-fail", target, &ok_head);
-        store.append_intent(target, &fail_i).unwrap();
+        store.test_append_intent(target, &fail_i).unwrap();
         assert_eq!(
             store.read_last_successful(target).as_deref(),
             Some(test_deployment_id("deploy-ok").as_str()),
@@ -964,7 +1212,7 @@ mod tests {
         // head stays deploy-ok), then a second successful deployment chains
         // onto deploy-ok and becomes the newest head.
         store
-            .append_terminal(
+            .test_append_terminal(
                 target,
                 fail_i.deployment_id(),
                 &fixtures::failed_preflight_terminal(&fail_i),
@@ -994,7 +1242,7 @@ mod tests {
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let target = "t1";
         let a_first = intent("deploy-a", target);
-        store.append_intent(target, &a_first).unwrap();
+        store.test_append_intent(target, &a_first).unwrap();
         // Fault deploy-a's terminal append ONCE: the terminal is NOT written
         // and deploy-a stays pending.
         store
@@ -1002,14 +1250,14 @@ mod tests {
             .arm_append_terminal(test_deployment_id("deploy-a").as_str());
         let a_i = intent("deploy-a", target);
         let err = store
-            .append_terminal(target, a_i.deployment_id(), &successful_terminal(&a_i))
+            .test_append_terminal(target, a_i.deployment_id(), &successful_terminal(&a_i))
             .unwrap_err();
         assert!(err.to_string().contains("append_terminal"));
         // The fault is consumed: a retry succeeds for deploy-a (becoming the
         // head), and deploy-b (planned over the NEW head — strictly linear)
         // is appended and finalized unaffected.
         store
-            .append_terminal(target, a_i.deployment_id(), &successful_terminal(&a_i))
+            .test_append_terminal(target, a_i.deployment_id(), &successful_terminal(&a_i))
             .unwrap();
         let b_i = crate::testutil::fixtures::group_intent(
             "deploy-b",
@@ -1020,9 +1268,9 @@ mod tests {
             &[slot_p1()],
             &[slot_p1()],
         );
-        store.append_intent(target, &b_i).unwrap();
+        store.test_append_intent(target, &b_i).unwrap();
         store
-            .append_terminal(target, b_i.deployment_id(), &successful_terminal(&b_i))
+            .test_append_terminal(target, b_i.deployment_id(), &successful_terminal(&b_i))
             .unwrap();
     }
 
@@ -1035,12 +1283,12 @@ mod tests {
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let target = "t1";
         let a_i = intent("deploy-a", target);
-        store.append_intent(target, &a_i).unwrap();
+        store.test_append_intent(target, &a_i).unwrap();
         // A terminal bound to a DIFFERENT (but otherwise valid) intent.
         let other = fixtures::full_intent("deploy-other", target, &[slot_p1()], &[]);
         let t = fixtures::successful_terminal(&other);
         let err = store
-            .append_terminal(target, a_i.deployment_id(), &t)
+            .test_append_terminal(target, a_i.deployment_id(), &t)
             .unwrap_err();
         assert!(
             err.to_string().contains("digest"),
@@ -1122,7 +1370,7 @@ mod tests {
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let target = "t1";
         store
-            .append_intent(target, &intent("deploy-a", target))
+            .test_append_intent(target, &intent("deploy-a", target))
             .unwrap();
         let before = std::fs::read(store.ledger_path(target)).unwrap();
         std::fs::create_dir_all(store.ledger_path(target).parent().unwrap()).unwrap();
@@ -1140,10 +1388,10 @@ mod tests {
             let dir2 = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
             let store2 = LocalStore::with_base(dir2.path().join("store")).unwrap();
             store2
-                .append_intent(target, &intent("deploy-a", target))
+                .test_append_intent(target, &intent("deploy-a", target))
                 .unwrap();
             arm_stage(&store2, stage, test_deployment_id("deploy-a").as_str());
-            let res = store2.append_terminal(target, a_i.deployment_id(), &t);
+            let res = store2.test_append_terminal(target, a_i.deployment_id(), &t);
             let p = store2.ledger_path(target);
             let text = std::fs::read_to_string(&p).unwrap();
             match stage {
@@ -1193,7 +1441,7 @@ mod tests {
             let store = LocalStore::with_base(dir.path().join("store")).unwrap();
             let target = "t1";
             store
-                .append_intent(target, &intent("deploy-a", target))
+                .test_append_intent(target, &intent("deploy-a", target))
                 .unwrap();
             let a_i = intent("deploy-a", target);
             let t = successful_terminal(&a_i);
@@ -1213,7 +1461,7 @@ mod tests {
                     }
                 }
             }
-            let res = store.append_terminal(target, a_i.deployment_id(), &t);
+            let res = store.test_append_terminal(target, a_i.deployment_id(), &t);
             let entries = store.read_ledger(target).unwrap();
             match res {
                 Ok(()) => {
@@ -1230,7 +1478,7 @@ mod tests {
                     // ledger, so a committed-but-Err terminal is a NO-OP
                     // "already carries" refusal — the ledger is already in
                     // the terminal state).
-                    let _ = store.append_terminal(target, a_i.deployment_id(), &t);
+                    let _ = store.test_append_terminal(target, a_i.deployment_id(), &t);
                     let entries = store.read_ledger(target).unwrap();
                     prop_assert_eq!(entries.len(), 1);
                     prop_assert!(entries[0].terminal.is_some());
@@ -1248,7 +1496,7 @@ mod tests {
         seed_successful(&store, target, "deploy-a");
         let before = std::fs::read(store.ledger_path(target)).unwrap();
         let err = store
-            .append_intent(target, &intent("deploy-a", target))
+            .test_append_intent(target, &intent("deploy-a", target))
             .unwrap_err();
         assert!(err.to_string().contains("second intent"));
         assert_eq!(
@@ -1624,15 +1872,15 @@ mod tests {
         let keys = vec![slot_p1(), slot_p2()];
         let h = fixtures::full_intent("deploy-h", target, &keys, &[]);
         let a = full_intent_over(&h, "deploy-a");
-        store.append_intent(target, &h).unwrap();
+        store.test_append_intent(target, &h).unwrap();
         store
-            .append_terminal(
+            .test_append_terminal(
                 target,
                 h.deployment_id(),
                 &fixtures::successful_terminal(&h),
             )
             .unwrap();
-        store.append_intent(target, &a).unwrap();
+        store.test_append_intent(target, &a).unwrap();
         // A duplicate intent line for deploy-h append AFTER the valid chain
         // (the strict reader's by_id gate fires): the store read must return
         // the typed DuplicateIntent evidence through Error::Kernel.
@@ -1715,5 +1963,533 @@ mod tests {
             let (mutation, code) = COVERED_MUTATIONS[idx as usize];
             run_semantic_mutation(mutation, code);
         }
+    }
+
+    // =====================================================================
+    // THE TXN-IS-THE-STATE-MACHINE PROPERTY (the review's acceptance): an
+    // ARBITRARY transaction sequence — intent / terminal / checkpoint-
+    // suffix operations, VALID and INVALID per the kernel's strictly-linear
+    // rules — is driven through a REAL [`TargetLedgerTxn`] AND the kernel's
+    // PURE fold ([`crate::kernel::transition::apply_event`]); after EVERY
+    // operation the txn's folded state must EQUAL the pure fold of the same
+    // event sequence (both accept or both refuse; on acceptance the states
+    // are identical). The txn IS the pure state machine — the fold and the
+    // bytes cannot disagree.
+
+    /// The generated transaction ops, materialized against the state at
+    /// each point of the sequence (each tag is re-materialized from the
+    /// CURRENT fold, so the same tag is VALID or INVALID depending on where
+    /// it lands):
+    ///
+    /// * [`PropOpTag::IntentOverHead`] — a full-push intent planned over the
+    ///   CURRENT successful head (parent-equality + inherited-slot checks
+    ///   pass by construction): VALID when no pending attempt exists,
+    ///   refused (`PendingAttemptExists`) when one does;
+    /// * [`PropOpTag::IntentStaleParent`] — the same intent planned over a
+    ///   FABRICATED parent id: ALWAYS refused (`ParentMismatch`);
+    /// * [`PropOpTag::TerminalValid`] — a valid terminal (matching digest,
+    ///   disposition agreed with the intent) for the PENDING attempt:
+    ///   VALID when one exists, refused otherwise;
+    /// * [`PropOpTag::TerminalBadDigest`] — a terminal bound to a DIFFERENT
+    ///   intent's digest: ALWAYS refused (`IntentDigestMismatch`);
+    /// * [`PropOpTag::TerminalNotPending`] — a valid terminal for a
+    ///   NON-pending entry (or an unknown id): ALWAYS refused;
+    /// * [`PropOpTag::CheckpointRetainHead`] — the VALIDATED SUFFIX
+    ///   REPLACEMENT retaining the current successful head (the only way a
+    ///   checkpoint event may enter a ledger): VALID when the ledger has a
+    ///   successful head; skipped (not expressible — the txn has no bare
+    ///   checkpoint append) otherwise.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum PropOpTag {
+        IntentOverHead,
+        IntentStaleParent,
+        TerminalValid,
+        TerminalBadDigest,
+        TerminalNotPending,
+        CheckpointRetainHead,
+    }
+
+    fn arbitrary_op_tag() -> impl Strategy<Value = PropOpTag> {
+        prop_oneof![
+            Just(PropOpTag::IntentOverHead),
+            Just(PropOpTag::IntentStaleParent),
+            Just(PropOpTag::TerminalValid),
+            Just(PropOpTag::TerminalBadDigest),
+            Just(PropOpTag::TerminalNotPending),
+            Just(PropOpTag::CheckpointRetainHead),
+        ]
+    }
+
+    /// A full-push intent (one selected slot p1, planned result
+    /// `snapshot_slot(p1)`, pre-push `KnownAbsent`) planned over the given
+    /// parent — the shape the fixtures' VALID terminals are built for.
+    fn prop_intent_over(
+        tag: &str,
+        target: &str,
+        parent: Option<&DeploymentIntent>,
+    ) -> DeploymentIntent {
+        use crate::kernel::intent::{PlanInput, PlannedDeploy};
+        let (parent_id, parent_snapshot) = match parent {
+            Some(h) => (
+                Some(h.deployment_id().clone()),
+                Some(h.resulting_snapshot()),
+            ),
+            None => (None, None),
+        };
+        let p1 = slot_p1();
+        crate::kernel::intent::plan(PlanInput {
+            deployment_id: test_deployment_id(tag),
+            target: TargetName::parse(target).expect("a test target"),
+            parent: parent_id,
+            parent_snapshot,
+            group: None,
+            selection: vec![p1.clone()],
+            planned: vec![PlannedDeploy {
+                slot: p1,
+                result: fixtures::snapshot_slot(&slot_p1()),
+                pre_push: Observation::KnownAbsent,
+            }],
+            behavior_digest: fixtures::behavior_digest(),
+            attempted_at: Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
+        })
+        .expect("a valid parented property intent plans")
+    }
+
+    /// Materialize one op tag against the CURRENT pure fold, run it through
+    /// the txn AND the pure fold, and assert the txn's state equals the
+    /// pure fold after it. Returns the op's pure-fold result (`None` when
+    /// the op was not expressible — the checkpoint op on a head-less
+    /// ledger).
+    fn run_prop_op(
+        txn: &mut TargetLedgerTxn<'_>,
+        state: &mut DeploymentState,
+        op: PropOpTag,
+        tag: &mut usize,
+    ) -> Result<Option<DeploymentState>> {
+        let tdi = |n: &str| test_deployment_id(n);
+        let next_tag = |tag: &mut usize| {
+            let t = format!("deploy-prop-{}", *tag);
+            *tag += 1;
+            t
+        };
+        let target = "prop-t";
+        match op {
+            PropOpTag::IntentOverHead => {
+                // A full-push intent over the CURRENT head: valid iff no
+                // pending attempt exists (parent/inherited checks pass by
+                // construction).
+                let head = state.successful_head().and_then(|h| {
+                    state
+                        .entries()
+                        .iter()
+                        .find(|e| e.deployment_id == *h)
+                        .map(|e| e.intent.clone())
+                });
+                let intent = prop_intent_over(&next_tag(tag), target, head.as_ref());
+                let event = LedgerEvent::Intent(IntentEvent {
+                    intent: intent.clone(),
+                });
+                let folded = crate::kernel::transition::apply_event(state.clone(), event);
+                let txn_res = txn.append_intent(&intent);
+                let fold_res = folded.map_err(Error::Kernel);
+                assert_eq!(
+                    txn_res.is_ok(),
+                    fold_res.is_ok(),
+                    "IntentOverHead({intent:?}): the txn and the pure fold must agree (txn {txn_res:?}, fold {fold_res:?})"
+                );
+                if let Ok(next) = fold_res {
+                    *state = next.clone();
+                    assert_eq!(
+                        txn.state(),
+                        &next,
+                        "IntentOverHead: the txn's folded state must equal the pure fold"
+                    );
+                    Ok(Some(next))
+                } else {
+                    assert_eq!(
+                        txn.state(),
+                        state,
+                        "a refused op leaves the txn's state unchanged"
+                    );
+                    Ok(None)
+                }
+            }
+            PropOpTag::IntentStaleParent => {
+                // A full-push intent planned over a FABRICATED parent: the
+                // parent never equals the current successful head, so the
+                // intent is ALWAYS refused.
+                let stale = prop_intent_over(
+                    &next_tag(tag),
+                    target,
+                    Some(&prop_intent_over(&next_tag(tag), target, None)),
+                );
+                let event = LedgerEvent::Intent(IntentEvent {
+                    intent: stale.clone(),
+                });
+                let folded = crate::kernel::transition::apply_event(state.clone(), event);
+                let txn_res = txn.append_intent(&stale);
+                assert!(
+                    txn_res.is_err(),
+                    "IntentStaleParent: a stale-parent intent must be refused by the txn, got {txn_res:?}"
+                );
+                assert!(
+                    folded.is_err(),
+                    "IntentStaleParent: the pure fold must also refuse"
+                );
+                assert_eq!(
+                    txn.state(),
+                    state,
+                    "a refused stale-parent intent leaves the txn's state unchanged"
+                );
+                Ok(None)
+            }
+            PropOpTag::TerminalValid => {
+                // A VALID terminal for the PENDING attempt (matching digest,
+                // disposition agreed with the intent): accepted only when a
+                // pending attempt exists. The disposition cycles through the
+                // kernel-decidable set (Successful-with-proof /
+                // FailedPreflight / Degraded / rolled-back) — each built
+                // VALID for the property intents.
+                let pending_id = state.pending().cloned();
+                let Some(pid) = pending_id else {
+                    // No pending: a valid terminal has nothing to settle —
+                    // refused (unknown id / not the pending attempt).
+                    let id = tdi(&format!("orphan-{}", *tag));
+                    *tag += 1;
+                    let intent = prop_intent_over(&next_tag(tag), target, None);
+                    let terminal = fixtures::successful_terminal(&intent);
+                    let event = LedgerEvent::Terminal(TerminalEvent {
+                        deployment_id: id,
+                        terminal: terminal.clone(),
+                    });
+                    let folded = crate::kernel::transition::apply_event(state.clone(), event);
+                    let txn_res =
+                        txn.append_terminal(&tdi(&format!("orphan-{}", *tag - 1)), &terminal);
+                    assert!(txn_res.is_err(), "no pending: the terminal must be refused");
+                    assert!(folded.is_err(), "no pending: the pure fold must refuse");
+                    assert_eq!(txn.state(), state);
+                    return Ok(None);
+                };
+                let intent = state
+                    .entries()
+                    .iter()
+                    .find(|e| e.deployment_id == pid)
+                    .map(|e| e.intent.clone())
+                    .expect("the pending entry exists in the fold");
+                let terminal = match *tag % 4 {
+                    0 => fixtures::successful_terminal(&intent),
+                    1 => fixtures::failed_preflight_terminal(&intent),
+                    2 => fixtures::degraded_terminal(&intent, &[slot_p1()]),
+                    _ => fixtures::rolled_back_terminal(&intent, &[slot_p1()]),
+                };
+                *tag += 1;
+                let event = LedgerEvent::Terminal(TerminalEvent {
+                    deployment_id: pid.clone(),
+                    terminal: terminal.clone(),
+                });
+                let folded = crate::kernel::transition::apply_event(state.clone(), event);
+                let txn_res = txn.append_terminal(&pid, &terminal);
+                let fold_res = folded.map_err(Error::Kernel);
+                assert_eq!(
+                    txn_res.is_ok(),
+                    fold_res.is_ok(),
+                    "TerminalValid for pending {pid}: txn {txn_res:?} vs fold {fold_res:?}"
+                );
+                if let Ok(next) = fold_res {
+                    *state = next.clone();
+                    assert_eq!(txn.state(), &next);
+                    Ok(Some(next))
+                } else {
+                    assert_eq!(txn.state(), state);
+                    Ok(None)
+                }
+            }
+            PropOpTag::TerminalBadDigest => {
+                // A terminal for an EXISTING entry bound to a DIFFERENT
+                // (valid) intent's digest: ALWAYS refused.
+                let id = state
+                    .pending()
+                    .cloned()
+                    .or_else(|| state.entries().last().map(|e| e.deployment_id.clone()))
+                    .unwrap_or_else(|| tdi(&next_tag(tag)));
+                let other = prop_intent_over(&next_tag(tag), target, None);
+                let terminal = fixtures::successful_terminal(&other);
+                let event = LedgerEvent::Terminal(TerminalEvent {
+                    deployment_id: id.clone(),
+                    terminal: terminal.clone(),
+                });
+                let folded = crate::kernel::transition::apply_event(state.clone(), event);
+                let txn_res = txn.append_terminal(&id, &terminal);
+                assert!(
+                    txn_res.is_err(),
+                    "a mismatched-digest terminal must be refused"
+                );
+                assert!(
+                    folded.is_err(),
+                    "the pure fold must refuse the mismatched digest"
+                );
+                assert_eq!(txn.state(), state);
+                Ok(None)
+            }
+            PropOpTag::TerminalNotPending => {
+                // A VALID terminal for a NON-pending entry (a settled one or
+                // an unknown id): ALWAYS refused (duplicate terminal / not
+                // the pending attempt).
+                let id = state
+                    .entries()
+                    .iter()
+                    .rev()
+                    .find(|e| state.pending() != Some(&e.deployment_id))
+                    .map(|e| e.deployment_id.clone())
+                    .unwrap_or_else(|| tdi(&next_tag(tag)));
+                let intent = prop_intent_over(&next_tag(tag), target, None);
+                let terminal = fixtures::successful_terminal(&intent);
+                let event = LedgerEvent::Terminal(TerminalEvent {
+                    deployment_id: id.clone(),
+                    terminal: terminal.clone(),
+                });
+                let folded = crate::kernel::transition::apply_event(state.clone(), event);
+                let txn_res = txn.append_terminal(&id, &terminal);
+                assert!(txn_res.is_err(), "a non-pending terminal must be refused");
+                assert!(
+                    folded.is_err(),
+                    "the pure fold must refuse the non-pending terminal"
+                );
+                assert_eq!(txn.state(), state);
+                Ok(None)
+            }
+            PropOpTag::CheckpointRetainHead => {
+                // THE VALIDATED SUFFIX REPLACEMENT: retain the CURRENT
+                // successful head (the only way a checkpoint event enters a
+                // ledger). Not expressible on a head-less ledger (the txn
+                // has no bare checkpoint append — structurally, a
+                // checkpoint is always the new ledger's first line, built
+                // from a validated successful anchor).
+                let Some(head_id) = state.successful_head().cloned() else {
+                    return Ok(None);
+                };
+                let pos = state
+                    .entries()
+                    .iter()
+                    .position(|e| e.deployment_id == head_id)
+                    .expect("the head is an entry");
+                let retained = state.entries()[pos..].to_vec();
+                let cp = CheckpointEvent {
+                    retained_from: head_id.clone(),
+                    discarded: pos as u64,
+                    recorded_at: crate::remote::helper::now_rfc3339_ts(),
+                };
+                // THE PURE FOLD of [checkpoint, ...retained events].
+                let mut pure = DeploymentState::new(state.target().clone());
+                pure = crate::kernel::transition::apply_event(
+                    pure,
+                    LedgerEvent::Checkpoint(cp.clone()),
+                )
+                .expect("a fresh ledger accepts its first checkpoint");
+                for e in &retained {
+                    pure = crate::kernel::transition::apply_event(
+                        pure,
+                        LedgerEvent::Intent(IntentEvent {
+                            intent: e.intent.clone(),
+                        }),
+                    )
+                    .expect("the retained entries re-fold");
+                    if let Some(t) = &e.terminal {
+                        pure = crate::kernel::transition::apply_event(
+                            pure,
+                            LedgerEvent::Terminal(TerminalEvent {
+                                deployment_id: e.deployment_id.clone(),
+                                terminal: t.clone(),
+                            }),
+                        )
+                        .expect("the retained terminals re-fold");
+                    }
+                }
+                // THE TXN'S validated suffix write: the checkpoint line +
+                // the retained entries' lines, built independently of the
+                // txn's own serializer (the txn writes them, then re-folds
+                // from disk).
+                let mut new_ledger = vec![
+                    serde_json::to_string(&LedgerEventWire::Checkpoint(
+                        crate::ledger::CheckpointWire::new(
+                            &cp.retained_from,
+                            cp.discarded,
+                            &cp.recorded_at.to_string(),
+                        ),
+                    ))
+                    .expect("serialize checkpoint"),
+                ];
+                for e in &retained {
+                    new_ledger.push(
+                        serde_json::to_string(&LedgerEventWire::Intent(LedgerIntentWire::from(
+                            &e.intent,
+                        )))
+                        .expect("serialize intent"),
+                    );
+                    if let Some(t) = &e.terminal {
+                        new_ledger.push(
+                            serde_json::to_string(&LedgerEventWire::Terminal(
+                                LedgerTerminalWire::to_wire(&e.deployment_id, t),
+                            ))
+                            .expect("serialize terminal"),
+                        );
+                    }
+                }
+                let outcome = txn
+                    .write_suffix(&new_ledger)
+                    .expect("the validated replacement commits");
+                assert!(
+                    matches!(outcome, ReplaceOutcome::ReplacedDurable),
+                    "a valid suffix replacement is durable, got {outcome:?}"
+                );
+                assert_eq!(
+                    txn.state(),
+                    &pure,
+                    "CheckpointRetainHead: the txn's re-folded state must equal the pure fold of [checkpoint, retained]"
+                );
+                *state = pure.clone();
+                Ok(Some(pure))
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: crate::testutil::proptest_cases(24),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        /// THE TXN-IS-THE-STATE-MACHINE PROPERTY: for every generated
+        /// transaction sequence (intent / terminal / checkpoint-suffix ops,
+        /// valid + invalid per the kernel's rules), the txn's folded state
+        /// after EVERY op equals the pure [`apply_event`] fold of the same
+        /// event sequence — the txn never diverges, a refused op never
+        /// writes, and a checkpoint enters a ledger ONLY through the
+        /// validated suffix replacement.
+        #[test]
+        fn txn_fold_equals_pure_state_machine(tags in prop::collection::vec(arbitrary_op_tag(), 0..40)) {
+            let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+            let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+            let target = "prop-t";
+            let mut txn = TargetLedgerTxn::open(&store, target, "prop-op").unwrap();
+            let mut state = DeploymentState::new(TargetName::parse(target).unwrap());
+            let mut tag: usize = 0;
+            for op in tags {
+                run_prop_op(&mut txn, &mut state, op, &mut tag).expect("the property drives the txn");
+            }
+            // The txn's state equals the pure fold of the WHOLE accepted
+            // sequence (the final state, after every accepted op).
+            assert_eq!(txn.state(), &state, "the txn's final folded state equals the pure fold");
+        }
+    }
+
+    // =====================================================================
+    // THE CONCURRENT-WRITER TESTS (the review's acceptance): the txn's
+    // target lock serializes writers — a second txn cannot open while the
+    // first holds (fail fast, "held by"), and NO LEDGER UPDATE IS EVER
+    // LOST: once writer 1 drops, writer 2 opens and appends, and BOTH
+    // appends survive (the whole-ledger rewrite always happens under the
+    // lock, so the old two-writers-race-losing-updates bug is structural
+    // gone).
+
+    /// Two writers on ONE target: writer 1 opens the txn and appends a
+    /// successful deployment; writer 2's open WHILE writer 1 holds is
+    /// REFUSED (the flock serializes), and after writer 1 releases, writer
+    /// 2 opens and appends a second successful deployment planned over
+    /// writer 1's head. BOTH appends survive — no update is lost.
+    #[test]
+    fn concurrent_txns_serialize_and_both_writers_appends_survive() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let store = Arc::new(LocalStore::with_base(dir.path().join("store")).unwrap());
+        let target = "t1";
+
+        let a_started = Arc::new(Barrier::new(2));
+        let a_refusal_seen = Arc::new(Barrier::new(2));
+        let a_released = Arc::new(Barrier::new(2));
+
+        // WRITER 1: open the txn (hold the target lock), append intent-a +
+        // its Successful terminal; park until writer 2 observed the
+        // refusal, then drop the txn (release the lock) and confirm.
+        let store_1 = Arc::clone(&store);
+        let started_1 = Arc::clone(&a_started);
+        let refusal_1 = Arc::clone(&a_refusal_seen);
+        let released_1 = Arc::clone(&a_released);
+        let writer_1 = thread::spawn(move || {
+            let mut txn = TargetLedgerTxn::open(&store_1, target, "op-a").unwrap();
+            let a = intent("deploy-a", target);
+            txn.append_intent(&a).unwrap();
+            txn.append_terminal(a.deployment_id(), &successful_terminal(&a))
+                .unwrap();
+            started_1.wait();
+            refusal_1.wait();
+            // txn drops here: the target lock is released.
+            drop(txn);
+            released_1.wait();
+        });
+
+        // WRITER 2: while writer 1 holds the lock, opening a second txn is
+        // REFUSED (fail fast — the lock serializes writers); after writer 1
+        // releases, writer 2 opens and appends intent-b planned over
+        // writer 1's head (deploy-a) + its Successful terminal.
+        let store_2 = Arc::clone(&store);
+        let started_2 = Arc::clone(&a_started);
+        let refusal_2 = Arc::clone(&a_refusal_seen);
+        let released_2 = Arc::clone(&a_released);
+        let writer_2 = thread::spawn(move || {
+            started_2.wait();
+            let err = match TargetLedgerTxn::open(&store_2, target, "op-b") {
+                Ok(_) => panic!("writer 2 cannot open while writer 1 holds the target lock"),
+                Err(e) => e,
+            };
+            assert!(
+                err.to_string().contains("held by"),
+                "the refusal names the holder, got: {err}"
+            );
+            refusal_2.wait();
+            released_2.wait();
+            let mut txn = TargetLedgerTxn::open(&store_2, target, "op-b").unwrap();
+            // The strict-linear model: intent-b plans over the head writer 1
+            // established (deploy-a), never a second pending on top.
+            let head = txn
+                .state()
+                .successful_head()
+                .and_then(|h| {
+                    txn.state()
+                        .entries()
+                        .iter()
+                        .find(|e| e.deployment_id == *h)
+                        .map(|e| e.intent.clone())
+                })
+                .expect("writer 1's successful head is visible to writer 2");
+            let b = intent_over_head("deploy-b", target, &head);
+            txn.append_intent(&b).unwrap();
+            txn.append_terminal(b.deployment_id(), &successful_terminal(&b))
+                .unwrap();
+        });
+
+        writer_1.join().expect("writer 1 completes");
+        writer_2.join().expect("writer 2 completes");
+
+        // NO UPDATE IS LOST: both writers' appends survive in the ledger.
+        let entries = store.read_ledger(target).unwrap();
+        assert_eq!(
+            entries.len(),
+            2,
+            "both writers' entries survive: {entries:?}"
+        );
+        assert_eq!(entries[0].deployment_id, test_deployment_id("deploy-a"));
+        assert_eq!(entries[1].deployment_id, test_deployment_id("deploy-b"));
+        assert_eq!(
+            entries[1].intent.parent(),
+            Some(&test_deployment_id("deploy-a"))
+        );
+        assert_eq!(
+            store.read_last_successful(target).as_deref(),
+            Some(test_deployment_id("deploy-b").as_str())
+        );
     }
 }

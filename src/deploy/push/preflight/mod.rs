@@ -40,6 +40,7 @@ use crate::ledger::recovery::reconcile_pending_commits;
 use crate::remote::canonical as tree;
 use crate::remote::helper::RemoteHelper;
 use crate::remote::transport::Remote;
+use crate::store::local::ledger::TargetLedgerTxn;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -115,10 +116,13 @@ pub(crate) struct PreflightOutcome {
 /// in the numbered order) and return the planning outcome. The per-slot
 /// `remotes`/`helpers`/`statuses` were opened by [`open_remotes`] +
 /// [`inspect_remotes`] and outlive this call (the helpers borrow the
-/// remotes — see [`PreflightOutcome`]).
+/// remotes — see [`PreflightOutcome`]). `txn` is the push's target ledger
+/// transaction (owned by the caller): `Some` for a real push (recovery
+/// appends through it), `None` for a dry run (which touches nothing).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_preflight(
     ctx: &PushContext,
+    txn: &mut Option<TargetLedgerTxn<'_>>,
     remotes: &HashMap<SlotId, Box<dyn Remote>>,
     helpers: &HashMap<SlotId, RemoteHelper>,
     statuses: &HashMap<SlotId, crate::remote::helper::RemoteStatus>,
@@ -253,8 +257,11 @@ pub(crate) fn run_preflight(
     // touches nothing).
     if !opts.dry_run {
         use crate::ledger::recovery::RecoveryOutcome;
+        let txn = txn
+            .as_mut()
+            .expect("a real push holds the target ledger txn");
         if let Some(RecoveryOutcome::StillPending) =
-            reconcile_pending_commits(store, config, target_name, op_id, helpers)?
+            reconcile_pending_commits(txn, config, op_id, helpers)?
         {
             return Err(Error::conflict("a previous deployment is still pending"));
         }
@@ -1385,6 +1392,9 @@ pub(crate) mod preflight_tests {
                 ref_token: None,
                 group: None,
             },
+            &mut Some(
+                crate::store::local::ledger::TargetLedgerTxn::open(&h.store, "t1", "test").unwrap(),
+            ),
         )
         .expect_err("capacity preflight must fail the push");
         assert!(
@@ -1481,6 +1491,9 @@ pub(crate) mod preflight_tests {
               -> Result<Box<dyn Remote>> {
             FakeCapacityRemote::build(rf.join(s.id.as_str()), 100)
         };
+        let txn =
+            crate::store::local::ledger::TargetLedgerTxn::open(&h.store, "t1", op_id.as_str())
+                .expect("a real push holds the target ledger txn");
         let err = push_inner(
             &project_root,
             &h.store,
@@ -1498,6 +1511,7 @@ pub(crate) mod preflight_tests {
                 ref_token: None,
                 group: None,
             },
+            &mut Some(txn),
         )
         .expect_err("the preflight terminal-append failure must fail the push");
         assert!(
@@ -1604,6 +1618,9 @@ pub(crate) mod preflight_tests {
                 ref_token: None,
                 group: None,
             },
+            &mut Some(
+                crate::store::local::ledger::TargetLedgerTxn::open(&h.store, "t1", "test").unwrap(),
+            ),
         )
         .expect_err("staging failure must fail the push");
         assert!(
@@ -1784,6 +1801,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 ref_token: None,
                 group: None,
             },
+            &mut Some(
+                crate::store::local::ledger::TargetLedgerTxn::open(&store, "t1", "test").unwrap(),
+            ),
         )
         .expect_err("the later staging failure must fail the push");
         assert!(
@@ -1964,6 +1984,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 ref_token: None,
                 group: None,
             },
+            &mut Some(
+                crate::store::local::ledger::TargetLedgerTxn::open(&h.store, "t1", "test").unwrap(),
+            ),
         )
         .expect_err("a release without its behavior snapshot must fail preflight");
         assert!(
@@ -2020,6 +2043,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 ref_token: None,
                 group: None,
             },
+            &mut Some(
+                crate::store::local::ledger::TargetLedgerTxn::open(&h.store, "t1", "test").unwrap(),
+            ),
         )
         .expect_err("a corrupt behavior snapshot must also fail preflight");
         assert!(

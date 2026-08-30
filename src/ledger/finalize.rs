@@ -27,7 +27,7 @@ pub use crate::ledger::records::{
     LedgerTerminal, LedgerTerminalWire, PhysicalBinding, TargetSnapshot, TerminalDisposition,
 };
 use crate::remote::helper::{HeldSlotLock, RemoteHelper};
-use crate::store::local::LocalStore;
+use crate::store::local::ledger::TargetLedgerTxn;
 use std::collections::{BTreeMap, HashMap};
 
 /// The two/three physical append line kinds — the WIRE enum the
@@ -46,8 +46,16 @@ pub type LedgerLine = LedgerEventWire;
 /// append time; a drifted head is refused and the caller finalizes the
 /// stale plan `Degraded`). The kernel decides the disposition; this
 /// function only gathers evidence and orchestrates the guarded mutations.
-pub fn finalize_successful_locked(
-    store: &LocalStore,
+///
+/// THE TXN IS THE WRITE SURFACE: the caller holds the target's
+/// [`TargetLedgerTxn`] (the target `operation.lock` + the folded ledger
+/// state) for the WHOLE finalization — the parent/head check and the
+/// terminal append are atomic under the txn's lock, and the `Successful`
+/// terminal is constructed with the SEALED [`VerifiedExecution`] proof
+/// minted EXACTLY at the verified-execution evidence point below
+/// ([`crate::kernel::terminal::VerifiedExecution::from_verified_report`]).
+pub(crate) fn finalize_successful_locked(
+    txn: &mut TargetLedgerTxn<'_>,
     attempt: &DeploymentIntent,
     helpers: &HashMap<SlotId, RemoteHelper>,
     settings: &FinalizeSettings<'_>,
@@ -57,7 +65,7 @@ pub fn finalize_successful_locked(
         op_id,
         application,
     } = settings;
-    let entries = store.read_ledger(attempt.target().as_str())?;
+    let entries = txn.state().entries();
     if let Some(e) = entries
         .iter()
         .find(|e| e.deployment_id == *attempt.deployment_id())
@@ -68,15 +76,15 @@ pub fn finalize_successful_locked(
     // THE STRICTLY-LINEAR HEAD CHECK (the spec's item 2 — the finalizer
     // ALWAYS requires `intent.parent() == store.read_last_successful(target)`,
     // no flag, no bypass): the attempt's parent must be the target's current
-    // successful head, verified HERE against the same ledger read the append
-    // gate uses — BEFORE any lock or marker mutation. A drifted head (a later
+    // successful head, verified HERE against the TXN'S OWN FOLDED STATE (the
+    // same fold the append gate uses — a single source, no re-read) —
+    // BEFORE any lock or marker mutation. A drifted head (a later
     // deployment already succeeded on this parent) makes the plan STALE and
     // the finalizer REFUSES ([`FinalizeOutcome::Refused`], the reason
     // carrying the kernel's Conflict/StalePlan message); the caller finalizes
     // the stale plan `Degraded` — never stranded, never `Successful`. The
-    // ATOMIC store/kernel gate (the pre-write terminal validation in
-    // [`crate::store::local::ledger`]) remains the ultimate authority; this
-    // is the early, no-mutation check.
+    // ATOMIC store/kernel gate (the txn's in-memory `apply_event` fold)
+    // remains the ultimate authority; this is the early, no-mutation check.
     let head = entries
         .iter()
         .rev()
@@ -152,35 +160,31 @@ pub fn finalize_successful_locked(
         }
     };
     let _ = observed;
-    // THE KERNEL DECIDES: with the verification evidence gathered (every
-    // selected slot verified at its planned result) the disposition is
-    // `Successful` — payload-free; the result resolves from the intent.
-    let disposition = crate::kernel::transition::decide_terminal(
-        attempt,
-        crate::kernel::transition::ExecutionReport::Verified,
-    )
-    .map_err(|e| Error::integrity(format!("finalize {}: {e}", attempt.deployment_id())))?;
-    let terminal = LedgerTerminal::new(
+    // THE SEALED PROOF — minted EXACTLY at the verified-execution evidence
+    // point (the second `LockedObservation::Verified` above): the ONLY
+    // production path that can produce a `Successful` terminal. The proof
+    // type is sealed (private field, `pub(crate)` mint), so a library
+    // caller without verified evidence cannot fabricate success. The
+    // kernel's [`crate::kernel::transition::decide_terminal`] truth table
+    // is what makes `Verified` mean `Successful`; the proof mint is the
+    // evidence gate.
+    let proof = crate::kernel::terminal::VerifiedExecution::from_verified_report();
+    let terminal = LedgerTerminal::successful(
+        proof,
         crate::remote::helper::now_rfc3339_ts(),
         crate::kernel::terminal::intent_digest(attempt),
-        disposition,
         Some(reason.to_string()),
     );
-    // THE STORE APPENDS THROUGH THE STATE MACHINE'S GATE: the pre-write
-    // validation ([`crate::store::local::ledger`]'s mirror of
-    // `apply_event`) refuses a `Successful` terminal whose intent's parent
-    // is no longer the current successful head — a drifted head (a later
-    // deployment already succeeded on this parent) makes THIS plan stale.
-    // The Conflict (StalePlan) refusal is translated into
+    // THE TXN APPENDS THROUGH THE STATE MACHINE'S GATE: the in-memory
+    // `apply_event` fold refuses a `Successful` terminal whose intent's
+    // parent is no longer the current successful head — a drifted head (a
+    // later deployment already succeeded on this parent) makes THIS plan
+    // stale. The Conflict (StalePlan) refusal is translated into
     // [`FinalizeOutcome::Refused`] with the kernel's conflict message as
     // the reason (the structured stale-plan source); the caller finalizes
     // the stale plan `Degraded`, never `Successful`, and the stale intent
     // never becomes the head — the newer head's snapshot is untouched.
-    match store.append_terminal(
-        attempt.target().as_str(),
-        attempt.deployment_id(),
-        &terminal,
-    ) {
+    match txn.append_terminal(attempt.deployment_id(), &terminal) {
         Ok(()) => Ok(FinalizeOutcome::Finalized),
         // The store mirror routes the stale-plan refusal through the TYPED
         // facade error ([`Error::Kernel`] carrying the complete

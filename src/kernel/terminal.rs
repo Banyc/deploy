@@ -292,6 +292,49 @@ impl TerminalDisposition {
     }
 }
 
+/// THE SEALED PROOF OF VERIFIED EXECUTION — the ONLY way a
+/// [`TerminalDisposition::Successful`] terminal may be constructed
+/// ([`LedgerTerminal::successful`]). A library caller CANNOT fabricate
+/// success: the proof has no public constructor (its field is private
+/// `_sealed`), so a `Successful` terminal is constructible ONLY inside the
+/// crate, at the verified-execution evidence point — the finalizer's
+/// lock-verified observation ([`crate::ledger::finalize::
+/// finalize_successful_locked`]'s `LockedObservation::Verified`) / the
+/// kernel's [`crate::kernel::transition::ExecutionReport::Verified`]
+/// report.
+///
+/// The sealed `_sealed: ()` shape mirrors the merged
+/// `VerifiedAdapterRestoration` pattern: the type is `pub` (so a caller
+/// can NAME the proof and pass it around) but has NO free constructor —
+/// the proof's only mint is `pub(crate)` and lives on the evidence path,
+/// never reachable by an external caller. There is NO
+/// `#[cfg(test)]`-gated production constructor: the private constructor is
+/// always present (only the crate's trusted paths call it); the test mint
+/// (`for_tests`) is a separate `#[cfg(test)]` helper for the fixtures.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedExecution {
+    _sealed: (),
+}
+
+impl VerifiedExecution {
+    /// MINT the proof at the verified-execution evidence point — the ONLY
+    /// production mint. Reachable only inside the crate (the successful
+    /// finalizer's `LockedObservation::Verified` path); a library caller
+    /// cannot construct the sealed type, so it cannot fabricate a
+    /// `Successful` terminal.
+    pub(crate) fn from_verified_report() -> Self {
+        VerifiedExecution { _sealed: () }
+    }
+
+    /// TEST-ONLY mint for the fixtures / unit tests. Never compiled into a
+    /// production build; an external caller (integration test / library
+    /// user) sees only the sealed type with no constructor.
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Self {
+        VerifiedExecution { _sealed: () }
+    }
+}
+
 /// An INTENT DIGEST: the validated scalar that binds a terminal event to
 /// the EXACT canonical intent — the sha256 of the intent's canonical wire
 /// bytes. Validated on every read (`terminal.intent_digest ==
@@ -330,6 +373,76 @@ pub fn intent_digest(intent: &DeploymentIntent) -> IntentDigest {
     IntentDigest(digest)
 }
 
+/// The terminal dispositions [`LedgerTerminal::new`] accepts — EVERYTHING
+/// except `Successful`. A `Successful` terminal is UNREPRESENTABLE here:
+/// it requires the sealed [`VerifiedExecution`] proof and the dedicated
+/// [`LedgerTerminal::successful`] constructor (the kernel's
+/// verified-execution evidence path). A library caller passing
+/// `TerminalDisposition::Successful` to `LedgerTerminal::new` is a
+/// COMPILE ERROR — success cannot be fabricated.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NonSuccessfulDisposition {
+    /// The attempt failed before any slot mutation: no payload, no
+    /// outcomes.
+    FailedPreflight,
+    /// The attempt failed after mutating slots and every attempted
+    /// mutation was restored or never advanced.
+    FailedRolledBack(FailedRolledBackTerminal),
+    /// The attempt ended degraded: at least one slot remains changed or
+    /// unknown.
+    Degraded(DegradedTerminal),
+}
+
+impl NonSuccessfulDisposition {
+    /// The disposition's STATUS (the non-Successful subset of
+    /// [`TerminalDisposition::status`]).
+    pub fn status(&self) -> crate::ledger::records::DeploymentStatus {
+        match self {
+            NonSuccessfulDisposition::FailedPreflight => {
+                crate::ledger::records::DeploymentStatus::FailedPreflight
+            }
+            NonSuccessfulDisposition::FailedRolledBack(_) => {
+                crate::ledger::records::DeploymentStatus::FailedRolledBack
+            }
+            NonSuccessfulDisposition::Degraded(_) => {
+                crate::ledger::records::DeploymentStatus::Degraded
+            }
+        }
+    }
+
+    /// Convert a NON-VERIFIED execution decision to the constructor's
+    /// disposition: the kernel's truth table
+    /// ([`crate::kernel::transition::decide_terminal`]) yields
+    /// `Successful` ONLY from [`crate::kernel::transition::
+    /// ExecutionReport::Verified`], so a failure/preflight decision never
+    /// is `Successful` here — the sealed-proof gate is the kernel's, and
+    /// reaching the `unreachable!` would expose a kernel truth-table bug,
+    /// never a caller error.
+    pub fn from_decision(disposition: TerminalDisposition) -> Self {
+        match disposition {
+            TerminalDisposition::FailedPreflight => Self::FailedPreflight,
+            TerminalDisposition::FailedRolledBack(payload) => Self::FailedRolledBack(payload),
+            TerminalDisposition::Degraded(payload) => Self::Degraded(payload),
+            TerminalDisposition::Successful => unreachable!(
+                "a Successful disposition is mintable only from ExecutionReport::Verified \
+                 (the sealed VerifiedExecution proof) — a non-verified decision never yields it"
+            ),
+        }
+    }
+}
+
+impl From<NonSuccessfulDisposition> for TerminalDisposition {
+    fn from(d: NonSuccessfulDisposition) -> Self {
+        match d {
+            NonSuccessfulDisposition::FailedPreflight => TerminalDisposition::FailedPreflight,
+            NonSuccessfulDisposition::FailedRolledBack(p) => {
+                TerminalDisposition::FailedRolledBack(p)
+            }
+            NonSuccessfulDisposition::Degraded(p) => TerminalDisposition::Degraded(p),
+        }
+    }
+}
+
 /// THE TERMINAL EVENT of one deployment — the VALIDATED DOMAIN form. The
 /// terminal binds itself to its intent via `intent_digest` (a validated
 /// scalar) and carries its structural disposition. Appended ONCE after the
@@ -346,16 +459,63 @@ pub struct LedgerTerminal {
 }
 
 impl LedgerTerminal {
+    /// Construct a NON-SUCCESSFUL terminal (`FailedPreflight` /
+    /// `FailedRolledBack` / `Degraded`). The `Successful` disposition is
+    /// NOT a parameter — it is UNREPRESENTABLE here: a Successful terminal
+    /// requires the sealed [`VerifiedExecution`] proof and the dedicated
+    /// [`LedgerTerminal::successful`] constructor (the kernel's
+    /// verified-execution evidence path). A library caller CANNOT
+    /// fabricate success: `LedgerTerminal::new(...,
+    /// TerminalDisposition::Successful, ...)` does not compile.
     pub fn new(
         recorded_at: Timestamp,
         intent_digest: IntentDigest,
-        disposition: TerminalDisposition,
+        disposition: NonSuccessfulDisposition,
         reason: Option<String>,
     ) -> Self {
         Self {
             recorded_at,
             intent_digest,
-            disposition,
+            disposition: disposition.into(),
+            reason,
+        }
+    }
+
+    /// Construct the SUCCESSFUL terminal: requires the sealed
+    /// [`VerifiedExecution`] proof, minted ONLY at the verified-execution
+    /// evidence point (the successful finalizer's `LockedObservation::Verified`
+    /// / the kernel's [`crate::kernel::transition::ExecutionReport::Verified`]).
+    /// The proof is consumed by value — it cannot be reused to fabricate a
+    /// second success.
+    pub fn successful(
+        _proof: VerifiedExecution,
+        recorded_at: Timestamp,
+        intent_digest: IntentDigest,
+        reason: Option<String>,
+    ) -> Self {
+        Self {
+            recorded_at,
+            intent_digest,
+            disposition: TerminalDisposition::Successful,
+            reason,
+        }
+    }
+
+    /// THE READ-PATH constructor (wire deserialization): reconstruct the
+    /// domain form of a PERSISTED `Successful` terminal. NOT fabrication —
+    /// a Successful terminal was only ever WRITTEN with the sealed proof
+    /// (the txn's append gate) or by the validated suffix replacement; this
+    /// crate-internal path re-reads that persisted fact. `pub(crate)`: an
+    /// external caller cannot reach it.
+    pub(crate) fn successful_unchecked(
+        recorded_at: Timestamp,
+        intent_digest: IntentDigest,
+        reason: Option<String>,
+    ) -> Self {
+        Self {
+            recorded_at,
+            intent_digest,
+            disposition: TerminalDisposition::Successful,
             reason,
         }
     }
@@ -424,24 +584,6 @@ impl LedgerTerminal {
         }
         Some(remaining)
     }
-}
-
-/// THE DIGEST-ENFORCING CONSTRUCTOR for the wire path: validate the digest
-/// scalar and construct the terminal.
-pub fn terminal_with_digest(
-    recorded_at: Timestamp,
-    intent_digest: IntentDigest,
-    disposition: TerminalDisposition,
-    reason: Option<String>,
-) -> KernelResult<LedgerTerminal> {
-    // The digest was already parsed by the wire conversion; the constructor
-    // keeps the domain uncorruptible (private fields).
-    Ok(LedgerTerminal::new(
-        recorded_at,
-        intent_digest,
-        disposition,
-        reason,
-    ))
 }
 
 /// THE PARENT == HEAD CHECK — `intent.parent == current successful

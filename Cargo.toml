@@ -31,3 +31,8 @@ libc = "0.2"
 # Default features (fork/timeout) are unused; the test pins its own
 # deterministic `ProptestConfig` (fixed seed + bounded cases).
 proptest = "1"
+# The sealed-writes compile-fail suite (tests/ui.rs + tests/ui/*.rs): proves
+# a library caller CANNOT fabricate a Successful terminal (the sealed
+# VerifiedExecution proof) or append outside a locked TargetLedgerTxn — the
+# sealed API surface is enforced at COMPILE time, never by a runtime check.
+trybuild = "1.0.120"

@@ -117,6 +117,7 @@ use crate::identity::{DeploymentId, OperationId, TargetName};
 use crate::retention::reachability::history_floor::{LedgerDiscards, LedgerOverride};
 use crate::store::atomic::ReplaceOutcome;
 use crate::store::local::LocalStore;
+use crate::store::local::ledger::TargetLedgerTxn;
 
 /// The outcome of one checkpoint invocation (preview or real).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -192,33 +193,29 @@ pub fn run_checkpoint(
     }
     let op_id = OperationId::generate();
     let local_guard = FileLock::acquire(&store.base().join("operation.lock"), op_id.as_str())?;
-    let target_guard = {
-        // Durable pre-creation of the target directory BEFORE the target
-        // lock, mirroring [`crate::deploy::push`]: the lock path must
-        // never create the target dir with an unsynced mkdir (the lock file
-        // lives inside it, so a plain `create_dir_all` here would bypass the
-        // durable first-append helper exactly as the reported bug did).
-        store.ensure_target_dir_durable(target)?;
-        FileLock::acquire(
-            &store.target_dir(target).join("operation.lock"),
-            op_id.as_str(),
-        )?
-    };
-    let result = checkpoint_inner(store, config, target, deployment_id);
+    // THE TARGET LEDGER TRANSACTION: the txn acquires the target
+    // `operation.lock` (durably pre-creating the target directory BEFORE
+    // the lock — the reported bug's durable first-append machinery — and
+    // folding the ledger state) and is the ONLY ledger write surface: the
+    // checkpoint's atomic suffix replacement runs THROUGH it (see
+    // [`TargetLedgerTxn::write_suffix`]).
+    let mut txn = TargetLedgerTxn::open(store, target, op_id.as_str())?;
+    let result = checkpoint_inner(store, config, target, deployment_id, &mut txn);
     // The guards drop here, releasing both advisory locks regardless of how
     // `checkpoint_inner` resolves.
-    drop(target_guard);
+    drop(txn);
     drop(local_guard);
     result
 }
 
 /// Test-only entry point: drive [`checkpoint_inner`] for a REAL checkpoint
-/// with the advisory LOCK ACQUISITION SKIPPED — mirroring the fixture's push
-/// entry points ([`crate::deploy::push_with_id`], which skip the local
-/// `FileLock` acquisition the same way). The state-machine fixture is
-/// single-threaded, so the locks would only add I/O; the validation, the
-/// atomic ledger replacement (the logical commit), and the full sweep path
-/// run UNMODIFIED.
+/// through a fresh [`TargetLedgerTxn`] (the txn's target `operation.lock`
+/// acquisition is the ONLY lock this entry takes — mirroring the fixture's
+/// push entry points ([`crate::deploy::push_with_id`], which skip the LOCAL
+/// application-store lock the same way). The state-machine fixture is
+/// single-threaded, so the flock adds only I/O; the validation, the atomic
+/// ledger replacement (the logical commit), and the full sweep path run
+/// UNMODIFIED.
 #[cfg(test)]
 pub(crate) fn run_checkpoint_unlocked(
     store: &LocalStore,
@@ -226,7 +223,8 @@ pub(crate) fn run_checkpoint_unlocked(
     target: &str,
     deployment_id: &DeploymentId,
 ) -> Result<CheckpointReport> {
-    checkpoint_inner(store, config, target, deployment_id)
+    let mut txn = TargetLedgerTxn::open(store, target, "test-checkpoint")?;
+    checkpoint_inner(store, config, target, deployment_id, &mut txn)
 }
 
 /// Build the checkpoint's NEW ledger payload: the checkpoint EVENT line
@@ -298,6 +296,7 @@ fn checkpoint_inner(
     config: &ProjectConfig,
     target: &str,
     deployment_id: &DeploymentId,
+    txn: &mut TargetLedgerTxn<'_>,
 ) -> Result<CheckpointReport> {
     // The TYPED sweep-debt marker carries the checkpoint's validated target
     // identity; parse it UP FRONT (pre-commit — an invalid target name fails
@@ -321,22 +320,25 @@ fn checkpoint_inner(
     // 2. THE LOGICAL COMMIT: atomically replace the ledger with the
     //    CHECKPOINT EVENT + the retained suffix — the checkpointed ledger's
     //    FIRST line is the checkpoint event (the record of the discarded
-    //    prefix), then the retained suffix lines. If the replacement fails,
-    //    NO DELETION HAPPENS — the previous ledger stands. `?` is correct
-    //    here: a failed replacement is a PRE-COMMIT failure and the
-    //    checkpoint returns a plain `Err`.
+    //    prefix), then the retained suffix lines. THE REPLACEMENT RUNS
+    //    THROUGH THE TXN ([`TargetLedgerTxn::write_suffix`] — the ONLY way
+    //    a checkpoint event enters a ledger; there is no general
+    //    `append_checkpoint`). If the replacement fails, NO DELETION
+    //    HAPPENS — the previous ledger stands. `?` is correct here: a
+    //    failed replacement is a PRE-COMMIT failure and the checkpoint
+    //    returns a plain `Err`.
     let new_ledger = checkpoint_ledger_payload(deployment_id, discarded_entries.len(), &suffix)?;
     // 2. THE LOGICAL COMMIT — the replace reports its TWO COMMIT POINTS
     //    (the rename → the truncated ledger becomes VISIBLE; the
     //    parent-directory fsync → it becomes DURABLE) explicitly, so the
     //    checkpoint can distinguish "the rename never happened" (a plain
-    //    `Err` from [`LocalStore::write_ledger_suffix`] — nothing
+    //    `Err` from [`TargetLedgerTxn::write_suffix`] — nothing
     //    committed, the full history stands) from "the rename happened but
     //    durability is unconfirmed" (the shortened ledger IS visible, so
     //    the checkpoint reports the commit as ESTABLISHED with a durability
     //    warning and DEFERS the sweep — never delete anything against a
     //    floor whose durability is unconfirmed).
-    match store.write_ledger_suffix(target, &new_ledger)? {
+    match txn.write_suffix(&new_ledger)? {
         // BOTH commit points confirmed: the new ledger is visible AND
         // durable — run the best-effort post-commit sweep as today.
         ReplaceOutcome::ReplacedDurable => {
@@ -787,9 +789,9 @@ mod tests {
                 // Successful: intent's desired must MATCH the rollback (generation, artifact, binding)
                 let rel = id.clone();
                 let matching_intent = intent_for_over(&id, target, &rel, "tree-1", head.as_ref());
-                store.append_intent(target, &matching_intent).unwrap();
+                store.test_append_intent(target, &matching_intent).unwrap();
                 store
-                    .append_terminal(
+                    .test_append_terminal(
                         target,
                         matching_intent.deployment_id(),
                         &terminal_for(&matching_intent),
@@ -803,9 +805,9 @@ mod tests {
                 // entry's terminal and never introduces a second pending
                 // attempt.
                 let it = intent_for_over(&id, target, "rel-1", "tree-1", head.as_ref());
-                store.append_intent(target, &it).unwrap();
+                store.test_append_intent(target, &it).unwrap();
                 store
-                    .append_terminal(
+                    .test_append_terminal(
                         target,
                         it.deployment_id(),
                         &crate::testutil::fixtures::rolled_back_terminal(
@@ -992,9 +994,9 @@ interval_seconds = 0
             })
             .map(|e| e.intent);
         let matching_intent = intent_for_over(id, target, release, tree, head.as_ref());
-        store.append_intent(target, &matching_intent).unwrap();
+        store.test_append_intent(target, &matching_intent).unwrap();
         store
-            .append_terminal(
+            .test_append_terminal(
                 target,
                 matching_intent.deployment_id(),
                 &crate::testutil::fixtures::successful_terminal(&matching_intent),

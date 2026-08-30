@@ -17,7 +17,9 @@
 use crate::error::{Error, Result};
 use crate::identity::DeploymentId;
 use crate::kernel;
-use crate::kernel::terminal::{DegradedTerminal, FailedRolledBackTerminal, LedgerTerminal};
+use crate::kernel::terminal::{
+    DegradedTerminal, FailedRolledBackTerminal, LedgerTerminal, NonSuccessfulDisposition,
+};
 use crate::ledger::records::{
     DeploymentStatus, NonEmptySlotTable, SlotOutcome, SlotOutcomeRowWire, SlotTable,
 };
@@ -107,10 +109,16 @@ impl LedgerTerminalWire {
         }
         // STATUS → DISPOSITION: each status maps to exactly one disposition,
         // and a status whose payload does not match its disposition is a
-        // conversion error (fail closed).
-        let disposition = match (&self.status, outcomes.is_empty()) {
+        // conversion error (fail closed). The READ PATH constructs the
+        // domain terminal DIRECTLY: a `Successful` terminal is a PERSISTED
+        // FACT (it was only ever written with the sealed
+        // [`crate::kernel::terminal::VerifiedExecution`] proof) — the
+        // internal read-path constructor re-reads it; the non-Successful
+        // dispositions go through [`LedgerTerminal::new`] (whose type
+        // excludes `Successful` by construction).
+        let terminal = match (&self.status, outcomes.is_empty()) {
             (DeploymentStatus::Successful, true) => {
-                kernel::terminal::TerminalDisposition::Successful
+                LedgerTerminal::successful_unchecked(recorded_at, intent_digest, self.reason)
             }
             (DeploymentStatus::Successful, false) => {
                 return Err(Error::integrity(format!(
@@ -118,9 +126,12 @@ impl LedgerTerminalWire {
                     self.deployment_id
                 )));
             }
-            (DeploymentStatus::FailedPreflight, true) => {
-                kernel::terminal::TerminalDisposition::FailedPreflight
-            }
+            (DeploymentStatus::FailedPreflight, true) => LedgerTerminal::new(
+                recorded_at,
+                intent_digest,
+                NonSuccessfulDisposition::FailedPreflight,
+                self.reason,
+            ),
             (DeploymentStatus::FailedPreflight, false) => {
                 return Err(Error::integrity(format!(
                     "terminal {}: status FailedPreflight must carry NO outcomes (a pre-mutation failure touched no slot)",
@@ -137,7 +148,12 @@ impl LedgerTerminalWire {
                 // append path — never by a second rule here. The unchecked
                 // constructor carries the wire rows over.
                 let payload = FailedRolledBackTerminal::new_unchecked(outcomes);
-                kernel::terminal::TerminalDisposition::FailedRolledBack(payload)
+                LedgerTerminal::new(
+                    recorded_at,
+                    intent_digest,
+                    NonSuccessfulDisposition::FailedRolledBack(payload),
+                    self.reason,
+                )
             }
             (DeploymentStatus::Degraded, _) => {
                 let non_empty =
@@ -153,11 +169,15 @@ impl LedgerTerminalWire {
                 // `Desired`/`Diverged`/`Unknown` delta) is enforced by
                 // [`crate::kernel::transition::validate_terminal_vs_intent`].
                 let payload = DegradedTerminal::new_unchecked(non_empty);
-                kernel::terminal::TerminalDisposition::Degraded(payload)
+                LedgerTerminal::new(
+                    recorded_at,
+                    intent_digest,
+                    NonSuccessfulDisposition::Degraded(payload),
+                    self.reason,
+                )
             }
         };
-        kernel::terminal::terminal_with_digest(recorded_at, intent_digest, disposition, self.reason)
-            .map_err(|e| Error::integrity(format!("terminal wire refused: {e}")))
+        Ok(terminal)
     }
 
     /// Build the WIRE form of a domain terminal for a given deployment

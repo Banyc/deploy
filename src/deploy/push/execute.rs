@@ -325,6 +325,9 @@ pub(crate) mod execute_tests {
                 ref_token: None,
                 group: None,
             },
+            &mut Some(
+                crate::store::local::ledger::TargetLedgerTxn::open(&h.store, "t1", "test").unwrap(),
+            ),
         )
         .unwrap();
         assert!(
@@ -479,6 +482,9 @@ pub(crate) mod execute_tests {
                 ref_token: None,
                 group: None,
             },
+            &mut Some(
+                crate::store::local::ledger::TargetLedgerTxn::open(&h.store, "t1", "test").unwrap(),
+            ),
         )
         .unwrap();
         assert_eq!(
@@ -791,6 +797,9 @@ interval_seconds = 0
                 ref_token: None,
                 group: None,
             },
+            &mut Some(
+                crate::store::local::ledger::TargetLedgerTxn::open(&store, "t1", "test").unwrap(),
+            ),
         )
         .unwrap();
         assert_eq!(
@@ -1082,6 +1091,9 @@ interval_seconds = 0
                 ref_token: None,
                 group: None,
             },
+            &mut Some(
+                crate::store::local::ledger::TargetLedgerTxn::open(&store, "t1", "test").unwrap(),
+            ),
         )
         .unwrap();
         assert_eq!(
@@ -1803,6 +1815,9 @@ interval_seconds = 0
                 ref_token: None,
                 group: None,
             },
+            &mut Some(
+                crate::store::local::ledger::TargetLedgerTxn::open(&store, "t1", "test").unwrap(),
+            ),
         )
         .unwrap();
         assert_eq!(

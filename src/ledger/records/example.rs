@@ -148,10 +148,14 @@ pub(crate) fn canonical_doc_pair() -> (LedgerIntentWire, LedgerTerminalWire) {
     .expect("the canonical example intent plans");
     let intent = LedgerIntentWire::from(&intent_domain);
 
-    let terminal_domain = crate::kernel::terminal::LedgerTerminal::new(
+    // THE DOC-EXAMPLE SUCCESSFUL TERMINAL: constructed through the
+    // READ-PATH constructor (a wire record of a persisted success — the
+    // same constructor the reader uses; a Successful terminal was only ever
+    // WRITTEN with the sealed proof, which this generator has no evidence
+    // for). `pub(crate)`: external callers cannot reach it.
+    let terminal_domain = crate::kernel::terminal::LedgerTerminal::successful_unchecked(
         crate::identity::Timestamp::parse("2026-08-21T10:25:00Z").unwrap(),
         crate::kernel::terminal::intent_digest(&intent_domain),
-        crate::kernel::terminal::TerminalDisposition::Successful,
         Some("push completed".to_string()),
     );
     let terminal = LedgerTerminalWire::to_wire(&deployment_id, &terminal_domain);

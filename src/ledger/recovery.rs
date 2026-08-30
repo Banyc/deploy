@@ -46,7 +46,7 @@ use crate::ledger::records::{
     ObservedGeneration, PhysicalBinding, SlotOutcome,
 };
 use crate::remote::helper::{HeldSlotLock, RemoteHelper};
-use crate::store::local::LocalStore;
+use crate::store::local::ledger::TargetLedgerTxn;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// The per-attempt outcome of the recovery step — one pending attempt is
@@ -103,21 +103,21 @@ pub(crate) enum RecoveryOutcome {
 /// — the caller (preflight) then REFUSES the push: a push that cannot
 /// finish the previous pending attempt never plans a second intent on top.
 pub(crate) fn reconcile_pending_commits(
-    store: &LocalStore,
+    txn: &mut TargetLedgerTxn<'_>,
     config: &ProjectConfig,
-    target_name: &str,
     op_id: &OperationId,
     helpers: &HashMap<SlotId, RemoteHelper>,
 ) -> Result<Option<RecoveryOutcome>> {
     let mut pending: Vec<DeploymentIntent> = Vec::new();
-    for entry in store.read_ledger(target_name)? {
+    for entry in txn.state().entries() {
         if entry.terminal.is_none() {
-            pending.push(entry.intent);
+            pending.push(entry.intent.clone());
         }
     }
     if pending.is_empty() {
         return Ok(None);
     }
+    let target_name = txn.target();
 
     let members: HashSet<String> = config
         .target_slots(target_name)?
@@ -158,13 +158,7 @@ pub(crate) fn reconcile_pending_commits(
                 outcome = Some(RecoveryOutcome::StillPending);
                 continue;
             };
-            append_degraded(
-                store,
-                target_name,
-                &attempt,
-                &evidence,
-                "membership mismatch",
-            )?;
+            append_degraded(txn, &attempt, &evidence, "membership mismatch")?;
             outcome = Some(RecoveryOutcome::Degraded);
             continue;
         }
@@ -192,7 +186,7 @@ pub(crate) fn reconcile_pending_commits(
                 outcome = Some(RecoveryOutcome::StillPending);
                 continue;
             };
-            append_degraded(store, target_name, &attempt, &evidence, "binding drift")?;
+            append_degraded(txn, &attempt, &evidence, "binding drift")?;
             outcome = Some(RecoveryOutcome::Degraded);
             continue;
         }
@@ -208,7 +202,7 @@ pub(crate) fn reconcile_pending_commits(
         // right now) reports [`RecoveryOutcome::StillPending`] — the
         // attempt stays intent-only and the push REFUSES to plan on top.
         match finalize_successful_locked(
-            store,
+            txn,
             &attempt,
             helpers,
             &FinalizeSettings {
@@ -237,7 +231,7 @@ pub(crate) fn reconcile_pending_commits(
                     outcome = Some(RecoveryOutcome::StillPending);
                     continue;
                 };
-                append_degraded(store, target_name, &attempt, &evidence, reason.as_str())?;
+                append_degraded(txn, &attempt, &evidence, reason.as_str())?;
                 outcome = Some(RecoveryOutcome::Degraded);
             }
         }
@@ -275,8 +269,7 @@ pub(crate) fn reconcile_pending_commits(
 /// changes); AT LEAST ONE `Desired`/`Diverged`/`Unknown` delta →
 /// `Degraded`.
 fn append_degraded(
-    store: &LocalStore,
-    target_name: &str,
+    txn: &mut TargetLedgerTxn<'_>,
     attempt: &DeploymentIntent,
     per_slot_evidence: &BTreeMap<SlotId, RecoverySlotEvidence>,
     reason: &str,
@@ -321,10 +314,10 @@ fn append_degraded(
     let terminal = LedgerTerminal::new(
         crate::remote::helper::now_rfc3339_ts(),
         kernel::terminal::intent_digest(attempt),
-        disposition,
+        crate::kernel::terminal::NonSuccessfulDisposition::from_decision(disposition),
         Some(reason.to_string()),
     );
-    store.append_terminal(target_name, attempt.deployment_id(), &terminal)
+    txn.append_terminal(attempt.deployment_id(), &terminal)
 }
 
 /// The PER-SLOT EVIDENCE of a recovery-degraded terminal: the slot's
@@ -1258,7 +1251,7 @@ mod tests {
         let terminal = LedgerTerminal::new(
             crate::remote::helper::now_rfc3339_ts(),
             kernel::terminal::intent_digest(&intent),
-            disposition,
+            crate::kernel::terminal::NonSuccessfulDisposition::from_decision(disposition),
             Some(failure.reason().to_string()),
         );
         assert_eq!(

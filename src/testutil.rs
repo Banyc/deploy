@@ -1918,7 +1918,7 @@ pub(crate) mod fixtures {
     use crate::ledger::TargetSnapshot;
     use crate::ledger::records::{
         DegradedTerminal, LedgerTerminal, NonEmptySlotTable, Observation, PhysicalBinding,
-        SlotOutcome, SlotTable, TerminalDisposition,
+        SlotOutcome, SlotTable,
     };
     use std::collections::BTreeMap;
 
@@ -2021,14 +2021,17 @@ pub(crate) mod fixtures {
     }
 
     /// A Successful TERMINAL for an intent: PAYLOAD-FREE, bound by the
-    /// canonical intent digest.
+    /// canonical intent digest. The SEALED verified-execution proof is the
+    /// TEST mint (the fixtures have no real verification evidence; the
+    /// proof type itself stays sealed — an external caller can never
+    /// construct it).
     pub(crate) fn successful_terminal(
         intent: &crate::kernel::intent::DeploymentIntent,
     ) -> LedgerTerminal {
-        LedgerTerminal::new(
+        LedgerTerminal::successful(
+            crate::kernel::terminal::VerifiedExecution::for_tests(),
             Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
             kernel::terminal::intent_digest(intent),
-            TerminalDisposition::Successful,
             Some("test seeds a successful deployment".to_string()),
         )
     }
@@ -2040,7 +2043,7 @@ pub(crate) mod fixtures {
         LedgerTerminal::new(
             Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
             kernel::terminal::intent_digest(intent),
-            TerminalDisposition::FailedPreflight,
+            crate::kernel::terminal::NonSuccessfulDisposition::FailedPreflight,
             Some("test: preflight failed".to_string()),
         )
     }
@@ -2076,7 +2079,7 @@ pub(crate) mod fixtures {
         LedgerTerminal::new(
             Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
             kernel::terminal::intent_digest(intent),
-            TerminalDisposition::FailedRolledBack(payload),
+            crate::kernel::terminal::NonSuccessfulDisposition::FailedRolledBack(payload),
             Some("test: rolled back".to_string()),
         )
     }
@@ -2113,7 +2116,7 @@ pub(crate) mod fixtures {
         LedgerTerminal::new(
             Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
             kernel::terminal::intent_digest(intent),
-            TerminalDisposition::Degraded(payload),
+            crate::kernel::terminal::NonSuccessfulDisposition::Degraded(payload),
             Some("test: degraded".to_string()),
         )
     }

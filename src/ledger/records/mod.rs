@@ -54,9 +54,9 @@
 //! [`crate::ledger::tables::NonEmptySlotTable`] over the private ordered
 //! map) are generic slot collection INFRASTRUCTURE and stay in
 //! [`crate::ledger::tables`]; the ledger WRITE path (replay-safe
-//! finalization [`crate::ledger::finalize::finalize_successful_locked`]
-//! and the two physical append line kinds
-//! [`crate::ledger::finalize::LedgerLine`]) lives in
+//! finalization `finalize_successful_locked` — crate-internal, it writes
+//! through the locked target ledger transaction — and the two physical
+//! append line kinds [`crate::ledger::finalize::LedgerLine`]) lives in
 //! [`crate::ledger::finalize`]; reconciliation lives in
 //! [`crate::ledger::recovery`]; reference resolution in
 //! [`crate::ledger::refs`]; rendering in [`crate::ledger::log`].
@@ -1587,11 +1587,10 @@ mod tests {
         let non_empty = NonEmptySlotTable::build(outcomes).unwrap();
         let g_t =
             crate::kernel::terminal::DegradedTerminal::try_new(non_empty, &group_intent).unwrap();
-        let disposition = TerminalDisposition::Degraded(g_t);
         let terminal = LedgerTerminal::new(
             Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
             kernel::terminal::intent_digest(&group_intent),
-            disposition,
+            crate::kernel::terminal::NonSuccessfulDisposition::Degraded(g_t),
             None,
         );
         let wire = LedgerTerminalWire::to_wire(group_intent.deployment_id(), &terminal);
@@ -1749,9 +1748,9 @@ mod tests {
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let head_intent = fixtures::full_intent("deploy-head", "t1", &[slot(0)], &[]);
-        store.append_intent("t1", &head_intent).unwrap();
+        store.test_append_intent("t1", &head_intent).unwrap();
         store
-            .append_terminal(
+            .test_append_terminal(
                 "t1",
                 head_intent.deployment_id(),
                 &fixtures::successful_terminal(&head_intent),
@@ -1766,7 +1765,7 @@ mod tests {
         // reader refuses the same persisted sequence as corruption
         // (Integrity). A stale intent can never be appended, so it can never
         // reach a Successful terminal.
-        let err = store.append_intent("t1", &i).unwrap_err();
+        let err = store.test_append_intent("t1", &i).unwrap_err();
         assert!(err.to_string().contains("ParentMismatch"), "got: {err}");
         assert!(err.to_string().contains("conflict"));
         let mut state = kernel::transition::DeploymentState::new(TargetName::parse("t1").unwrap());
@@ -1877,16 +1876,16 @@ mod tests {
         // THE WRITE BOUNDARY mirror: the store refuses B (Conflict).
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
-        store.append_intent("t1", &h_intent).unwrap();
+        store.test_append_intent("t1", &h_intent).unwrap();
         store
-            .append_terminal(
+            .test_append_terminal(
                 "t1",
                 h_intent.deployment_id(),
                 &fixtures::successful_terminal(&h_intent),
             )
             .unwrap();
-        store.append_intent("t1", &a).unwrap();
-        let store_err = store.append_intent("t1", &b).unwrap_err();
+        store.test_append_intent("t1", &a).unwrap();
+        let store_err = store.test_append_intent("t1", &b).unwrap_err();
         assert!(store_err.to_string().contains("still pending"));
         assert!(store_err.to_string().contains("conflict"));
         // Once A reaches its Successful terminal (clearing the pending
@@ -1894,9 +1893,9 @@ mod tests {
         // the NEW head: B's stale parent H is refused, and a replanned B
         // over A appends fine.
         store
-            .append_terminal("t1", a.deployment_id(), &fixtures::successful_terminal(&a))
+            .test_append_terminal("t1", a.deployment_id(), &fixtures::successful_terminal(&a))
             .unwrap();
-        let store_err = store.append_intent("t1", &b).unwrap_err();
+        let store_err = store.test_append_intent("t1", &b).unwrap_err();
         assert!(
             store_err.to_string().contains("ParentMismatch"),
             "got: {store_err}"
@@ -1910,9 +1909,9 @@ mod tests {
             &[slot(0), slot(1)],
             &[slot(1)],
         );
-        store.append_intent("t1", &b2).unwrap();
+        store.test_append_intent("t1", &b2).unwrap();
         store
-            .append_terminal(
+            .test_append_terminal(
                 "t1",
                 b2.deployment_id(),
                 &fixtures::successful_terminal(&b2),

@@ -37,9 +37,11 @@
 //!   [`NonEmptySlotTable`] over the private ordered map): generic slot
 //!   collection INFRASTRUCTURE shared by the record model.
 //! * [`finalize`] — the ledger WRITE path: replay-safe, LOCK-VERIFIED
-//!   finalization ([`finalize_successful_locked`]) and the two
-//!   physical append line kinds ([`LedgerLine`] — the intent + terminal
-//!   WIRE events) with the merged-entry re-export.
+//!   finalization (`finalize_successful_locked`, crate-internal — it
+//!   writes through the locked target ledger transaction and is not
+//!   callable outside the crate) and the two physical append line kinds
+//!   ([`LedgerLine`] — the intent + terminal WIRE events) with the
+//!   merged-entry re-export.
 //! * [`recovery`] — pending-attempt RECONCILIATION
 //!   (`reconcile_pending_commits`).
 //! * [`refs`] — reference RESOLUTION against the ledger
@@ -82,9 +84,11 @@ pub mod tables;
 
 pub use crate::kernel::intent::{PlannedSlot, SlotAction};
 pub use crate::kernel::snapshot::PreviousGeneration;
-pub use finalize::{
-    FinalizeOutcome, FinalizeSettings, LedgerEntry, LedgerLine, finalize_successful_locked,
-};
+pub use finalize::{FinalizeOutcome, FinalizeSettings, LedgerEntry, LedgerLine};
+// The shared successful finalizer is crate-internal now: it writes through
+// the crate-internal [`crate::store::local::ledger::TargetLedgerTxn`] (the
+// ONLY ledger write surface), so no external caller can invoke it.
+pub(crate) use finalize::finalize_successful_locked;
 pub use log::render_log;
 pub use records::{
     ActualSlotState, ArtifactRefWire, BehaviorIndex, CheckpointWire, DegradedTerminal,

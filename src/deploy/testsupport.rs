@@ -253,6 +253,11 @@ pub(crate) fn two_slot_push(
             script.clone(),
         )?))
     };
+    // The fixture pushes skip the LOCAL application-store lock (single-,
+    // threaded per-fixture state) but every ledger write goes through the
+    // TARGET LEDGER TXN — the ONLY write surface (owns the target
+    // `operation.lock` + the folded state).
+    let txn = crate::store::local::ledger::TargetLedgerTxn::open(&h.store, "t1", op_id.as_str())?;
     push_inner(
         &project_root,
         &h.store,
@@ -270,6 +275,7 @@ pub(crate) fn two_slot_push(
             ref_token: None,
             group: group.map(str::to_string),
         },
+        &mut Some(txn),
     )
 }
 
@@ -430,10 +436,10 @@ pub(crate) fn seed_snapshot_over(
         attempted_at: crate::identity::Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
     };
     let intended = crate::kernel::intent::plan(plan_input).expect("a seeded intent plans");
-    store.append_intent(target, &intended).unwrap();
+    store.test_append_intent(target, &intended).unwrap();
     let terminal = crate::testutil::fixtures::successful_terminal(&intended);
     store
-        .append_terminal(target, intended.deployment_id(), &terminal)
+        .test_append_terminal(target, intended.deployment_id(), &terminal)
         .unwrap();
     let _ = intended;
 }
@@ -915,6 +921,11 @@ pub(crate) fn push_main_with_id(
             script.clone(),
         )?))
     };
+    // The fixture pushes skip the LOCAL application-store lock (single-,
+    // threaded per-fixture state) but every ledger write goes through the
+    // TARGET LEDGER TXN — the ONLY write surface (owns the target
+    // `operation.lock` + the folded state).
+    let txn = crate::store::local::ledger::TargetLedgerTxn::open(&h.store, "t1", op_id.as_str())?;
     push_inner(
         &project_root,
         &h.store,
@@ -932,6 +943,7 @@ pub(crate) fn push_main_with_id(
             ref_token: None,
             group: None,
         },
+        &mut Some(txn),
     )
 }
 
@@ -1117,6 +1129,11 @@ impl SysdHarness {
               -> Result<Box<dyn Remote>> {
             Ok(Box::new(LocalTransport::new(&env, rf.join(s.id.as_str()))?))
         };
+        // The fixture pushes skip the LOCAL application-store lock
+        // (single-threaded per-fixture state) but every ledger write goes
+        // through the TARGET LEDGER TXN — the ONLY write surface.
+        let txn =
+            crate::store::local::ledger::TargetLedgerTxn::open(&self.store, "t1", op_id.as_str())?;
         push_inner(
             &project_root,
             &self.store,
@@ -1134,6 +1151,7 @@ impl SysdHarness {
                 ref_token: None,
                 group: None,
             },
+            &mut Some(txn),
         )
     }
 }

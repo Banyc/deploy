@@ -12,6 +12,7 @@ use crate::deploy::push::PushReport;
 use crate::deploy::rollout::SlotExecution;
 use crate::error::Result;
 use crate::identity::SlotId;
+use crate::kernel::terminal::NonSuccessfulDisposition;
 use crate::ledger;
 use crate::ledger::DeploymentIntent;
 use crate::ledger::DeploymentStatus;
@@ -20,6 +21,7 @@ use crate::ledger::LedgerTerminal;
 use crate::ledger::NonEmptySlotTable;
 use crate::ledger::SlotOutcome;
 use crate::remote::helper::RemoteHelper;
+use crate::store::local::ledger::TargetLedgerTxn;
 
 // POST-MUTATION phases of the push transaction (steps 16-17): the terminal
 // event finalization (the `Successful` / `Degraded` / `FailedRolledBack`
@@ -36,8 +38,13 @@ use crate::remote::helper::RemoteHelper;
 /// terminal: the entry stays intent-only (the recoverable pending state a
 /// later push reconciles before its own no-op check) — appending a
 /// PendingCommit terminal would strand the attempt forever.
+///
+/// `txn` is the push's target ledger transaction — the ONLY ledger write
+/// surface (every terminal append and the shared finalizer write through
+/// it, under the target lock).
 pub(crate) fn run_commit(
     ctx: &PushContext,
+    txn: &mut TargetLedgerTxn<'_>,
     attempt_intent: &DeploymentIntent,
     execution: &ExecutionOutcome,
     members: &[(&SlotConfig, &crate::config::ServerDef)],
@@ -91,13 +98,12 @@ pub(crate) fn run_commit(
             ))
         })?;
         status = disposition.status();
-        store.append_terminal(
-            target_name,
+        txn.append_terminal(
             deployment_id,
             &LedgerTerminal::new(
                 crate::remote::helper::now_rfc3339_ts(),
                 crate::kernel::terminal::intent_digest(attempt_intent),
-                disposition,
+                NonSuccessfulDisposition::from_decision(disposition),
                 Some("push failed after mutation".to_string()),
             ),
         )?;
@@ -163,7 +169,7 @@ pub(crate) fn run_commit(
         }
 
         match ledger::finalize_successful_locked(
-            store,
+            txn,
             attempt_intent,
             helpers,
             &ledger::FinalizeSettings {
@@ -262,13 +268,12 @@ pub(crate) fn run_commit(
                         "push {deployment_id}: the kernel refused the degraded disposition: {e}"
                     ))
                 })?;
-                store.append_terminal(
-                    target_name,
+                txn.append_terminal(
                     deployment_id,
                     &LedgerTerminal::new(
                         crate::remote::helper::now_rfc3339_ts(),
                         crate::kernel::terminal::intent_digest(attempt_intent),
-                        disposition,
+                        NonSuccessfulDisposition::from_decision(disposition),
                         Some(reason.to_string()),
                     ),
                 )?;
@@ -1167,7 +1172,7 @@ pub(crate) mod commit_tests {
         );
         // A reaches its Successful terminal — the head advances to A.
         h.store
-            .append_terminal(
+            .test_append_terminal(
                 "t1",
                 a.deployment_id(),
                 &crate::testutil::fixtures::successful_terminal(&a),
@@ -1205,7 +1210,7 @@ pub(crate) mod commit_tests {
         );
         h.store.append_attempt("t1", &b2).unwrap();
         h.store
-            .append_terminal(
+            .test_append_terminal(
                 "t1",
                 b2.deployment_id(),
                 &crate::testutil::fixtures::successful_terminal(&b2),
@@ -1963,7 +1968,9 @@ pub(crate) mod commit_tests {
 
             // RECOVER against the mutated config.
             let op_id = OperationId::new("op-frozen-binding-prop".to_string());
-            reconcile_pending_commits(&h.store, &live, "t1", &op_id, &helpers).unwrap();
+            let mut txn =
+                crate::store::local::ledger::TargetLedgerTxn::open(&h.store, "t1", "test").unwrap();
+            reconcile_pending_commits(&mut txn, &live, &op_id, &helpers).unwrap();
 
             let status = h
                 .store
@@ -2273,7 +2280,9 @@ pub(crate) mod commit_tests {
             // GenerationRefs, writes the markers, and appends the terminal —
             // or refuses on the injected divergence.
             let op_id = OperationId::new("op-swap-prop".to_string());
-            reconcile_pending_commits(&h.store, &h.config, "t1", &op_id, &helpers).unwrap();
+            let mut txn =
+                crate::store::local::ledger::TargetLedgerTxn::open(&h.store, "t1", "test").unwrap();
+            reconcile_pending_commits(&mut txn, &h.config, &op_id, &helpers).unwrap();
 
             let status = h
                 .store
@@ -2515,8 +2524,10 @@ pub(crate) mod commit_tests {
             helpers.insert(p1.clone(), RemoteHelper::new(p1_remote.as_ref()));
             helpers.insert(p2.clone(), RemoteHelper::new(p2_remote.as_ref()));
             let op_id = OperationId::new("op-stale-prop".to_string());
+            let mut txn =
+                crate::store::local::ledger::TargetLedgerTxn::open(&h.store, "t1", "test").unwrap();
             let outcome = ledger::finalize_successful_locked(
-                &h.store,
+                &mut txn,
                 &intent,
                 &helpers,
                 &ledger::FinalizeSettings {
@@ -2776,7 +2787,10 @@ pub(crate) mod commit_tests {
             let before = std::fs::read(&ledger_path).unwrap();
 
             match ledger::finalize_successful_locked(
-                &h.store,
+                &mut crate::store::local::ledger::TargetLedgerTxn::open(
+                    &h.store, "t1", "test",
+                )
+                .unwrap(),
                 &intent,
                 &helpers,
                 &ledger::FinalizeSettings {

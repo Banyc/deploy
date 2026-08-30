@@ -24,6 +24,7 @@ use crate::identity::DeploymentId;
 use crate::identity::GenerationId;
 use crate::identity::OperationId;
 use crate::identity::SlotId;
+use crate::kernel::terminal::NonSuccessfulDisposition;
 use crate::ledger;
 use crate::ledger::DeploymentStatus;
 use crate::ledger::LedgerIntentReport;
@@ -33,6 +34,7 @@ use crate::ledger::RefExpr;
 use crate::remote::helper::RemoteHelper;
 use crate::remote::transport::Remote;
 use crate::store::local::LocalStore;
+use crate::store::local::ledger::TargetLedgerTxn;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -251,13 +253,16 @@ pub fn push(
     // COMPLETE current membership — never the group-filtered selection).
     gate_direct_release_membership(store, config, target_name, &ref_expr)?;
 
-    // 2. Acquire local application-store lock then target lock (in that
-    //    order), held as advisory (flock) locks on open file descriptors;
-    //    see [`acquire_locks`] for the durable
-    //    target-directory pre-creation and the dry-run no-lock rule. The
-    //    guards drop here (releasing both advisory locks) regardless of how
+    // 2. Acquire local application-store lock then the TARGET LEDGER
+    //    TRANSACTION (in that order — the txn's `open` acquires the target
+    //    `operation.lock` AND folds the ledger state; see
+    //    [`acquire_locks`] for the durable target-directory pre-creation
+    //    and the dry-run no-lock rule). The txn is the ONLY ledger write
+    //    surface for the whole push: every intent/terminal write happens
+    //    through it under the target lock. The guards drop here (releasing
+    //    the advisory lock and the txn's target lock) regardless of how
     //    `push_inner` resolves.
-    let (local_guard, target_guard) = acquire_locks(store, target_name, &op_id, opts.dry_run)?;
+    let (local_guard, mut txn) = acquire_locks(store, target_name, &op_id, opts.dry_run)?;
 
     let result = push_inner(
         &project_root,
@@ -272,9 +277,10 @@ pub fn push(
         config,
         target,
         opts,
+        &mut txn,
     );
 
-    drop(target_guard);
+    drop(txn);
     drop(local_guard);
     result
 }
@@ -284,7 +290,9 @@ pub fn push(
 /// can arm the one-shot store faults (keyed by deployment id) BEFORE the push
 /// runs. Mirrors the recovery tests' `push_main_with_id`; exposed crate-wide
 /// for the [`crate::semantic_invariants`] fixture. Same as [`push`] minus the
-/// advisory-lock acquisition (irrelevant to the fault matrix).
+/// LOCAL application-store lock acquisition (irrelevant to the fault
+/// matrix); the TARGET ledger transaction is still opened (every write goes
+/// through the locked txn).
 #[cfg(test)]
 pub(crate) fn push_with_id(
     config_path: &Path,
@@ -302,6 +310,7 @@ pub(crate) fn push_with_id(
     let project_root = config.project_root(config_path);
     let selection =
         crate::deploy::plan::SlotSelection::normalize(config, target_name, opts.group.as_deref())?;
+    let txn = TargetLedgerTxn::open(store, target_name, op_id.as_str())?;
     push_inner(
         &project_root,
         store,
@@ -317,6 +326,7 @@ pub(crate) fn push_with_id(
         config,
         target,
         opts,
+        &mut Some(txn),
     )
 }
 
@@ -349,6 +359,7 @@ pub(crate) fn push_ref_with_id(
     };
     let selection =
         crate::deploy::plan::SlotSelection::normalize(config, target_name, opts.group.as_deref())?;
+    let txn = TargetLedgerTxn::open(store, target_name, op_id.as_str())?;
     push_inner(
         &project_root,
         store,
@@ -364,6 +375,7 @@ pub(crate) fn push_ref_with_id(
         config,
         target,
         opts,
+        &mut Some(txn),
     )
 }
 
@@ -378,9 +390,9 @@ pub(crate) fn push_ref_with_id(
 // PHASE modules receive; this signature stays put so the test entry points
 // drive the spine unchanged.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn push_inner(
+pub(crate) fn push_inner<'a>(
     project_root: &Path,
-    store: &LocalStore,
+    store: &'a LocalStore,
     factory: &RemoteFactory,
     target_name: &str,
     selection: &crate::deploy::plan::SlotSelection,
@@ -396,6 +408,11 @@ pub(crate) fn push_inner(
     config: &ProjectConfig,
     target: &crate::config::TargetConfig,
     opts: &PushOptions,
+    // THE TARGET LEDGER TRANSACTION — the push's ONLY ledger write surface
+    // (owns the target `operation.lock` + the folded state): `Some` for a
+    // real push (opened by [`push`] / the test entry points), `None` for a
+    // dry run (which touches nothing and opens no txn).
+    txn: &mut Option<TargetLedgerTxn<'a>>,
 ) -> Result<PushReport> {
     // The shared context the phase modules consume (see [`PushContext`]).
     let ctx = PushContext {
@@ -446,7 +463,7 @@ pub(crate) fn push_inner(
     // pre-push observation tables.
     open_remotes(&ctx, &mut remotes)?;
     inspect_remotes(&ctx, &remotes, &mut helpers, &mut statuses)?;
-    let preflight = run_preflight(&ctx, &remotes, &helpers, &statuses)?;
+    let preflight = run_preflight(&ctx, txn, &remotes, &helpers, &statuses)?;
 
     // ---- Dry-run: read-only planning, no mutation of store/remote/locks -----
     if opts.dry_run {
@@ -532,7 +549,10 @@ pub(crate) fn push_inner(
     // record carries NO outcomes — the actual per-slot outcomes and the
     // status live in the deployment's TERMINAL EVENT. See
     // [`persist_intent`].
-    let attempt_intent = persist_intent(&ctx, &preflight)?;
+    let txn = txn
+        .as_mut()
+        .expect("a real push opens the target ledger txn");
+    let attempt_intent = persist_intent(&ctx, txn, &preflight)?;
 
     // 8 & 9. Capacity + staging preflight — capacity is the caller's CURRENT
     // per-server policy; every failure ends the attempt `FailedPreflight`
@@ -574,13 +594,12 @@ pub(crate) fn push_inner(
                 .remove_incoming(deployment_id.as_str())
                 .ok();
         }
-        store.append_terminal(
-            target_name,
+        txn.append_terminal(
             deployment_id,
             &LedgerTerminal::new(
                 crate::remote::helper::now_rfc3339_ts(),
                 crate::kernel::terminal::intent_digest(&attempt_intent),
-                disposition,
+                NonSuccessfulDisposition::from_decision(disposition),
                 Some(failure.reason.to_string()),
             ),
         )?;
@@ -597,7 +616,7 @@ pub(crate) fn push_inner(
     // terminal event finalization (successful finalizer / plain terminal
     // append), the observed refresh + step-17 maintenance, and the report
     // assembly.
-    run_commit(&ctx, &attempt_intent, &execution, &members, &helpers)
+    run_commit(&ctx, txn, &attempt_intent, &execution, &members, &helpers)
 }
 
 #[cfg(test)]

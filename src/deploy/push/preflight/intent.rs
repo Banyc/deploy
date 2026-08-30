@@ -11,10 +11,14 @@ use crate::kernel;
 use crate::kernel::intent::{PlanInput, PlannedDeploy};
 use crate::kernel::snapshot::SnapshotSlot;
 use crate::ledger::TargetSnapshot;
+use crate::store::local::ledger::TargetLedgerTxn;
 
-/// The intent built by [`persist_intent`] before the append.
+/// The intent built by [`persist_intent`] before the append. The append
+/// happens through the push's [`TargetLedgerTxn`] — the ONLY ledger write
+/// surface (the txn owns the target lock + the folded state).
 pub(crate) fn persist_intent(
     ctx: &PushContext,
+    txn: &mut TargetLedgerTxn<'_>,
     outcome: &PreflightOutcome,
 ) -> Result<kernel::intent::DeploymentIntent> {
     let store = ctx.store;
@@ -120,16 +124,16 @@ pub(crate) fn persist_intent(
     // target's current successful head AT THE MOMENT OF MUTATION — a drifted
     // head is a stale plan (refused, never reconciled implicitly). The
     // ledger is a SINGLE-WRITER authority under the target lock, so this is
-    // the defensive cross-process check.
-    let head = store
-        .read_last_successful(target_name)
-        .and_then(|h| DeploymentId::parse(&h).ok());
-    kernel::terminal::assert_parent_is_head(&attempt_intent, head.as_ref()).map_err(|e| {
-        crate::error::Error::conflict(format!(
-            "push for target '{target_name}' refused before mutation: {e}"
-        ))
-    })?;
+    // the defensive cross-process check. THE HEAD COMES FROM THE TXN'S OWN
+    // FOLDED STATE (the same fold the append gate validates against — a
+    // single source, never a second read that could disagree).
+    kernel::terminal::assert_parent_is_head(&attempt_intent, txn.state().successful_head())
+        .map_err(|e| {
+            crate::error::Error::conflict(format!(
+                "push for target '{target_name}' refused before mutation: {e}"
+            ))
+        })?;
 
-    store.append_intent(target_name, &attempt_intent)?;
+    txn.append_intent(&attempt_intent)?;
     Ok(attempt_intent)
 }

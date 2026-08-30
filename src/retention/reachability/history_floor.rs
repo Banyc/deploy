@@ -105,11 +105,7 @@ use std::collections::BTreeSet;
 #[cfg(test)]
 use crate::identity::SlotId;
 #[cfg(test)]
-use crate::ledger::records::{NonEmptySlotTable, Observation, ObservedGeneration, SlotOutcome};
-#[cfg(test)]
-use crate::ledger::{
-    DeploymentIntent, DeploymentStatus, LedgerTerminal, SlotResult, SlotTable, TerminalDisposition,
-};
+use crate::ledger::{DeploymentIntent, DeploymentStatus, LedgerTerminal, SlotResult};
 #[cfg(test)]
 use crate::testutil::test_faults::FaultKind;
 #[cfg(test)]
@@ -863,9 +859,15 @@ impl LocalStore {
         self.read_ledger(target)
     }
 
-    /// TEST-ONLY: append the durable intent (the old `append_attempt`).
-    pub fn append_attempt(&self, target: &str, intent: &DeploymentIntent) -> Result<()> {
-        self.append_intent(target, intent)
+    /// TEST-ONLY: append the durable intent (the old `append_attempt`),
+    /// through a freshly opened
+    /// [`crate::store::local::ledger::TargetLedgerTxn`] — every ledger write
+    /// goes through the locked txn (there is no unlocked append anywhere).
+    /// `#[cfg(test)]`: an external caller sees no such write method at all.
+    #[cfg(test)]
+    pub(crate) fn append_attempt(&self, target: &str, intent: &DeploymentIntent) -> Result<()> {
+        let mut txn = crate::store::local::ledger::TargetLedgerTxn::open(self, target, "test")?;
+        txn.append_intent(intent)
     }
 
     /// TEST-ONLY: the ledger's raw PHYSICAL lines (the old raw readers).
@@ -911,106 +913,6 @@ impl LocalStore {
                     .collect()
             })
             .ok_or_else(|| Error::store(format!("no results for deployment '{id}'")))
-    }
-
-    /// TEST-ONLY: append a terminal event for a deployment (the old
-    /// `append_transition`). The terminal is BUILT FROM the deployment's
-    /// intent (the digest binds it); the disposition matches the status and
-    /// carries the outcome payload the disposition requires (the status-only
-    /// shapes build the minimal valid payload over the intent's selected
-    /// membership).
-    pub fn append_transition(
-        &self,
-        id: &str,
-        status: &DeploymentStatus,
-        reason: Option<&str>,
-    ) -> Result<()> {
-        let target = self.target_for(id)?;
-        let entries = self.read_ledger(&target)?;
-        let intent = entries
-            .iter()
-            .find(|e| e.deployment_id.as_str() == id)
-            .map(|e| e.intent.clone())
-            .ok_or_else(|| Error::store(format!("no intent for deployment '{id}'")))?;
-        let selected: Vec<crate::identity::SlotId> = intent.selected().map(|(k, _)| k).collect();
-        let disposition = match status {
-            DeploymentStatus::Successful => TerminalDisposition::Successful,
-            DeploymentStatus::FailedPreflight => TerminalDisposition::FailedPreflight,
-            DeploymentStatus::FailedRolledBack => {
-                let outcomes = SlotTable::from_map(
-                    selected
-                        .iter()
-                        .map(|sid| {
-                            // The restored observation is the slot's OWN
-                            // pre-push state (the delta classifier sees
-                            // observed == pre-push → Unchanged).
-                            let observation = match intent.pre_push(sid) {
-                                Some(Observation::Known(prev)) => {
-                                    Observation::Known(ObservedGeneration {
-                                        generation: prev.generation.clone(),
-                                    })
-                                }
-                                _ => Observation::KnownAbsent,
-                            };
-                            (sid.clone(), SlotOutcome::Restored { observation })
-                        })
-                        .collect(),
-                );
-                let payload =
-                    crate::kernel::terminal::FailedRolledBackTerminal::try_new(outcomes, &intent)
-                        .map_err(|e| Error::store(format!("append_transition: {e}")))?;
-                TerminalDisposition::FailedRolledBack(payload)
-            }
-            DeploymentStatus::Degraded => {
-                let degraded_outcomes: std::collections::BTreeMap<
-                    crate::identity::SlotId,
-                    SlotOutcome,
-                > = selected
-                    .iter()
-                    .map(|sid| {
-                        (
-                            sid.clone(),
-                            SlotOutcome::FailedAfterAdvance {
-                                observation: Observation::Known(ObservedGeneration {
-                                    generation: crate::identity::test_generation_id(sid.as_str()),
-                                }),
-                                error: Some("test failure".to_string()),
-                            },
-                        )
-                    })
-                    .collect();
-                let outcomes = NonEmptySlotTable::build(degraded_outcomes)
-                    .map_err(|e| Error::store(format!("append_transition outcomes: {e}")))?;
-                let payload = crate::kernel::terminal::DegradedTerminal::try_new(outcomes, &intent)
-                    .map_err(|e| Error::store(format!("append_transition: {e}")))?;
-                TerminalDisposition::Degraded(payload)
-            }
-        };
-        let terminal = crate::kernel::terminal::LedgerTerminal::new(
-            crate::remote::helper::now_rfc3339_ts(),
-            crate::kernel::terminal::intent_digest(&intent),
-            disposition,
-            reason.map(str::to_string),
-        );
-        self.append_terminal(
-            &target,
-            &crate::identity::DeploymentId::new(id.to_string()),
-            &terminal,
-        )
-    }
-
-    /// TEST-ONLY: the target whose ledger holds a deployment id.
-    fn target_for(&self, id: &str) -> Result<String> {
-        for dir in self.target_names()? {
-            for e in self.read_ledger(&dir)? {
-                if e.deployment_id.as_str() == id {
-                    return Ok(dir);
-                }
-            }
-        }
-        Err(Error::store(format!(
-            "no ledger entry for deployment '{id}'"
-        )))
     }
 
     /// TEST-ONLY: every target directory name under `targets/`.

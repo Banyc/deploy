@@ -291,9 +291,9 @@ fn seed_history(store: &LocalStore, target: &str, prefix: &str, history: &[bool]
             let rel = crate::identity::test_release_id(&id).as_str().to_string();
             let tree = format!("tree-{id}");
             let matching_intent = success_intent_over(&id, target, &rel, &tree, head.as_ref());
-            store.append_intent(target, &matching_intent).unwrap();
+            store.test_append_intent(target, &matching_intent).unwrap();
             store
-                .append_terminal(
+                .test_append_terminal(
                     target,
                     matching_intent.deployment_id(),
                     &terminal_for(&matching_intent),
@@ -315,9 +315,9 @@ fn seed_history(store: &LocalStore, target: &str, prefix: &str, history: &[bool]
                 "p1",
                 head.as_ref(),
             );
-            store.append_intent(target, &it).unwrap();
+            store.test_append_intent(target, &it).unwrap();
             store
-                .append_terminal(target, it.deployment_id(), &failed_terminal(&it))
+                .test_append_terminal(target, it.deployment_id(), &failed_terminal(&it))
                 .unwrap();
         }
     }
