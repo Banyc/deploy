@@ -253,8 +253,8 @@ mod noop_tests {
     use crate::deploy::push::*;
     use crate::deploy::push::{PushOptions, push};
     use crate::deploy::testsupport::{
-        NONE_TOML, RecordingRemote, RecoveryHarness, known_artifact, push_clean, push_main_with_id,
-        snapshot_files,
+        NONE_TOML, RecordingRemote, RecoveryHarness, known_artifact, known_generation, push_clean,
+        push_main_with_id, snapshot_files,
     };
     use crate::identity::{SlotId, test_deployment_id};
     use crate::ledger::DeploymentStatus;
@@ -306,8 +306,8 @@ mod noop_tests {
             panic!("observed p1 must be a successful read");
         };
         assert_eq!(
-            Some(generation.clone()),
-            r1.attempt.as_ref().unwrap().slots[&SlotId::new("p1")].generation
+            known_generation(&r1.attempt.as_ref().unwrap().slots[&SlotId::new("p1")]).clone(),
+            generation.clone()
         );
     }
 
@@ -663,7 +663,7 @@ interval_seconds = 0
         let first_slot = &first_attempt.slots[&SlotId::new("p1")];
         assert_eq!(known_artifact(first_slot).variant.as_str(), "standard");
         let first_tree = known_artifact(first_slot).tree.clone();
-        let first_gen = first_slot.generation.clone().expect("generation minted");
+        let first_gen = known_generation(first_slot).clone();
         let argv1 = executed.lock().unwrap().clone();
         assert_eq!(argv1.len(), 1, "push 1 runs verification once: {argv1:?}");
         assert_eq!(
@@ -717,7 +717,7 @@ interval_seconds = 0
             first_tree,
             "both variants materialize the SAME tree bytes; only the variant differs"
         );
-        let second_gen = second_slot.generation.clone().expect("generation minted");
+        let second_gen = known_generation(second_slot).clone();
         assert_ne!(
             second_gen, first_gen,
             "the switch must mint a NEW generation, never reuse the standard one"

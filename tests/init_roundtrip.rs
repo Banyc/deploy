@@ -19,13 +19,20 @@ use deploy::remote::layout;
 use deploy::remote::transport::{LocalTransport, Remote};
 use deploy::store::local::LocalStore;
 
-/// The KNOWN artifact of a report actual ([`deploy::ledger::SlotAttemptState`]):
+/// The KNOWN artifact of a report actual ([`deploy::ledger::ActualSlotState::Observed`]):
 /// a successful push's actuals are always `Known`. Test code asserting on a
 /// real actual artifact unwraps the observation here.
-fn known_artifact(s: &deploy::ledger::SlotAttemptState) -> &deploy::identity::ArtifactRef {
-    match &s.artifact {
-        deploy::ledger::Observation::Known(a) => a,
-        other => panic!("expected a Known actual artifact, got {other:?}"),
+fn known_artifact(s: &deploy::ledger::ActualSlotState) -> &deploy::identity::ArtifactRef {
+    match s {
+        deploy::ledger::ActualSlotState::Observed { artifact, .. } => artifact,
+        other => panic!("expected an Observed actual, got {other:?}"),
+    }
+}
+
+fn known_generation(s: &deploy::ledger::ActualSlotState) -> &deploy::identity::GenerationId {
+    match s {
+        deploy::ledger::ActualSlotState::Observed { generation, .. } => generation,
+        other => panic!("expected an Observed actual, got {other:?}"),
     }
 }
 
@@ -197,7 +204,7 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
     let attempt = r.attempt.expect("attempt recorded");
     assert_eq!(attempt.slot_ids.len(), 1);
     let srv = &attempt.slots[&deploy::identity::SlotId::parse("app-1").unwrap()];
-    let generation = srv.generation.as_ref().expect("generation assigned");
+    let generation = known_generation(srv);
 
     // 6. Remote state: the local endpoint now carries the full layout, the
     // `current` symlink points at the new generation, and the mapped artifact

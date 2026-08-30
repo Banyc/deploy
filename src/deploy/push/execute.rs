@@ -11,7 +11,7 @@ use crate::deploy::push::PushContext;
 use crate::deploy::rollout::BatchRun;
 use crate::error::Result;
 use crate::identity::SlotId;
-use crate::ledger::SlotAttemptState;
+use crate::ledger::ActualSlotState;
 use crate::ledger::SlotResult;
 use crate::remote::helper::RemoteHelper;
 use crate::remote::transport::Remote;
@@ -39,11 +39,10 @@ pub(crate) struct ExecutionOutcome {
     /// Whether any slot failed during the mutation loop (the failure-path
     /// evidence; a successful yield feeds the finalizer's verification).
     pub had_failure: bool,
-    /// THE FAILURE EVIDENCE: whether every attempted mutation was restored
-    /// or never advanced (the kernel decides what that means).
-    pub everything_restored: bool,
-    /// The per-slot ACTUAL final state (read from the live remote generation).
-    pub actual_servers: BTreeMap<SlotId, SlotAttemptState>,
+    /// The per-slot ACTUAL final state (read from the live remote
+    /// generation) — the structural [`ActualSlotState`] per member slot
+    /// (a desired artifact NEVER rides an actual).
+    pub actual_servers: BTreeMap<SlotId, ActualSlotState>,
     /// The deployment-order slot list (step 17's per-slot retention runs in
     /// the same order).
     pub servers_order: Vec<SlotId>,
@@ -119,14 +118,15 @@ pub(crate) fn run_execution(
 
     // 13 & 14. The FAILURE-POLICY PASS lives in [`crate::deploy::rollout`]:
     // the step-13 compensation of still-advanced servers (RollbackChanged)
-    // and the GATHERED FAILURE EVIDENCE (whether every attempted mutation was
-    // restored or never advanced) — the STATUS DECISION IS THE KERNEL'S
-    // ([`crate::kernel::transition::decide_terminal`]); the engine gathers
-    // evidence only. The commit-marker step for an otherwise-successful
-    // attempt lives in the shared lock-verified finalizer
-    // ([`crate::ledger::finalize::finalize_successful_locked`]) at commit
-    // time.
-    let everything_restored = crate::deploy::rollout::apply_failure_policy(
+    // — the STATUS DECISION IS THE KERNEL'S
+    // ([`crate::kernel::transition::decide_terminal`] now DERIVES the
+    // rolled-back-vs-degraded disposition from the outcomes' derived
+    // transitions, so the engine no longer gathers an all_restored boolean);
+    // the engine gathers evidence only. The commit-marker step for an
+    // otherwise-successful attempt lives in the shared lock-verified
+    // finalizer ([`crate::ledger::finalize::finalize_successful_locked`]) at
+    // commit time.
+    crate::deploy::rollout::apply_failure_policy(
         had_failure,
         failure_policy,
         &outcome.assignments,
@@ -173,7 +173,6 @@ pub(crate) fn run_execution(
     Ok(ExecutionOutcome {
         results,
         had_failure,
-        everything_restored,
         actual_servers,
         servers_order,
     })
@@ -302,7 +301,7 @@ pub(crate) mod execute_tests {
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
         let prior =
             r1.attempt.as_ref().expect("attempt recorded").slots[&SlotId::new("p1")].clone();
-        let prior_gen = prior.generation.clone().expect("prior generation");
+        let prior_gen = known_generation(&prior).clone();
         let prior_tree = known_artifact(&prior).tree.clone();
         let prior_release = known_artifact(&prior).release.clone();
         // Behavior digest A (verification argv "true") frozen into s0.
@@ -396,7 +395,7 @@ pub(crate) mod execute_tests {
         // The report's ACTUAL per-slot state reflects the restored PRIOR
         // generation and artifact, never the desired v2 tree.
         let actual = &r2.attempt.as_ref().expect("attempt recorded").slots[&SlotId::new("p1")];
-        assert_eq!(actual.generation, Some(prior_gen.clone()));
+        assert_eq!(known_generation(actual), &prior_gen);
         assert_eq!(
             known_artifact(actual).tree,
             prior_tree,
@@ -1035,7 +1034,7 @@ interval_seconds = 0
         let r1 = h.push_head(&id1).unwrap();
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
         let prior = r1.attempt.as_ref().unwrap().slots[&SlotId::new("p1")].clone();
-        let prior_gen = prior.generation.clone().expect("prior generation");
+        let prior_gen = known_generation(&prior).clone();
         let prior_tree = known_artifact(&prior).tree.clone();
         let prior_release = known_artifact(&prior).release.clone();
         let remote =
@@ -1084,7 +1083,7 @@ interval_seconds = 0
         // The report's ACTUAL per-slot state reflects the restored PRIOR
         // generation and artifact, never the desired v2 tree.
         let actual = &r2.attempt.as_ref().expect("attempt recorded").slots[&SlotId::new("p1")];
-        assert_eq!(actual.generation, Some(prior_gen.clone()));
+        assert_eq!(known_generation(actual), &prior_gen);
         assert_eq!(
             known_artifact(actual).tree,
             prior_tree,
@@ -1187,14 +1186,26 @@ interval_seconds = 0
     }
 
     #[test]
-    fn activation_failure_compensation_failure_is_degraded_not_rolled_back() {
+    fn activation_failure_compensation_failure_is_rolled_back_by_the_derived_evidence() {
         // Same scenario, but the marker is NEVER consumed (`once = false`):
         // the desired activation fails AND the compensation's prior-activation
-        // restart fails too. requirement.md step 13 pins the contract: "If all
-        // compensation succeeds, mark the attempt failed_rolled_back;
-        // otherwise mark it degraded and retain the actual mixed per-server
-        // state." A failed compensation must therefore end `Degraded`, never a
-        // falsely clean `FailedRolledBack`.
+        // restart fails too. The in-process compensation records the failure
+        // WITHOUT `compensated` (the per-server pipeline could not fully
+        // restore the prior service) — an uncompensated `Failed` outcome. The
+        // kernel's DERIVED disposition rule
+        // ([`crate::kernel::transition::decide_terminal`]) classifies from
+        // the outcome evidence, never a stored boolean: rolled-back iff NO
+        // outcome has an `Advanced` transition (no slot PROVABLY ON the new
+        // state). This slot's outcome derives `AdvanceUnknown` — the
+        // compensation swap-back DID move `current` back to the prior
+        // generation, so it is NOT provably on the new state — and the
+        // attempt therefore ends `FailedRolledBack`, with the uncompensated
+        // `Failed` outcome visible in the rolled-back terminal's compensation
+        // report ("which compensations failed"). This is a pure-policy edge
+        // where the old `all_restored` boolean (compensation count — DSL
+        // "otherwise mark it degraded") disagreed with the outcome evidence;
+        // the structural evidence is authoritative now (requirement.md step
+        // 13 updated to the derived rule).
         let env_dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let marker = env_dir.path().join("fail-restart");
         // Hermetic env: the fake systemctl and its markers ride the snapshot's
@@ -1205,10 +1216,8 @@ interval_seconds = 0
         let id1 = test_deployment_id("deploy-act-compfail-baseline");
         let r1 = h.push_head(&id1).unwrap();
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
-        let prior_gen = r1.attempt.as_ref().unwrap().slots[&SlotId::new("p1")]
-            .generation
-            .clone()
-            .expect("prior generation");
+        let prior_gen =
+            known_generation(&r1.attempt.as_ref().unwrap().slots[&SlotId::new("p1")]).clone();
         let prior_tree = known_artifact(&r1.attempt.as_ref().unwrap().slots[&SlotId::new("p1")])
             .tree
             .clone();
@@ -1228,8 +1237,8 @@ interval_seconds = 0
         let r2 = h.push_head(&id2).unwrap();
         assert_eq!(
             r2.status,
-            Some(DeploymentStatus::Degraded),
-            "a failed compensation must end Degraded (docs: 'otherwise mark it degraded'), got {:?}",
+            Some(DeploymentStatus::FailedRolledBack),
+            "the derived rule sees no slot PROVABLY ON the new state (the compensation swap-back moved current to the prior generation), so the attempt is rolled back, got {:?}",
             r2.status
         );
         assert!(
@@ -1248,11 +1257,12 @@ interval_seconds = 0
             "the failed compensation must not be recorded as compensated"
         );
 
-        // The attempt is terminal Degraded and produced no snapshot; s0 is
-        // untouched.
+        // The attempt is terminal FailedRolledBack (the uncompensated Failed
+        // outcome rides the rolled-back terminal's compensation report) and
+        // produced no snapshot; s0 is untouched.
         assert_eq!(
             h.store.latest_status(id2.as_str()).unwrap(),
-            Some(DeploymentStatus::Degraded)
+            Some(DeploymentStatus::FailedRolledBack)
         );
         let snapshots = h.store.read_snapshots("t1").unwrap();
         assert_eq!(snapshots.len(), 1, "only the baseline snapshot exists");
@@ -1385,10 +1395,9 @@ interval_seconds = 0
         // The baseline's REAL live generation: the generation the prior
         // observed record carried (an unreadable assignment must fall back to
         // it, not to a fabricated/unknown marker).
-        let gen1 = r1.attempt.as_ref().expect("attempt").slots[&SlotId::new("p1")]
-            .generation
-            .clone()
-            .expect("baseline generation");
+        let gen1 =
+            known_generation(&r1.attempt.as_ref().expect("attempt").slots[&SlotId::new("p1")])
+                .clone();
 
         // Corrupt the live generation's assignment record on the remote.
         let remote =

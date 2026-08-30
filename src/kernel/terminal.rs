@@ -39,14 +39,15 @@ pub struct FailedRolledBackTerminal {
 
 impl FailedRolledBackTerminal {
     /// VALIDATE "every attempted mutation restored or never advanced": no
-    /// outcome may show a slot PROVABLY ON the new state (`Advanced`
-    /// transition — a slot still on the deployed generation is never a
-    /// rolled-back slot). A pre-swap failure (an uncompensated failure —
-    /// the attempt never advanced the slot) and a restored slot are both
-    /// legitimate members of a rolled-back terminal.
+    /// outcome may show a slot PROVABLY ON the new state (a DERIVED
+    /// `Advanced` transition — [`SlotOutcome::transition`] — a slot still
+    /// on the deployed generation is never a rolled-back slot). A pre-swap
+    /// failure (an uncompensated failure — the attempt never advanced the
+    /// slot) and a restored slot are both legitimate members of a rolled-
+    /// back terminal.
     pub fn try_new(outcomes: SlotTable<SlotOutcome>) -> KernelResult<Self> {
         for (slot, o) in outcomes.iter() {
-            if o.transition == crate::ledger::records::SlotTransition::Advanced {
+            if o.transition() == crate::ledger::records::SlotTransition::Advanced {
                 return Err(KernelError::integrity(format!(
                     "a FailedRolledBack terminal cannot carry slot '{slot}' with an Advanced outcome — every attempted mutation must be restored or never advanced"
                 )));
@@ -70,15 +71,16 @@ pub struct DegradedTerminal {
 impl DegradedTerminal {
     /// VALIDATE "nonempty, at least one non-restored/unknown result": the
     /// table is non-empty by TYPE, and at least one outcome is NOT a clean
-    /// restoration — an outcome kind other than `Restored` (a slot still
-    /// changed or with an unknown advance outcome), or an `Unknown`
-    /// observation (a failed post-mutation read is uncertain, so it is
-    /// always a remaining change). An all-restored outcome set is a
-    /// `FailedRolledBack`, never a `Degraded`.
+    /// restoration — an outcome variant other than
+    /// [`SlotOutcome::Restored`] (a slot still changed or with an unknown
+    /// advance outcome), or an `Unknown` observation (a failed post-mutation
+    /// read is uncertain, so it is always a remaining change). An
+    /// all-restored outcome set is a `FailedRolledBack`, never a
+    /// `Degraded`.
     pub fn try_new(outcomes: NonEmptySlotTable<SlotOutcome>) -> KernelResult<Self> {
         let has_remaining = outcomes.iter().any(|(_, o)| {
-            o.outcome != crate::ledger::records::SlotOutcomeKind::Restored
-                || matches!(o.observation, Observation::Unknown(_))
+            !matches!(o, crate::ledger::records::SlotOutcome::Restored { .. })
+                || matches!(o.observation(), Observation::Unknown(_))
         });
         if !has_remaining {
             return Err(KernelError::integrity(
@@ -284,7 +286,7 @@ impl LedgerTerminal {
             crate::ledger::records::Observation<crate::ledger::records::ObservedGeneration>,
         > = crate::ledger::records::SlotTable::new();
         for (sid, r) in dt.outcomes().iter() {
-            let is_change = match r.transition {
+            let is_change = match r.transition() {
                 crate::ledger::records::SlotTransition::NeverAdvanced
                 | crate::ledger::records::SlotTransition::Restored => false,
                 crate::ledger::records::SlotTransition::Advanced => true,
@@ -295,7 +297,7 @@ impl LedgerTerminal {
                         }
                         _ => None,
                     });
-                    match &r.observation {
+                    match r.observation() {
                         crate::ledger::records::Observation::Known(og) => {
                             let obs = og.generation.clone();
                             match (Some(obs), pre) {
@@ -310,7 +312,7 @@ impl LedgerTerminal {
                 }
             };
             if is_change {
-                remaining.insert(sid.clone(), r.observation.clone());
+                remaining.insert(sid.clone(), r.observation().clone());
             }
         }
         Some(remaining)

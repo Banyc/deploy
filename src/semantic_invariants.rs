@@ -81,7 +81,6 @@ use crate::identity::{
 use crate::ledger;
 use crate::ledger::DeploymentStatus;
 use crate::ledger::LedgerEntry;
-use crate::ledger::SlotOutcomeKind;
 use crate::remote::helper::{GenerationAssignment, LockRecord, RemoteHelper};
 use crate::remote::layout;
 use crate::remote::transport::{
@@ -2236,10 +2235,9 @@ fn identity_artifact_component_change_prevents_noop() {
     // never proceed, and certainly never no-op.
     let f = Fixture::new();
     let r1 = f.push("t1").expect("push v1");
-    let first_tree = match &r1.attempt.as_ref().expect("attempt").slots[&SlotId::new("p1")].artifact
-    {
-        crate::ledger::Observation::Known(a) => a.tree.clone(),
-        other => panic!("a successful push's actual artifact is Known, got {other:?}"),
+    let first_tree = match &r1.attempt.as_ref().expect("attempt").slots[&SlotId::new("p1")] {
+        crate::ledger::ActualSlotState::Observed { artifact, .. } => artifact.tree.clone(),
+        other => panic!("a successful push's actual is Observed, got {other:?}"),
     };
     f.apply(Action::Build(2));
     f.push("t1").expect("push v2 (current is now T2)");
@@ -3201,6 +3199,15 @@ fn observed_scope_pre_swap_failure_keeps_prior_record_untouched() {
 // bounded 16-case property (both supported policies x every batch position,
 // fixed seed 0x5EED_5EED).
 
+/// The wire-visible `compensated` fact of a structural outcome (only
+/// `Failed` carries it; every other variant is uncompensated).
+fn compensated_of(o: &crate::ledger::SlotOutcome) -> bool {
+    match o {
+        crate::ledger::SlotOutcome::Failed { compensated, .. } => *compensated,
+        _ => false,
+    }
+}
+
 /// Drive one failure-position case: baseline push (tree v1) on both `t1`
 /// slots, then a real push (tree v2) whose batch `position` fails pre-swap,
 /// then assert the policy's postconditions on the live remote generations,
@@ -3258,18 +3265,41 @@ fn run_failure_position_case(policy: FailurePolicy, position: usize) {
     // they mirror the generations asserted below.
     let observed = f.store.read_observed("t1", &f.config).unwrap();
 
-    // The terminal status per policy.
+    // The terminal status per policy — THE DERIVED DISPOSITION RULE
+    // ([`crate::kernel::transition::decide_terminal`]) owns the
+    // classification from the outcomes' DERIVED transitions: rolled-back
+    // iff NO outcome has an `Advanced` transition (a slot PROVABLY ON the
+    // new state). Under `RollbackChanged` every advanced server was
+    // compensated (or nothing had advanced) — no `Advanced` outcome →
+    // `FailedRolledBack`. Under `LeaveChanged` the RETAINED advances stay on
+    // the new state (`Advanced` outcomes) → `Degraded` — EXCEPT a failure at
+    // batch 0 (NOTHING advanced: the failing slot never swapped and the
+    // later batches were skipped) whose evidence carries no `Advanced`
+    // outcome → `FailedRolledBack` (a pure-policy edge where the old
+    // all_restored boolean — unconditionally false under leave_changed —
+    // disagreed with the outcome evidence; the structural evidence is
+    // authoritative now).
     match policy {
         FailurePolicy::RollbackChanged => assert_eq!(
             status,
             DeploymentStatus::FailedRolledBack,
             "rollback_changed: every advanced server was compensated"
         ),
-        FailurePolicy::LeaveChanged => assert_eq!(
-            status,
-            DeploymentStatus::Degraded,
-            "leave_changed: a failing batch always ends Degraded"
-        ),
+        FailurePolicy::LeaveChanged => {
+            if position == 0 {
+                assert_eq!(
+                    status,
+                    DeploymentStatus::FailedRolledBack,
+                    "leave_changed with a batch-0 pre-swap failure: NOTHING advanced, so the evidence carries no Advanced transition → rolled back"
+                );
+            } else {
+                assert_eq!(
+                    status,
+                    DeploymentStatus::Degraded,
+                    "leave_changed retains the earlier advances (Advanced outcomes) → degraded"
+                );
+            }
+        }
     }
     assert_eq!(
         terminal.status(),
@@ -3309,15 +3339,14 @@ fn run_failure_position_case(policy: FailurePolicy, position: usize) {
             (FailurePolicy::RollbackChanged, std::cmp::Ordering::Less) => {
                 // POSTCONDITION: rolled back to the pre-push generation.
                 assert_eq!(live, &baseline[sid], "slot {sid} must be compensated back");
-                assert_eq!(
-                    out.outcome,
-                    SlotOutcomeKind::Restored,
+                assert!(
+                    matches!(out, crate::ledger::SlotOutcome::Restored { .. }),
                     "slot {sid}: compensation upgrades the outcome to Restored"
                 );
-                assert!(
-                    out.compensated,
-                    "slot {sid}: the ledger marks the restoration"
-                );
+                // The compensation mark IS the structural `Restored` variant
+                // (the wire's separate `compensated` flag is only carried by
+                // `Failed` in the structural model — a `Restored` outcome
+                // IS a compensated restoration).
             }
             (FailurePolicy::LeaveChanged, std::cmp::Ordering::Less) => {
                 // POSTCONDITION: stays at the NEW generation.
@@ -3325,12 +3354,11 @@ fn run_failure_position_case(policy: FailurePolicy, position: usize) {
                     live, &baseline[sid],
                     "slot {sid}: leave_changed retains the advance (tree v2)"
                 );
-                assert_eq!(
-                    out.outcome,
-                    SlotOutcomeKind::Activated,
+                assert!(
+                    matches!(out, crate::ledger::SlotOutcome::Activated { .. }),
                     "slot {sid}: the advance is retained"
                 );
-                assert!(!out.compensated, "slot {sid}: no compensation pass ran");
+                assert!(!compensated_of(out), "slot {sid}: no compensation pass ran");
             }
             // The failed batch k itself.
             (_, std::cmp::Ordering::Equal) => {
@@ -3340,26 +3368,24 @@ fn run_failure_position_case(policy: FailurePolicy, position: usize) {
                     live, &baseline[sid],
                     "slot {sid}: the failed batch never advanced"
                 );
-                assert_eq!(
-                    out.outcome,
-                    SlotOutcomeKind::Failed,
+                assert!(
+                    matches!(out, crate::ledger::SlotOutcome::Failed { .. }),
                     "slot {sid}: batch {position} is recorded failed"
                 );
                 assert!(
-                    !out.compensated,
+                    !compensated_of(out),
                     "slot {sid}: a pre-swap failure is not compensated"
                 );
             }
             // Batches after the failed batch: skipped under stop_on_failure.
             (_, std::cmp::Ordering::Greater) => {
                 assert_eq!(live, &baseline[sid], "slot {sid}: skipped, untouched");
-                assert_eq!(
-                    out.outcome,
-                    SlotOutcomeKind::Skipped,
+                assert!(
+                    matches!(out, crate::ledger::SlotOutcome::Skipped { .. }),
                     "slot {sid}: the later batch is skipped"
                 );
                 assert!(
-                    !out.compensated,
+                    !compensated_of(out),
                     "slot {sid}: skipped slots are not compensated"
                 );
             }
@@ -3379,7 +3405,11 @@ fn failure_policy_rollback_changed_rolls_back_earlier_batches() {
 
 /// The `leave_changed` postcondition (deterministic): earlier batches stay
 /// at the NEW state after a later batch fails (`Degraded`, no compensation
-/// pass); a failure at batch 0 (nothing earlier) also ends `Degraded`.
+/// pass). A failure at batch 0 (NOTHING advanced — a pre-swap failure, the
+/// later batches skipped) carries no Advanced outcome under the DERIVED
+/// disposition rule, so it ends `FailedRolledBack` instead (a pure-policy
+/// edge: the old leave_changed boolean said Degraded unconditionally, the
+/// structural evidence says nothing was left on the new state).
 #[test]
 fn failure_policy_leave_changed_retains_earlier_batches() {
     run_failure_position_case(FailurePolicy::LeaveChanged, 1);
@@ -3402,8 +3432,10 @@ proptest! {
     // policy and every batch position of the multi-server fixture push, a
     // fault at that position must leave exactly the policy's postcondition —
     // `RollbackChanged` rolls earlier batches back to their pre-push state
-    // (ledger shows the restoration, attempt `FailedRolledBack`),
-    // `LeaveChanged` keeps them at the new state (`Degraded`). Bounded
+    // (ledger shows the restoration, attempt `FailedRolledBack`);
+    // `LeaveChanged` keeps them at the new state (`Degraded`) EXCEPT a
+    // batch-0 failure (nothing advanced — the DERIVED rule sees no Advanced
+    // transition and rolls back). Bounded
     // `proptest_cases(16)` (full 16 with `DEPLOY_FULL_TESTS=1`, fast
     // default), fixed seed 0x5EED_5EED (house style), no persistence — the
     // identical vectors on every run; each case drives its OWN fixture

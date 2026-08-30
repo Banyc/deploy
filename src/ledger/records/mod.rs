@@ -1,7 +1,7 @@
 //! THE LEDGER RECORD MODEL — the wire + domain record shapes of the
 //! deployment ledger (feature area A2: Ledger semantics), one cohesive
 //! feature GROUP DIRECTORY, recursively nested by relatedness: the SHARED
-//! core record shapes live in this module ([`SlotAttemptState`] /
+//! core record shapes live in this module ([`ActualSlotState`] /
 //! [`DeploymentStatus`]), the LEDGER LINE + ENTRY facets live in `wire`
 //! (intent, terminal, outcomes, the merged entry), the RECORD-VALIDATION
 //! facets live in `validation` (rollback payload, rebinding proof,
@@ -9,7 +9,7 @@
 //! THREE-STATE observation lives in `observation`.
 //!
 //! The SHARED core comes first — the deployment-record fields
-//! ([`SlotAttemptState`] / [`DeploymentStatus`]), the ROLLBACK records
+//! ([`ActualSlotState`] / [`DeploymentStatus`]), the ROLLBACK records
 //! ([`TargetSnapshot`] / [`SnapshotEntry`] / [`PhysicalBinding`] /
 //! [`CompleteRollback`]), the PLAN/report records ([`BehaviorIndex`],
 //! [`SlotPlan`], [`DeploymentPlanWire`] / [`DeploymentPlan`], [`PlanSource`] /
@@ -219,23 +219,38 @@ impl DeploymentStatus {
     }
 }
 
-/// A per-slot assignment snapshot: the artifact a slot runs (or planned to
-/// run) plus the generation it is bound to. `generation` is `None` when the
-/// slot's server was never started (e.g. skipped after an earlier failure
-/// under `stop_on_failure`), or when only the pre-push state is unknown.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SlotAttemptState {
-    /// The slot's assignment as a THREE-STATE observation
-    /// ([`Observation<ArtifactRef>`]): `Known(artifact)` is a real artifact
-    /// read from the remote, `KnownAbsent` carries no artifact, and
-    /// `Unknown(error)` preserves the read failure. An unknown assignment is
-    /// a DISTINCT value — never a valid-looking [`ArtifactRef`] (there is no
-    /// sentinel artifact: an `ArtifactRef` always means a known artifact).
-    pub artifact: Observation<ArtifactRef>,
-    /// The generation this slot actually advanced to. `None` when the slot's
-    /// server was never started (e.g. skipped after an earlier failure under
-    /// `stop_on_failure`), or when only the pre-push state is unknown.
-    pub generation: Option<GenerationId>,
+/// The ACTUAL per-slot state of a deployment attempt — the observed state
+/// of each member slot AFTER the mutation loop (the report's in-memory
+/// display actuals). One variant per REAL observation — a desired artifact
+/// NEVER appears inside an "actual" value unless the remote was observed
+/// carrying it: `Observed` (a successful status + assignment read), `Absent`
+/// (a successful observation of NO state — never deployed, or rotated away;
+/// NOT the desired artifact), `Unknown` (a FAILED read — the preserved
+/// error, with the generation hint when the status read succeeded but the
+/// assignment read failed), or `NotAttempted` (a member slot the deployment
+/// never started). NO serde derive (strict wire types only deserialize; the
+/// report's `slots` map is in-memory display only).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ActualSlotState {
+    /// A successful status + assignment read: the slot runs this artifact at
+    /// this generation.
+    Observed {
+        artifact: ArtifactRef,
+        generation: GenerationId,
+    },
+    /// A successful status read showing NO state (never deployed, or
+    /// rotated away).
+    Absent,
+    /// A failed read: the preserved error, plus the generation hint when
+    /// the status read succeeded but the assignment read failed. The error
+    /// NEVER looks like a known state (there is no sentinel artifact).
+    Unknown {
+        error: ObservationError,
+        generation: Option<GenerationId>,
+    },
+    /// A member slot the deployment did not attempt (never started — e.g.
+    /// never reached under `stop_on_failure`).
+    NotAttempted,
 }
 
 /// The complete PHYSICAL binding of one placement slot at terminal time: the
@@ -1240,26 +1255,22 @@ mod tests {
         let mut outcomes = BTreeMap::new();
         outcomes.insert(
             keys[0].clone(),
-            SlotOutcome {
-                outcome: SlotOutcomeKind::Failed,
+            SlotOutcome::Failed {
                 observation: Observation::Known(ObservedGeneration {
                     generation: test_generation_id("g0"),
                 }),
                 compensated: false,
                 error: None,
-                transition: SlotTransition::AdvanceUnknown,
             },
         );
         outcomes.insert(
             keys[1].clone(),
-            SlotOutcome {
-                outcome: SlotOutcomeKind::Failed,
+            SlotOutcome::Failed {
                 observation: Observation::Known(ObservedGeneration {
                     generation: test_generation_id("g1"),
                 }),
                 compensated: false,
                 error: None,
-                transition: SlotTransition::AdvanceUnknown,
             },
         );
         let non_empty = NonEmptySlotTable::build(outcomes).unwrap();

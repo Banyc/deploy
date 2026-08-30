@@ -9,8 +9,7 @@ use crate::error::Result;
 use crate::identity::{DeploymentId, RolloutGroupName, SlotId, TargetName};
 use crate::kernel;
 use crate::kernel::intent::{PlanInput, PlannedDeploy};
-use crate::kernel::snapshot::{PreviousGeneration, SnapshotSlot};
-use crate::ledger::Observation;
+use crate::kernel::snapshot::SnapshotSlot;
 use crate::ledger::TargetSnapshot;
 
 /// The intent built by [`persist_intent`] before the append.
@@ -60,7 +59,11 @@ pub(crate) fn persist_intent(
             })?;
         let generation = outcome.new_gen[&a.placement_slot].clone();
         let result = SnapshotSlot::new(generation, a.artifact.clone(), binding);
-        let pre_push = pre_push_observation(&a.placement_slot, &outcome.pre_push);
+        // The intent's pre-push observation IS the map entry — the preflight
+        // built it DIRECTLY as `Observation<PreviousGeneration>` (from the
+        // live status/assignment reads), so there is no intermediate
+        // re-conversion to lose or re-wrap.
+        let pre_push = outcome.pre_push[&a.placement_slot].clone();
         planned.push(PlannedDeploy {
             slot: a.placement_slot.clone(),
             result,
@@ -129,27 +132,4 @@ pub(crate) fn persist_intent(
 
     store.append_intent(target_name, &attempt_intent)?;
     Ok(attempt_intent)
-}
-
-/// The observed pre-push state of one selected slot, as the kernel's
-/// three-state [`Observation<PreviousGeneration>`]: `Known` prior
-/// generation (with its artifact), `KnownAbsent` (never deployed), or
-/// `Unknown(error)` (the read failed).
-fn pre_push_observation(
-    sid: &SlotId,
-    pre_push: &std::collections::BTreeMap<SlotId, Option<crate::ledger::SlotAttemptState>>,
-) -> Observation<PreviousGeneration> {
-    match pre_push.get(sid).and_then(|p| p.clone()) {
-        None => Observation::KnownAbsent,
-        Some(state) => match (state.artifact, state.generation) {
-            (Observation::Known(artifact), Some(generation)) => {
-                Observation::Known(PreviousGeneration {
-                    generation,
-                    artifact,
-                })
-            }
-            (Observation::KnownAbsent, _) | (_, None) => Observation::KnownAbsent,
-            (Observation::Unknown(e), _) => Observation::Unknown(e),
-        },
-    }
 }

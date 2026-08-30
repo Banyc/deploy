@@ -630,19 +630,29 @@ fn print_report(report: &PushReport) {
     }
     if let Some(attempt) = &report.attempt {
         for (slot_id, s) in &attempt.slots {
-            // The actual artifact is an observation: render a `Known`
-            // artifact, and a non-`Known` actual explicitly rather than
-            // printing a fabricated variant/tree.
-            let artifact = match &s.artifact {
-                crate::ledger::Observation::Known(a) => {
-                    format!("variant={} tree={}", a.variant, a.tree)
-                }
-                crate::ledger::Observation::KnownAbsent => "artifact=known_absent".to_string(),
-                crate::ledger::Observation::Unknown(e) => {
-                    format!("artifact=unknown ({})", e.message)
+            // The actual is a structural state: render `Observed` as its
+            // artifact + generation, `Absent` / `NotAttempted` explicitly
+            // (never a fabricated artifact), and `Unknown` with the
+            // preserved error (+ the generation hint when the status read
+            // succeeded).
+            let line = match s {
+                crate::ledger::ActualSlotState::Observed {
+                    artifact,
+                    generation,
+                } => format!(
+                    "variant={} tree={} generation={}",
+                    artifact.variant, artifact.tree, generation
+                ),
+                crate::ledger::ActualSlotState::Absent => "artifact=absent".to_string(),
+                crate::ledger::ActualSlotState::Unknown { error, generation } => match generation {
+                    Some(g) => format!("artifact=unknown ({}) generation={}", error.message, g),
+                    None => format!("artifact=unknown ({})", error.message),
+                },
+                crate::ledger::ActualSlotState::NotAttempted => {
+                    "artifact=not_attempted".to_string()
                 }
             };
-            println!("  {slot_id}  {artifact} generation={:?}", s.generation);
+            println!("  {slot_id}  {line}");
         }
     }
 }

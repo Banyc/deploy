@@ -1812,7 +1812,7 @@ pub(crate) mod fixtures {
     use crate::ledger::TargetSnapshot;
     use crate::ledger::records::{
         DegradedTerminal, LedgerTerminal, NonEmptySlotTable, Observation, PhysicalBinding,
-        SlotOutcome, SlotOutcomeKind, SlotTable, SlotTransition, TerminalDisposition,
+        SlotOutcome, SlotTable, TerminalDisposition,
     };
     use std::collections::BTreeMap;
 
@@ -1951,16 +1951,12 @@ pub(crate) mod fixtures {
                 .map(|sid| {
                     (
                         sid.clone(),
-                        SlotOutcome {
-                            outcome: SlotOutcomeKind::Restored,
+                        SlotOutcome::Restored {
                             observation: Observation::Known(
                                 crate::ledger::records::ObservedGeneration {
                                     generation: test_generation_id(sid.as_str()),
                                 },
                             ),
-                            compensated: true,
-                            error: None,
-                            transition: SlotTransition::Restored,
                         },
                     )
                 })
@@ -1987,8 +1983,7 @@ pub(crate) mod fixtures {
             .map(|sid| {
                 (
                     sid.clone(),
-                    SlotOutcome {
-                        outcome: SlotOutcomeKind::Failed,
+                    SlotOutcome::Failed {
                         observation: Observation::Known(
                             crate::ledger::records::ObservedGeneration {
                                 generation: test_generation_id(sid.as_str()),
@@ -1996,7 +1991,6 @@ pub(crate) mod fixtures {
                         ),
                         compensated: false,
                         error: Some("test failure".to_string()),
-                        transition: SlotTransition::AdvanceUnknown,
                     },
                 )
             })

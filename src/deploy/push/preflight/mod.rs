@@ -28,13 +28,13 @@ use crate::identity::ReleaseId;
 use crate::identity::SlotId;
 use crate::identity::TreeDigest;
 use crate::identity::VariantName;
+use crate::kernel::snapshot::PreviousGeneration;
 use crate::ledger;
 use crate::ledger::BehaviorIndex;
 use crate::ledger::DeploymentPlan;
 use crate::ledger::Observation;
 use crate::ledger::ObservationError;
 use crate::ledger::PushRef;
-use crate::ledger::SlotAttemptState;
 use crate::ledger::SlotPlan;
 use crate::ledger::recovery::reconcile_pending_commits;
 use crate::remote::canonical as tree;
@@ -103,8 +103,10 @@ pub(crate) struct PreflightOutcome {
     pub plan_servers: BTreeMap<SlotId, SlotPlan>,
     /// The freshly minted desired generation per planned slot.
     pub new_gen: HashMap<SlotId, GenerationId>,
-    /// The observed pre-push state per planned slot.
-    pub pre_push: BTreeMap<SlotId, Option<SlotAttemptState>>,
+    /// The observed pre-push state per planned slot — the intent's OWN
+    /// three-state observations ([`Observation<PreviousGeneration>`]), used
+    /// DIRECTLY (no intermediate re-wrap).
+    pub pre_push: BTreeMap<SlotId, Observation<PreviousGeneration>>,
     /// The plan persisted BEFORE any server mutation.
     pub plan: DeploymentPlan,
 }
@@ -498,7 +500,7 @@ pub(crate) fn run_preflight(
     // Build the per-slot plan with expected (pre-push) generation.
     let mut plan_servers: BTreeMap<SlotId, SlotPlan> = BTreeMap::new();
     let mut new_gen: HashMap<SlotId, GenerationId> = HashMap::new();
-    let mut pre_push: BTreeMap<SlotId, Option<SlotAttemptState>> = BTreeMap::new();
+    let mut pre_push: BTreeMap<SlotId, Observation<PreviousGeneration>> = BTreeMap::new();
     for a in &assignments {
         let slot_id = &a.placement_slot;
         let expected = statuses
@@ -519,31 +521,29 @@ pub(crate) fn run_preflight(
                 expected_tree,
             },
         );
+        // Record the slot's *actual* current assignment (read from the
+        // remote generation), not the desired one, DIRECTLY as the intent's
+        // three-state pre-push observation ([`Observation<PreviousGeneration>`]):
+        // `Known(PreviousGeneration { generation, artifact })` after a
+        // successful assignment read, `Unknown(error)` when the read fails (a
+        // DISTINCT value, never a valid-looking artifact — there is no
+        // sentinel artifact), and `KnownAbsent` when the status read showed
+        // no state (never deployed) — the same contract the post-push
+        // `actual_servers` refresh uses (see below).
         pre_push.insert(
             slot_id.clone(),
-            expected.as_ref().map(|g| {
-                // Record the slot's *actual* current assignment (read from the
-                // remote generation), not the desired one. When the live
-                // generation's assignment cannot be read (a missing or corrupt
-                // `assignment.json`), never substitute the planned (desired)
-                // artifact: preserve the observed generation and record the
-                // assignment as `Observation::Unknown(error)` — the same
-                // contract the post-push `actual_servers` refresh uses (see
-                // below). An unknown assignment is a DISTINCT value, never a
-                // valid-looking artifact (there is no sentinel artifact).
-                helpers[slot_id]
-                    .read_assignment(g.as_str())
-                    .map(|asn| SlotAttemptState {
-                        artifact: Observation::Known(asn.artifact.clone()),
-                        generation: Some(g.clone()),
-                    })
-                    .unwrap_or_else(|e| SlotAttemptState {
-                        artifact: Observation::Unknown(ObservationError {
-                            message: format!("assignment read failed: {e}"),
-                        }),
-                        generation: Some(g.clone()),
-                    })
-            }),
+            match expected {
+                Some(g) => match helpers[slot_id].read_assignment(g.as_str()) {
+                    Ok(asn) => Observation::Known(PreviousGeneration {
+                        generation: g,
+                        artifact: asn.artifact,
+                    }),
+                    Err(e) => Observation::Unknown(ObservationError {
+                        message: format!("assignment read failed: {e}"),
+                    }),
+                },
+                None => Observation::KnownAbsent,
+            },
         );
     }
 
@@ -1097,7 +1097,7 @@ pub(crate) mod preflight_tests {
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
         let s0 = &r1.attempt.as_ref().unwrap().slots[&SlotId::new("p1")];
         let s0_tree = known_artifact(s0).tree.clone();
-        let s0_gen = s0.generation.clone().expect("s0 generation");
+        let s0_gen = known_generation(s0).clone();
 
         let store_before = snapshot_files(h.store.base());
         let remotes_before = snapshot_files(&h.remotes_base);

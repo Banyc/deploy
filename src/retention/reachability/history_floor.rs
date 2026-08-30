@@ -87,10 +87,7 @@ use std::collections::BTreeSet;
 #[cfg(test)]
 use crate::identity::SlotId;
 #[cfg(test)]
-use crate::ledger::records::{
-    NonEmptySlotTable, Observation, ObservedGeneration, SlotOutcome, SlotOutcomeKind,
-    SlotTransition,
-};
+use crate::ledger::records::{NonEmptySlotTable, Observation, ObservedGeneration, SlotOutcome};
 #[cfg(test)]
 use crate::ledger::{
     DeploymentIntent, DeploymentStatus, LedgerTerminal, SlotResult, SlotTable, TerminalDisposition,
@@ -855,16 +852,12 @@ impl LocalStore {
                         .map(|sid| {
                             (
                                 sid.clone(),
-                                SlotOutcome {
-                                    outcome: SlotOutcomeKind::Restored,
+                                SlotOutcome::Restored {
                                     observation: Observation::Known(ObservedGeneration {
                                         generation: crate::identity::test_generation_id(
                                             sid.as_str(),
                                         ),
                                     }),
-                                    compensated: true,
-                                    error: None,
-                                    transition: SlotTransition::Restored,
                                 },
                             )
                         })
@@ -883,14 +876,12 @@ impl LocalStore {
                     .map(|sid| {
                         (
                             sid.clone(),
-                            SlotOutcome {
-                                outcome: SlotOutcomeKind::Failed,
+                            SlotOutcome::Failed {
                                 observation: Observation::Known(ObservedGeneration {
                                     generation: crate::identity::test_generation_id(sid.as_str()),
                                 }),
                                 compensated: false,
                                 error: None,
-                                transition: SlotTransition::AdvanceUnknown,
                             },
                         )
                     })

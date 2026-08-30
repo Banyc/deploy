@@ -305,9 +305,11 @@ impl From<&DeploymentIntent> for LedgerIntentWire {
 /// memory from the durable intent at push time and NEVER persisted: the
 /// ledger's intent line carries NO outcomes. The report is display-facing
 /// and keeps the split shape: the display `desired` map re-expands each
-/// SELECTED slot's result from the full slot table, the `pre_push` map
-/// re-expands the observed pre-push states, and the actuals are observed
-/// post-mutation states.
+/// SELECTED slot's result from the full slot table, the `pre_push` map is
+/// the intent's OWN observed pre-push observations (the three-state
+/// [`Observation<PreviousGeneration>`] — used DIRECTLY, never re-wrapped),
+/// and the actuals are the observed post-mutation states
+/// ([`ActualSlotState`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LedgerIntentReport {
     pub deployment_id: DeploymentId,
@@ -317,15 +319,19 @@ pub struct LedgerIntentReport {
     pub behavior_sha256: BehaviorDigest,
     pub attempted_at: Timestamp,
     pub desired: BTreeMap<SlotId, crate::identity::GenerationRef>,
-    pub pre_push: BTreeMap<SlotId, Option<crate::ledger::SlotAttemptState>>,
-    pub slots: BTreeMap<SlotId, crate::ledger::SlotAttemptState>,
+    pub pre_push: BTreeMap<SlotId, crate::ledger::Observation<PreviousGeneration>>,
+    pub slots: BTreeMap<SlotId, crate::ledger::ActualSlotState>,
 }
 
 impl LedgerIntentReport {
     /// Build the in-memory report from a verified domain intent, re-expanding
     /// the one full slot table into the display-facing split maps. The
     /// intent's values are already scalar-gated by the wire → domain
-    /// conversion, so no re-parsing is needed here.
+    /// conversion, so no re-parsing is needed here. The `pre_push` entries
+    /// come from the intent's OWN pre-push observations directly; the
+    /// `slots` map (the ACTUAL post-mutation states) starts EMPTY and is
+    /// overwritten by the engine's actuals (`observe_actual_servers`) — a
+    /// report never fabricates an actual that was not observed.
     pub fn from_intent(i: &DeploymentIntent) -> Result<LedgerIntentReport> {
         let slot_ids: Vec<SlotId> = i.selected().map(|(k, _)| k).collect();
         let desired: BTreeMap<SlotId, crate::identity::GenerationRef> = i
@@ -341,28 +347,14 @@ impl LedgerIntentReport {
                 )
             })
             .collect();
-        let pre_push: BTreeMap<SlotId, Option<crate::ledger::SlotAttemptState>> = i
+        let pre_push: BTreeMap<SlotId, crate::ledger::Observation<PreviousGeneration>> = i
             .selected()
             .map(|(k, p)| {
-                let state = match &p.action() {
-                    SlotAction::Deploy { pre_push } => match pre_push {
-                        crate::ledger::Observation::KnownAbsent => None,
-                        crate::ledger::Observation::Known(prev) => {
-                            Some(crate::ledger::SlotAttemptState {
-                                artifact: crate::ledger::Observation::Known(prev.artifact.clone()),
-                                generation: Some(prev.generation.clone()),
-                            })
-                        }
-                        crate::ledger::Observation::Unknown(e) => {
-                            Some(crate::ledger::SlotAttemptState {
-                                artifact: crate::ledger::Observation::Unknown(e.clone()),
-                                generation: None,
-                            })
-                        }
-                    },
-                    SlotAction::Inherit => None,
+                let obs = match &p.action() {
+                    SlotAction::Deploy { pre_push } => pre_push.clone(),
+                    SlotAction::Inherit => crate::ledger::Observation::KnownAbsent,
                 };
-                (k, state)
+                (k, obs)
             })
             .collect();
         Ok(LedgerIntentReport {

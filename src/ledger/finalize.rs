@@ -152,12 +152,7 @@ pub fn finalize_successful_locked(
     // `Successful` — payload-free; the result resolves from the intent.
     let disposition = crate::kernel::transition::decide_terminal(
         attempt,
-        crate::kernel::transition::ExecutionReport {
-            preflight_failed: false,
-            verified: true,
-            all_restored: true,
-            outcomes: crate::ledger::records::SlotTable::new(),
-        },
+        crate::kernel::transition::ExecutionReport::Verified,
     )
     .map_err(|e| Error::integrity(format!("finalize {}: {e}", attempt.deployment_id())))?;
     let terminal = LedgerTerminal::new(

@@ -30,7 +30,6 @@ use crate::ledger::LedgerIntentReport;
 use crate::ledger::LedgerTerminal;
 use crate::ledger::PushRef;
 use crate::ledger::RefExpr;
-use crate::ledger::TerminalDisposition;
 use crate::remote::helper::RemoteHelper;
 use crate::remote::transport::Remote;
 use crate::store::local::LocalStore;
@@ -547,14 +546,26 @@ pub(crate) fn push_inner(
         config,
     ) {
         // FailedPreflight terminal (empty outcomes — no slot was touched) +
-        // best-effort incoming cleanup, then the ORIGINAL error.
+        // best-effort incoming cleanup, then the ORIGINAL error. The engine
+        // NEVER constructs terminal variants itself — [`decide_terminal`]
+        // owns the truth table, so the preflight-failure path routes through
+        // it with the intent, exactly like every other disposition.
+        let disposition = crate::kernel::transition::decide_terminal(
+            &attempt_intent,
+            crate::kernel::transition::ExecutionReport::PreflightFailed,
+        )
+        .map_err(|e| {
+            Error::integrity(format!(
+                "push {deployment_id}: the kernel refused the preflight-failure disposition: {e}"
+            ))
+        })?;
         let _ = store.append_terminal(
             target_name,
             deployment_id,
             &LedgerTerminal::new(
                 crate::remote::helper::now_rfc3339_ts(),
                 crate::kernel::terminal::intent_digest(&attempt_intent),
-                TerminalDisposition::FailedPreflight,
+                disposition,
                 Some(failure.reason.to_string()),
             ),
         );
@@ -633,10 +644,7 @@ pub(crate) mod push_tests {
         let snap_p1 = rollback.get(&SlotId::new("p1")).unwrap();
         assert_eq!(
             snap_p1.generation().clone(),
-            actual
-                .generation
-                .clone()
-                .expect("a successful slot records its generation"),
+            known_generation(actual).clone(),
             "the snapshot's generation equals the observed actual generation"
         );
         assert_eq!(

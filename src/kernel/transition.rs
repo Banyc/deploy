@@ -74,9 +74,12 @@
 use crate::identity::{DeploymentId, SlotId, TargetName, Timestamp};
 use crate::kernel::error::{KernelError, KernelResult};
 use crate::kernel::intent::DeploymentIntent;
-use crate::kernel::terminal::{LedgerTerminal, TerminalDisposition};
+use crate::kernel::terminal::{
+    DegradedTerminal, FailedRolledBackTerminal, LedgerTerminal, TerminalDisposition,
+};
 use crate::ledger::LedgerEntry;
 use crate::ledger::records::DeploymentStatus;
+use crate::ledger::records::{NonEmptySlotTable, SlotOutcome, SlotTable, SlotTransition};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
@@ -578,23 +581,29 @@ pub fn validate_inherited_slots(
 
 /// The engine's gathered evidence, handed to [`decide_terminal`]: the
 /// engine GATHERS EVIDENCE (did preflight fail? were the selected slots
-/// verified at their planned result? on a failure, was every attempted
-/// mutation restored or never advanced? what per-slot outcomes remain?)
-/// and the kernel OWNS the truth table.
+/// verified at their planned result? what per-slot outcomes remain on a
+/// failure?) and the kernel OWNS the truth table. The mutually exclusive
+/// execution states are ENUM VARIANTS — never combinations of booleans
+/// (`{preflight_failed: true, verified: true}` was representable):
+/// `PreflightFailed` (no slot was touched), `Verified` (the selected slots
+/// were verified at their planned result), or `Failed { outcomes }` (the
+/// per-slot outcomes of a failed execution; NON-EMPTY — the failure
+/// outcomes always cover the selected membership).
 #[derive(Clone, Debug)]
-pub struct ExecutionReport {
+pub enum ExecutionReport {
     /// The attempt's preflight failed before any slot mutation.
-    pub preflight_failed: bool,
+    PreflightFailed,
     /// Execution succeeded AND the selected slots were verified at their
     /// planned result.
-    pub verified: bool,
-    /// On a failed execution: every attempted mutation was restored or
-    /// never advanced (the engine's failure-policy evidence; `leave_changed`
-    /// retentions and failed compensations leave something changed).
-    pub all_restored: bool,
-    /// The per-slot outcomes of a failed execution (restored /
-    /// never-advanced / remaining changes).
-    pub outcomes: crate::ledger::records::SlotTable<crate::ledger::records::SlotOutcome>,
+    Verified,
+    /// The attempt failed after mutating slots: the per-slot outcomes
+    /// (restored / never-advanced / remaining changes). The outcome keys
+    /// must EXACTLY equal the intent's selected membership (the kernel
+    /// validates that at decision time); the disposition is DERIVED from
+    /// the outcomes' derived transitions.
+    Failed {
+        outcomes: NonEmptySlotTable<SlotOutcome>,
+    },
 }
 
 /// THE COMPLETE TRUTH TABLE of the terminal decision — the ONLY place a
@@ -602,39 +611,64 @@ pub struct ExecutionReport {
 ///
 /// * preflight failed                → `FailedPreflight`
 /// * execution succeeded AND verified → `Successful`
-/// * failure and everything restored  → `FailedRolledBack`
-/// * anything remains changed/unknown → `Degraded`
+/// * failure with NO outcome still on the new state (every derived
+///   transition is `Restored` / `NeverAdvanced` / `AdvanceUnknown` — no
+///   slot `PROVABLY ON the new state`) → `FailedRolledBack`
+/// * anything still changed/unknown → `Degraded`
 ///
+/// The disposition is DERIVED from the outcomes' DERIVED transitions
+/// ([`SlotOutcome::transition`]) — a rolled-back decision requires NO
+/// outcome with an `Advanced` transition; anything with an `Advanced`
+/// outcome (a slot still on the deployed generation) is degraded. The
+/// intent is USED: the failed outcomes' keys must EXACTLY equal the
+/// intent's selected membership (a mismatch is an integrity refusal — the
+/// kernel owns this check at decision time; the existing
+/// [`validate_terminal_vs_intent`] stays as a terminal-append re-check).
 /// The outcome payloads are constructed ONLY through the validated
 /// constructors, so an impossible combination (a rolled-back terminal with
 /// an Advanced slot; a Degraded terminal with all-restored outcomes) is
 /// unrepresentable.
 pub fn decide_terminal(
-    _intent: &DeploymentIntent,
+    intent: &DeploymentIntent,
     report: ExecutionReport,
 ) -> KernelResult<TerminalDisposition> {
-    if report.preflight_failed {
-        return Ok(TerminalDisposition::FailedPreflight);
-    }
-    if report.verified {
-        return Ok(TerminalDisposition::Successful);
-    }
-    // Failed execution: everything restored or never advanced → rolled back;
-    // anything remaining → degraded.
-    if report.all_restored {
-        let payload = crate::kernel::terminal::FailedRolledBackTerminal::try_new(report.outcomes)?;
-        Ok(TerminalDisposition::FailedRolledBack(payload))
-    } else {
-        let non_empty = crate::ledger::NonEmptySlotTable::build(
-            report.outcomes.iter().map(|(k, v)| (k.clone(), v.clone())),
-        )
-        .map_err(|e| {
-            KernelError::invariant(format!(
-                "a degraded decision requires at least one outcome: {e}"
-            ))
-        })?;
-        let payload = crate::kernel::terminal::DegradedTerminal::try_new(non_empty)?;
-        Ok(TerminalDisposition::Degraded(payload))
+    match report {
+        ExecutionReport::PreflightFailed => Ok(TerminalDisposition::FailedPreflight),
+        ExecutionReport::Verified => Ok(TerminalDisposition::Successful),
+        ExecutionReport::Failed { outcomes } => {
+            // 1. THE KERNEL OWNS THE KEY-SET CHECK at decision time: the
+            // failed outcome keys must EXACTLY equal the intent's selected
+            // membership. (The existing [`validate_terminal_vs_intent`]
+            // stays as a terminal-append re-check.) A mismatch means the
+            // engine's evidence does not cover the attempt's plan — refuse
+            // with an integrity error, never decide on partial evidence.
+            let selected: BTreeSet<SlotId> = intent.selected_membership();
+            let keys: BTreeSet<SlotId> = outcomes.keys().cloned().collect();
+            if keys != selected {
+                return Err(KernelError::integrity(format!(
+                    "the failure outcomes cover slots {keys:?} but the intent's selected membership is {selected:?} — the failed evidence must EXACTLY cover the selected membership"
+                )));
+            }
+            // 2. DERIVE the disposition from the outcomes' DERIVED
+            // transitions (NO all_restored boolean): rolled-back iff NO
+            // outcome has transition() == Advanced — a slot PROVABLY ON the
+            // new state — otherwise degraded. `AdvanceUnknown` (a pre-swap
+            // failure) and `Restored` / `NeverAdvanced` outcomes are all
+            // legitimate members of a rolled-back terminal (matching
+            // [`FailedRolledBackTerminal::try_new`]'s own validator).
+            let rolled_back = !outcomes
+                .iter()
+                .any(|(_, o)| o.transition() == SlotTransition::Advanced);
+            if rolled_back {
+                let payload = FailedRolledBackTerminal::try_new(SlotTable::from_map(
+                    outcomes.clone().into_map(),
+                ))?;
+                Ok(TerminalDisposition::FailedRolledBack(payload))
+            } else {
+                let payload = DegradedTerminal::try_new(outcomes)?;
+                Ok(TerminalDisposition::Degraded(payload))
+            }
+        }
     }
 }
 
@@ -1339,6 +1373,169 @@ mod tests {
         #[test]
         fn strict_linear_ledger_matches_the_reference_model(steps in prop::collection::vec(step_strategy(), 1..=30)) {
             run_case(steps)
+        }
+    }
+
+    // ---- THE KERNEL DECISION PROPERTY (spec item 2 — the DECISION-TIME
+    // gate) ----------------------------------------------------------------
+    //
+    // Independent generators for the DECISION property: an arbitrary
+    // intent (arbitrary selected membership) and every constructible
+    // [`ExecutionReport`] shape — `PreflightFailed`, `Verified`, and
+    // `Failed { outcomes }` over exact-selected keys AND over mismatched
+    // keys. For every CONSTRUCTIBLE (accepted) report, [`decide_terminal`]
+    // produces EXACTLY ONE terminal whose disposition's outcome keys
+    // EXACTLY equal the intent's selected membership (the payload-free
+    // dispositions carry none, the failed dispositions carry exactly the
+    // selected set); mismatched-key failure reports are REFUSED with an
+    // integrity error.
+
+    /// An arbitrary NON-EMPTY selected membership (the intent's Deploy set).
+    fn selected_slots() -> impl Strategy<Value = Vec<SlotId>> {
+        prop::collection::btree_set((0u32..4).prop_map(|i| SlotId::new(format!("p{i}"))), 1..=3)
+            .prop_map(|s| s.into_iter().collect())
+    }
+
+    /// An arbitrary THREE-STATE post-mutation observation.
+    fn arbitrary_observation()
+    -> impl Strategy<Value = crate::ledger::Observation<crate::ledger::records::ObservedGeneration>>
+    {
+        prop_oneof![
+            Just(crate::ledger::Observation::KnownAbsent),
+            (0u32..3).prop_map(|i| crate::ledger::Observation::Known(
+                crate::ledger::records::ObservedGeneration {
+                    generation: test_generation_id(&format!("g-{i}")),
+                }
+            )),
+            prop::sample::select(vec![
+                "status read failed: boom".to_string(),
+                "assignment read failed: boom".to_string(),
+            ])
+            .prop_map(|m| crate::ledger::Observation::Unknown(
+                crate::ledger::records::ObservationError { message: m }
+            )),
+        ]
+    }
+
+    /// An arbitrary STRUCTURAL outcome: every variant (incl. both
+    /// compensated values and with/without an operation error on `Failed`).
+    fn arbitrary_outcome() -> impl Strategy<Value = SlotOutcome> {
+        (
+            prop_oneof![
+                2 => Just(0u8), // Activated
+                2 => Just(1u8), // Restored
+                2 => Just(2u8), // Skipped
+                4 => Just(3u8), // Failed
+            ],
+            arbitrary_observation(),
+            prop::bool::ANY,
+            prop::bool::ANY,
+        )
+            .prop_map(|(kind, observation, compensated, has_error)| match kind {
+                0 => SlotOutcome::Activated { observation },
+                1 => SlotOutcome::Restored { observation },
+                2 => SlotOutcome::Skipped { observation },
+                _ => SlotOutcome::Failed {
+                    observation,
+                    compensated,
+                    error: has_error.then(|| "boom".to_string()),
+                },
+            })
+    }
+
+    /// An arbitrary NON-EMPTY outcome table over an arbitrary key set (the
+    /// `Failed` report's evidence — generated INDEPENDENTLY of the selected
+    /// membership, so both exact-keys and mismatched-keys reports are
+    /// constructible).
+    fn arbitrary_outcome_table() -> impl Strategy<Value = BTreeMap<SlotId, SlotOutcome>> {
+        prop::collection::btree_set((0u32..4).prop_map(|i| SlotId::new(format!("p{i}"))), 1..=3)
+            .prop_flat_map(|keys| {
+                let n = keys.len();
+                prop::collection::vec(arbitrary_outcome(), n)
+                    .prop_map(move |outcomes| keys.iter().cloned().zip(outcomes).collect())
+            })
+    }
+
+    /// A FULL-PUSH intent over the given selected membership (fresh target,
+    /// group None — the selected set is the entire membership, so the
+    /// intent is valid for ANY non-empty selection).
+    fn full_intent(tag: &str, selected: &[SlotId]) -> DeploymentIntent {
+        let planned: Vec<PlannedDeploy> = selected
+            .iter()
+            .map(|sid| PlannedDeploy {
+                slot: sid.clone(),
+                result: crate::testutil::fixtures::snapshot_slot(sid),
+                pre_push: crate::ledger::Observation::KnownAbsent,
+            })
+            .collect();
+        crate::kernel::intent::plan(PlanInput {
+            deployment_id: test_deployment_id(tag),
+            target: target(),
+            parent: None,
+            parent_snapshot: None,
+            group: None,
+            selection: selected.to_vec(),
+            planned,
+            behavior_digest: crate::testutil::fixtures::behavior_digest(),
+            attempted_at: crate::identity::Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
+        })
+        .expect("a valid full-push intent plans over an arbitrary selection")
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: crate::testutil::proptest_cases(32),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+        #[test]
+        fn decide_terminal_uses_the_intent_and_derives_the_disposition(
+            selected in selected_slots(),
+            outcome_table in arbitrary_outcome_table(),
+            shape in 0u8..3,
+        ) {
+            let intent = full_intent("deploy-decide", &selected);
+            let selected_set: BTreeSet<SlotId> = selected.iter().cloned().collect();
+            match shape {
+                0 => {
+                    // PreflightFailed → FailedPreflight, payload-free.
+                    let d = decide_terminal(&intent, ExecutionReport::PreflightFailed).unwrap();
+                    prop_assert!(d.outcomes().is_empty());
+                    prop_assert_eq!(d, TerminalDisposition::FailedPreflight);
+                }
+                1 => {
+                    // Verified → Successful, payload-free.
+                    let d = decide_terminal(&intent, ExecutionReport::Verified).unwrap();
+                    prop_assert!(d.outcomes().is_empty());
+                    prop_assert_eq!(d, TerminalDisposition::Successful);
+                }
+                _ => {
+                    // Failed { outcomes }: exact selected keys are ACCEPTED
+                    // (the disposition's outcome keys EXACTLY equal the
+                    // selected membership); mismatched keys are REFUSED.
+                    let keys: BTreeSet<SlotId> = outcome_table.keys().cloned().collect();
+                    let table = NonEmptySlotTable::build(outcome_table).expect("non-empty table");
+                    if keys == selected_set {
+                        let d = decide_terminal(
+                            &intent,
+                            ExecutionReport::Failed { outcomes: table },
+                        )
+                        .unwrap();
+                        let dkeys: BTreeSet<SlotId> = d.outcomes().keys().cloned().collect();
+                        prop_assert_eq!(
+                            dkeys, selected_set,
+                            "the decided terminal's outcome keys must EXACTLY equal the intent's selected membership"
+                        );
+                    } else {
+                        prop_assert!(
+                            decide_terminal(&intent, ExecutionReport::Failed { outcomes: table })
+                                .is_err(),
+                            "a failure report whose outcome keys do not exactly match the selected membership must be refused with an integrity error"
+                        );
+                    }
+                }
+            }
         }
     }
 }

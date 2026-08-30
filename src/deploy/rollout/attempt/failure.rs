@@ -50,7 +50,7 @@ use std::collections::HashMap;
 pub(crate) fn apply_failure_policy(
     had_failure: bool,
     failure_policy: FailurePolicy,
-    assignments: &[PlannedAssignment],
+    _assignments: &[PlannedAssignment],
     members: &[(&SlotConfig, &ServerDef)],
     config: &ProjectConfig,
     target_name: &str,
@@ -64,7 +64,7 @@ pub(crate) fn apply_failure_policy(
     advanced: &mut Vec<SlotId>,
     compensated: &mut Vec<SlotId>,
     results: &mut BTreeMap<SlotId, SlotResult>,
-) -> Result<bool> {
+) -> Result<()> {
     // 13. Failure policy compensation of still-advanced servers. The policy
     // is matched EXHAUSTIVELY (no `_ =>` fallback, no string compare):
     //
@@ -118,26 +118,15 @@ pub(crate) fn apply_failure_policy(
         }
     }
 
-    // 14. GATHER THE FAILURE EVIDENCE (the STATUS DECISION IS THE KERNEL'S
-    // — [`crate::kernel::transition::decide_terminal`] owns the complete
-    // truth table; the engine only reports whether every attempted mutation
-    // was restored or never advanced): under `RollbackChanged` every
-    // advanced server was compensated (or nothing had advanced) — i.e. the
-    // failure left nothing changed; under `LeaveChanged` the advances are
-    // retained deliberately, so something remains changed. A push with NO
-    // failure returns `true` (the success decision is the finalizer's
-    // verification evidence).
-    let everything_restored = if !had_failure {
-        true
-    } else {
-        match failure_policy {
-            FailurePolicy::RollbackChanged => {
-                compensated.len() == assignments.len() || advanced.is_empty()
-            }
-            FailurePolicy::LeaveChanged => false,
-        }
-    };
-    Ok(everything_restored)
+    // 14. THE STATUS DECISION IS THE KERNEL'S — the caller does NOT gather
+    // an all_restored boolean anymore (the pre-reshape engine reported
+    // "whether every attempted mutation was restored or never advanced";
+    // the kernel's [`crate::kernel::transition::decide_terminal`] now
+    // DERIVES the rolled-back-vs-degraded disposition from the per-slot
+    // outcomes' derived transitions — the all_restored boolean was a second
+    // authority that could disagree with them). This pass only performs the
+    // step-13 compensation of still-advanced servers (above).
+    Ok(())
 }
 
 /// A pre-swap failure (never advanced) records the ACTUAL observed

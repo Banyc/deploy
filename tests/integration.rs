@@ -35,15 +35,23 @@ fn rollback_of(e: &LedgerEntry) -> TargetSnapshot {
         .expect("a successful entry resolves its snapshot from the intent")
 }
 
-/// The KNOWN artifact of a report actual ([`deploy::ledger::SlotAttemptState`]):
-/// a successful push's actuals are always `Known` — an `Unknown` actual only
+/// The KNOWN artifact of a report actual ([`deploy::ledger::ActualSlotState::Observed`]):
+/// a successful push's actuals are always `Observed` — an `Unknown` actual only
 /// arises for an unreadable live assignment, which fails the status read
 /// before any successful finalize. Test code asserting on a real actual
 /// artifact unwraps the observation here.
-fn known_artifact(s: &deploy::ledger::SlotAttemptState) -> &deploy::identity::ArtifactRef {
-    match &s.artifact {
-        deploy::ledger::Observation::Known(a) => a,
-        other => panic!("expected a Known actual artifact, got {other:?}"),
+fn known_artifact(s: &deploy::ledger::ActualSlotState) -> &deploy::identity::ArtifactRef {
+    match s {
+        deploy::ledger::ActualSlotState::Observed { artifact, .. } => artifact,
+        other => panic!("expected an Observed actual, got {other:?}"),
+    }
+}
+
+/// The KNOWN generation of a report actual ([`deploy::ledger::ActualSlotState::Observed`]).
+fn known_generation(s: &deploy::ledger::ActualSlotState) -> &deploy::identity::GenerationId {
+    match s {
+        deploy::ledger::ActualSlotState::Observed { generation, .. } => generation,
+        other => panic!("expected an Observed actual, got {other:?}"),
     }
 }
 
@@ -1013,7 +1021,6 @@ fn dry_run_reports_plan() -> Result<()> {
 // Additional tests for the hardening findings (1, 2, 4, 5, 6).
 // ===========================================================================
 
-use deploy::ledger::SlotOutcomeKind;
 use deploy::remote::create_remote;
 use deploy::remote::helper::{GenerationAssignment, RemoteHelper};
 use deploy::remote::transport::{ExecOutcome, RemoteEntry, RemoteMeta};
@@ -2387,17 +2394,26 @@ interval_seconds = 0
         );
     }
     // First slot failed; later slots were never started (Skipped).
-    assert_eq!(
-        results[&SlotId::parse("p1").unwrap()].outcome,
-        SlotOutcomeKind::Failed
+    assert!(
+        matches!(
+            results[&SlotId::parse("p1").unwrap()],
+            deploy::ledger::SlotOutcome::Failed { .. }
+        ),
+        "the first slot's outcome is Failed"
     );
-    assert_eq!(
-        results[&SlotId::parse("p2").unwrap()].outcome,
-        SlotOutcomeKind::Skipped
+    assert!(
+        matches!(
+            results[&SlotId::parse("p2").unwrap()],
+            deploy::ledger::SlotOutcome::Skipped { .. }
+        ),
+        "the second slot was never started"
     );
-    assert_eq!(
-        results[&SlotId::parse("p3").unwrap()].outcome,
-        SlotOutcomeKind::Skipped
+    assert!(
+        matches!(
+            results[&SlotId::parse("p3").unwrap()],
+            deploy::ledger::SlotOutcome::Skipped { .. }
+        ),
+        "the third slot was never started"
     );
     // Later servers were left untouched (no `current` pointer was ever created).
     assert!(!remotes_base.join("server-02/current").exists());
@@ -4589,10 +4605,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     let prod_slot = &rp.attempt.expect("attempt recorded").slots[&SlotId::parse("p1").unwrap()];
 
     let prod_v1 = known_artifact(prod_slot).tree.clone();
-    let prod_gen = prod_slot
-        .generation
-        .clone()
-        .expect("production advanced a generation");
+    let prod_gen = known_generation(prod_slot).clone();
 
     // A slot has exactly one owning target: production's observed state
     // carries p1's actual assignment, and staging's view is EMPTY (its own
@@ -4636,10 +4649,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     let staging_slot = &rs.attempt.expect("attempt recorded").slots[&SlotId::parse("p2").unwrap()];
 
     let staging_v2 = known_artifact(staging_slot).tree.clone();
-    let staging_gen = staging_slot
-        .generation
-        .clone()
-        .expect("staging advanced a generation");
+    let staging_gen = known_generation(staging_slot).clone();
     assert_ne!(prod_v1, staging_v2, "staging deployed the newer content");
 
     // Per-target records are separate: each target has its own attempt and
@@ -4712,8 +4722,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         "production rolled back to its own s0 tree"
     );
     assert_eq!(
-        Some(generation.clone()),
-        restored_prod_slot.generation,
+        *generation,
+        *known_generation(restored_prod_slot),
         "production's observed generation is the actual restored generation"
     );
     // The production rollback does NOT touch staging's observed state.

@@ -16,8 +16,8 @@ use crate::ledger::DeploymentIntent;
 use crate::ledger::DeploymentStatus;
 use crate::ledger::LedgerIntentReport;
 use crate::ledger::LedgerTerminal;
+use crate::ledger::NonEmptySlotTable;
 use crate::ledger::SlotOutcome;
-use crate::ledger::SlotTable;
 use crate::remote::helper::RemoteHelper;
 use std::collections::BTreeMap;
 
@@ -65,24 +65,30 @@ pub(crate) fn run_commit(
     let status;
     if execution.had_failure {
         // THE FAILURE PATH: the engine gathered the per-slot outcome
-        // evidence (and whether every attempted mutation was restored or
-        // never advanced); the KERNEL decides `FailedRolledBack` /
-        // `Degraded` and validates the payload through the constructors.
-        let outcomes: SlotTable<SlotOutcome> = SlotTable::from_map(
-            execution
-                .results
-                .iter()
-                .map(|(key, result)| Ok((key.clone(), SlotOutcome::from_wire(result.clone())?)))
-                .collect::<Result<BTreeMap<SlotId, SlotOutcome>>>()?,
-        );
+        // evidence; the KERNEL decides `FailedRolledBack` / `Degraded` and
+        // validates the payload through the constructors. The failure
+        // outcomes ALWAYS cover the nonempty selected membership (the
+        // engine completes the results table with `Skipped` fillers); a set
+        // that could be empty is REFUSED with an integrity error — never an
+        // accepted empty failure.
+        let outcomes: NonEmptySlotTable<SlotOutcome> =
+            NonEmptySlotTable::build(
+                execution
+                    .results
+                    .iter()
+                    .map(|(key, result)| {
+                        Ok((key.clone(), SlotOutcome::from_wire(result.clone())?))
+                    })
+                    .collect::<Result<BTreeMap<SlotId, SlotOutcome>>>()?,
+            )
+            .map_err(|e| {
+                crate::error::Error::integrity(format!(
+                    "push {deployment_id}: the failure outcomes must cover the selected membership (nonempty): {e}"
+                ))
+            })?;
         let disposition = crate::kernel::transition::decide_terminal(
             attempt_intent,
-            crate::kernel::transition::ExecutionReport {
-                preflight_failed: false,
-                verified: false,
-                all_restored: execution.everything_restored,
-                outcomes,
-            },
+            crate::kernel::transition::ExecutionReport::Failed { outcomes },
         )
         .map_err(|e| {
             crate::error::Error::integrity(format!(
@@ -223,24 +229,33 @@ pub(crate) fn run_commit(
                 // parent head drifted ("stale plan"), or a conflicting commit
                 // marker exists ("marker integrity conflict"). Append a
                 // `Degraded` terminal — NEVER `Successful`. The kernel
-                // decides the disposition from the failure evidence.
-                let outcomes: SlotTable<SlotOutcome> = SlotTable::from_map(
-                    execution
-                        .results
-                        .iter()
-                        .map(|(key, result)| {
-                            Ok((key.clone(), SlotOutcome::from_wire(result.clone())?))
-                        })
-                        .collect::<Result<BTreeMap<SlotId, SlotOutcome>>>()?,
-                );
+                // decides the disposition from the failure evidence: a
+                // refusal means the attempt did NOT fully run, so its
+                // evidence carries a non-restored (Advanced) transition —
+                // some slot is still on the deployed generation — which the
+                // DERIVED rule (rolled back iff no `Advanced` transition)
+                // classifies `Degraded`. The failure outcomes ALWAYS cover
+                // the nonempty selected membership (the engine completed the
+                // results table); an empty set is REFUSED with an integrity
+                // error, never an accepted empty failure.
+                let outcomes: NonEmptySlotTable<SlotOutcome> =
+                    NonEmptySlotTable::build(
+                        execution
+                            .results
+                            .iter()
+                            .map(|(key, result)| {
+                                Ok((key.clone(), SlotOutcome::from_wire(result.clone())?))
+                            })
+                            .collect::<Result<BTreeMap<SlotId, SlotOutcome>>>()?,
+                    )
+                    .map_err(|e| {
+                        crate::error::Error::integrity(format!(
+                            "push {deployment_id}: the refused disposition's outcomes must cover the selected membership (nonempty): {e}"
+                        ))
+                    })?;
                 let disposition = crate::kernel::transition::decide_terminal(
                     attempt_intent,
-                    crate::kernel::transition::ExecutionReport {
-                        preflight_failed: false,
-                        verified: false,
-                        all_restored: false,
-                        outcomes,
-                    },
+                    crate::kernel::transition::ExecutionReport::Failed { outcomes },
                 )
                 .map_err(|e| {
                     crate::error::Error::integrity(format!(

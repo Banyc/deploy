@@ -6,7 +6,7 @@
 //!
 //! * [`records`] — THE LEDGER RECORD MODEL: every wire + domain record
 //!   shape the ledger carries, one feature GROUP DIRECTORY recursively
-//!   nested by relatedness — the shared core fields ([`SlotAttemptState`] /
+//!   nested by relatedness — the shared core fields ([`ActualSlotState`] /
 //!   [`DeploymentStatus`]) and the plan/pins records live in
 //!   [`crate::ledger::records`] itself; the LEDGER LINE + ENTRY facets
 //!   (intent, terminal, outcomes, the merged entry) live in
@@ -16,7 +16,7 @@
 //!   foundational three-state observation lives in
 //!   `crate::ledger::records::observation`. The record names are all
 //!   re-exported at [`crate::ledger::records`]: the shared core
-//!   ([`SlotAttemptState`] / [`DeploymentStatus`] / [`TargetSnapshot`] /
+//!   ([`ActualSlotState`] / [`DeploymentStatus`] / [`TargetSnapshot`] /
 //!   [`SnapshotEntry`] / [`PhysicalBinding`]), the plan/report records
 //!   ([`DeploymentPlanWire`] / [`DeploymentPlan`] / [`PlanSource`] /
 //!   [`PlanOrigin`] / [`BehaviorIndex`] / [`SlotPlan`]), the pins/server
@@ -86,12 +86,12 @@ pub use finalize::{
 };
 pub use log::render_log;
 pub use records::{
-    ArtifactRefWire, BehaviorIndex, CheckpointWire, DegradedTerminal, DeploymentIntent,
-    DeploymentPlan, DeploymentPlanWire, DeploymentStatus, FrozenSlotTopology, LedgerEventWire,
-    LedgerIntentReport, LedgerIntentWire, LedgerTerminal, LedgerTerminalWire, NonEmptySlotTable,
-    Observation, ObservationError, ObservationWire, ObservedAssignment, ObservedGeneration,
-    ObservedGenerationWire, ObservedSlot, ObservedTarget, PhysicalBinding, Pins, PlanOrigin,
-    PlanSource, RebindingPlan, ServerState, SlotAttemptState, SlotOutcome, SlotOutcomeKind,
+    ActualSlotState, ArtifactRefWire, BehaviorIndex, CheckpointWire, DegradedTerminal,
+    DeploymentIntent, DeploymentPlan, DeploymentPlanWire, DeploymentStatus, FrozenSlotTopology,
+    LedgerEventWire, LedgerIntentReport, LedgerIntentWire, LedgerTerminal, LedgerTerminalWire,
+    NonEmptySlotTable, Observation, ObservationError, ObservationWire, ObservedAssignment,
+    ObservedGeneration, ObservedGenerationWire, ObservedSlot, ObservedTarget, PhysicalBinding,
+    Pins, PlanOrigin, PlanSource, RebindingPlan, ServerState, SlotOutcome, SlotOutcomeKind,
     SlotPlan, SlotResult, SlotTable, SlotTransition, SnapshotEntry, SnapshotSlotWire,
     TargetSnapshot, TerminalDisposition, VerifiedReleaseRebinding,
 };

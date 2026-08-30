@@ -1,11 +1,13 @@
 //! The per-slot OUTCOME records of the deployment ledger (feature areas A1
 //! "outcome dispositions" / "per-slot outcome kinds" / "degraded
 //! semantics"): the per-slot outcome kinds ([`SlotOutcomeKind`]) and the
-//! domain outcome ([`SlotOutcome`]) with its [`SlotTransition`] state, the
-//! WIRE outcome row ([`SlotResult`] — the raw serde form the ledger's
-//! JSONL carries, owned HERE next to its domain sibling), the wire → domain
-//! derivations ([`SlotOutcome::from_wire`], [`SlotResult::from_outcome`]),
-//! the [`CompensationReport`] alias, and the
+//! STRUCTURAL domain outcome ([`SlotOutcome`] — one variant per
+//! classification, with the per-slot TRANSITION STATE ([`SlotTransition`])
+//! DERIVED from the variant, never stored), the WIRE outcome row
+//! ([`SlotResult`] — the raw serde form the ledger's JSONL carries, owned
+//! HERE next to its domain sibling), the wire → domain BIJECTION
+//! ([`SlotOutcome::from_wire`], [`SlotResult::from_outcome`]), the
+//! [`CompensationReport`] alias, and the
 //! [`LedgerTerminal::remaining_changes`],
 //! [`LedgerTerminal::compensation`]) — the derivations implemented on the
 //! terminal here, next to the outcomes they derive from.
@@ -35,12 +37,14 @@ pub enum SlotOutcomeKind {
 }
 
 /// The per-slot TRANSITION STATE of one slot during a deployment attempt —
-/// the per-slot fact the terminal's outcomes carry (the DOMAIN form; the
-/// WIRE keeps the current on-disk shape and the wire → domain conversion
-/// derives the transition from the wire's status/outcome fields). The
-/// remaining-changes derivation is based on THIS state, never on the
-/// outcome's generation field alone: a slot that was never advanced (or
-/// whose advance outcome is unknown) records a generation that is not
+/// the per-slot CLASSIFICATION the terminal's outcomes derive. Since the
+/// structural outcome reshape, the transition is a DERIVED view of the
+/// outcome variant ([`SlotOutcome::transition`]) — NEVER stored as an
+/// independent field that could disagree with the outcome (the old
+/// `SlotOutcome { outcome, compensated, transition }` stored the SAME fact
+/// twice). The remaining-changes derivation is based on this state, never
+/// on the outcome's generation field alone: a slot that was never advanced
+/// (or whose advance outcome is unknown) records a generation that is not
 /// evidence of a change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -97,97 +101,171 @@ pub struct SlotResult {
 }
 
 /// The per-slot OUTCOME of one slot during a deployment's mutation loop —
-/// the DOMAIN value of the wire's [`SlotResult`] with the REDUNDANT
-/// `slot_id` DROPPED: the enclosing [`SlotTable`] key owns the slot
-/// identity, so the value stores each fact exactly once (the wire keeps the
-/// on-disk shape — the wire outcome carries the slot; the wire → domain
-/// conversion verifies the outcome names its own key and then drops it into
-/// the key). The value ALSO carries the per-slot TRANSITION STATE
-/// ([`SlotTransition`]) the remaining-changes derivation is based on (the
-/// wire keeps the current on-disk shape; the wire → domain conversion
-/// derives the transition from the wire's status/outcome fields).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SlotOutcome {
-    pub outcome: SlotOutcomeKind,
-    /// The THREE-STATE OBSERVATION of the slot's post-mutation state — the
-    /// observed generation the remaining-changes derivation compares against
-    /// pre_push. `Unknown(error)` when the post-mutation status read failed
-    /// (the slot may or may not have changed — never classified as
-    /// unchanged); `KnownAbsent` when the read succeeded showing no state
-    /// (never deployed).
-    pub observation: Observation<ObservedGeneration>,
-    pub compensated: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    /// The per-slot transition state (see [`SlotTransition`]).
-    pub transition: SlotTransition,
+/// the STRUCTURAL DOMAIN value of the wire's [`SlotResult`] with the
+/// REDUNDANT `slot_id` DROPPED: the enclosing [`SlotTable`] key owns the
+/// slot identity, so the value stores each fact exactly once. The
+/// classification is the VARIANT ITSELF — one variant per outcome class —
+/// so a nonsense combination (a compensated `Activated`, a restored
+/// `Skipped`) is UNREPRESENTABLE instead of being accepted as three
+/// independent fields. The wire keeps the current on-disk shape (the wire
+/// outcome carries the slot + the raw kind/compensated/error fields); the
+/// wire → domain conversion ([`SlotOutcome::from_wire`]) maps the wire's
+/// (kind, compensated, observation, error) to the ONE variant the wire
+/// describes, and [`SlotResult::from_outcome`] encodes the variant back to
+/// its CANONICAL wire shape — the conversion is a BIJECTION (variant-
+/// preserving: both `Failed { compensated: true }` and `Compensated`
+/// derive `Restored`, but they are DISTINCT variants that round-trip to
+/// their exact wire shapes). The per-slot TRANSITION STATE
+/// ([`SlotTransition`]) — the fact the remaining-changes derivation is
+/// based on — is DERIVED from the variant ([`SlotOutcome::transition`]),
+/// never stored. The domain carries NO serde (strict wire types only
+/// deserialize; the ledger's JSONL carries [`SlotResult`] and the
+/// `ObservationWire` forms).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SlotOutcome {
+    /// The slot advanced to the new state (the swap + activation +
+    /// verification succeeded): always a remaining change when the new
+    /// state differs from pre_push.
+    Activated {
+        observation: Observation<ObservedGeneration>,
+    },
+    /// The slot advanced then was compensated back to its pre_push state
+    /// (by the per-server pipeline or the failure-policy pass): never a
+    /// remaining change.
+    Restored {
+        observation: Observation<ObservedGeneration>,
+    },
+    /// The slot was never mutated (skipped under `stop_on_failure`, or a
+    /// compare-and-swap precondition skip): never a remaining change.
+    Skipped {
+        observation: Observation<ObservedGeneration>,
+    },
+    /// The slot FAILED. `compensated: true` records a successful in-process
+    /// compensation (the failure AND the compensation result are both
+    /// recorded); `error` is the pure OPERATION error (e.g. a swap
+    /// failure), INDEPENDENT of the observation. An UNCOMPENSATED failure
+    /// is a pre-swap failure OR a post-swap failure whose compensation
+    /// failed — the wire cannot distinguish them, so the advance outcome is
+    /// UNKNOWN (the slot may or may not have changed; the remaining-changes
+    /// derivation compares the outcome's OBSERVED generation against
+    /// pre_push).
+    Failed {
+        observation: Observation<ObservedGeneration>,
+        compensated: bool,
+        error: Option<String>,
+    },
+    /// Reserved by the wire (never emitted today). A restored slot, like a
+    /// compensated `Failed` — distinct from it on the wire.
+    Compensated {
+        observation: Observation<ObservedGeneration>,
+    },
 }
 
 impl SlotOutcome {
-    /// Derive the per-slot TRANSITION STATE from the wire's status/outcome
-    /// fields (the wire keeps the current on-disk shape; the transition is
-    /// the per-slot fact the domain outcomes carry). `Restored` and a
-    /// compensated `Failed` are a compensation that restored the slot;
-    /// `Skipped` never advanced; `Activated` advanced; an UNCOMPENSATED
-    /// `Failed` is a pre-swap failure OR a post-swap failure whose
-    /// compensation failed — the wire cannot distinguish them, so the
-    /// advance outcome is UNKNOWN (the slot may or may not have changed;
-    /// the remaining-changes derivation compares the outcome's OBSERVED
-    /// generation against pre_push).
+    /// WIRE → DOMAIN (the boundary's fail-closed conversion): map the
+    /// wire's (kind, compensated, observation, error) to the ONE structural
+    /// variant the wire describes. Each kind maps to exactly one variant —
+    /// `Activated` → [`SlotOutcome::Activated`], `Restored` →
+    /// [`SlotOutcome::Restored`], `Skipped` → [`SlotOutcome::Skipped`],
+    /// `Failed` (with BOTH `compensated` values) → [`SlotOutcome::Failed`],
+    /// the reserved `Compensated` → [`SlotOutcome::Compensated`] — so the
+    /// variant and the wire's classification can never disagree (the old
+    /// domain stored the kind + a separately-written `transition` that a
+    /// caller could contradict). The strict adjacently-tagged wire
+    /// observation converts to the permissive domain observation; a wire
+    /// value that is not representable is refused here (never read as a
+    /// half-known state). `error` is the pure OPERATION error — it NEVER
+    /// participates in the observation.
     pub fn from_wire(r: SlotResult) -> Result<SlotOutcome> {
-        let transition = match r.outcome {
-            SlotOutcomeKind::Restored => SlotTransition::Restored,
-            SlotOutcomeKind::Skipped => SlotTransition::NeverAdvanced,
-            SlotOutcomeKind::Activated => SlotTransition::Advanced,
-            SlotOutcomeKind::Failed => {
-                if r.compensated {
-                    SlotTransition::Restored
-                } else {
-                    SlotTransition::AdvanceUnknown
-                }
-            }
+        let observation: Observation<ObservedGeneration> = r.observation.try_into()?;
+        Ok(match r.outcome {
+            SlotOutcomeKind::Activated => SlotOutcome::Activated { observation },
+            SlotOutcomeKind::Restored => SlotOutcome::Restored { observation },
+            SlotOutcomeKind::Skipped => SlotOutcome::Skipped { observation },
+            SlotOutcomeKind::Failed => SlotOutcome::Failed {
+                observation,
+                compensated: r.compensated,
+                error: r.error,
+            },
             // Reserved: never emitted today. The in-process compensation
             // marker (a post-swap failure restored by the per-server
             // pipeline) is recorded as `Failed` with `compensated = true`;
             // a `Compensated` outcome would be a restored slot.
-            SlotOutcomeKind::Compensated => SlotTransition::Restored,
-        };
-        // WIRE → DOMAIN (fail closed): the strict adjacently-tagged wire
-        // observation converts to the permissive domain observation. The
-        // serde-gated wire types guarantee exactly one representation per
-        // variant, so the conversion is total in practice; a wire value that
-        // is not representable is refused here (the boundary's fail-closed
-        // contract), never read as a half-known state. `error` is the pure
-        // OPERATION error — it NEVER participates in the observation.
-        let observation: Observation<ObservedGeneration> = r.observation.try_into()?;
-        Ok(SlotOutcome {
-            outcome: r.outcome,
-            observation,
-            compensated: r.compensated,
-            error: r.error,
-            transition,
+            SlotOutcomeKind::Compensated => SlotOutcome::Compensated { observation },
         })
+    }
+
+    /// The per-slot TRANSITION STATE, DERIVED from the variant (never
+    /// stored — the variant IS the fact). `Restored` and a compensated
+    /// `Failed` are a compensation that restored the slot; `Skipped` never
+    /// advanced; `Activated` advanced; an UNCOMPENSATED `Failed` is a
+    /// pre-swap failure OR a post-swap failure whose compensation failed —
+    /// the wire cannot distinguish them, so the advance outcome is UNKNOWN
+    /// (the slot may or may not have changed; the remaining-changes
+    /// derivation compares the outcome's OBSERVED generation against
+    /// pre_push).
+    pub fn transition(&self) -> SlotTransition {
+        match self {
+            Self::Activated { .. } => SlotTransition::Advanced,
+            Self::Restored { .. } | Self::Compensated { .. } => SlotTransition::Restored,
+            Self::Skipped { .. } => SlotTransition::NeverAdvanced,
+            Self::Failed {
+                compensated: true, ..
+            } => SlotTransition::Restored,
+            Self::Failed {
+                compensated: false, ..
+            } => SlotTransition::AdvanceUnknown,
+        }
+    }
+
+    /// The outcome's three-state post-mutation OBSERVATION (the observed
+    /// generation the remaining-changes derivation compares against
+    /// pre_push) — shared by every variant.
+    pub fn observation(&self) -> &Observation<ObservedGeneration> {
+        match self {
+            Self::Activated { observation }
+            | Self::Restored { observation }
+            | Self::Skipped { observation }
+            | Self::Failed { observation, .. }
+            | Self::Compensated { observation } => observation,
+        }
     }
 }
 
 impl SlotResult {
     /// Re-attach the table key as the wire outcome's `slot_id` (the wire
     /// keeps the on-disk shape; the domain value carries no slot) and encode
-    /// the domain's TWO INDEPENDENT error facts back into the wire's shape:
+    /// the structural variant back into the wire's CANONICAL shape: the
+    /// variant's OWN kind + `compensated` value (only `Failed` carries
+    /// `compensated`/`error` — the other variants encode their canonical
+    /// `compensated: false, error: None` shape; the reserved `Compensated`
+    /// encodes its own kind). The DOMAIN's TWO INDEPENDENT error facts map
+    /// back into the wire's shape:
     /// `error` carries the pure OPERATION error (always, regardless of the
     /// observation — the two facts never share a slot); the THREE-STATE
     /// OBSERVATION is encoded as its EXACT strict wire form
     /// ([`ObservationWire<ObservedGenerationWire>`]) — the `Known` half is
     /// the recorded generation, the `Unknown` half is its OWN preserved
-    /// error, and a `KnownAbsent` observation carries no value fields. Every
-    /// (operation_error, observation) combination round-trips EXACTLY.
+    /// error, and a `KnownAbsent` observation carries no value fields. The
+    /// conversion is a BIJECTION: every domain variant maps to EXACTLY one
+    /// wire shape, and [`SlotOutcome::from_wire`] reads that shape back to
+    /// the SAME variant.
     pub fn from_outcome(key: &SlotId, o: &SlotOutcome) -> Self {
+        let (outcome, compensated, error) = match o {
+            SlotOutcome::Activated { .. } => (SlotOutcomeKind::Activated, false, None),
+            SlotOutcome::Restored { .. } => (SlotOutcomeKind::Restored, false, None),
+            SlotOutcome::Skipped { .. } => (SlotOutcomeKind::Skipped, false, None),
+            SlotOutcome::Failed {
+                compensated, error, ..
+            } => (SlotOutcomeKind::Failed, *compensated, error.clone()),
+            SlotOutcome::Compensated { .. } => (SlotOutcomeKind::Compensated, false, None),
+        };
         SlotResult {
             slot_id: key.clone(),
-            outcome: o.outcome.clone(),
-            observation: ObservationWire::from(&o.observation),
-            compensated: o.compensated,
-            error: o.error.clone(),
+            outcome,
+            observation: ObservationWire::from(o.observation()),
+            compensated,
+            error,
         }
     }
 }
@@ -247,6 +325,42 @@ mod tests_outcomes {
         ]
     }
 
+    /// EVERY constructible wire outcome: each [`SlotOutcomeKind`] (incl. the
+    /// reserved `Compensated`), BOTH `compensated` values on `Failed` (the
+    /// other kinds carry the canonical `false`), every three-state
+    /// observation, and with/without an operation error.
+    fn arbitrary_wire_outcome() -> impl Strategy<Value = SlotResult> {
+        (
+            arbitrary_observation(),
+            arbitrary_operation_error(),
+            prop::bool::ANY,
+            0u32..6,
+        )
+            .prop_map(|(observation, error, compensated, idx)| {
+                let outcome = match idx {
+                    0 => SlotOutcomeKind::Activated,
+                    1 => SlotOutcomeKind::Restored,
+                    2 => SlotOutcomeKind::Skipped,
+                    3 => SlotOutcomeKind::Compensated,
+                    _ => SlotOutcomeKind::Failed,
+                };
+                // Only `Failed` carries the generated compensation flag (the
+                // wire's canonical shape for every other kind); every kind
+                // may carry an operation error by generation but the domain
+                // only KEEPS it on `Failed` — the other kinds canonicalize
+                // to `error: None` on re-encode, so the domain fixed point
+                // is preserved either way.
+                let is_failed = matches!(outcome, SlotOutcomeKind::Failed);
+                SlotResult {
+                    slot_id: slot(0),
+                    outcome,
+                    observation: ObservationWire::from(&observation),
+                    compensated: is_failed && compensated,
+                    error,
+                }
+            })
+    }
+
     /// MIRROR of the engine's post-observation pass (`src/push/engine.rs`'s
     /// `never_advanced` loop): apply a generated post-mutation observation
     /// to a wire [`SlotResult`], mutating ONLY the observation — the
@@ -263,14 +377,12 @@ mod tests_outcomes {
     /// distinct operation error alongside a failed observation).
     #[test]
     fn operation_error_and_unknown_observation_round_trip_preserves_both() {
-        let outcome = SlotOutcome {
-            outcome: SlotOutcomeKind::Failed,
+        let outcome = SlotOutcome::Failed {
             observation: Observation::Unknown(ObservationError {
                 message: "status read failed: boom".to_string(),
             }),
             compensated: false,
             error: Some("swap failed: boom".to_string()),
-            transition: SlotTransition::AdvanceUnknown,
         };
         let wire = SlotResult::from_outcome(&slot(1), &outcome);
         assert_eq!(
@@ -292,13 +404,13 @@ mod tests_outcomes {
         assert_eq!(wire_json.observation, wire.observation);
         let back = SlotOutcome::from_wire(wire).unwrap();
         assert_eq!(
-            back.error,
+            back.error(),
             Some("swap failed: boom".to_string()),
             "the operation error survives the wire untouched"
         );
         assert_eq!(
-            back.observation,
-            Observation::Unknown(ObservationError {
+            back.observation(),
+            &Observation::Unknown(ObservationError {
                 message: "status read failed: boom".to_string()
             }),
             "the Unknown observation survives the wire untouched"
@@ -390,6 +502,98 @@ mod tests_outcomes {
         );
     }
 
+    /// (b2) THE STRUCTURAL VARIANT + DERIVED TRANSITION: every variant
+    /// derives the transition the old independently-stored field carried,
+    /// and the wire round trip preserves the EXACT variant (a `Failed {
+    /// compensated: true }` stays `Failed`, distinct from the reserved
+    /// `Compensated`, even though both derive `Restored`).
+    #[test]
+    fn structural_variants_derive_the_transition_and_round_trip_exactly() {
+        let cases: Vec<(SlotOutcome, SlotTransition)> = vec![
+            (
+                SlotOutcome::Activated {
+                    observation: Observation::KnownAbsent,
+                },
+                SlotTransition::Advanced,
+            ),
+            (
+                SlotOutcome::Restored {
+                    observation: Observation::KnownAbsent,
+                },
+                SlotTransition::Restored,
+            ),
+            (
+                SlotOutcome::Skipped {
+                    observation: Observation::KnownAbsent,
+                },
+                SlotTransition::NeverAdvanced,
+            ),
+            (
+                SlotOutcome::Failed {
+                    observation: Observation::KnownAbsent,
+                    compensated: false,
+                    error: None,
+                },
+                SlotTransition::AdvanceUnknown,
+            ),
+            (
+                SlotOutcome::Failed {
+                    observation: Observation::KnownAbsent,
+                    compensated: true,
+                    error: Some("activation failed".to_string()),
+                },
+                SlotTransition::Restored,
+            ),
+            (
+                SlotOutcome::Compensated {
+                    observation: Observation::KnownAbsent,
+                },
+                SlotTransition::Restored,
+            ),
+        ];
+        for (outcome, expected) in &cases {
+            assert_eq!(
+                outcome.transition(),
+                *expected,
+                "the derived transition must match the variant: {outcome:?}"
+            );
+            // Variant-preserving wire round trip: from_outcome → from_wire
+            // reproduces the EXACT domain variant.
+            let wire = SlotResult::from_outcome(&slot(0), outcome);
+            let back = SlotOutcome::from_wire(wire.clone()).unwrap();
+            assert_eq!(
+                &back, outcome,
+                "the wire round trip must preserve the EXACT variant"
+            );
+            assert_eq!(
+                back.transition(),
+                *expected,
+                "the round-tripped variant derives the same transition"
+            );
+            // The encoded wire is canonical for the variant.
+            assert_eq!(wire.compensated, outcome.compensated());
+            assert_eq!(wire.error, outcome.error());
+        }
+    }
+
+    impl SlotOutcome {
+        /// TEST-ONLY helpers: the wire-visible facts of the structural
+        /// variant (the compensated flag and the operation error — only
+        /// `Failed` carries them).
+        fn compensated(&self) -> bool {
+            match self {
+                Self::Failed { compensated, .. } => *compensated,
+                _ => false,
+            }
+        }
+        fn error(&self) -> Option<String> {
+            match self {
+                Self::Failed { error, .. } => error.clone(),
+                _ => None,
+            }
+        }
+    }
+
     proptest! {
         // THE USER'S PROPERTY: the operation error and the post-mutation
         // observation are TWO INDEPENDENT facts. (1) Every (operation_error,
@@ -414,13 +618,12 @@ mod tests_outcomes {
             operation_error in arbitrary_operation_error(),
             observation in arbitrary_observation(),
         ) {
-            // A domain outcome carrying EXACTLY the two generated facts.
-            let outcome = SlotOutcome {
-                outcome: SlotOutcomeKind::Failed,
+            // A domain FAILED outcome carrying EXACTLY the two generated facts.
+            let outcome = SlotOutcome::Failed {
                 observation: observation.clone(),
                 compensated: false,
                 error: operation_error.clone(),
-                transition: SlotTransition::AdvanceUnknown};
+            };
             // Domain → wire: each fact lands in its OWN wire slot.
             let wire = SlotResult::from_outcome(&slot(0), &outcome);
             assert_eq!(
@@ -436,13 +639,13 @@ mod tests_outcomes {
             // Wire → domain: both facts survive INDEPENDENTLY.
             let back = SlotOutcome::from_wire(wire.clone()).unwrap();
             assert_eq!(
-                back.error,
+                back.error(),
                 operation_error.clone(),
                 "the operation error survives the wire untouched"
             );
             assert_eq!(
-                back.observation,
-                observation,
+                back.observation(),
+                &observation,
                 "the observation survives the wire untouched"
             );
             // A full serde_json round trip of the wire preserves both facts.
@@ -451,8 +654,8 @@ mod tests_outcomes {
             assert_eq!(wire2.error, operation_error.clone());
             assert_eq!(wire2.observation, wire.observation);
             let back2 = SlotOutcome::from_wire(wire2).unwrap();
-            assert_eq!(back2.error, operation_error);
-            assert_eq!(back2.observation, observation);
+            assert_eq!(back2.error(), operation_error);
+            assert_eq!(back2.observation(), &observation);
         }
 
         #[test]
@@ -487,14 +690,42 @@ mod tests_outcomes {
             // The injected wire still converts back to the SAME two facts.
             let back = SlotOutcome::from_wire(wire).unwrap();
             assert_eq!(
-                back.error,
+                back.error(),
                 operation_error,
                 "the operation error survives the injection untouched"
             );
             assert_eq!(
-                back.observation,
-                observation,
+                back.observation(),
+                &observation,
                 "the observation survives the injection untouched"
+            );
+        }
+
+        // THE FULL-VARIANT ROUND-TRIP PROPERTY (the spec's acceptance gate,
+        // item 1): generate EVERY wire outcome variant — each
+        // [`SlotOutcomeKind`], both `compensated` values on `Failed`, every
+        // observation state, with/without an operation error — and assert
+        // the full round trip `wire → from_wire → from_outcome → from_wire`
+        // preserves the EXACT semantic variant and the same derived
+        // `transition()` (the domain value is a FIXED POINT of the
+        // conversion: the canonical re-encode is the variant's one wire
+        // shape).
+        #[test]
+        fn every_wire_outcome_variant_round_trips_to_the_same_domain_value(
+            wire in arbitrary_wire_outcome(),
+        ) {
+            let domain = SlotOutcome::from_wire(wire.clone()).unwrap();
+            let domain_transition = domain.transition();
+            let re_encoded = SlotResult::from_outcome(&wire.slot_id, &domain);
+            let domain2 = SlotOutcome::from_wire(re_encoded).unwrap();
+            assert_eq!(
+                domain, domain2,
+                "wire → from_wire → from_outcome → from_wire must preserve the EXACT semantic variant"
+            );
+            assert_eq!(
+                domain2.transition(),
+                domain_transition,
+                "the derived transition must be preserved by the round trip"
             );
         }
     }

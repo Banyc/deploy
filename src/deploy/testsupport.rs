@@ -20,9 +20,8 @@ pub(crate) use crate::identity::{
     TreeDigest, VariantName, test_generation_id, test_tree_digest,
 };
 pub(crate) use crate::ledger::{
-    self, DeploymentIntent, DeploymentPlan, DeploymentStatus, LedgerEntry, LedgerIntentReport,
-    Observation, ObservationWire, ObservedAssignment, ObservedGenerationWire, RefExpr,
-    SlotAttemptState,
+    self, ActualSlotState, DeploymentIntent, DeploymentPlan, DeploymentStatus, LedgerEntry,
+    LedgerIntentReport, ObservationWire, ObservedAssignment, ObservedGenerationWire, RefExpr,
 };
 pub(crate) use crate::remote::transport::{
     CreateNewVerdict, FsBytes, LocalTransport, Remote, scripted::ScriptedExec,
@@ -36,15 +35,24 @@ pub(crate) use std::path::{Path, PathBuf};
 pub(crate) use std::sync::atomic::{AtomicBool, Ordering};
 pub(crate) use std::sync::{Arc, Mutex};
 
-/// The KNOWN artifact of a report actual ([`SlotAttemptState`]): a
-/// successful push's actuals are always `Known` — the post-push refresh
+/// The KNOWN artifact of a report actual ([`ActualSlotState::Observed`]): a
+/// successful push's actuals are always `Observed` — the post-push refresh
 /// only records `Unknown` for an unreadable live assignment, which fails
 /// the status read before any successful finalize. Test code asserting
 /// on a real actual artifact unwraps the observation here.
-pub(crate) fn known_artifact(s: &SlotAttemptState) -> &ArtifactRef {
-    match &s.artifact {
-        Observation::Known(a) => a,
-        other => panic!("expected a Known actual artifact, got {other:?}"),
+pub(crate) fn known_artifact(s: &ActualSlotState) -> &ArtifactRef {
+    match s {
+        ActualSlotState::Observed { artifact, .. } => artifact,
+        other => panic!("expected an Observed actual, got {other:?}"),
+    }
+}
+
+/// The KNOWN generation of a report actual ([`ActualSlotState::Observed`]) —
+/// see [`known_artifact`].
+pub(crate) fn known_generation(s: &ActualSlotState) -> &GenerationId {
+    match s {
+        ActualSlotState::Observed { generation, .. } => generation,
+        other => panic!("expected an Observed actual, got {other:?}"),
     }
 }
 

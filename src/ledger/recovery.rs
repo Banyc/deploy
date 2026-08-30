@@ -18,8 +18,7 @@ use crate::kernel;
 use crate::ledger::finalize::{FinalizeOutcome, FinalizeSettings, finalize_successful_locked};
 use crate::ledger::records::{
     DegradedTerminal, DeploymentIntent, LedgerTerminal, NonEmptySlotTable, Observation,
-    ObservedGeneration, SlotOutcome, SlotOutcomeKind, SlotTable, SlotTransition,
-    TerminalDisposition,
+    ObservedGeneration, SlotOutcome, SlotTable, TerminalDisposition,
 };
 use crate::remote::helper::RemoteHelper;
 use crate::store::local::LocalStore;
@@ -165,14 +164,12 @@ fn append_degraded(
             let entry = snapshot.get(&sid).expect("selected in snapshot");
             (
                 sid.clone(),
-                SlotOutcome {
-                    outcome: SlotOutcomeKind::Failed,
+                SlotOutcome::Failed {
                     observation: Observation::Known(ObservedGeneration {
                         generation: entry.generation().clone(),
                     }),
                     compensated: false,
                     error: None,
-                    transition: SlotTransition::AdvanceUnknown,
                 },
             )
         })
@@ -194,7 +191,7 @@ fn append_degraded(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::deploy::testsupport::{RefExpr, TwoSlotHarness, two_slot_push};
+    use crate::deploy::testsupport::{RefExpr, TwoSlotHarness, known_generation, two_slot_push};
     use crate::identity::{
         ArtifactRef, BehaviorDigest, DeploymentId, GenerationId, RolloutGroupName, TargetName,
         Timestamp, VariantName, test_deployment_id, test_generation_id, test_release_id,
@@ -300,14 +297,14 @@ mod tests {
         let bindings = h.config.target_slot_bindings("t1").unwrap();
         // The REAL head push minted p1's live generation at runtime (not a
         // test fixture id) — the prior state A's deployment advances.
-        let head_p1 = r_head
-            .attempt
-            .as_ref()
-            .expect("the head push records an attempt")
-            .slots[&p1()]
-            .generation
-            .clone()
-            .expect("the head push minted p1's generation");
+        let head_p1 = known_generation(
+            &r_head
+                .attempt
+                .as_ref()
+                .expect("the head push records an attempt")
+                .slots[&p1()],
+        )
+        .clone();
 
         // A (group-a): deploys p1 (generation a-p1), inherits p2 from the
         // head. PENDING (intent-only — a push that crashed after the remote
@@ -439,12 +436,9 @@ mod tests {
         );
         assert_eq!(
             b_snapshot.get(&p2()).map(|e| e.generation()),
-            Some(
-                r2.attempt.as_ref().expect("attempt").slots[&p2()]
-                    .generation
-                    .as_ref()
-                    .expect("p2 generation")
-            ),
+            Some(known_generation(
+                &r2.attempt.as_ref().expect("attempt").slots[&p2()]
+            )),
             "B's deployed p2 is its own plan-minted generation"
         );
         assert_ne!(
