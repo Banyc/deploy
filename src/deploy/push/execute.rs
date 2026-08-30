@@ -368,7 +368,7 @@ pub(crate) mod execute_tests {
         let var_a = h.config.variant("standard").unwrap();
         let a_digest =
             crate::verify::release::behavior_contract_digest(&crate::identity::BehaviorContract {
-                activation: crate::config::ActivationConfig::from(var_a.activation.clone()),
+                activation: var_a.activation.clone(),
                 verification: var_a.verification.clone(),
             });
 
@@ -398,7 +398,7 @@ pub(crate) mod execute_tests {
         let var_b = config2.variant("standard").unwrap();
         let b_digest =
             crate::verify::release::behavior_contract_digest(&crate::identity::BehaviorContract {
-                activation: crate::config::ActivationConfig::from(var_b.activation.clone()),
+                activation: var_b.activation.clone(),
                 verification: var_b.verification.clone(),
             });
         assert_ne!(a_digest, b_digest, "behaviors must differ");

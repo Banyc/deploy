@@ -21,11 +21,12 @@ use crate::config::{Mapping, SlotConfig};
 use crate::digest::sha256_bytes;
 use crate::error::{Error, Result};
 use crate::identity::{
-    CanonicalReleasePayload, CanonicalSlot, CanonicalSlots, Provenance, ReleaseDigest, ReleaseId,
-    ReleaseRecord, TreeDigest, VariantName,
+    AbsoluteDeployDir, BehaviorContract, CanonicalReleasePayload, CanonicalSlot, CanonicalSlots,
+    Identifier, Provenance, ReleaseDigest, ReleaseId, ReleaseRecord, RolloutGroupName, TreeDigest,
+    VariantName,
 };
 use jiff::Timestamp;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
 /// The canonical release identity PAYLOAD version
@@ -49,9 +50,6 @@ pub(crate) const RELEASE_PAYLOAD_SCHEMA_VERSION: u32 = 3;
 /// `groups`); version 1 records (the multi-target `targets` shape) are
 /// rejected on read — no compatibility fallback.
 pub(crate) const RELEASE_RECORD_SCHEMA_VERSION: u32 = 2;
-
-#[cfg(test)]
-use crate::identity::BehaviorContract;
 
 /// Canonical digest of the frozen mapping set.
 pub fn mapping_digest(mappings: &[Mapping]) -> String {
@@ -317,6 +315,175 @@ pub fn verify_release_identity(rec: &ReleaseRecord) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// The COMPLETE release-graph validator: converts a frozen
+/// [`ReleaseRecord`] (plus its per-variant closed behavior contracts and the
+/// available-server set) into the [`ValidatedRelease`] DOMAIN value, checking
+/// the record MEANINGFULLY — not just re-hashing it:
+///
+/// 1. **Identity** — the stored `release_sha256`/`release_id` still recompute
+///    from the record's own content ([`verify_release_identity`]), and the
+///    record's provenance `behavior_sha256` equals the canonical digest of
+///    the supplied behavior contracts (the release graph and the behavior
+///    graph agree).
+/// 2. **Slot snapshot as a graph** — the slot declarations are COMPLETE
+///    (every variant the record binds has declared slots, and no slot
+///    snapshot names an undeclared variant), every slot is PARSEABLE (its
+///    id/server/target are valid identifiers, its deploy_dir is an absolute
+///    traversal-free path, its group names are valid), no slot id is
+///    DUPLICATED anywhere in the snapshot, and every slot's `server` exists
+///    in the available-server set (the graph's server nodes).
+/// 3. **Behavior coverage** — EVERY variant the record binds has a behavior
+///    contract, and no contract names an undeclared variant (incomplete
+///    behavior coverage is rejected, as are orphan contracts).
+///
+/// The domain value is what consumers use thereafter; it is constructed ONLY
+/// through [`ValidatedRelease::try_new`], with no unchecked public
+/// constructor — a record that fails any rule here cannot become a
+/// [`ValidatedRelease`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidatedRelease {
+    /// The identity-verified, semantically validated frozen record (the
+    /// wire bytes, re-serializable for remote publication).
+    record: ReleaseRecord,
+    /// The per-variant behavior contracts (closed enums), coverage-complete
+    /// and digest-consistent with the record's provenance.
+    behaviors: BTreeMap<String, BehaviorContract>,
+}
+
+impl ValidatedRelease {
+    /// Validate the frozen wire record + behavior contracts + server set
+    /// and build the domain value. Any rule violation (identity mismatch,
+    /// slot-graph inconsistency, unknown/unsupported adapter already
+    /// refused at the closed-enum parse, incomplete behavior coverage,
+    /// behavior-digest disagreement) fails closed WITHOUT producing a
+    /// [`ValidatedRelease`].
+    pub fn try_new(
+        rec: ReleaseRecord,
+        behaviors: BTreeMap<String, BehaviorContract>,
+        servers: &BTreeSet<String>,
+    ) -> Result<ValidatedRelease> {
+        // 1. IDENTITY: the stored identity must recompute from the record's
+        // own content, and the behavior graph must agree with the record's
+        // provenance digest (what [`verify_behavior_json`] enforces on the
+        // serialized behavior document).
+        verify_release_identity(&rec)?;
+        if variant_behaviors_digest(&behaviors) != rec.provenance.behavior_sha256 {
+            return Err(Error::integrity(format!(
+                "release {} behavior graph inconsistent: the per-variant behavior digest {} does not match the record provenance behavior_sha256 {}",
+                rec.release_id,
+                variant_behaviors_digest(&behaviors),
+                rec.provenance.behavior_sha256
+            )));
+        }
+
+        // 3. BEHAVIOR COVERAGE: every variant the record binds must carry a
+        // behavior contract, and no contract may name an undeclared variant.
+        // (The BTreeMaps iterate in sorted key order, so the key-set
+        // comparison is exact.)
+        if !rec.variants.keys().eq(behaviors.keys()) {
+            let missing: Vec<&String> = rec
+                .variants
+                .keys()
+                .filter(|v| !behaviors.contains_key(*v))
+                .collect();
+            let extra: Vec<&String> = behaviors
+                .keys()
+                .filter(|v| !rec.variants.contains_key(*v))
+                .collect();
+            return Err(Error::integrity(format!(
+                "release {} behavior coverage incomplete or orphaned: missing contracts for variants {:?}, contracts for undeclared variants {:?}",
+                rec.release_id, missing, extra
+            )));
+        }
+
+        // 2. SLOT SNAPSHOT AS A GRAPH: complete declarations, parseable
+        // slots, unique slot ids, and every slot's server inside the
+        // available-server set.
+        if !rec.variants.keys().eq(rec.slots.keys()) {
+            let missing: Vec<&String> = rec
+                .variants
+                .keys()
+                .filter(|v| !rec.slots.contains_key(*v))
+                .collect();
+            let extra: Vec<&String> = rec
+                .slots
+                .keys()
+                .filter(|v| !rec.variants.contains_key(*v))
+                .collect();
+            return Err(Error::integrity(format!(
+                "release {} slot snapshot incomplete or dangling: variants without declared slots {:?}, slot snapshot entries for undeclared variants {:?}",
+                rec.release_id, missing, extra
+            )));
+        }
+        let mut seen_ids: BTreeSet<String> = BTreeSet::new();
+        for cs in rec.slots.values() {
+            for s in &cs.slots {
+                Identifier::parse(&s.id).map_err(|e| {
+                    Error::integrity(format!(
+                        "release {} slot id {:?} is not a valid identifier: {e}",
+                        rec.release_id, s.id
+                    ))
+                })?;
+                Identifier::parse(&s.server).map_err(|e| {
+                    Error::integrity(format!(
+                        "release {} slot '{}' server {:?} is not a valid identifier: {e}",
+                        rec.release_id, s.id, s.server
+                    ))
+                })?;
+                Identifier::parse(&s.target).map_err(|e| {
+                    Error::integrity(format!(
+                        "release {} slot '{}' owning target {:?} is not a valid identifier: {e}",
+                        rec.release_id, s.id, s.target
+                    ))
+                })?;
+                AbsoluteDeployDir::parse(&s.deploy_dir).map_err(|e| {
+                    Error::integrity(format!(
+                        "release {} slot '{}' deploy_dir {:?} is not an absolute valid path: {e}",
+                        rec.release_id, s.id, s.deploy_dir
+                    ))
+                })?;
+                for g in &s.groups {
+                    RolloutGroupName::parse(g).map_err(|e| {
+                        Error::integrity(format!(
+                            "release {} slot '{}' group {:?} is not a valid group name: {e}",
+                            rec.release_id, s.id, g
+                        ))
+                    })?;
+                }
+                if !seen_ids.insert(s.id.clone()) {
+                    return Err(Error::integrity(format!(
+                        "release {} declares duplicate slot id '{}'",
+                        rec.release_id, s.id
+                    )));
+                }
+                if !servers.contains(&s.server) {
+                    return Err(Error::integrity(format!(
+                        "release {} slot '{}' binds unknown server '{}': the server is not in the available server set",
+                        rec.release_id, s.id, s.server
+                    )));
+                }
+            }
+        }
+
+        Ok(ValidatedRelease {
+            record: rec,
+            behaviors,
+        })
+    }
+
+    /// The validated frozen record (the wire bytes — re-serializable for
+    /// remote publication).
+    pub fn record(&self) -> &ReleaseRecord {
+        &self.record
+    }
+
+    /// The per-variant behavior contracts (coverage-complete, closed enums,
+    /// digest-consistent with the record's provenance).
+    pub fn behaviors(&self) -> &BTreeMap<String, BehaviorContract> {
+        &self.behaviors
+    }
 }
 
 #[cfg(test)]
@@ -814,8 +981,7 @@ mod tests {
         contracts.insert(
             "standard".to_string(),
             BehaviorContract {
-                activation: crate::config::ActivationConfig {
-                    adapter: "systemd".to_string(),
+                activation: crate::config::Activation::Systemd(crate::config::ValidatedSystemd {
                     scope: crate::config::ActivationScope::System,
                     reconcile_managed_units: true,
                     units: vec![crate::config::UnitDef {
@@ -824,14 +990,15 @@ mod tests {
                         enable: true,
                         restart: true,
                     }],
-                },
-                verification: crate::config::VerificationConfig {
-                    adapter: "command".to_string(),
-                    argv: vec!["true".to_string()],
-                    timeout_seconds: 30,
-                    attempts: 2,
-                    interval_seconds: 1,
-                },
+                }),
+                verification: crate::config::Verification::Command(
+                    crate::config::ValidatedCommand {
+                        argv: vec!["true".to_string()],
+                        timeout_seconds: 30,
+                        attempts: 2,
+                        interval_seconds: 1,
+                    },
+                ),
             },
         );
         let sha = variant_behaviors_digest(&contracts);
@@ -846,23 +1013,58 @@ mod tests {
         let reordered = br#"{"standard":{"verification":{"adapter":"command","argv":["true"],"timeout_seconds":30,"attempts":2,"interval_seconds":1},"activation":{"adapter":"systemd","scope":"system","reconcile_managed_units":true,"units":[{"name":"app.service","artifact_path":"integration/systemd/app.service","enable":true,"restart":true}]}}}"#;
         verify_behavior_json(reordered, "rel-x", &sha).expect("reordered JSON passes");
 
-        // Every identity-bearing change alters the digest -> fail closed.
+        // Every identity-bearing change that still PARSES to a valid (but
+        // different) contract set alters the digest -> fail closed with the
+        // digest mismatch.
         let mutations: Vec<serde_json::Value> = vec![
-            serde_json::json!({"standard": {"activation": {"adapter": "none", "scope": "system", "reconcile_managed_units": true, "units": []}, "verification": {"adapter": "command", "argv": ["true"], "timeout_seconds": 30, "attempts": 2, "interval_seconds": 1}}}),
-            serde_json::json!({"standard": {"activation": {"adapter": "systemd", "scope": "system", "reconcile_managed_units": true, "units": []}, "verification": {"adapter": "command", "argv": ["true"], "timeout_seconds": 30, "attempts": 2, "interval_seconds": 1}}}),
-            serde_json::json!({"standard": {"activation": {"adapter": "systemd", "scope": "system", "reconcile_managed_units": true, "units": []}, "verification": {"adapter": "command", "argv": ["false"], "timeout_seconds": 30, "attempts": 2, "interval_seconds": 1}}}),
-            serde_json::json!({"standard": {"activation": {"adapter": "systemd", "scope": "system", "reconcile_managed_units": true, "units": []}, "verification": {"adapter": "command", "argv": ["true"], "timeout_seconds": 31, "attempts": 2, "interval_seconds": 1}}}),
-            serde_json::json!({"standard": {"activation": {"adapter": "systemd", "scope": "user", "reconcile_managed_units": true, "units": []}, "verification": {"adapter": "command", "argv": ["true"], "timeout_seconds": 30, "attempts": 2, "interval_seconds": 1}}}),
-            serde_json::json!({"canary": {"activation": {"adapter": "systemd", "scope": "system", "reconcile_managed_units": true, "units": []}, "verification": {"adapter": "command", "argv": ["true"], "timeout_seconds": 30, "attempts": 2, "interval_seconds": 1}}}),
+            serde_json::json!({"standard": {"activation": {"adapter": "none", "scope": "user", "reconcile_managed_units": true, "units": []}, "verification": {"adapter": "command", "argv": ["true"], "timeout_seconds": 30, "attempts": 2, "interval_seconds": 1}}}),
+            serde_json::json!({"standard": {"activation": {"adapter": "systemd", "scope": "system", "reconcile_managed_units": true, "units": [{"name": "other.service", "artifact_path": "integration/systemd/other.service", "enable": true, "restart": true}]}, "verification": {"adapter": "command", "argv": ["true"], "timeout_seconds": 30, "attempts": 2, "interval_seconds": 1}}}),
+            serde_json::json!({"standard": {"activation": {"adapter": "systemd", "scope": "system", "reconcile_managed_units": true, "units": [{"name": "app.service", "artifact_path": "integration/systemd/app.service", "enable": true, "restart": true}]}, "verification": {"adapter": "command", "argv": ["false"], "timeout_seconds": 30, "attempts": 2, "interval_seconds": 1}}}),
+            serde_json::json!({"standard": {"activation": {"adapter": "systemd", "scope": "system", "reconcile_managed_units": true, "units": [{"name": "app.service", "artifact_path": "integration/systemd/app.service", "enable": true, "restart": true}]}, "verification": {"adapter": "command", "argv": ["true"], "timeout_seconds": 31, "attempts": 2, "interval_seconds": 1}}}),
+            serde_json::json!({"standard": {"activation": {"adapter": "systemd", "scope": "user", "reconcile_managed_units": true, "units": [{"name": "app.service", "artifact_path": "integration/systemd/app.service", "enable": true, "restart": true}]}, "verification": {"adapter": "command", "argv": ["true"], "timeout_seconds": 30, "attempts": 2, "interval_seconds": 1}}}),
+            serde_json::json!({"canary": {"activation": {"adapter": "systemd", "scope": "system", "reconcile_managed_units": true, "units": [{"name": "app.service", "artifact_path": "integration/systemd/app.service", "enable": true, "restart": true}]}, "verification": {"adapter": "command", "argv": ["true"], "timeout_seconds": 30, "attempts": 2, "interval_seconds": 1}}}),
             serde_json::json!({}),
         ];
         for (i, m) in mutations.iter().enumerate() {
             let bytes = serde_json::to_vec(m).unwrap();
             let err = verify_behavior_json(&bytes, "rel-x", &sha)
-                .expect_err("every contract change must fail verification");
+                .expect_err("every valid-but-different contract set must fail verification");
             assert!(
                 err.to_string().contains("digest mismatch"),
                 "mutation {i} must name the digest mismatch, got: {err}"
+            );
+        }
+
+        // CLOSED-ENUM REFUSALS (the review's fix): a behavior document that
+        // PARSES to a DIFFERENT canonical set is a digest mismatch, but a
+        // document that can no longer form a VALID contract at all — an
+        // unsupported adapter, a `none` contract carrying units/non-default
+        // scope (irrelevant fields), a systemd contract without units, an
+        // empty argv, zero attempts/timeout, an unknown template variable,
+        // or an unknown field at any nesting level — is REFUSED at the
+        // closed-enum parse (fail closed, never silently accepted/dropped).
+        let refusals: Vec<serde_json::Value> = vec![
+            serde_json::json!({"standard": {"activation": {"adapter": "bogus", "scope": "user", "reconcile_managed_units": true, "units": []}, "verification": {"adapter": "command", "argv": ["true"], "timeout_seconds": 30, "attempts": 2, "interval_seconds": 1}}}),
+            serde_json::json!({"standard": {"activation": {"adapter": "none", "scope": "system", "reconcile_managed_units": true, "units": []}, "verification": {"adapter": "command", "argv": ["true"], "timeout_seconds": 30, "attempts": 2, "interval_seconds": 1}}}),
+            serde_json::json!({"standard": {"activation": {"adapter": "none", "scope": "user", "reconcile_managed_units": true, "units": [{"name": "app.service", "artifact_path": "integration/systemd/app.service", "enable": true, "restart": true}]}, "verification": {"adapter": "command", "argv": ["true"], "timeout_seconds": 30, "attempts": 2, "interval_seconds": 1}}}),
+            serde_json::json!({"standard": {"activation": {"adapter": "systemd", "scope": "system", "reconcile_managed_units": true, "units": []}, "verification": {"adapter": "command", "argv": ["true"], "timeout_seconds": 30, "attempts": 2, "interval_seconds": 1}}}),
+            serde_json::json!({"standard": {"activation": {"adapter": "systemd", "scope": "system", "reconcile_managed_units": true, "units": [{"name": "../app.service", "artifact_path": "integration/systemd/app.service", "enable": true, "restart": true}]}, "verification": {"adapter": "command", "argv": ["true"], "timeout_seconds": 30, "attempts": 2, "interval_seconds": 1}}}),
+            serde_json::json!({"standard": {"activation": {"adapter": "systemd", "scope": "system", "reconcile_managed_units": true, "units": [{"name": "app.service", "artifact_path": "integration/systemd/app.service", "enable": true, "restart": true}]}, "verification": {"adapter": "docker", "argv": ["true"], "timeout_seconds": 30, "attempts": 2, "interval_seconds": 1}}}),
+            serde_json::json!({"standard": {"activation": {"adapter": "systemd", "scope": "system", "reconcile_managed_units": true, "units": [{"name": "app.service", "artifact_path": "integration/systemd/app.service", "enable": true, "restart": true}]}, "verification": {"adapter": "command", "argv": [], "timeout_seconds": 30, "attempts": 2, "interval_seconds": 1}}}),
+            serde_json::json!({"standard": {"activation": {"adapter": "systemd", "scope": "system", "reconcile_managed_units": true, "units": [{"name": "app.service", "artifact_path": "integration/systemd/app.service", "enable": true, "restart": true}]}, "verification": {"adapter": "command", "argv": ["true"], "timeout_seconds": 30, "attempts": 0, "interval_seconds": 1}}}),
+            serde_json::json!({"standard": {"activation": {"adapter": "systemd", "scope": "system", "reconcile_managed_units": true, "units": [{"name": "app.service", "artifact_path": "integration/systemd/app.service", "enable": true, "restart": true}]}, "verification": {"adapter": "command", "argv": ["true"], "timeout_seconds": 0, "attempts": 2, "interval_seconds": 1}}}),
+            serde_json::json!({"standard": {"activation": {"adapter": "systemd", "scope": "system", "reconcile_managed_units": true, "units": [{"name": "app.service", "artifact_path": "integration/systemd/app.service", "enable": true, "restart": true}]}, "verification": {"adapter": "command", "argv": ["{{ bogus }}"], "timeout_seconds": 30, "attempts": 2, "interval_seconds": 1}}}),
+            serde_json::json!({"standard": {"activation": {"adapter": "systemd", "scope": "system", "reconcile_managed_units": true, "units": [{"name": "app.service", "artifact_path": "integration/systemd/app.service", "enable": true, "restart": true}]}, "verification": {"adapter": "command", "argv": ["true"], "timeout_seconds": 30, "attempts": 2, "interval_seconds": 1}, "extra": 1}}),
+            serde_json::json!({"standard": {"activation": {"adapter": "systemd", "scope": "system", "reconcile_managed_units": true, "units": [{"name": "app.service", "artifact_path": "integration/systemd/app.service", "enable": true, "restart": true, "bogus": true}]}, "verification": {"adapter": "command", "argv": ["true"], "timeout_seconds": 30, "attempts": 2, "interval_seconds": 1}}}),
+            serde_json::json!({"standard": {"activation": {"adapter": "systemd", "scope": "system", "reconcile_managed_units": true, "units": [{"name": "app.service", "artifact_path": "integration/systemd/app.service", "enable": true, "restart": true}]}, "verification": {"adapter": "command", "argv": ["true"], "timeout_seconds": 30, "attempts": 2, "interval_seconds": 1, "bogus": 1}}}),
+        ];
+        for (i, m) in refusals.iter().enumerate() {
+            let bytes = serde_json::to_vec(m).unwrap();
+            let err = verify_behavior_json(&bytes, "rel-x", &sha)
+                .expect_err("an invalid contract shape must be refused at the closed-enum parse");
+            assert!(
+                err.to_string().contains("malformed"),
+                "refusal {i} must be a closed-enum parse refusal, got: {err}"
             );
         }
 
@@ -1492,8 +1694,653 @@ mod tests {
         verify_release_identity(&rec_c).expect("the deduplicated release verifies");
     }
 
+    // -------------------------------------------------------------------
+    // COMPLETE-VALIDATOR ACCEPTANCE (the review's property): arbitrary
+    // nested release/behavior documents — valid and systematically-invalid
+    // (bad adapter names, duplicate slots, missing behavior coverage, empty
+    // argv, zero attempts, irrelevant fields at each nesting level) — are
+    // compared against an INDEPENDENT semantic reference validator; they
+    // must AGREE on every document, and every document the production
+    // validator accepts must yield a [`ValidatedRelease`] whose domain
+    // invariants hold.
+    // -------------------------------------------------------------------
+
+    /// One generated document: a frozen release record (identity-consistent
+    /// with its OWN composition, optionally identity-tampered), its behavior
+    /// document (wire JSON), and the available-server set of the graph.
+    #[derive(Clone, Debug)]
+    struct GraphDoc {
+        rec: ReleaseRecord,
+        behaviors_json: serde_json::Value,
+        servers: BTreeSet<String>,
+    }
+
+    fn doc_variant_name_strategy() -> impl Strategy<Value = String> {
+        prop::sample::select(vec![
+            "standard".to_string(),
+            "canary".to_string(),
+            "".to_string(),
+            "Variant-2".to_string(),
+        ])
+    }
+
+    fn doc_slot_id_strategy() -> impl Strategy<Value = String> {
+        // A SMALL pool: slots SHARE ids across variants (duplicate detection
+        // must be snapshot-wide), and the pool includes an invalid id.
+        prop::sample::select(vec![
+            "p1".to_string(),
+            "p2".to_string(),
+            "p3".to_string(),
+            "".to_string(),
+        ])
+    }
+
+    fn doc_server_strategy() -> impl Strategy<Value = String> {
+        // The graph's server set is FIXED at {server-01, server-02}; the
+        // pool includes known servers (valid bindings) and unknown/malformed
+        // servers (invalid bindings).
+        prop::sample::select(vec![
+            "server-01".to_string(),
+            "server-02".to_string(),
+            "server-03".to_string(),
+            "".to_string(),
+            "edge/1".to_string(),
+        ])
+    }
+
+    fn doc_target_strategy() -> impl Strategy<Value = String> {
+        prop::sample::select(vec![
+            "production".to_string(),
+            "edge".to_string(),
+            "".to_string(),
+        ])
+    }
+
+    fn doc_deploy_dir_strategy() -> impl Strategy<Value = String> {
+        prop::sample::select(vec![
+            "/srv/deploy/example".to_string(),
+            "//srv/deploy/example/".to_string(),
+            "relative/path".to_string(),
+            "/".to_string(),
+            "/srv/../x".to_string(),
+            "".to_string(),
+        ])
+    }
+
+    fn doc_group_strategy() -> impl Strategy<Value = String> {
+        prop::sample::select(vec![
+            "canary".to_string(),
+            "wave-1".to_string(),
+            "".to_string(),
+            "a/b".to_string(),
+        ])
+    }
+
+    /// A VALID closed-enum activation wire (common case): `none` with the
+    /// canonical defaults, or `systemd` with 1..2 valid units.
+    fn valid_activation_wire() -> impl Strategy<Value = serde_json::Value> {
+        prop_oneof![
+            Just(serde_json::json!({
+                "adapter": "none", "scope": "user", "reconcile_managed_units": true,
+                "units": []
+            })),
+            (any::<bool>(), any::<bool>()).prop_map(|(a, b)| {
+                serde_json::json!({
+                    "adapter": "systemd", "scope": "system",
+                    "reconcile_managed_units": true,
+                    "units": [{
+                        "name": "app.service",
+                        "artifact_path": "integration/systemd/app.service",
+                        "enable": a,
+                        "restart": b
+                    }]
+                })
+            }),
+        ]
+    }
+
+    /// A VALID closed-enum verification wire: `command` with a non-empty
+    /// argv (template variables known), nonzero attempts/timeout.
+    fn valid_verification_wire() -> impl Strategy<Value = serde_json::Value> {
+        (
+            prop::sample::select(vec![
+                vec!["true".to_string()],
+                vec!["{{ deploy_dir }}/bin/probe".to_string(), "--x".to_string()],
+            ]),
+            1..5u64,
+            1..4u32,
+            0..2u64,
+        )
+            .prop_map(|(argv, timeout, attempts, interval)| {
+                serde_json::json!({
+                    "adapter": "command",
+                    "argv": argv,
+                    "timeout_seconds": timeout,
+                    "attempts": attempts,
+                    "interval_seconds": interval
+                })
+            })
+    }
+
+    /// A SYSTEMATICALLY-INVALID wire contract: an unsupported adapter, a
+    /// `none` contract carrying irrelevant fields, a systemd contract
+    /// without units or with an unsafe unit, an empty argv, zero
+    /// attempts/timeout, an unknown template variable, or an unknown field
+    /// at the contract/activation/unit/verification nesting level.
+    fn invalid_contract_wire() -> impl Strategy<Value = serde_json::Value> {
+        let activation_invalids = vec![
+            serde_json::json!({"adapter": "bogus", "scope": "user", "reconcile_managed_units": true, "units": []}),
+            serde_json::json!({"adapter": "none", "scope": "system", "reconcile_managed_units": true, "units": []}),
+            serde_json::json!({"adapter": "none", "scope": "user", "reconcile_managed_units": true, "units": [{"name": "app.service", "artifact_path": "integration/systemd/app.service", "enable": true, "restart": true}]}),
+            serde_json::json!({"adapter": "systemd", "scope": "system", "reconcile_managed_units": true, "units": []}),
+            serde_json::json!({"adapter": "systemd", "scope": "system", "reconcile_managed_units": true, "units": [{"name": "../app.service", "artifact_path": "integration/systemd/app.service", "enable": true, "restart": true}]}),
+            serde_json::json!({"adapter": "systemd", "scope": "system", "reconcile_managed_units": true, "units": [{"name": "app.service", "artifact_path": "/etc/x.service", "enable": true, "restart": true}]}),
+            serde_json::json!({"adapter": "systemd", "scope": "system", "reconcile_managed_units": true, "units": [{"name": "app.service", "artifact_path": "integration/systemd/app.service", "enable": true, "restart": true}], "scope2": "user"}),
+            serde_json::json!({"adapter": "systemd", "scope": "system", "reconcile_managed_units": true, "units": [{"name": "app.service", "artifact_path": "integration/systemd/app.service", "enable": true, "restart": true, "bogus": true}]}),
+        ];
+        let verification_invalids = vec![
+            serde_json::json!({"adapter": "docker", "argv": ["true"], "timeout_seconds": 30, "attempts": 2, "interval_seconds": 1}),
+            serde_json::json!({"adapter": "command", "argv": [], "timeout_seconds": 30, "attempts": 2, "interval_seconds": 1}),
+            serde_json::json!({"adapter": "command", "argv": ["true"], "timeout_seconds": 30, "attempts": 0, "interval_seconds": 1}),
+            serde_json::json!({"adapter": "command", "argv": ["true"], "timeout_seconds": 0, "attempts": 2, "interval_seconds": 1}),
+            serde_json::json!({"adapter": "command", "argv": ["{{ bogus }}"], "timeout_seconds": 30, "attempts": 2, "interval_seconds": 1}),
+            serde_json::json!({"adapter": "command", "argv": ["true"], "timeout_seconds": 30, "attempts": 2, "interval_seconds": 1, "retries": 3}),
+        ];
+        (
+            prop::sample::select(activation_invalids),
+            prop::sample::select(verification_invalids),
+        )
+            .prop_map(|(activation, verification)| {
+                serde_json::json!({"activation": activation, "verification": verification})
+            })
+    }
+
+    fn contract_wire_strategy() -> impl Strategy<Value = serde_json::Value> {
+        prop_oneof![
+            4 => valid_activation_wire().prop_flat_map(|activation| {
+                valid_verification_wire().prop_map(move |verification| {
+                    serde_json::json!({"activation": activation, "verification": verification})
+                })
+            }),
+            1 => invalid_contract_wire(),
+            1 => valid_verification_wire().prop_map(|verification| {
+                serde_json::json!({
+                    "activation": {"adapter": "none", "scope": "user", "reconcile_managed_units": true, "units": []},
+                    "verification": verification,
+                    "extra": 1
+                })
+            }),
+        ]
+    }
+
+    fn behavior_doc_strategy() -> impl Strategy<Value = serde_json::Value> {
+        prop::collection::btree_map(doc_variant_name_strategy(), contract_wire_strategy(), 0..3)
+            .prop_map(|m| {
+                let mut map = serde_json::Map::new();
+                for (k, v) in m {
+                    map.insert(k, v);
+                }
+                serde_json::Value::Object(map)
+            })
+    }
+
+    fn canonical_slot_strategy() -> impl Strategy<Value = CanonicalSlot> {
+        (
+            doc_slot_id_strategy(),
+            doc_server_strategy(),
+            doc_deploy_dir_strategy(),
+            doc_target_strategy(),
+            prop::collection::vec(doc_group_strategy(), 0..2),
+        )
+            .prop_map(|(id, server, deploy_dir, target, groups)| CanonicalSlot {
+                id,
+                server,
+                deploy_dir,
+                target,
+                groups,
+            })
+    }
+
+    /// The full generated document. The record's identity digest is built
+    /// A CANONICALLY-VALID document: distinct valid variant names, each with
+    /// its slots on KNOWN servers (server-01/02) and valid absolute
+    /// deploy_dirs, behaviors covering EXACTLY the variant set (valid
+    /// closed-enum contracts), and the CANONICAL behavior digest — so the
+    /// generator provably reaches the ACCEPTED branch (the agreement
+    /// property is never vacuous: it compares production and the reference
+    /// on BOTH accepted and refused documents).
+    fn canonical_valid_doc_strategy() -> impl Strategy<Value = GraphDoc> {
+        (1..=2usize).prop_flat_map(|count| {
+            prop::sample::subsequence(vec!["standard".to_string(), "canary".to_string()], count)
+                .prop_flat_map(move |names| {
+                    let name_count = names.len();
+                    let names_for_slots = names.clone();
+                    // Per-variant slots (each variant 0..2 slots on KNOWN
+                    // servers only — the valid graph's server set).
+                    prop::collection::vec(
+                        prop::collection::vec(
+                            (
+                                doc_slot_id_strategy(),
+                                prop::sample::select(vec![
+                                    "server-01".to_string(),
+                                    "server-02".to_string(),
+                                ]),
+                                doc_deploy_dir_strategy(),
+                                doc_target_strategy(),
+                                prop::collection::vec(doc_group_strategy(), 0..2),
+                            )
+                                .prop_map(
+                                    |(id, server, deploy_dir, target, groups)| CanonicalSlot {
+                                        id,
+                                        server,
+                                        deploy_dir,
+                                        target,
+                                        groups,
+                                    },
+                                ),
+                            0..2,
+                        ),
+                        name_count,
+                    )
+                    .prop_flat_map(move |per_variant_slots| {
+                        let names = names_for_slots.clone();
+                        // Valid contracts covering EXACTLY the variants.
+                        prop::collection::vec(
+                            valid_activation_wire().prop_flat_map(|activation| {
+                                valid_verification_wire().prop_map(move |verification| {
+                                    serde_json::json!({
+                                        "activation": activation,
+                                        "verification": verification,
+                                    })
+                                })
+                            }),
+                            names.len(),
+                        )
+                        .prop_map(move |contracts| {
+                            let servers =
+                                BTreeSet::from(["server-01".to_string(), "server-02".to_string()]);
+                            let mut variants: BTreeMap<String, String> = BTreeMap::new();
+                            let mut slot_defs: BTreeMap<String, Vec<SlotConfig>> = BTreeMap::new();
+                            let mut behaviors: BTreeMap<String, BehaviorContract> = BTreeMap::new();
+                            for (i, name) in names.iter().enumerate() {
+                                variants.insert(name.clone(), hex::encode([0xAAu8; 8]));
+                                slot_defs.insert(
+                                    name.clone(),
+                                    per_variant_slots[i]
+                                        .iter()
+                                        .map(|s| {
+                                            SlotConfig::new(
+                                                s.id.clone(),
+                                                s.server.clone(),
+                                                PathBuf::from(&s.deploy_dir),
+                                                s.target.clone(),
+                                                s.groups.clone(),
+                                            )
+                                        })
+                                        .collect(),
+                                );
+                                behaviors.insert(
+                                    name.clone(),
+                                    serde_json::from_value(contracts[i].clone())
+                                        .expect("a valid contract wire parses"),
+                                );
+                            }
+                            let bindings: BTreeMap<VariantName, TreeDigest> = variants
+                                .iter()
+                                .map(|(n, t)| {
+                                    (VariantName::new(n.clone()), TreeDigest::new(t.clone()))
+                                })
+                                .collect();
+                            let behavior_sha = variant_behaviors_digest(&behaviors);
+                            let rec = build_release(
+                                &hex::encode([0xBBu8; 8]),
+                                &behavior_sha,
+                                &bindings,
+                                &slot_defs,
+                                Path::new("."),
+                            );
+                            GraphDoc {
+                                rec,
+                                behaviors_json: serde_json::to_value(&behaviors)
+                                    .expect("behaviors serialize"),
+                                servers,
+                            }
+                        })
+                    })
+                })
+        })
+    }
+
+    /// The mixed generator: mostly MUTATED (often-invalid) documents plus a
+    /// canonical-valid arm, so the agreement property compares production and
+    /// the independent reference on both accepted and refused documents.
+    fn graph_doc_strategy() -> impl Strategy<Value = GraphDoc> {
+        prop_oneof![
+            3 => mutated_doc_strategy(),
+            2 => canonical_valid_doc_strategy(),
+        ]
+    }
+
+    /// from the SAME composition (via [`build_release`], so a non-tampered
+    /// record is internally consistent), then mutated per the generated
+    /// flags: identity tamper, a variant binding addition, a removed /
+    /// dangling / emptied slot snapshot entry, and a behavior-digest
+    /// disagreement (arbitrary `behavior_sha256`).
+    fn mutated_doc_strategy() -> impl Strategy<Value = GraphDoc> {
+        (
+            prop::collection::vec(
+                (
+                    doc_variant_name_strategy(),
+                    any::<[u8; 8]>(),
+                    prop::collection::vec(canonical_slot_strategy(), 0..3),
+                ),
+                1..4,
+            ),
+            behavior_doc_strategy(),
+            any::<[u8; 8]>(),
+            any::<[u8; 8]>(),
+            any::<bool>(),
+            prop::sample::select(vec![0u8, 1, 2]),
+            any::<bool>(),
+            any::<bool>(),
+        )
+            .prop_map(
+                |(
+                    groups,
+                    behaviors_json,
+                    mapping_seed,
+                    digest_seed,
+                    tamper_identity,
+                    slot_mutation,
+                    extra_variant_binding,
+                    canonical_digest,
+                )| {
+                    let servers =
+                        BTreeSet::from(["server-01".to_string(), "server-02".to_string()]);
+                    let mut variants: BTreeMap<String, String> = BTreeMap::new();
+                    let mut slot_defs: BTreeMap<String, Vec<SlotConfig>> = BTreeMap::new();
+                    for (name, tree_seed, slots) in &groups {
+                        if variants.contains_key(name) {
+                            continue;
+                        }
+                        variants.insert(name.clone(), hex::encode(tree_seed));
+                        let defs: Vec<SlotConfig> = slots
+                            .iter()
+                            .map(|s| {
+                                SlotConfig::new(
+                                    s.id.clone(),
+                                    s.server.clone(),
+                                    PathBuf::from(&s.deploy_dir),
+                                    s.target.clone(),
+                                    s.groups.clone(),
+                                )
+                            })
+                            .collect();
+                        slot_defs.insert(name.clone(), defs);
+                    }
+                    // SNAPSHOT MUTATIONS happen on the PRE-BUILD inputs so
+                    // the record's stored identity recomputes CONSISTENTLY
+                    // from the mutated snapshot: the refusal then comes from
+                    // the GRAPH rule (completeness / dangling entries), not
+                    // from an identity mismatch that would shadow it.
+                    match slot_mutation {
+                        1 => {
+                            // A variant binding with NO declared slots
+                            // (incomplete slot declarations).
+                            if let Some(first) = slot_defs.keys().next().cloned() {
+                                slot_defs.remove(&first);
+                            }
+                        }
+                        2 => {
+                            // A DANGLE: a slot snapshot entry for an
+                            // undeclared variant.
+                            slot_defs.insert(
+                                "zzz-dangling-variant".to_string(),
+                                vec![SlotConfig::new(
+                                    "p9",
+                                    "server-01",
+                                    PathBuf::from("/srv/dangling"),
+                                    "production",
+                                    Vec::new(),
+                                )],
+                            );
+                        }
+                        _ => {}
+                    }
+                    if extra_variant_binding {
+                        // A variant binding with no slots and (usually) no
+                        // behavior contract: incomplete on both graphs.
+                        variants.insert("zzz-extra".to_string(), hex::encode(digest_seed));
+                    }
+                    let bindings: BTreeMap<VariantName, TreeDigest> = variants
+                        .iter()
+                        .map(|(n, t)| (VariantName::new(n.clone()), TreeDigest::new(t.clone())))
+                        .collect();
+                    // The provenance behavior_sha256 is sometimes the
+                    // CANONICAL digest of the wire behaviors (when the wire
+                    // parses) — a digest-consistent behavior graph —
+                    // sometimes an arbitrary hex (disagreement).
+                    let behaviors_digest = match serde_json::from_value::<
+                        BTreeMap<String, BehaviorContract>,
+                    >(behaviors_json.clone())
+                    {
+                        Ok(contracts) if canonical_digest => variant_behaviors_digest(&contracts),
+                        _ => hex::encode(digest_seed),
+                    };
+                    let mut rec = build_release(
+                        &hex::encode(mapping_seed),
+                        &behaviors_digest,
+                        &bindings,
+                        &slot_defs,
+                        Path::new("."),
+                    );
+                    if tamper_identity {
+                        rec.release_sha256 = "tampered-identity".to_string();
+                    }
+                    GraphDoc {
+                        rec,
+                        behaviors_json,
+                        servers,
+                    }
+                },
+            )
+    }
+
+    /// The INDEPENDENT leaf predicates (the scalar rules, re-implemented
+    /// plainly — NOT the production parsers).
+    fn ref_name_ok(s: &str) -> bool {
+        !s.trim().is_empty()
+            && s.trim() == s
+            && !s.chars().any(|c| c.is_control())
+            && !s.contains('/')
+            && !s.contains('\\')
+            && s != "."
+            && s != ".."
+    }
+
+    /// The deploy_dir rule: absolute, traversal-free (`/`-split `.`/`..`
+    /// segments refused), at least one normal component below the root.
+    fn ref_deploy_dir_ok(s: &str) -> bool {
+        if !Path::new(s).is_absolute() {
+            return false;
+        }
+        let mut normal = 0usize;
+        for seg in s.split('/') {
+            if seg == "." || seg == ".." {
+                return false;
+            }
+            if !seg.is_empty() {
+                normal += 1;
+            }
+        }
+        normal > 0
+    }
+
+    /// The INDEPENDENT semantic reference validator: re-implements the
+    /// release-graph + closed-behavior rules without calling
+    /// [`ValidatedRelease`]. The only shared machinery is the digest
+    /// recompute (the identity rule itself) and the closed-enum serde parse
+    /// of the behavior wire (the wire boundary both sides use); every
+    /// GRAPH rule below is re-derived from the plain predicates.
+    fn reference_accepts(doc: &GraphDoc) -> bool {
+        let rec = &doc.rec;
+        // Identity: schema version + recompute-and-verify.
+        if rec.release_schema_version != RELEASE_RECORD_SCHEMA_VERSION {
+            return false;
+        }
+        let Some(rd) = recompute_release_digest(rec) else {
+            return false;
+        };
+        if rec.release_sha256 != rd.as_str()
+            || rec.release_id != ReleaseId::from_digest(&rd).as_str()
+        {
+            return false;
+        }
+        // Behavior wire must parse through the closed enums (unsupported
+        // adapters / empty argv / zero attempts / irrelevant fields refuse
+        // HERE) and must agree with the record provenance digest.
+        let Ok(behaviors) = serde_json::from_value::<BTreeMap<String, BehaviorContract>>(
+            doc.behaviors_json.clone(),
+        ) else {
+            return false;
+        };
+        if variant_behaviors_digest(&behaviors) != rec.provenance.behavior_sha256 {
+            return false;
+        }
+        // Complete behavior coverage (both directions).
+        if rec.variants.keys().ne(behaviors.keys()) {
+            return false;
+        }
+        // Complete slot declarations (both directions).
+        if rec.variants.keys().ne(rec.slots.keys()) {
+            return false;
+        }
+        // Per-slot graph rules.
+        let mut seen_ids = BTreeSet::new();
+        for cs in rec.slots.values() {
+            for s in &cs.slots {
+                if !ref_name_ok(&s.id) || !ref_name_ok(&s.server) || !ref_name_ok(&s.target) {
+                    return false;
+                }
+                if !s.groups.iter().all(|g| ref_name_ok(g)) {
+                    return false;
+                }
+                if !ref_deploy_dir_ok(&s.deploy_dir) {
+                    return false;
+                }
+                if !seen_ids.insert(s.id.clone()) {
+                    return false;
+                }
+                if !doc.servers.contains(&s.server) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Production acceptance: the wire behaviors parsed through the closed
+    /// enums, then [`ValidatedRelease::try_new`].
+    fn production_accepts(doc: &GraphDoc) -> bool {
+        let Ok(behaviors) = serde_json::from_value::<BTreeMap<String, BehaviorContract>>(
+            doc.behaviors_json.clone(),
+        ) else {
+            return false;
+        };
+        ValidatedRelease::try_new(doc.rec.clone(), behaviors, &doc.servers).is_ok()
+    }
+
+    /// The acceptance contract for one generated document: production and
+    /// the independent reference AGREE, and an accepted document yields a
+    /// [`ValidatedRelease`] whose domain invariants hold.
+    fn run_acceptance_contract(doc: &GraphDoc) {
+        let prod_ok = production_accepts(doc);
+        let ref_ok = reference_accepts(doc);
+        assert_eq!(
+            prod_ok, ref_ok,
+            "production validator and the independent reference must agree on the document:\n{doc:#?}"
+        );
+        if prod_ok {
+            let behaviors = serde_json::from_value::<BTreeMap<String, BehaviorContract>>(
+                doc.behaviors_json.clone(),
+            )
+            .expect("accepted documents parse");
+            let vr = ValidatedRelease::try_new(doc.rec.clone(), behaviors, &doc.servers)
+                .expect("accepted");
+            // Domain invariants of the accepted value.
+            verify_release_identity(vr.record()).expect("record identity still verifies");
+            assert!(
+                vr.record().variants.keys().eq(vr.record().slots.keys()),
+                "every variant's slots declared"
+            );
+            assert!(
+                vr.record().variants.keys().eq(vr.behaviors().keys()),
+                "behavior coverage complete"
+            );
+            assert_eq!(
+                crate::verify::release::variant_behaviors_digest(vr.behaviors()),
+                vr.record().provenance.behavior_sha256,
+                "behavior graph consistent with the record provenance"
+            );
+            let mut ids = BTreeSet::new();
+            for cs in vr.record().slots.values() {
+                for s in &cs.slots {
+                    assert!(ids.insert(s.id.clone()), "no duplicate slot id '{}'", s.id);
+                    assert!(
+                        doc.servers.contains(&s.server),
+                        "slot '{}' binds a known server",
+                        s.id
+                    );
+                    assert!(
+                        AbsoluteDeployDir::parse(&s.deploy_dir).is_ok(),
+                        "slot '{}' deploy_dir absolute and valid",
+                        s.id
+                    );
+                }
+            }
+        }
+    }
+
+    /// The generator must actually REACH the accepted branch (otherwise the
+    /// acceptance property would be vacuously agreeing on refusals only):
+    /// under the pinned seed, drawing 400 documents yields at least one that
+    /// the reference accepts, and every drawn document keeps production and
+    /// reference in agreement.
+    #[test]
+    fn acceptance_generator_reaches_valid_documents() {
+        use proptest::strategy::ValueTree;
+        use proptest::test_runner::{RngAlgorithm, TestRng, TestRunner};
+        let mut runner = TestRunner::new_with_rng(
+            proptest::test_runner::Config::default(),
+            TestRng::from_seed(
+                RngAlgorithm::XorShift,
+                &0x5EED_5EEDu64.to_le_bytes().repeat(2),
+            ),
+        );
+        let mut accepted = 0;
+        for _ in 0..400 {
+            let doc = graph_doc_strategy()
+                .new_tree(&mut runner)
+                .unwrap()
+                .current();
+            assert_eq!(
+                production_accepts(&doc),
+                reference_accepts(&doc),
+                "agreement"
+            );
+            if reference_accepts(&doc) {
+                accepted += 1;
+            }
+        }
+        assert!(
+            accepted > 0,
+            "generator must reach accepted documents (got {accepted}/400)"
+        );
+    }
+
     proptest! {
-        // Main property: ORDINARY RANDOMIZED SEEDS with FAILURE PERSISTENCE
+        // MAIN acceptance property: ORDINARY RANDOMIZED SEEDS with FAILURE
+        // PERSISTENCE
         // (proptest's defaults) — a failing vector writes to
         // `proptest-regressions/release.txt` and is replayed on the next run
         // (commit it so CI keeps reproducing the regression until fixed). The
@@ -1507,6 +2354,11 @@ mod tests {
         #[test]
         fn release_identity_digest_contract(components in release_components_strategy()) {
             run_release_identity_contract(&components);
+        }
+
+        #[test]
+        fn validated_release_acceptance_property(doc in graph_doc_strategy()) {
+            run_acceptance_contract(&doc);
         }
     }
 
@@ -1528,6 +2380,11 @@ mod tests {
             components in release_components_strategy(),
         ) {
             run_release_identity_contract(&components);
+        }
+
+        #[test]
+        fn validated_release_acceptance_property_fixed_seed_regression(doc in graph_doc_strategy()) {
+            run_acceptance_contract(&doc);
         }
     }
 }

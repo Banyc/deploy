@@ -14,7 +14,13 @@
 //! a narrowly scoped restart permission; it never installs an
 //! artifact-controlled unit into `/etc/systemd/system`.
 
-use crate::config::{ActivationConfig, validate_relative_path};
+// The adapter is driven OFF the closed [`Activation`] enum: only an
+// explicit `Activation::Systemd(..)` value can reach it (the `None` variant
+// is the intended no-op), so the old `if cfg.adapter != "systemd" { return
+// Ok(()) }` silent no-op on unknown adapter names is structurally gone — an
+// unknown adapter cannot construct an [`Activation`] in the first place.
+use crate::config::activation::validate_unit_name;
+use crate::config::{Activation, ActivationScope, ValidatedSystemd, validate_relative_path};
 use crate::error::{Error, Result};
 use crate::remote::canonical::TemplateVars;
 use crate::remote::transport::Remote;
@@ -92,30 +98,6 @@ pub fn resolve_remote_config_home(remote: &dyn Remote) -> Result<PathBuf> {
     Ok(PathBuf::from(home))
 }
 
-/// Reject unit names that could escape the systemd/user directory
-/// (absolute paths, parent-dir components, or empty names).
-fn validate_unit_name(name: &str) -> Result<()> {
-    if name.is_empty() {
-        return Err(Error::config("systemd unit name must not be empty"));
-    }
-    if Path::new(name).is_absolute() {
-        return Err(Error::config(format!(
-            "systemd unit name '{}' must not be an absolute path",
-            name
-        )));
-    }
-    let dangerous = name
-        .split('/')
-        .any(|c| c == ".." || c == "." || c.is_empty());
-    if dangerous {
-        return Err(Error::config(format!(
-            "systemd unit name '{}' must be a single filename",
-            name
-        )));
-    }
-    Ok(())
-}
-
 /// Build the activation command vectors for the given remote root.
 ///
 /// Ordering follows the required contract:
@@ -138,15 +120,15 @@ fn validate_unit_name(name: &str) -> Result<()> {
 pub fn activation_commands(
     remote_root: &Path,
     config_home: &Path,
-    cfg: &ActivationConfig,
+    sa: &ValidatedSystemd,
 ) -> Vec<Vec<String>> {
     let mut cmds = Vec::new();
-    let scope_user = matches!(cfg.scope, crate::config::ActivationScope::User);
+    let scope_user = matches!(sa.scope, ActivationScope::User);
 
     // 1. Parent directory + install each unit from its rendered staging file
     //    (user scope only).
     if scope_user {
-        for u in &cfg.units {
+        for u in &sa.units {
             let link = user_unit_link_for(config_home, &u.name);
             if let Some(parent) = link.parent() {
                 cmds.push(vec![
@@ -179,7 +161,7 @@ pub fn activation_commands(
     }
 
     // 3. enable + restart.
-    for u in &cfg.units {
+    for u in &sa.units {
         if u.enable && scope_user {
             cmds.push(vec![
                 "systemctl".into(),
@@ -214,7 +196,7 @@ pub fn activation_commands(
 pub fn stage_rendered_units(
     remote: &dyn Remote,
     generation_root: &Path,
-    cfg: &ActivationConfig,
+    sa: &ValidatedSystemd,
     vars: &TemplateVars,
 ) -> Result<()> {
     // `generation_root` is an absolute host path (`remote.root()` joined with
@@ -227,7 +209,7 @@ pub fn stage_rendered_units(
             remote.root().display()
         ))
     })?;
-    for u in &cfg.units {
+    for u in &sa.units {
         let src = gen_rel.join(&u.artifact_path);
         let raw = remote.read(&src).map_err(|e| {
             Error::remote(format!(
@@ -256,9 +238,9 @@ pub fn stage_rendered_units(
 pub fn validate_artifact_paths(
     remote: &dyn Remote,
     generation_root_rel: &Path,
-    cfg: &ActivationConfig,
+    sa: &ValidatedSystemd,
 ) -> Result<()> {
-    for u in &cfg.units {
+    for u in &sa.units {
         let p = generation_root_rel.join(&u.artifact_path);
         if remote.metadata_opt(&p)?.is_none() {
             return Err(Error::remote(format!(
@@ -287,15 +269,21 @@ pub fn validate_artifact_paths(
 pub fn run_activation(
     remote: &dyn Remote,
     generation_root: &Path,
-    cfg: &ActivationConfig,
+    activation: &Activation,
     vars: &TemplateVars,
 ) -> Result<()> {
-    if cfg.adapter != "systemd" {
+    // Only an explicit `Activation::Systemd` payload reaches the adapter; the
+    // `None` variant is the DELIBERATE no-op of `adapter = "none"`. There is
+    // no other arm: an unknown adapter cannot construct an [`Activation`], so
+    // an unsupported adapter can never silently skip activation here.
+    let Activation::Systemd(sa) = activation else {
         return Ok(());
-    }
+    };
     // Validate every declared unit name and artifact path before touching any
     // remote state; a path traversal here would escape the generation root.
-    for u in &cfg.units {
+    // (The config/record closed-enum boundary already validated these, so
+    // this is a defense-in-depth re-check for hand-built payloads.)
+    for u in &sa.units {
         validate_unit_name(&u.name)?;
         validate_relative_path(Path::new(&u.artifact_path))
             .map_err(|e| Error::remote(format!("unit '{}' artifact path invalid: {e}", u.name)))?;
@@ -303,12 +291,12 @@ pub fn run_activation(
     // Render + stage the units BEFORE any command runs: a template error
     // (unknown variable, malformed syntax) must fail activation loudly, never
     // install a half-rendered unit or leave the previous unit in place.
-    if matches!(cfg.scope, crate::config::ActivationScope::User) {
-        stage_rendered_units(remote, generation_root, cfg, vars)?;
+    if matches!(sa.scope, ActivationScope::User) {
+        stage_rendered_units(remote, generation_root, sa, vars)?;
     }
     // Resolve the unit directory base on the *remote* host, not the controller.
     let config_home = resolve_remote_config_home(remote)?;
-    let cmds = activation_commands(remote.root(), &config_home, cfg);
+    let cmds = activation_commands(remote.root(), &config_home, sa);
     for argv in &cmds {
         let outcome = remote.exec(argv, Duration::from_secs(30))?;
         if !outcome.success() {
@@ -318,7 +306,7 @@ pub fn run_activation(
             )));
         }
     }
-    let managed: Vec<String> = cfg.units.iter().map(|u| u.name.clone()).collect();
+    let managed: Vec<String> = sa.units.iter().map(|u| u.name.clone()).collect();
     let payload = serde_json::json!({ "managed_units": managed });
     let bytes = serde_json::to_vec_pretty(&payload)
         .map_err(|e| Error::remote(format!("serialize systemd state: {e}")))?;
@@ -329,14 +317,13 @@ pub fn run_activation(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::config::{ActivationConfig, ActivationScope, UnitDef};
+    use crate::config::{ActivationScope, UnitDef, ValidatedSystemd};
     use crate::identity::{TreeDigest, test_deployment_id, test_generation_id};
     use crate::remote::transport::LocalTransport;
     use std::os::unix::fs::PermissionsExt;
 
-    fn cfg(scope: ActivationScope, units: Vec<&str>) -> ActivationConfig {
-        ActivationConfig {
-            adapter: "systemd".into(),
+    fn cfg(scope: ActivationScope, units: Vec<&str>) -> ValidatedSystemd {
+        ValidatedSystemd {
             scope,
             reconcile_managed_units: true,
             units: units
@@ -775,7 +762,12 @@ pub(crate) mod tests {
 
         let result = {
             let c = cfg(ActivationScope::User, vec!["example.service"]);
-            run_activation(&remote, &generation_root, &c, &slot_vars())
+            run_activation(
+                &remote,
+                &generation_root,
+                &Activation::Systemd(c.clone()),
+                &slot_vars(),
+            )
         };
         result.unwrap();
 

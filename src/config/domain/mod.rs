@@ -32,7 +32,7 @@
 //! The name [`DomainConfig`] aliases the validated graph type (the two-layer
 //! story: raw serde shapes -> validated domain).
 
-use crate::config::activation::{Activation, SystemdActivation};
+use crate::config::activation::Activation;
 use crate::config::capacity::CapacityConfig;
 use crate::config::pins::Pin;
 use crate::config::raw::{CONFIG_SCHEMA_VERSION, RawConfig, RawVariant};
@@ -44,7 +44,7 @@ use crate::config::servers::{
     validate_server_identity,
 };
 use crate::config::slots::SlotConfig;
-use crate::config::verification::VerificationConfig;
+use crate::config::verification::Verification;
 use crate::error::{Error, Result};
 use crate::identity::{
     AbsoluteDeployDir, ApplicationStoreKey, BatchSize, CapacityPercent, Host, Identifier,
@@ -96,7 +96,11 @@ pub struct VariantConfig {
     /// The variant's typed activation policy ([`Activation`]); the raw
     /// `adapter` string has already been consumed by the conversion.
     pub activation: Activation,
-    pub verification: VerificationConfig,
+    /// The variant's typed verification policy ([`Verification`] — ALWAYS
+    /// [`Verification::Command`]); the raw `adapter` string has already been
+    /// consumed by the conversion, and the payload is fully validated
+    /// (non-empty argv, nonzero attempts/timeout, known template variables).
+    pub verification: Verification,
     /// This variant's deployment slots, declared inside its own file. The
     /// declaring variant file is the slot's variant binding.
     pub slots: Vec<SlotConfig>,
@@ -410,37 +414,16 @@ impl TryFrom<RawProject> for ProjectConfig {
                     "variant name '{vname}' must be a non-empty, well-formed identifier"
                 ))
             })?;
-            let activation = match variant.activation.adapter.as_str() {
-                "none" => Activation::None,
-                "systemd" => {
-                    if variant.activation.units.is_empty() {
-                        return Err(Error::config(format!(
-                            "variant '{vname}': systemd activation requires at least one unit"
-                        )));
-                    }
-                    Activation::Systemd(SystemdActivation {
-                        scope: variant.activation.scope.clone(),
-                        reconcile_managed_units: variant.activation.reconcile_managed_units,
-                        units: variant.activation.units.clone(),
-                    })
-                }
-                other => {
-                    return Err(Error::config(format!(
-                        "variant '{vname}': unknown activation adapter '{other}'"
-                    )));
-                }
-            };
-            if variant.verification.adapter != "command" {
-                return Err(Error::config(format!(
-                    "variant '{vname}': unsupported verification adapter '{}'",
-                    variant.verification.adapter
-                )));
-            }
-            if variant.verification.argv.is_empty() {
-                return Err(Error::config(format!(
-                    "variant '{vname}': verification argv must not be empty"
-                )));
-            }
+            // The activation and verification ADAPTER STRINGS are consumed
+            // here through the CLOSED enums: an unknown/unsupported adapter
+            // (or an invalid payload — systemd without units, an invalid
+            // unit name/artifact path, empty argv, zero attempts, zero
+            // timeout, an unknown template variable, irrelevant fields) is a
+            // REFUSAL at the load, never a silent no-op later.
+            let activation = Activation::try_from(&variant.activation)
+                .map_err(|e| Error::config(format!("variant '{vname}': {e}")))?;
+            let verification = Verification::try_from(&variant.verification)
+                .map_err(|e| Error::config(format!("variant '{vname}': {e}")))?;
 
             // Validate mapping modes and artifact-relative destinations.
             for (i, m) in variant.artifact.mappings.iter().enumerate() {
@@ -483,7 +466,7 @@ impl TryFrom<RawProject> for ProjectConfig {
                     description: variant.description.clone(),
                     artifact: variant.artifact.clone(),
                     activation,
-                    verification: variant.verification.clone(),
+                    verification: verification.clone(),
                     // The slots enter the domain graph with their deploy_dir
                     // stored in the validated CANONICAL form (the ONE
                     // authoritative effective root each local slot operates

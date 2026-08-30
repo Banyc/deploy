@@ -17,6 +17,7 @@ mod materialize;
 
 pub use materialize::{
     ELECTED_VARIABLES, TemplateVars, materialize_variant, render_argv, render_template,
+    validate_template_variables,
 };
 
 use crate::digest::sha256_bytes;

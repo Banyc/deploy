@@ -744,6 +744,41 @@ pub fn render_template(template: &str, vars: &TemplateVars) -> Result<String> {
     Ok(out)
 }
 
+/// Statically validate every `{{ name }}` variable reference in `template`
+/// WITHOUT rendering: the same grammar as [`render_template`] (unterminated
+/// `{{`, empty `{{ }}`, and any non-`ELECTED_VARIABLES` name — including
+/// every form of filter/property syntax, since only bare names are elected —
+/// are refused). Used at the closed-enum boundary so a frozen record or
+/// config whose argv/unit templates reference an unknown variable is refused
+/// before any deployment work, instead of failing at render time after
+/// remote state was touched.
+pub fn validate_template_variables(template: &str) -> Result<()> {
+    let mut rest = template;
+    while let Some(start) = rest.find("{{") {
+        let after = &rest[start + 2..];
+        let Some(close) = after.find("}}") else {
+            return Err(Error::template(format!(
+                "malformed template: unterminated '{{{{' in {template:?}"
+            )));
+        };
+        let name = after[..close].trim();
+        if name.is_empty() {
+            return Err(Error::template(format!(
+                "malformed template: empty '{{{{ }}}}' variable in {template:?}"
+            )));
+        }
+        if !ELECTED_VARIABLES.contains(&name) {
+            return Err(Error::template(format!(
+                "unknown template variable '{name}' in {template:?} \
+                 (supported variables: {})",
+                ELECTED_VARIABLES.join(", ")
+            )));
+        }
+        rest = &after[close + 2..];
+    }
+    Ok(())
+}
+
 /// Render every element of a command vector (e.g. verification `argv`).
 /// Elements without templates are unchanged; malformed or unknown variables
 /// fail loudly before the command is executed.

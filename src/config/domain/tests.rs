@@ -271,13 +271,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     assert!(names.contains(&"high-capacity".to_string()));
 
     let std = cfg.variant("standard").expect("standard variant present");
-    assert_eq!(std.verification.argv, vec!["true".to_string()]);
+    assert_eq!(std.verification.argv(), &vec!["true".to_string()]);
     assert_eq!(std.activation, Activation::None);
 
     let hc = cfg
         .variant("high-capacity")
         .expect("high-capacity variant present");
-    assert_eq!(hc.verification.argv, vec!["false".to_string()]);
+    assert_eq!(hc.verification.argv(), &vec!["false".to_string()]);
     let Activation::Systemd(hc_act) = &hc.activation else {
         panic!("high-capacity variant must carry the systemd activation");
     };
@@ -1811,6 +1811,99 @@ fn conversion_rejects_impossible_activation_and_verification() {
         .argv
         .clear();
     expect_conversion_err(p, "empty verification argv");
+
+    // Zero verification attempts: a zero-attempt verification could never
+    // verify, so it is REFUSED at the load (the closed-enum rule), never
+    // silently upgraded to a single attempt.
+    let mut p = minimal_raw_project();
+    p.variants
+        .get_mut("standard")
+        .unwrap()
+        .verification
+        .attempts = 0;
+    expect_conversion_err(p, "zero verification attempts");
+
+    // Zero verification timeout: a zero-second exec timeout is a malformed
+    // verification contract, refused at the load.
+    let mut p = minimal_raw_project();
+    p.variants
+        .get_mut("standard")
+        .unwrap()
+        .verification
+        .timeout_seconds = 0;
+    expect_conversion_err(p, "zero verification timeout");
+
+    // An argv element referencing an unknown template variable: refused at
+    // the load (the template-variable rule), instead of failing at verify
+    // time after remote state was touched.
+    let mut p = minimal_raw_project();
+    p.variants.get_mut("standard").unwrap().verification = VerificationConfig {
+        adapter: "command".to_string(),
+        argv: vec!["{{ bogus }}".to_string()],
+        timeout_seconds: 5,
+        attempts: 1,
+        interval_seconds: 0,
+    };
+    expect_conversion_err(p, "unknown template variable in argv");
+
+    // A `none` activation contract carrying units is an irrelevant-field
+    // refusal (the units would be silently dropped by the canonical form).
+    let mut p = minimal_raw_project();
+    p.variants.get_mut("standard").unwrap().activation = ActivationConfig {
+        adapter: "none".to_string(),
+        scope: ActivationScope::User,
+        reconcile_managed_units: true,
+        units: vec![UnitDef {
+            name: "app.service".to_string(),
+            artifact_path: "integration/systemd/app.service".to_string(),
+            enable: true,
+            restart: true,
+        }],
+    };
+    expect_conversion_err(p, "none activation with units");
+
+    // A `none` activation contract carrying a non-default scope is an
+    // irrelevant-field refusal.
+    let mut p = minimal_raw_project();
+    p.variants.get_mut("standard").unwrap().activation = ActivationConfig {
+        adapter: "none".to_string(),
+        scope: ActivationScope::System,
+        reconcile_managed_units: true,
+        units: Vec::new(),
+    };
+    expect_conversion_err(p, "none activation with non-default scope");
+
+    // A systemd unit whose NAME could escape the systemd directory is
+    // refused at the load, not at activation time.
+    let mut p = minimal_raw_project();
+    p.variants.get_mut("standard").unwrap().activation = ActivationConfig {
+        adapter: "systemd".to_string(),
+        scope: ActivationScope::User,
+        reconcile_managed_units: true,
+        units: vec![UnitDef {
+            name: "../app.service".to_string(),
+            artifact_path: "integration/systemd/app.service".to_string(),
+            enable: true,
+            restart: true,
+        }],
+    };
+    expect_conversion_err(p, "traversal unit name");
+
+    // A systemd unit whose artifact path is absolute (could escape the
+    // generation tree) is refused at the load.
+    let mut p = minimal_raw_project();
+    p.variants.get_mut("standard").unwrap().activation = ActivationConfig {
+        adapter: "systemd".to_string(),
+        scope: ActivationScope::User,
+        reconcile_managed_units: true,
+        units: vec![UnitDef {
+            name: "app.service".to_string(),
+            artifact_path: "/etc/systemd/app.service".to_string(),
+            enable: true,
+            restart: true,
+        }],
+    };
+    expect_conversion_err(p, "absolute unit artifact path");
 }
 
 #[test]
@@ -2061,7 +2154,7 @@ fn conversion_maps_systemd_activation_to_typed_enum() {
     // The domain -> contract conversion is the ONLY path and is
     // canonical: the serialized contract has adapter systemd + the
     // carried scope/units (this is what the behavior digest hashes).
-    let contract = ActivationConfig::from(Activation::Systemd(SystemdActivation {
+    let contract = ActivationConfig::from(Activation::Systemd(ValidatedSystemd {
         scope: ActivationScope::System,
         reconcile_managed_units: true,
         units: vec![UnitDef {

@@ -11,7 +11,7 @@ pub(crate) use compensation::*;
 // re-verify, artifact-path validation, activation, commit marker), the
 // [`ServerProc`] outcome, the tree download helper.
 
-use crate::config::ProjectConfig;
+use crate::config::{Activation, ProjectConfig};
 use crate::deploy::rollout::SlotExecution;
 use crate::error::Error;
 use crate::error::Result;
@@ -197,7 +197,11 @@ pub(crate) fn process_server(
     }
 
     // 3. Validate all declared artifact paths and types before changing current.
-    if let Err(e) = validate_artifact_paths(remote, &object_rel, &behavior.activation) {
+    //    (`Activation::None` declares no units, so there is nothing to
+    //    validate; a `Systemd` payload carries the fully validated units.)
+    if let Activation::Systemd(sa) = &behavior.activation
+        && let Err(e) = validate_artifact_paths(remote, &object_rel, sa)
+    {
         return Ok(ServerProc::failed_before(format!(
             "artifact validation: {e}"
         )));
@@ -642,7 +646,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         pub(crate) fn behave(&self) -> BehaviorContract {
             let v = self.config.variant("standard").unwrap();
             BehaviorContract {
-                activation: crate::config::ActivationConfig::from(v.activation.clone()),
+                activation: v.activation.clone(),
                 verification: v.verification.clone(),
             }
         }

@@ -1394,7 +1394,7 @@ pub(crate) fn membership_drift_fixture(
     let variant_behaviors: BTreeMap<String, BehaviorContract> = BTreeMap::from([(
         "standard".to_string(),
         BehaviorContract {
-            activation: crate::config::ActivationConfig::from(vcfg.activation.clone()),
+            activation: vcfg.activation.clone(),
             verification: vcfg.verification.clone(),
         },
     )]);
@@ -1601,7 +1601,7 @@ pub(crate) fn group_membership_fixture(
     let variant_behaviors: BTreeMap<String, BehaviorContract> = BTreeMap::from([(
         "standard".to_string(),
         BehaviorContract {
-            activation: crate::config::ActivationConfig::from(vcfg.activation.clone()),
+            activation: vcfg.activation.clone(),
             verification: vcfg.verification.clone(),
         },
     )]);

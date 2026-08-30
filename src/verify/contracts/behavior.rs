@@ -11,14 +11,17 @@
 //! recomputes it from a stored `behavior.json` and fails closed on any
 //! payload whose canonical contract set differs.
 
-use crate::config::{ActivationConfig, VerificationConfig};
+use crate::config::{Activation, Verification};
 use crate::digest::sha256_bytes;
 use crate::error::{Error, Result};
 use crate::identity::{BehaviorContract, ReleaseId};
 use std::collections::BTreeMap;
 
-/// Canonical digest of the activation + verification contract.
-pub fn behavior_digest(activation: &ActivationConfig, verification: &VerificationConfig) -> String {
+/// Canonical digest of the activation + verification contract. The closed
+/// enums serialize to the canonical wire bytes (identical to the raw
+/// `ActivationConfig`/`VerificationConfig` shapes), so the digest is
+/// byte-stable with the pre-closed-enum form.
+pub fn behavior_digest(activation: &Activation, verification: &Verification) -> String {
     let act = serde_json::to_value(activation).expect("activation serializes");
     let ver = serde_json::to_value(verification).expect("verification serializes");
     let payload = serde_json::json!({ "activation": act, "verification": ver });

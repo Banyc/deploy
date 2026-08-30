@@ -201,7 +201,7 @@ pub(crate) fn run_preflight(
         variant_behaviors.insert(
             v.clone(),
             BehaviorContract {
-                activation: crate::config::ActivationConfig::from(vcfg.activation.clone()),
+                activation: vcfg.activation.clone(),
                 verification: vcfg.verification.clone(),
             },
         );
@@ -212,6 +212,15 @@ pub(crate) fn run_preflight(
     let behavior_json = serde_json::to_value(&variant_behaviors)?;
     let mapping_toml = toml::to_string_pretty(&variant_mappings)
         .map_err(|e| Error::store(format!("serialize mappings: {e}")))?;
+
+    // The available SERVER SET of the graph being deployed: every release's
+    // frozen slots must bind servers that exist in the caller's CURRENT
+    // configuration (a slot binding an unknown server cannot be operated on).
+    // This is the server context handed to the complete release validator.
+    let server_ids: BTreeSet<String> = config
+        .servers()
+        .map(|s| s.id.as_str().to_string())
+        .collect();
 
     // The helpers/statuses cover ALL of the target's member slots (a pending
     // attempt may involve any of them, and deferred-retention debt for any of
@@ -296,6 +305,20 @@ pub(crate) fn run_preflight(
         );
         let rid = ReleaseId::parse(&rec.release_id)
             .expect("newly built release record carries a validated release id");
+        // COMPLETE SEMANTIC VALIDATION of the freshly built record BEFORE it
+        // is persisted or planned: the record + its behavior contracts must
+        // form a consistent release graph (slot declarations complete and
+        // parseable, unique slot ids, every binding's server known, complete
+        // behavior coverage, digest-consistent record AND behavior graph).
+        // An unsupported/unknown activation or verification adapter was
+        // already refused when the contracts were parsed into the closed
+        // enums above, so a silent no-op adapter can never reach a push.
+        crate::verify::release::ValidatedRelease::try_new(
+            rec.clone(),
+            variant_behaviors.clone(),
+            &server_ids,
+        )
+        .map_err(|e| Error::preflight(format!("release {rid} fails semantic validation: {e}")))?;
         if !opts.dry_run {
             store.write_release(&rec)?;
             let release_json = serde_json::to_string(&rec)
@@ -336,6 +359,32 @@ pub(crate) fn run_preflight(
                 "historical behavior unavailable (immutable behavior required): {e}"
             ))
         })?;
+        // COMPLETE SEMANTIC VALIDATION of EVERY referenced release BEFORE
+        // anything is planned or published (dry-run too): each record + its
+        // own per-variant behavior contracts must form a consistent release
+        // graph (slot declarations complete and parseable, unique slot ids,
+        // every frozen slot binding a known server, complete behavior
+        // coverage with digest-consistent record AND behavior graph). An
+        // unsupported activation/verification adapter in a frozen behavior
+        // snapshot was already refused when the contracts were parsed into
+        // the closed enums by [`LocalStore::read_release_behaviors`] — a
+        // silent no-op adapter can never reach a historical push.
+        for rid in &releases {
+            let rec = store.read_release(rid).map_err(|e| {
+                Error::preflight(format!("historical release {rid} not found: {e}"))
+            })?;
+            let behaviors = index.get(rid).cloned().ok_or_else(|| {
+                Error::preflight(format!(
+                    "historical release {rid} has no behavior contracts (fail closed)"
+                ))
+            })?;
+            crate::verify::release::ValidatedRelease::try_new(rec, behaviors, &server_ids)
+                .map_err(|e| {
+                    Error::preflight(format!(
+                        "historical release {rid} fails semantic validation: {e}"
+                    ))
+                })?;
+        }
         if !opts.dry_run {
             // Publish EVERY referenced release's record + behavior snapshot:
             // each slot's server publishes ITS OWN slot's release, so a

@@ -164,8 +164,7 @@ mod tests {
         let contracts: BTreeMap<String, BehaviorContract> = BTreeMap::from([(
             "standard".to_string(),
             BehaviorContract {
-                activation: crate::config::ActivationConfig {
-                    adapter: "systemd".to_string(),
+                activation: crate::config::Activation::Systemd(crate::config::ValidatedSystemd {
                     scope: crate::config::ActivationScope::System,
                     reconcile_managed_units: true,
                     units: vec![crate::config::UnitDef {
@@ -174,14 +173,15 @@ mod tests {
                         enable: true,
                         restart: true,
                     }],
-                },
-                verification: crate::config::VerificationConfig {
-                    adapter: "command".to_string(),
-                    argv: vec!["true".to_string()],
-                    timeout_seconds: 30,
-                    attempts: 2,
-                    interval_seconds: 1,
-                },
+                }),
+                verification: crate::config::Verification::Command(
+                    crate::config::ValidatedCommand {
+                        argv: vec!["true".to_string()],
+                        timeout_seconds: 30,
+                        attempts: 2,
+                        interval_seconds: 1,
+                    },
+                ),
             },
         )]);
         let sha = crate::verify::release::variant_behaviors_digest(&contracts);
@@ -259,7 +259,7 @@ mod tests {
 
         // ...and the stored snapshot is untouched (no torn write).
         let read = store.read_release_behaviors(&id).expect("snapshot exists");
-        assert_eq!(read["standard"].activation.adapter, "systemd");
+        assert_eq!(read["standard"].activation.to_config().adapter, "systemd");
     }
 
     /// `read_release` recomputes the canonical digest from the record's own

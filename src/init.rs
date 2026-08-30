@@ -782,7 +782,7 @@ mod tests {
         assert_eq!(config.release().as_str(), "v1");
         assert_eq!(config.target_slot_ids("production").unwrap(), vec!["app-1"]);
         assert_eq!(
-            config.variant("standard").unwrap().verification.argv,
+            config.variant("standard").unwrap().verification.argv(),
             vec!["true"]
         );
 

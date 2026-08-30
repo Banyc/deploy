@@ -1927,13 +1927,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     /// recompute-and-verify reads succeed. Returns the release id.
     fn seed_distinct_release(store: &LocalStore, seed: usize) -> ReleaseId {
         let contract = BehaviorContract {
-            activation: crate::config::ActivationConfig::default(),
-            verification: crate::config::VerificationConfig {
-                adapter: "command".to_string(),
+            activation: crate::config::Activation::None,
+            verification: crate::config::Verification::Command(crate::config::ValidatedCommand {
                 argv: vec![format!("verify-{seed}")],
                 timeout_seconds: 5,
-                ..Default::default()
-            },
+                attempts: 1,
+                interval_seconds: 0,
+            }),
         };
         let behaviors = BTreeMap::from([("standard".to_string(), contract)]);
         let behavior_sha = crate::verify::release::variant_behaviors_digest(&behaviors);

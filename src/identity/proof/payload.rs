@@ -20,18 +20,28 @@
 //! later encapsulation passes; they are parked here with the identity
 //! payload for now.
 
-use crate::config::{ActivationConfig, VerificationConfig};
+use crate::config::{Activation, Verification};
 use crate::identity::{GenerationId, ReleaseId, SlotId, TreeDigest, VariantName};
 use serde::{Deserialize, Serialize};
 
 /// The canonical behavior contract (activation + verification) that fully
-/// describes how an assignment is activated and verified. It is frozen into the
-/// release identity and copied into every generation record so a historical
-/// push restores its original behavior rather than the caller's current config.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// describes how an assignment is activated and verified. It is frozen into
+/// the release identity and copied into every generation record so a
+/// historical push restores its original behavior rather than the caller's
+/// current config.
+///
+/// The two halves are CLOSED domain enums ([`Activation`] /
+/// [`Verification`]): the serialized contract is parsed through them, so a
+/// frozen record that names an adapter the tool cannot run, carries an
+/// invalid payload (empty argv, zero attempts, no units, an unknown
+/// template variable), or carries irrelevant fields is REFUSED at the
+/// record boundary — it can never reach the adapters, where an unsupported
+/// adapter used to become a silent no-op.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BehaviorContract {
-    pub activation: ActivationConfig,
-    pub verification: VerificationConfig,
+    pub activation: Activation,
+    pub verification: Verification,
 }
 
 /// One entry in a canonical tree object.

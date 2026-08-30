@@ -1263,7 +1263,7 @@ pub(crate) mod commit_tests {
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
         let var_a = h.config.variant("standard").unwrap();
         let digest_a = crate::verify::release::behavior_contract_digest(&BehaviorContract {
-            activation: crate::config::ActivationConfig::from(var_a.activation.clone()),
+            activation: var_a.activation.clone(),
             verification: var_a.verification.clone(),
         });
         let attempt1 = r1.attempt.as_ref().expect("attempt recorded");
@@ -1306,7 +1306,7 @@ pub(crate) mod commit_tests {
         let config2 = ProjectConfig::load(&h.cfg_path).unwrap();
         let var_b = config2.variant("standard").unwrap();
         let digest_b = crate::verify::release::behavior_contract_digest(&BehaviorContract {
-            activation: crate::config::ActivationConfig::from(var_b.activation.clone()),
+            activation: var_b.activation.clone(),
             verification: var_b.verification.clone(),
         });
         assert_ne!(

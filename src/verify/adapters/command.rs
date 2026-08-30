@@ -9,7 +9,15 @@
 //! unchanged; an unknown or malformed variable fails loudly before anything
 //! is executed.
 
-use crate::config::VerificationConfig;
+// The adapter is driven OFF the closed [`Verification`] enum: its only
+// variant is [`Command`](Verification::Command), so the adapter's payload is
+// fully validated (non-empty argv, nonzero attempts/timeout) by construction
+// and the adapter USES it — the old code never looked at the `adapter` field
+// at all, so an unsupported adapter string in a frozen record was silently
+// "verified" with no check. That cannot happen: the record boundary already
+// refused any adapter other than `command` before a [`Verification`] could
+// exist.
+use crate::config::Verification;
 use crate::error::{Error, Result};
 use crate::remote::canonical::TemplateVars;
 use crate::remote::transport::Remote;
@@ -19,14 +27,18 @@ use std::time::Duration;
 /// between tries. Returns Ok on the first zero exit status.
 pub fn run_verification(
     remote: &dyn Remote,
-    cfg: &VerificationConfig,
+    verification: &Verification,
     vars: &TemplateVars,
 ) -> Result<()> {
-    let attempts = cfg.attempts.max(1);
-    let timeout = Duration::from_secs(cfg.timeout_seconds);
+    let Verification::Command(vc) = verification;
+    // The payload is fully validated by construction (non-empty argv, nonzero
+    // attempts and timeout), so no defensive `max(1)` upgrade is possible or
+    // needed — a zero-attempt command was refused at the record boundary.
+    let attempts = vc.attempts;
+    let timeout = Duration::from_secs(vc.timeout_seconds);
     // Render BEFORE the first exec: a template error fails the verification
     // loudly instead of executing a half-rendered command.
-    let argv = crate::remote::canonical::render_argv(&cfg.argv, vars)?;
+    let argv = crate::remote::canonical::render_argv(&vc.argv, vars)?;
     let mut last_stderr = String::new();
     for attempt in 0..attempts {
         let outcome = remote.exec(&argv, timeout)?;
@@ -34,8 +46,8 @@ pub fn run_verification(
             return Ok(());
         }
         last_stderr = outcome.stderr;
-        if attempt + 1 < attempts && cfg.interval_seconds > 0 {
-            std::thread::sleep(Duration::from_secs(cfg.interval_seconds));
+        if attempt + 1 < attempts && vc.interval_seconds > 0 {
+            std::thread::sleep(Duration::from_secs(vc.interval_seconds));
         }
     }
     Err(Error::remote(format!(
@@ -46,7 +58,7 @@ pub fn run_verification(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::VerificationConfig;
+    use crate::config::{ValidatedCommand, Verification};
     use crate::remote::transport::CreateNewVerdict;
     use std::cell::RefCell;
     use std::path::{Path, PathBuf};
@@ -131,14 +143,13 @@ mod tests {
         }
     }
 
-    fn cfg(argv: &[&str]) -> VerificationConfig {
-        VerificationConfig {
-            adapter: "command".to_string(),
+    fn cfg(argv: &[&str]) -> Verification {
+        Verification::Command(ValidatedCommand {
             argv: argv.iter().map(|a| a.to_string()).collect(),
             timeout_seconds: 5,
             attempts: 1,
             interval_seconds: 0,
-        }
+        })
     }
 
     fn slot_vars() -> TemplateVars {

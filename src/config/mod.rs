@@ -70,7 +70,7 @@ pub(crate) use policies::{
 mod domain;
 mod policies;
 
-pub use activation::{Activation, ActivationConfig, ActivationScope, SystemdActivation, UnitDef};
+pub use activation::{Activation, ActivationConfig, ActivationScope, UnitDef, ValidatedSystemd};
 pub use capacity::CapacityConfig;
 pub use domain::{
     ArtifactConfig, ConflictPolicy, DomainConfig, Mapping, ProjectConfig, TargetConfig,
@@ -83,4 +83,4 @@ pub use retention::{DeploymentRetention, PerServerRetention, RetentionConfig};
 pub use rollout::{FailurePolicy, RolloutConfig};
 pub use servers::{Fingerprint, HostIdentity, ServerConnection, ServerDef};
 pub use slots::SlotConfig;
-pub use verification::VerificationConfig;
+pub use verification::{ValidatedCommand, Verification, VerificationConfig};

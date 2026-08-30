@@ -1894,20 +1894,14 @@ fn historical_rollback_uses_historical_behavior() -> Result<()> {
     let a_var = config_a
         .variant("standard")
         .expect("standard variant present");
-    let a_digest = release::behavior_digest(
-        &deploy::config::ActivationConfig::from(a_var.activation.clone()),
-        &a_var.verification,
-    );
+    let a_digest = release::behavior_digest(&a_var.activation, &a_var.verification);
     let b_digest = {
         // Behavior B: verification command differs (so its digest differs).
         let config_b = setup_single(&proj, "false", true, 1);
         let b_var = config_b
             .variant("standard")
             .expect("standard variant present");
-        release::behavior_digest(
-            &deploy::config::ActivationConfig::from(b_var.activation.clone()),
-            &b_var.verification,
-        )
+        release::behavior_digest(&b_var.activation, &b_var.verification)
     };
     assert_ne!(a_digest, b_digest, "behaviors must differ");
 

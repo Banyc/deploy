@@ -100,7 +100,7 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
         1
     );
     let variant = config.variant("standard")?;
-    assert_eq!(variant.verification.argv, vec!["true"]);
+    assert_eq!(variant.verification.argv(), vec!["true"]);
     assert_eq!(
         variant.activation,
         deploy::config::Activation::None,

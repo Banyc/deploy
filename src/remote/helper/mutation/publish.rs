@@ -312,24 +312,26 @@ mod tests_publish {
             std::collections::BTreeMap::from([(
                 "standard".to_string(),
                 crate::identity::BehaviorContract {
-                    activation: crate::config::ActivationConfig {
-                        adapter: "systemd".to_string(),
-                        scope: crate::config::ActivationScope::System,
-                        reconcile_managed_units: true,
-                        units: vec![crate::config::UnitDef {
-                            name: "app.service".to_string(),
-                            artifact_path: "integration/systemd/app.service".to_string(),
-                            enable: true,
-                            restart: true,
-                        }],
-                    },
-                    verification: crate::config::VerificationConfig {
-                        adapter: "command".to_string(),
-                        argv: vec!["true".to_string()],
-                        timeout_seconds: 30,
-                        attempts: 2,
-                        interval_seconds: 1,
-                    },
+                    activation: crate::config::Activation::Systemd(
+                        crate::config::ValidatedSystemd {
+                            scope: crate::config::ActivationScope::System,
+                            reconcile_managed_units: true,
+                            units: vec![crate::config::UnitDef {
+                                name: "app.service".to_string(),
+                                artifact_path: "integration/systemd/app.service".to_string(),
+                                enable: true,
+                                restart: true,
+                            }],
+                        },
+                    ),
+                    verification: crate::config::Verification::Command(
+                        crate::config::ValidatedCommand {
+                            argv: vec!["true".to_string()],
+                            timeout_seconds: 30,
+                            attempts: 2,
+                            interval_seconds: 1,
+                        },
+                    ),
                 },
             )]);
         let behavior_sha = crate::verify::release::variant_behaviors_digest(&contracts);

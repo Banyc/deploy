@@ -4558,10 +4558,11 @@ fn integrity_tampered_stored_behavior_json_blocks_historical_push() {
     f.apply(Action::Push("t1"));
     f.tamper(TamperKind::BehaviorJson);
 
-    // The tampered snapshot's canonical digest no longer matches the release
-    // record's provenance: the historical read fails closed with an integrity
-    // error naming the mismatch, surfaced through the historical-behavior
-    // preflight.
+    // The tamper rewrites `activation.adapter` to an UNSUPPORTED adapter:
+    // the closed-enum record boundary REFUSES it at the parse (the review's
+    // fix — an unsupported adapter was previously tolerated as a silent
+    // activation no-op and only caught as a digest mismatch), surfaced
+    // through the historical-behavior preflight as a closed refusal.
     let releases_root = f.store.base().join(layout::RELEASES);
     let dir = std::fs::read_dir(&releases_root)
         .unwrap()
@@ -4575,12 +4576,12 @@ fn integrity_tampered_stored_behavior_json_blocks_historical_push() {
         .expect_err("a historical push against a tampered behavior snapshot must fail closed");
     let msg = err.to_string();
     assert!(
-        msg.contains("digest mismatch"),
-        "error must name the behavior digest mismatch, got: {msg}"
-    );
-    assert!(
         msg.contains("historical behavior"),
         "error must surface through the historical-behavior preflight, got: {msg}"
+    );
+    assert!(
+        msg.contains("refused") || msg.contains("unknown activation adapter"),
+        "error must name the unsupported-adapter refusal, got: {msg}"
     );
     // And the direct historical read fails closed too.
     let rerr = f
@@ -4588,8 +4589,9 @@ fn integrity_tampered_stored_behavior_json_blocks_historical_push() {
         .read_release_behaviors(&id)
         .expect_err("the historical behavior read must fail closed");
     assert!(
-        rerr.to_string().contains("digest mismatch"),
-        "read error must name the digest mismatch, got: {rerr}"
+        rerr.to_string().contains("malformed")
+            && rerr.to_string().contains("unknown activation adapter"),
+        "read error must name the closed-enum parse refusal, got: {rerr}"
     );
 }
 
