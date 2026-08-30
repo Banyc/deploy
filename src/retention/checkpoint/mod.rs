@@ -51,20 +51,26 @@
 //! 3. BEST-EFFORT GLOBAL SWEEP (`LocalStore::run_sweep`) of unreachable
 //!    deployment directories (`deployments/<id>/`), release records
 //!    (`releases/<release-id>/`), and tree objects
-//!    (`objects/sha256/<digest>/`). The reachability scan
-//!    (`LocalStore::reachable_set`) is recomputed FRESH on every retry and
-//!    keeps everything reachable from ANOTHER target's ledger, the
-//!    current/incomplete state (observed artifacts, pending intent-only
-//!    entries, in-flight deployment dirs), or a PIN. A failed sweep is
-//!    retried by RECOMPUTING reachability — no persisted deletion worklist,
-//!    no backup — and an incomplete sweep records a DURABLE, TYPED
-//!    SWEEP-DEBT marker ("<base>/sweep-debt.json"):
+//!    (`objects/sha256/<digest>/`). The sweep builds ONE locked
+//!    reachability snapshot (`LocalStore::reachability_snapshot`) — every
+//!    root source read ONCE and frozen — and every deletion stage consumes
+//!    ONLY that snapshot's retained sets: no stage re-reads a source that
+//!    could drift. The scan
+//!    is recomputed FRESH on every retry and keeps everything reachable
+//!    from ANOTHER target's ledger, the current/incomplete state (observed
+//!    artifacts, pending intent-only entries, in-flight deployment dirs),
+//!    or a PIN. A failed sweep is retried by RECOMPUTING reachability — no
+//!    persisted deletion worklist, no backup — and an incomplete sweep
+//!    records a DURABLE, TYPED SWEEP-DEBT marker ("<base>/sweep-debt.json"):
 //!    [`crate::store::local::debt::SweepDebt::Ready`] when
 //!    the ledger commit was durable (the sweep may run on a later push),
 //!    [`crate::store::local::debt::SweepDebt::AwaitingCheckpointDurability`] when the commit's
 //!    durability is unconfirmed (the sweep is gated until the
-//!    durability-confirming rewrite). Sweeps are best-effort and NOT secure
-//!    erasure.
+//!    durability-confirming rewrite). The marker is TRIAGE-ONLY — it decides
+//!    HOW the next push's reconciliation proceeds, never WHETHER it runs:
+//!    every push (real and no-op) reconciles regardless of any marker, so a
+//!    missing or failed marker write can never skip the owed maintenance
+//!    forever. Sweeps are best-effort and NOT secure erasure.
 //!
 //! # Preview == execution (the ledger override)
 //!

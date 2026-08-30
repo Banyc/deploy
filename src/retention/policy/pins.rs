@@ -16,7 +16,7 @@
 use crate::config::Pin;
 use crate::error::{Error, Result};
 use crate::identity::ReleaseId;
-use crate::retention::history_floor::ReachableSet;
+use crate::retention::history_floor::ReachabilitySnapshot;
 use crate::store::atomic::path_state;
 use crate::store::local::LocalStore;
 use std::collections::HashSet;
@@ -39,7 +39,7 @@ impl LocalStore {
     /// pin" — it is a pin naming nothing on disk, an integrity violation.)
     pub(crate) fn honor_release_pin(
         &self,
-        out: &mut ReachableSet,
+        out: &mut ReachabilitySnapshot,
         rid: &ReleaseId,
         expand_release_variants: bool,
     ) -> Result<()> {

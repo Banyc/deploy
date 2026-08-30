@@ -5,7 +5,8 @@
 //!   `crate::store::gc`): reachability, the sweep stages, the
 //!   PLANNED-vs-REMOVED counting, and the sweep-debt interactions.
 //! * [`history_floor`] — the pusher-side ledger/history semantics (moved from
-//!   `crate::store::history_floor`): `reachable_set`, the retained-suffix
+//!   `crate::store::history_floor`): the ONE locked `ReachabilitySnapshot`,
+//!   the retained-suffix
 //!   `LedgerOverride`, the
 //!   Unknown-observation conservatism, and the post-commit sweep.
 

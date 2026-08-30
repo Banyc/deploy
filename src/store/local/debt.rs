@@ -27,7 +27,14 @@ use std::path::PathBuf;
 /// marker makes the durability gate STRUCTURAL: the sweep runner refuses an
 /// [`SweepDebt::AwaitingCheckpointDurability`] marker — running only the
 /// durability-confirming rewrite first — and only a durably-rewritten ledger
-/// ([`SweepDebt::Ready`]) may be swept.
+/// ([`SweepDebt::Ready`]) may be swept. THE MARKER IS TRIAGE-ONLY: every
+/// push (real and no-op) and checkpoint runs the sweep RECONCILIATION
+/// regardless of any marker — the marker decides HOW the reconciliation
+/// proceeds (Awaiting → confirm durability only; Ready → run the sweep
+/// pass; missing → run the sweep pass), never WHETHER work is attempted. A
+/// missing or failed marker write can therefore never cause the owed
+/// maintenance to be skipped forever: the next push reconciles again
+/// anyway.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SweepDebt {
     /// The triggering checkpoint's ledger replace is VISIBLE but its

@@ -95,7 +95,8 @@
 //! garbage on disk (never less), which the retry reclaims once the store is
 //! readable again.
 
-use super::history_floor::{LedgerOverride, ReachableSet};
+use super::history_floor::ReachabilitySnapshot;
+#[cfg(test)]
 use crate::config::ProjectConfig;
 use crate::error::{Error, Result};
 #[cfg(test)]
@@ -178,78 +179,47 @@ fn enumerate_dirs(root: &Path) -> Result<Vec<String>> {
 }
 
 impl LocalStore {
-    /// Run the global artifact garbage collection: scan the WHOLE store,
-    /// compute the retained set, and unlink every unreachable release record
-    /// and tree object. See the module docs for the reachability model, the
-    /// failure model, and the durability protocol.
+    /// Run the global artifact garbage collection against an ALREADY-BUILT
+    /// locked [`ReachabilitySnapshot`]: unlink every release record and tree
+    /// object the SNAPSHOT's retained sets exclude. See the module docs for
+    /// the reachability model, the failure model, and the durability
+    /// protocol.
+    ///
+    /// THERE IS NO SCAN HERE — and there CANNOT be: the caller's ONE locked
+    /// snapshot ([`LocalStore::reachability_snapshot`], built by
+    /// [`LocalStore::run_sweep`]) is the single deletion authority, and this
+    /// pass consumes ONLY its retained sets. A separately-read source that
+    /// could drift from the snapshot is never consulted by a deletion stage.
     ///
     /// `anchor` names the triggering checkpoint's deployment id: it is used
     /// ONLY as the per-fixture fault-injection key — production behavior
-    /// never depends on it. `ledger_override` — the checkpoint's
-    /// retained-suffix override (see [`LocalStore::reachable_set`]): the GC
-    /// scans the checkpointed target's ledger as-if the replacement already
-    /// happened, so the retained set here is the SAME one the dry-run
-    /// preview computed — the sweep deletes exactly what the preview
-    /// reported.
+    /// never depends on it.
     pub(crate) fn gc_artifacts(
         &self,
-        anchor: &str,
-        config: &ProjectConfig,
-        ledger_override: Option<&LedgerOverride>,
+        #[cfg(test)] anchor: &str,
+        snapshot: &ReachabilitySnapshot,
     ) -> Result<GcOutcome> {
-        // Fault hook: the SCAN itself aborts before any deletion (a failed
-        // reachability pass must never unlink anything). The sweep is
-        // reported retry-required and the retry recomputes reachability
-        // fresh — no deletion worklist is ever persisted.
-        #[cfg(test)]
-        if self.fault_registry().consume(FaultKind::GcScan, anchor) {
-            return Err(Error::store(
-                "test fault: artifact GC scan forced to fail once",
-            ));
-        }
-        // KEEP-BOTH (merge): the gc side's fail-closed taxonomy — a
-        // pin-abort keeps its INTEGRITY class, every other anchor failure is
-        // annotated with the triggering checkpoint — combined with the
-        // preview side's retained-suffix ledger override threaded into the
-        // reachability scan. Both compose: reachability runs WITH the
-        // override; the fail-closed error classes are preserved.
-        let retained = match self.reachable_set(config, ledger_override) {
-            Ok(rs) => rs,
-            // A pin-abort (an un-honorable pinned release) is an integrity
-            // error: keep its class — callers distinguish "corrupt anchor"
-            // from "disk read failed", and the requirement is that a pin
-            // that cannot be honored aborts the sweep with an integrity
-            // error before any deletion.
-            Err(e @ Error::Integrity(_)) => return Err(e),
-            // Any other anchor failure is annotated with the triggering
-            // checkpoint for the report.
-            Err(e) => {
-                return Err(Error::store(format!(
-                    "artifact GC (triggered by checkpoint {anchor}): {e}"
-                )));
-            }
-        };
         // `anchor` is the test-only fault-registry key (see the deletion
         // functions) — the argument exists only under `#[cfg(test)]`.
         #[cfg(test)]
-        let releases = self.delete_unretained_releases(anchor, &retained)?;
+        let releases = self.delete_unretained_releases(anchor, snapshot)?;
         #[cfg(not(test))]
-        let releases = self.delete_unretained_releases(&retained)?;
+        let releases = self.delete_unretained_releases(snapshot)?;
         // FAIL CLOSED: a failed release stage stops the artifact pass — the
         // tree stage stays PENDING (its candidates are planned, nothing
         // removed). The tree candidates are still enumerated so the planned
-        // count is exact.
+        // count is exact (against the SAME snapshot's retained trees).
         let trees = if releases.completed {
             #[cfg(test)]
-            let trees = self.delete_unretained_trees(anchor, &retained)?;
+            let trees = self.delete_unretained_trees(anchor, snapshot)?;
             #[cfg(not(test))]
-            let trees = self.delete_unretained_trees(&retained)?;
+            let trees = self.delete_unretained_trees(snapshot)?;
             trees
         } else {
             let planned = match enumerate_dirs(&self.base().join(layout::objects())) {
                 Ok(names) => names
                     .iter()
-                    .filter(|n| !retained.trees.contains(*n))
+                    .filter(|n| !snapshot.trees.contains(*n))
                     .count(),
                 Err(_) => 0,
             };
@@ -268,14 +238,15 @@ impl LocalStore {
         })
     }
 
-    /// Unlink every release record NOT in the retained set, then fsync the
-    /// `releases/` parent so the unlinks are durable. A deletion is TRI-STATE:
-    /// an already-removed dir (a previous interrupted pass) is a skip. FAIL
-    /// CLOSED: ANY stat, unlink, or fsync failure STOPS the stage — the
-    /// removed count reports exactly the successful unlinks and the remaining
-    /// candidates stay PENDING (planned, never reported as removed). The ONLY
-    /// `Err` here is a root-enumeration read failure, which aborts the pass
-    /// BEFORE any deletion.
+    /// Unlink every release record NOT in the snapshot's retained set, then
+    /// fsync the `releases/` parent so the unlinks are durable. A deletion is
+    /// TRI-STATE: an already-removed dir (a previous interrupted pass) is a
+    /// skip. FAIL CLOSED: ANY stat, unlink, or fsync failure STOPS the
+    /// stage — the removed count reports exactly the successful unlinks and
+    /// the remaining candidates stay PENDING (planned, never reported as
+    /// removed). The ONLY `Err` here is a root-enumeration read failure,
+    /// which aborts the pass BEFORE any deletion. The retained set comes
+    /// from the caller's ONE locked snapshot — no re-read that could drift.
     ///
     /// `anchor` is TEST-ONLY: the per-fixture fault registry's key (the
     /// triggering checkpoint's deployment id); production never depends on
@@ -283,7 +254,7 @@ impl LocalStore {
     fn delete_unretained_releases(
         &self,
         #[cfg(test)] anchor: &str,
-        retained: &ReachableSet,
+        snapshot: &ReachabilitySnapshot,
     ) -> Result<SweepStageStats> {
         // Fault hook (test-only, keyed by the checkpoint deployment id):
         // the release-deletion phase fails BEFORE any release is removed —
@@ -299,7 +270,7 @@ impl LocalStore {
         }
         let root = self.base().join(layout::RELEASES);
         let mut candidates = enumerate_dirs(&root)?;
-        candidates.retain(|n| !retained.releases.contains(n));
+        candidates.retain(|n| !snapshot.releases.contains(n));
         let planned = candidates.len();
         let mut removed = 0usize;
         for name in &candidates {
@@ -366,16 +337,17 @@ impl LocalStore {
         })
     }
 
-    /// Unlink every tree object NOT in the retained tree set, then fsync
-    /// the `objects/sha256/` parent. Same tri-state and fail-closed rules as
-    /// the release phase: a failure stops the stage and the remaining
-    /// candidates stay pending (planned, never reported as removed).
-    /// `anchor` is TEST-ONLY (the fault registry's key, like the release
-    /// stage's).
+    /// Unlink every tree object NOT in the snapshot's retained tree set,
+    /// then fsync the `objects/sha256/` parent. Same tri-state and fail-closed
+    /// rules as the release phase: a failure stops the stage and the
+    /// remaining candidates stay pending (planned, never reported as
+    /// removed). The retained set comes from the caller's ONE locked
+    /// snapshot — no re-read that could drift. `anchor` is TEST-ONLY (the
+    /// fault registry's key, like the release stage's).
     fn delete_unretained_trees(
         &self,
         #[cfg(test)] anchor: &str,
-        retained: &ReachableSet,
+        snapshot: &ReachabilitySnapshot,
     ) -> Result<SweepStageStats> {
         // Fault hook (test-only): the tree-deletion phase fails before any
         // removal.
@@ -390,7 +362,7 @@ impl LocalStore {
         }
         let root = self.base().join(layout::objects());
         let mut candidates = enumerate_dirs(&root)?;
-        candidates.retain(|n| !retained.trees.contains(n));
+        candidates.retain(|n| !snapshot.trees.contains(n));
         let planned = candidates.len();
         let mut removed = 0usize;
         for name in &candidates {
@@ -1151,7 +1123,7 @@ interval_seconds = 0
 
     /// Run ONE generated pre-push assignment observation through the REAL
     /// collection logic: the intent is appended to a REAL store and the REAL
-    /// [`LocalStore::reachable_set`] scan reads it back through the wire
+    /// [`LocalStore::reachability_snapshot`] scan reads it back through the wire
     /// (append_intent → read_ledger → into_domain) and collects the
     /// reachability entries. This is the production code path the sweep and
     /// the checkpoint preview share — not a copy of its logic.
@@ -1182,7 +1154,7 @@ interval_seconds = 0
         // attempt, so reachability would be incomplete).
         match &pre_push {
             crate::ledger::Observation::KnownAbsent => {
-                let retained = store.reachable_set(&config, None).unwrap();
+                let retained = store.reachability_snapshot(&config, None).unwrap();
                 assert_eq!(
                     retained.releases.len(),
                     1,
@@ -1205,7 +1177,7 @@ interval_seconds = 0
                 );
             }
             crate::ledger::Observation::Known(prev) => {
-                let retained = store.reachable_set(&config, None).unwrap();
+                let retained = store.reachability_snapshot(&config, None).unwrap();
                 assert!(
                     retained.releases.contains(prev.artifact.release.as_str()),
                     "a Known pre-push artifact retains its release, got {retained:?}"
@@ -1216,7 +1188,7 @@ interval_seconds = 0
                 );
             }
             crate::ledger::Observation::Unknown(_) => {
-                let err = store.reachable_set(&config, None).unwrap_err();
+                let err = store.reachability_snapshot(&config, None).unwrap_err();
                 assert!(
                     err.to_string().contains("pre-push"),
                     "an Unknown pre-push MUST fail the reachability sweep closed, got: {err}"
@@ -1290,7 +1262,7 @@ interval_seconds = 0
             matches!(read_back, Some(crate::ledger::Observation::Unknown(_))),
             "the unknown pre-push must survive the wire as Unknown, got: {read_back:?}"
         );
-        let err = store.reachable_set(&config, None).unwrap_err();
+        let err = store.reachability_snapshot(&config, None).unwrap_err();
         assert!(
             err.to_string().contains("pre-push"),
             "an Unknown pre-push MUST fail the reachability sweep closed, got: {err}"
@@ -1360,11 +1332,13 @@ interval_seconds = 0
                 .exists(),
             "zero deletions: the garbage tree survives"
         );
-        // The gc's own entry point preserves the integrity class too.
-        let err = store.gc_artifacts("anchor", &config, None).unwrap_err();
+        // The ONE-SCAN path preserves the integrity class too: the single
+        // locked snapshot fails closed before ANY deletion, exactly like the
+        // sweep entry point that builds it (`run_sweep`).
+        let err = store.reachability_snapshot(&config, None).unwrap_err();
         assert!(
             matches!(err, Error::Integrity(_)),
-            "gc_artifacts must preserve the pin-abort class, got: {err}"
+            "reachability_snapshot must preserve the pin-abort class, got: {err}"
         );
     }
 

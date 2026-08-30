@@ -1845,7 +1845,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .unwrap();
             crate::config::ProjectConfig::load(&proj.join("deploy.toml")).unwrap()
         };
-        let err = store.reachable_set(&cfg, None).unwrap_err();
+        let err = store.reachability_snapshot(&cfg, None).unwrap_err();
         assert!(
             err.to_string().contains("UNKNOWN") || err.to_string().contains("Unknown"),
             "GC must abort on Unknown, got: {err}"

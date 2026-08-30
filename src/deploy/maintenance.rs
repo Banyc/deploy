@@ -6,9 +6,14 @@
 //!   fails the push — a failure or a contended slot lock defers the slot as
 //!   a durable debt marker + a warning, never a silent skip).
 //! * `retry_deferred_retentions` / `retry_pending_sweep` — the
-//!   deferred-maintenance retry (A4 "deferred-retention retry": later
-//!   pushes — real and no-op — service the debt markers; the push report's
-//!   `warning` channel surfaces what stayed deferred).
+//!   deferred-maintenance retry + THE RECONCILIATION (A4
+//!   "deferred-retention retry" + the P2 fix): later pushes — real and
+//!   no-op — service the debt markers, and the global sweep reconciliation
+//!   runs on EVERY push REGARDLESS of any sweep-debt marker (the marker is
+//!   triage-only: it decides HOW the reconciliation proceeds, never WHETHER
+//!   it runs — a missing/failed marker write can never skip the owed
+//!   maintenance forever). The push report's `warning` channel surfaces
+//!   what stayed deferred.
 //! * `refresh_observed_from_live` / `refresh_observed` — the observed
 //!   refresh projection: the real-push path feeds the actual post-mutation
 //!   state, the no-op path feeds the EXISTING generation's assignment —
@@ -519,15 +524,26 @@ pub(crate) fn retry_deferred_retentions(
     still_deferred
 }
 
-/// Retry the store-global PENDING SWEEP (the checkpoint's best-effort global
-/// sweep, deferred as durable sweep debt — `<base>/sweep-debt.json`). Runs on
-/// later pushes — real and no-op — because the sweep is POST-COMMIT
-/// MAINTENANCE that must never change a deployment's reported outcome: a
-/// sweep that has not run (or failed) is retried here, recomputing
-/// reachability FRESH (no persisted deletion worklist), and the marker is
-/// cleared once the sweep completes. NON-FALLIBLE by contract: this function
-/// never returns `Err` — a debt read/write failure (a read treated as no
-/// debt, or a write/remove of the marker) becomes a WARNING entry in the
+/// Retry the store-global PENDING SWEEP — THE RECONCILIATION (the P2 fix):
+/// runs on EVERY push — real and no-op — REGARDLESS of any debt marker. The
+/// marker is TRIAGE-ONLY: it decides HOW the reconciliation proceeds — an
+/// [`crate::store::local::debt::SweepDebt::AwaitingCheckpointDurability`]
+/// marker confines this pass to the durability-confirming rewrite; a
+/// [`crate::store::local::debt::SweepDebt::Ready`] marker (or NO marker)
+/// runs the full sweep pass — never WHETHER work is attempted. A missing or
+/// failed marker write can NEVER cause the owed maintenance to be skipped
+/// forever: the next push reconciles again anyway.
+///
+/// The sweep pass recomputes reachability FRESH under ONE locked
+/// [`crate::retention::reachability::history_floor::ReachabilitySnapshot`]
+/// (no persisted deletion worklist, fail-closed — never against a partial
+/// retained set), and the marker is written ONLY as the retry-triage record
+/// (cleared once the sweep completes). On a marker WRITE failure, the
+/// CURRENT call still performed the reconciliation — nothing is left
+/// waiting on the marker for this push; a later push reconciles again
+/// anyway. NON-FALLIBLE by contract: this function never returns `Err` — a
+/// debt read failure (which STILL runs the reconciliation) or a
+/// write/remove failure of the marker becomes a WARNING entry in the
 /// returned vec, so a debt-file fault can never turn a push (real or no-op)
 /// into an error after the deployment durably committed. Returns the
 /// pending-sweep warnings for the push report's maintenance channel.
@@ -538,28 +554,35 @@ pub(crate) fn retry_deferred_retentions(
 /// means the ledger replace is VISIBLE but its durability is UNCONFIRMED —
 /// the sweep MUST NOT run (a crash could restore an OLDER, longer ledger
 /// that still references below-floor history already deleted by the sweep):
-/// the ONLY thing this pass may do is the durability-confirming rewrite,
-/// and the sweep is deferred to the pass that reads the marker as `Ready`.
+/// the ONLY thing this pass may do is the durability-confirming rewrite, and
+/// the sweep is deferred to the pass that reads the marker as `Ready` (the
+/// next push — which reconciles regardless of the marker).
 pub(crate) fn retry_pending_sweep(
     store: &LocalStore,
     config: &ProjectConfig,
     anchor: &str,
 ) -> Vec<String> {
-    // A debt READ failure is treated as no debt: nothing can be serviced
-    // this push, and the marker file (if any) is left untouched for a later
-    // push to retry — the warning keeps the deferral explicit.
+    // A debt READ failure fails closed (the marker must never read as "no
+    // debt") — but the reconciliation STILL runs: only the triage is lost.
+    // The warning keeps the read failure explicit.
     let pending = match store.read_sweep_debt() {
         Ok(p) => p,
         Err(e) => {
-            return vec![format!(
+            let mut w = vec![format!(
                 "sweep debt maintenance deferred: failed to read sweep debt: {e}"
             )];
+            w.extend(reconcile_sweep_pass(store, config, anchor, None));
+            return w;
         }
     };
-    let Some(debt) = pending else {
-        return Vec::new();
-    };
-    match debt {
+    match pending {
+        // NO MARKER — the reconciliation STILL runs (the marker is never
+        // the trigger): the sweep pass recomputes reachability fresh (one
+        // locked snapshot) and deletes the unreachable content NOW. No
+        // triage marker is rewritten afterwards: nothing durable is owed
+        // (the next push reconciles anyway) and an incomplete/failed pass
+        // warns — the next push's own reconciliation converges it.
+        None => reconcile_sweep_pass(store, config, anchor, None),
         // THE DURABILITY GATE: the triggering checkpoint's ledger replace is
         // VISIBLE but its durability is UNCONFIRMED — REFUSE to execute the
         // sweep. Run ONLY the durability-confirming retry
@@ -571,11 +594,12 @@ pub(crate) fn retry_pending_sweep(
         // parent-directory fsync confirmed — the exact transition, never a
         // bare "fsync the current bytes" shortcut). The marker transitions
         // to `Ready` inside the confirmation; the sweep itself is deferred to
-        // the pass that reads `Ready`.
-        SweepDebt::AwaitingCheckpointDurability {
+        // the pass that reads `Ready` (the next push — which reconciles
+        // regardless of the marker).
+        Some(SweepDebt::AwaitingCheckpointDurability {
             target,
             retained_from,
-        } => {
+        }) => {
             match crate::retention::checkpoint::confirm_checkpoint_durability(
                 store,
                 &target,
@@ -612,40 +636,71 @@ pub(crate) fn retry_pending_sweep(
                 )],
             }
         }
-        // The floor IS durable: the sweep may run. Recompute reachability
-        // from the CURRENT ledgers (fresh, no persisted deletion worklist)
-        // and reconcile the marker; every failure stays a warning, never an
-        // `Err`.
-        SweepDebt::Ready {
+        // The floor IS durable: run the sweep pass now (fresh reachability
+        // under ONE locked snapshot — no persisted deletion worklist) and
+        // reconcile the triage marker (clear on completion; rewrite `Ready`
+        // while the sweep stays owed). Every failure stays a warning, never
+        // an `Err`.
+        Some(SweepDebt::Ready {
             target,
             retained_from,
-        } => {
-            // The push-side sweep retry recomputes reachability from the
-            // CURRENT ledgers — NO checkpoint ledger override: the override
-            // is the checkpoint's retained-suffix hypothetical and exists
-            // only while a checkpoint sweep runs (see
-            // `crate::retention::checkpoint`).
-            match store.run_sweep(config, anchor, None) {
-                Ok((_, true)) => {
-                    // The sweep completed: clear the marker. A write/remove
-                    // failure is post-commit maintenance: warn and leave the
-                    // marker as it is — a later push retries and converges.
-                    // Never an `Err`.
-                    if let Err(e) = store.write_sweep_debt(None) {
-                        return vec![format!(
-                            "sweep debt maintenance deferred: failed to clear sweep debt: {e}"
-                        )];
-                    }
-                    Vec::new()
-                }
-                Ok((_, false)) => {
-                    // Still incomplete: keep the marker `Ready` (the floor is
-                    // durable — the marker's pair identifies the checkpoint
-                    // whose sweep stays owed).
-                    let marker = SweepDebt::Ready {
-                        target: target.clone(),
-                        retained_from: retained_from.clone(),
-                    };
+        }) => reconcile_sweep_pass(
+            store,
+            config,
+            anchor,
+            Some(SweepDebt::Ready {
+                target,
+                retained_from,
+            }),
+        ),
+    }
+}
+
+/// Run ONE global sweep pass — fresh reachability under ONE locked
+/// [`crate::retention::reachability::history_floor::ReachabilitySnapshot`],
+/// no persisted deletion worklist — and reconcile the retry-triage marker.
+/// `owed` — the marker to (re)write while the sweep stays incomplete or
+/// fails (`Some` on the Ready-marker path: the durable floor pair records
+/// what is owed; `None` on the no-marker path: nothing durable is owed, the
+/// next push reconciles anyway). On a marker WRITE failure, the CURRENT
+/// call still performed the reconciliation — nothing is left waiting on the
+/// marker for this push — and the warning keeps the deferral explicit.
+/// NON-FALLIBLE: every failure stays a warning entry, never an `Err`.
+fn reconcile_sweep_pass(
+    store: &LocalStore,
+    config: &ProjectConfig,
+    anchor: &str,
+    owed: Option<SweepDebt>,
+) -> Vec<String> {
+    // The push-side sweep recomputes reachability from the CURRENT ledgers
+    // — NO checkpoint ledger override: the override is the checkpoint's
+    // retained-suffix hypothetical and exists only while a checkpoint sweep
+    // runs (see `crate::retention::checkpoint`).
+    match store.run_sweep(config, anchor, None) {
+        Ok((_, true)) => {
+            // The sweep completed: clear the triage marker. A clear failure
+            // is post-commit maintenance: warn and leave the marker as it
+            // is — a later push retries and converges (it reconciles
+            // regardless). Never an `Err`. Nothing to clear when no marker
+            // was owed (the no-marker path read `None` and wrote nothing).
+            match owed {
+                None => Vec::new(),
+                Some(_) => match store.write_sweep_debt(None) {
+                    Ok(()) => Vec::new(),
+                    Err(e) => vec![format!(
+                        "sweep debt maintenance deferred: failed to clear sweep debt: {e}"
+                    )],
+                },
+            }
+        }
+        Ok((_, false)) => {
+            // Still incomplete: the triage marker records what is owed (when
+            // one was owed — the floor stays durable; the marker's pair
+            // identifies the checkpoint whose sweep stays owed). A write
+            // failure is post-commit maintenance: warn and leave the marker
+            // as it is — a later push reconciles anyway. Never an `Err`.
+            match owed {
+                Some(marker) => {
                     if let Err(e) = store.write_sweep_debt(Some(&marker)) {
                         return vec![format!(
                             "sweep debt maintenance deferred: failed to write sweep debt: {e}"
@@ -657,13 +712,22 @@ pub(crate) fn retry_pending_sweep(
                             .to_string(),
                     ]
                 }
-                Err(e) => {
-                    // The sweep failed: keep the marker `Ready` with the
-                    // durable floor.
-                    let marker = SweepDebt::Ready {
-                        target: target.clone(),
-                        retained_from: retained_from.clone(),
-                    };
+                None => vec![
+                    "sweep still deferred: the global sweep did not complete; \
+                     a later push retries it"
+                        .to_string(),
+                ],
+            }
+        }
+        Err(e) => {
+            // The sweep failed (fail-closed: nothing was deleted against a
+            // partial retained set — a snapshot that fails to build aborts
+            // before any unlink). The CURRENT call still performed the
+            // reconciliation; keep the triage record (when owed) and warn —
+            // a later fault-free push recomputes a fresh snapshot and
+            // converges.
+            match owed {
+                Some(marker) => {
                     if let Err(e2) = store.write_sweep_debt(Some(&marker)) {
                         return vec![format!(
                             "sweep debt maintenance deferred: failed to write sweep debt: {e2}"
@@ -671,6 +735,7 @@ pub(crate) fn retry_pending_sweep(
                     }
                     vec![format!("sweep still deferred: {e}")]
                 }
+                None => vec![format!("sweep still deferred: {e}")],
             }
         }
     }

@@ -515,7 +515,11 @@ fn run_no_leak_case(
         );
     }
     // Ghost content is gone.
-    assert!(!store.deployment_dir("ghost-deploy").exists());
+    assert!(
+        !store
+            .deployment_dir(crate::identity::test_deployment_id("ghost-deploy").as_str())
+            .exists()
+    );
     assert!(
         !store
             .release_dir(&crate::identity::test_release_id("rel-sha256-ghost"))
@@ -695,7 +699,11 @@ fn run_fault_case(pusher_history: Vec<bool>, checkpoint_at: usize, fault: SweepF
         store.read_sweep_debt().unwrap().is_none(),
         "the sweep debt is cleared once the sweep completes"
     );
-    assert!(!store.deployment_dir("ghost-deploy").exists());
+    assert!(
+        !store
+            .deployment_dir(crate::identity::test_deployment_id("ghost-deploy").as_str())
+            .exists()
+    );
     assert!(
         !store
             .release_dir(&crate::identity::test_release_id("rel-sha256-ghost"))
@@ -748,6 +756,128 @@ proptest! {
     ) {
         run_fault_case(pusher_history, checkpoint_at, fault);
     }
+
+    /// THE MARKER-INDEPENDENCE CONTRACT (review finding 8): the
+    /// reconciliation runs on EVERY push REGARDLESS of any debt marker —
+    /// a store with NO marker, a FAULTED pass, then ONE later fault-free
+    /// pass: reachable + pinned content is NEVER deleted, and every
+    /// unreachable object disappears after the fault-free reconciliation.
+    #[test]
+    fn reconciliation_runs_without_a_debt_marker_and_converges_after_one_fault_free_pass(
+        fault in prop_oneof![
+            Just(SweepFault::SweepDeployments),
+            Just(SweepFault::SweepReleases),
+            Just(SweepFault::SweepObjects),
+            Just(SweepFault::GcScan),
+        ],
+    ) {
+        run_markerless_fault_case(fault);
+    }
+}
+
+/// One markerless-fault case: seed reachable (deploy-0 + pinned) and
+/// unreachable (ghost) content with NO sweep-debt marker; fault ONE
+/// reconciliation; assert reachable never deleted; then one fault-free
+/// reconciliation deletes every unreachable object and leaves reachable +
+/// pinned intact — all without any marker having been the trigger.
+fn run_markerless_fault_case(fault: SweepFault) {
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+    let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+    let pinned = seed_real_release(&store);
+    seed_object(&store, "tree-pinned");
+    let cfg = config_for(&dir, Some(&pinned));
+    // A settled history with ONE successful deployment (reachable) + a ghost
+    // (unreachable) — NO checkpoint runs, so NO marker is ever seeded.
+    let ids = seed_history(&store, TARGET, "deploy", &[true, false]);
+    assert_eq!(ids.len(), 1, "one successful deployment seeded");
+    // The reachable deployment's dir + release + tree (mirroring
+    // [`seed_unreachable`]'s dir creation) so the never-deleted reachable
+    // assertions are meaningful.
+    let deploy0_dir =
+        store.deployment_dir(crate::identity::test_deployment_id("deploy-0").as_str());
+    std::fs::create_dir_all(&deploy0_dir).unwrap();
+    std::fs::write(deploy0_dir.join("plan.json"), "{}").unwrap();
+    seed_named_release(
+        &store,
+        crate::identity::test_release_id("deploy-0").as_str(),
+    );
+    seed_object(&store, "tree-deploy-0");
+    seed_unreachable(
+        &store,
+        "ghost-deploy",
+        crate::identity::test_release_id("rel-sha256-ghost").as_str(),
+        "tree-ghost",
+    );
+    assert!(
+        store.read_sweep_debt().unwrap().is_none(),
+        "no debt marker is seeded — the marker is never the trigger"
+    );
+
+    // A FAULTED reconciliation (push-side, markerless): the sweep RUNS
+    // anyway; reachable + pinned survive; the faulted stage's unreachable
+    // content stays (extra garbage, never less).
+    arm_sweep_fault(&store, "markerless-faulted", fault);
+    let warnings = retry_pending_sweep(&store, &cfg, "markerless-faulted");
+    assert!(
+        store
+            .deployment_dir(crate::identity::test_deployment_id("deploy-0").as_str())
+            .exists(),
+        "reachable deployment survives the faulted pass: {warnings:?}"
+    );
+    assert!(
+        store
+            .release_dir(&crate::identity::test_release_id("deploy-0"))
+            .exists()
+    );
+    assert!(
+        store
+            .object_root(&crate::identity::test_tree_digest("tree-deploy-0"))
+            .exists()
+    );
+    assert!(
+        store.release_dir(&pinned).exists(),
+        "pinned release survives"
+    );
+    assert!(
+        store
+            .object_root(&crate::identity::test_tree_digest("tree-pinned"))
+            .exists()
+    );
+
+    // ONE later FAULT-FREE reconciliation: every unreachable object
+    // disappears; reachable + pinned survive; nothing is owed afterwards.
+    let warnings = retry_pending_sweep(&store, &cfg, "markerless-converged");
+    assert!(warnings.is_empty(), "converges cleanly: {warnings:?}");
+    assert!(
+        !store
+            .deployment_dir(crate::identity::test_deployment_id("ghost-deploy").as_str())
+            .exists()
+    );
+    assert!(
+        !store
+            .release_dir(&crate::identity::test_release_id("rel-sha256-ghost"))
+            .exists()
+    );
+    assert!(
+        !store
+            .object_root(&crate::identity::test_tree_digest("tree-ghost"))
+            .exists()
+    );
+    assert!(
+        store
+            .deployment_dir(crate::identity::test_deployment_id("deploy-0").as_str())
+            .exists()
+    );
+    assert!(store.release_dir(&pinned).exists());
+    assert!(
+        store
+            .object_root(&crate::identity::test_tree_digest("tree-pinned"))
+            .exists()
+    );
+    assert!(
+        store.read_sweep_debt().unwrap().is_none(),
+        "a markerless converged pass owes nothing"
+    );
 }
 
 // ---------------------------------------------------------------------------

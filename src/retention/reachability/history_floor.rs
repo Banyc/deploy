@@ -19,15 +19,19 @@
 //! maintenance debt that remains is the SWEEP-DEBT marker
 //! (`<base>/sweep-debt.json`, see [`LocalStore::read_sweep_debt`]): the
 //! checkpoint's best-effort global sweep is POST-COMMIT MAINTENANCE, so an
-//! incomplete sweep records a durable TYPED marker and the NEXT PUSH (not
-//! just the next checkpoint) retries the sweep and clears it — see
-//! `crate::deploy::retry_pending_sweep`. The marker is TWO-STATE
-//! ([`crate::store::local::debt::SweepDebt`]):
+//! incomplete sweep records a durable TYPED marker — and EVERY push (real
+//! and no-op) and checkpoint runs the sweep RECONCILIATION regardless of
+//! any marker. The marker is TRIAGE-ONLY: it decides HOW the next
+//! reconciliation proceeds, never WHETHER it runs — a missing or failed
+//! marker write can never cause the owed maintenance to be skipped
+//! forever — see `crate::deploy::retry_pending_sweep`. The marker is
+//! TWO-STATE ([`crate::store::local::debt::SweepDebt`]):
 //! [`crate::store::local::debt::SweepDebt::Ready`] when the
 //! checkpoint's ledger replace is durable (the sweep may run), and
 //! [`crate::store::local::debt::SweepDebt::AwaitingCheckpointDurability`] when the replace is visible
-//! but its durability is unconfirmed (the sweep must NOT run until a
-//! durability-confirming rewrite transitions the marker).
+//! but its durability is unconfirmed (only the durability-confirming
+//! rewrite may run; the sweep must NOT run until a durability-confirming
+//! rewrite transitions the marker).
 //!
 //! A checkpoint (`deploy checkpoint <target> <deployment-id>`) is exactly
 //! three steps:
@@ -51,21 +55,29 @@
 //!    [`crate::retention::checkpoint`].
 //! 3. BEST-EFFORT GLOBAL SWEEP of unreachable deployment directories
 //!    (`deployments/<id>/`), release records (`releases/<release-id>/`), and
-//!    tree objects (`objects/sha256/<digest>/`). The reachability scan
-//!    (`LocalStore::sweep_discards`) is recomputed FRESH on every retry:
-//!    everything reachable from ANOTHER target's ledger, the CURRENT /
-//!    INCOMPLETE state (observed artifacts, pending intent-only entries,
-//!    in-flight deployment dirs), or a PIN is kept; everything else is
-//!    unreachable and swept. A checkpoint sweep scans the checkpointed
-//!    target's ledger AS-IF the suffix replacement ALREADY happened — the
-//!    retained-suffix `LedgerOverride` — so the pre-checkpoint history's
+//!    tree objects (`objects/sha256/<digest>/`). The sweep builds ONE
+//!    LOCKED [`ReachabilitySnapshot`] — every root source read ONCE under
+//!    the caller's lock and FROZEN: every target's CURRENT ledger (post any
+//!    suffix the checkpoint is about to install), each entry's deployment
+//!    id and intent/rollback artifacts, pending (terminal-less) intents,
+//!    configured pins, observed assignments, and in-flight deployment
+//!    dirs — and every deletion stage (deployment dirs, release records,
+//!    tree objects) consumes ONLY that snapshot's retained sets: no stage
+//!    re-reads a source that could drift. Everything reachable from
+//!    another target's ledger, the CURRENT / INCOMPLETE state (observed
+//!    artifacts, pending intent-only entries, in-flight deployment dirs),
+//!    or a PIN is kept; everything else is unreachable and swept. A
+//!    checkpoint sweep scans the checkpointed target's ledger AS-IF the
+//!    suffix replacement ALREADY happened — the retained-suffix
+//!    `LedgerOverride` — so the pre-checkpoint history's
 //!    releases/trees/deployment dirs are unreachable the moment the ledger
 //!    is shortened, and the DRY-RUN PREVIEW computes its deletion sets with
 //!    the SAME override the real execution uses: the previewed deletions
 //!    exactly equal the real ones. A failed sweep is retried by RECOMPUTING
 //!    reachability — no persisted deletion worklist, no debt marker, no
-//!    backup. The report carries at most: the logical commit status + sweep
-//!    completed / retry-required.
+//!    backup — and EVERY push and checkpoint runs the reconciliation
+//!    regardless of any debt marker. The report carries at most: the
+//!    logical commit status + sweep completed / retry-required.
 //!
 //! Because the atomic replacement is the only logical commit, a failed
 //! checkpoint leaves EXACTLY the pre-call state; a failed sweep leaves the
@@ -323,15 +335,16 @@ impl LocalStore {
 
     // ---- the global reachability sweep (step 3 — best-effort) -------------
 
-    /// Compute the LOCAL store's reachable set for a sweep: everything the
-    /// sweep must keep —
+    /// Build the ONE LOCKED REACHABILITY SNAPSHOT for a sweep: everything
+    /// the sweep must keep, computed ONCE under the caller's lock from ALL
+    /// ROOT SOURCES and FROZEN data —
     ///
     /// * EVERY target's CURRENT ledger (after a checkpoint the retained
     ///   suffix IS the ledger, so this is "or its retained suffix"): each
     ///   entry's deployment id (its `deployments/<id>/` dir), the artifacts
     ///   referenced by its intent (`desired` + `pre_push` — the pre-push
     ///   assignment is an [`Observation`], and an `Unknown` pre-push
-    ///   assignment fails the sweep closed, exactly like an `Unknown`
+    ///   assignment fails the snapshot closed, exactly like an `Unknown`
     ///   observed slot), and its terminal rollback's release + per-slot
     ///   trees,
     /// * the CURRENT/INCOMPLETE state: every target's `observed.json`
@@ -345,15 +358,24 @@ impl LocalStore {
     /// variant/tree of its release. `deployments/<id>/` dirs of the
     /// retained ledger entries AND observed `last_deployment`s are reachable.
     ///
-    /// FAIL CLOSED on EVERY retention anchor: a PRESENT-but-unreadable
-    /// anchor — an unreadable ledger, an unreadable observed record, an
-    /// unreadable or malformed pins file, or a release record a pin names —
-    /// is an ERROR, never ABSENCE. An anchor that reads as absent shrinks
-    /// the retained set and the sweep would delete content the failed read
-    /// might have protected; the failed scan must abort the pass BEFORE any
-    /// unlink (extra garbage on disk is safe, a partial retained set is
-    /// not). (KEEP-BOTH merge: the gc side's fail-closed anchor docs + the
-    /// preview side's override docs + parameter — both compose.)
+    /// THE SINGLE DELETION AUTHORITY: ONLY values derived from THIS snapshot
+    /// may be deleted — the sweep's three deletion stages (deployment dirs,
+    /// release records, tree objects) all consume this snapshot's retained
+    /// sets or the planned sets enumerated from it ([`LocalStore::run_sweep`]
+    /// builds it once and passes it to every stage). A separately-read source
+    /// that could drift from the snapshot is never consulted by a deletion
+    /// stage.
+    ///
+    /// FAIL CLOSED on EVERY retention anchor (no half-state): a
+    /// PRESENT-but-unreadable anchor — an unreadable ledger, an unreadable
+    /// observed record, an unreadable or malformed pins file, or a release
+    /// record a pin names — is an ERROR, never ABSENCE. An anchor that
+    /// reads as absent shrinks the retained set and the sweep would delete
+    /// content the failed read might have protected; a snapshot that fails
+    /// to build must abort the pass BEFORE any unlink (extra garbage on
+    /// disk is safe, a partial retained set is not). (KEEP-BOTH merge: the
+    /// gc side's fail-closed anchor docs + the preview side's override docs
+    /// + parameter — both compose.)
     ///
     /// `ledger_override` — the checkpoint's retained-suffix override: when
     /// `Some`, the named target's ledger is scanned as the OVERRIDE entries
@@ -361,12 +383,12 @@ impl LocalStore {
     /// ledger; every other target's ledger is read as-is. The preview and
     /// the real execution pass the SAME override, so the two compute the
     /// identical retained set.
-    pub(crate) fn reachable_set(
+    pub(crate) fn reachability_snapshot(
         &self,
         config: &ProjectConfig,
         ledger_override: Option<&LedgerOverride>,
-    ) -> Result<ReachableSet> {
-        let mut out = ReachableSet::default();
+    ) -> Result<ReachabilitySnapshot> {
+        let mut out = ReachabilitySnapshot::default();
         let targets_dir = self.base().join("targets");
         let mut target_names: Vec<String> = Vec::new();
         if path_state(&targets_dir)? {
@@ -525,6 +547,14 @@ impl LocalStore {
     /// so the preview and the real sweep delete from the SAME reachability:
     /// the preview never under-reports the artifacts that become unreachable
     /// only after the suffix replacement.
+    ///
+    /// THE ONE-SCAN PATH: builds the single locked [`ReachabilitySnapshot`]
+    /// (every root source read ONCE and frozen) and enumerates from it; the
+    /// real sweep ([`LocalStore::run_sweep`]) builds the snapshot once and
+    /// reuses the SAME enumeration
+    /// ([`LocalStore::sweep_discards_from_snapshot`]), so the previewed
+    /// deletion sets are exactly the snapshot-derived sets the deletion
+    /// stages consume.
     pub(crate) fn sweep_discards(
         &self,
         config: &ProjectConfig,
@@ -535,14 +565,33 @@ impl LocalStore {
         // enumeration or deletion. The checkpoint's explicit post-commit
         // boundary converts this `Err` into a warning (the ledger commit
         // stands; the sweep is retry-required) — it must never surface as a
-        // checkpoint `Err` after the irreversible replacement.
+        // checkpoint `Err` after the irreversible replacement. The real
+        // sweep's entry ([`LocalStore::run_sweep`]) fires the same hook
+        // before its own snapshot build, so both paths fail closed identically.
         #[cfg(test)]
         if self.fault_registry().consume(FaultKind::SweepScan, "") {
             return Err(Error::store(
                 "test fault: checkpoint sweep reachability scan forced to fail once",
             ));
         }
-        let reachable = self.reachable_set(config, ledger_override)?;
+        // ONE locked snapshot, then enumerate from it. A snapshot that fails
+        // to build aborts the enumeration before ANY candidate is listed —
+        // a partial retained set must never produce a deletion list.
+        let snapshot = self.reachability_snapshot(config, ledger_override)?;
+        self.sweep_discards_from_snapshot(&snapshot)
+    }
+
+    /// Enumerate the discard candidates from an ALREADY-BUILT
+    /// [`ReachabilitySnapshot`] — the difference between what EXISTS under
+    /// `deployments/`, `releases/`, `objects/sha256/` and the snapshot's
+    /// retained sets. Pure read: the preview ([`LocalStore::sweep_discards`])
+    /// and the real sweep ([`LocalStore::run_sweep`]) share it, so every
+    /// pass enumerates FROM THE SAME FROZEN SNAPSHOT the deletion stages
+    /// consume — never a separately-read source that could drift.
+    pub(crate) fn sweep_discards_from_snapshot(
+        &self,
+        snapshot: &ReachabilitySnapshot,
+    ) -> Result<LedgerDiscards> {
         // POST-COMMIT SWEEP ENUMERATION FAULT HOOK (test-only, global key):
         // the directory-ENUMERATION stage fails after the scan succeeded —
         // nothing is listed, nothing is deleted. Same conversion contract as
@@ -564,7 +613,7 @@ impl LocalStore {
                 .map_err(|e| Error::store(format!("deployments entry: {e}")))?;
             names.sort();
             for n in names {
-                if !reachable.deployments.contains(&n) {
+                if !snapshot.deployments.contains(&n) {
                     discards.sweep_deployments.push(n);
                 }
             }
@@ -578,7 +627,7 @@ impl LocalStore {
                 .map_err(|e| Error::store(format!("releases entry: {e}")))?;
             names.sort();
             for n in names {
-                if !reachable.releases.contains(&n) {
+                if !snapshot.releases.contains(&n) {
                     discards.sweep_releases.push(n);
                 }
             }
@@ -592,7 +641,7 @@ impl LocalStore {
                 .map_err(|e| Error::store(format!("objects entry: {e}")))?;
             names.sort();
             for n in names {
-                if !reachable.trees.contains(&n) {
+                if !snapshot.trees.contains(&n) {
                     discards.sweep_objects.push(n);
                 }
             }
@@ -610,7 +659,7 @@ impl LocalStore {
     /// retry-required. The release-record and tree-object stages are performed
     /// by the GLOBAL ARTIFACT GC ([`super::gc::LocalStore::gc_artifacts`])
     /// — its own faults ([`FaultKind::GcScan`] / [`FaultKind::GcDeleteReleases`]
-    /// / [`FaultKind::GcDeleteTrees`]) fire inside the pass, and its
+    /// / [`FaultKind::GcDeleteTrees`]) fire before/inside the pass, and its
     /// per-candidate unlink faults ([`FaultKind::GcUnlinkReleases`] /
     /// [`FaultKind::GcUnlinkTrees`], armed with
     /// [`crate::testutil::test_faults::FaultRegistry::arm_release_unlink_after`]
@@ -622,17 +671,48 @@ impl LocalStore {
     /// PLANNED candidate sets plus the counts ACTUALLY unlinked per category
     /// (only successful unlinks — see [`LedgerDiscards`]) and whether EVERY
     /// stage ran clean.
-    /// `ledger_override` — the checkpoint's retained-suffix override, passed
-    /// to BOTH the discard enumeration and the artifact GC so the sweep
-    /// stays on the SAME reachability the dry-run preview reported; `None`
-    /// for the push-side debt retry (current ledgers as-is).
+    /// `ledger_override` — the checkpoint's retained-suffix override, fed to
+    /// the ONE snapshot so the sweep deletes on the SAME reachability the
+    /// dry-run preview reported; `None` for the push-side reconciliation
+    /// (current ledgers as-is).
+    ///
+    /// THE ONE LOCKED SNAPSHOT — THE SINGLE DELETION AUTHORITY: the sweep
+    /// builds ONE frozen [`ReachabilitySnapshot`] ([`LocalStore::reachability_snapshot`])
+    /// — every root source read ONCE under the caller's lock — and every
+    /// deletion stage consumes ONLY that snapshot: the deployment-dir stage
+    /// deletes the planned set enumerated from it
+    /// ([`LocalStore::sweep_discards_from_snapshot`]), and the artifact GC
+    /// unlinks releases/trees against its retained sets. No stage re-reads a
+    /// source that could drift from the snapshot. Building is fail-closed
+    /// (no half-state): an unreadable anchor aborts the sweep BEFORE any
+    /// deletion — exactly today's behavior.
     pub(crate) fn run_sweep(
         &self,
         config: &ProjectConfig,
         anchor: &str,
         ledger_override: Option<&LedgerOverride>,
     ) -> Result<(LedgerDiscards, bool)> {
-        let mut discards = self.sweep_discards(config, ledger_override)?;
+        // POST-COMMIT SWEEP READ FAULT HOOK (test-only, global key): the
+        // REACHABILITY-SCAN stage fails — the sweep aborts before any
+        // enumeration or deletion. Same conversion contract as the
+        // `sweep_discards` hook: the checkpoint reports the sweep
+        // retry-required (warning), never `Err`.
+        #[cfg(test)]
+        if self.fault_registry().consume(FaultKind::SweepScan, "") {
+            return Err(Error::store(
+                "test fault: checkpoint sweep reachability scan forced to fail once",
+            ));
+        }
+        // THE ONE LOCKED SNAPSHOT — THE SINGLE DELETION AUTHORITY: built
+        // ONCE here, frozen (fail closed — no half-state: an unreadable
+        // anchor aborts the sweep before ANY deletion), and consumed by
+        // every deletion stage below.
+        let snapshot = self.reachability_snapshot(config, ledger_override)?;
+        // `anchor` is the test-only fault-registry key (the `GcScan` consume
+        // below); in production builds the sweep has no per-fixture key.
+        #[cfg(not(test))]
+        let _ = anchor;
+        let mut discards = self.sweep_discards_from_snapshot(&snapshot)?;
         let mut complete = true;
         // Stage 1: deployment directories. The deployment stage's own
         // per-candidate unlink fault (`SweepDeploymentsNth`) fires INSIDE
@@ -653,26 +733,31 @@ impl LocalStore {
             }
         }
         // Stages 2+3: unreachable release records and tree objects — the
-        // artifact GC recomputes the retained set from the ledgers (each
-        // target's ledger / retained suffix), the observed slot state, the
-        // pending entries, and the pins, then unlinks the unreachable
-        // releases and objects. The `SweepReleases` / `SweepObjects` stage
-        // faults each block the whole artifact pass BEFORE any deletion; the
-        // GC's own faults (`GcScan` / `GcDeleteReleases` / `GcDeleteTrees` /
-        // the per-candidate `GcUnlinkReleases` / `GcUnlinkTrees`) fire
+        // artifact GC unlinks the releases/objects the SNAPSHOT's retained
+        // sets exclude (NO second scan: the snapshot built above is the
+        // single authority — a separately-read source could drift from it).
+        // The `SweepReleases` / `SweepObjects` stage faults and the GC's
+        // `GcScan` fault each block the whole artifact pass BEFORE any
+        // deletion; the GC's own faults (`GcDeleteReleases` / `GcDeleteTrees`
+        // / the per-candidate `GcUnlinkReleases` / `GcUnlinkTrees`) fire
         // inside it. FAIL CLOSED: when an earlier stage failed or faulted
         // (`complete` already false) the artifact stages stay PENDING —
-        // nothing is removed and the retry recomputes reachability fresh.
+        // nothing is removed and the retry recomputes a fresh snapshot.
         #[cfg(test)]
         let gc_faulted = complete
             && (self.fault_registry().consume(FaultKind::SweepReleases, "")
-                || self.fault_registry().consume(FaultKind::SweepObjects, ""));
+                || self.fault_registry().consume(FaultKind::SweepObjects, "")
+                || self.fault_registry().consume(FaultKind::GcScan, anchor));
         #[cfg(not(test))]
         let gc_faulted = false;
         if gc_faulted {
             complete = false;
         } else if complete {
-            match self.gc_artifacts(anchor, config, ledger_override) {
+            #[cfg(test)]
+            let gc = self.gc_artifacts(anchor, &snapshot);
+            #[cfg(not(test))]
+            let gc = self.gc_artifacts(&snapshot);
+            match gc {
                 Ok(gc) => {
                     discards.removed_releases = gc.removed_releases;
                     discards.removed_objects = gc.removed_trees;
@@ -948,11 +1033,28 @@ impl LocalStore {
     }
 }
 
-/// The LOCAL store's reachable set for a checkpoint sweep: the union of
-/// everything the sweep must keep (retained ledgers, current/incomplete
-/// state, pins). See `LocalStore::reachable_set`.
+/// THE ONE LOCKED REACHABILITY SNAPSHOT — the sweep's SINGLE DELETION
+/// AUTHORITY: the frozen union of everything the sweep must keep, computed
+/// ONCE under the caller's lock in a single scan
+/// (`LocalStore::reachability_snapshot`) from EVERY ROOT SOURCE — every
+/// target's CURRENT ledger (post any retained-suffix override the
+/// checkpoint is about to install), each entry's deployment id (its
+/// `deployments/<id>/` dir) and its intent/rollback artifacts, pending
+/// (terminal-less) intents with their in-flight deployment dirs, every
+/// slot's observed assignment (artifact + `last_deployment`), and every
+/// configured pin (store-level + `deploy.toml`).
+///
+/// ONLY values computed from THIS snapshot may be deleted: the sweep's
+/// three deletion stages — deployment dirs, release records, tree objects —
+/// all consume this snapshot's retained sets (or the planned sets
+/// enumerated from them), never a separately-read source that could drift
+/// from it. Building is fail-closed (no half-state): an unreadable anchor —
+/// an unreadable ledger, observed record, pins file, or release record a
+/// pin names — or an unverifiable assignment (an UNKNOWN pre-push /
+/// observed assignment) aborts the computation with an ERROR, and no
+/// deletion may happen from a failed build.
 #[derive(Clone, Debug, Default)]
-pub struct ReachableSet {
+pub struct ReachabilitySnapshot {
     /// Deployment ids reachable (their `deployments/<id>/` dirs stay).
     pub deployments: BTreeSet<String>,
     /// Release ids reachable (their `releases/<id>/` dirs stay).

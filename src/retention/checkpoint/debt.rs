@@ -21,7 +21,11 @@
 //! to [`SweepDebt::Ready`] only via the durability-confirming rewrite
 //! (`ReplacedDurable` — the same-suffix ledger rewrite + parent-directory
 //! fsync confirmed), and the push-side sweep runner serves the sweep only
-//! for a `Ready` marker.
+//! for a `Ready` marker. THE MARKER IS TRIAGE-ONLY, never the trigger:
+//! every push (real and no-op) and checkpoint runs the sweep
+//! RECONCILIATION regardless of any marker — a missing or failed marker
+//! write can never cause the owed maintenance to be skipped forever (a
+//! later push reconciles anyway).
 //!
 //! The marker I/O lives in [`crate::store::local::LocalStore`]
 //! ([`LocalStore::read_sweep_debt`] / [`LocalStore::write_sweep_debt`]); the
