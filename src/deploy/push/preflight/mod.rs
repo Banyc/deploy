@@ -236,7 +236,9 @@ pub(crate) fn run_preflight(
     // must see. THE STRICT-LINEAR REFUSAL (spec item 6): when the recovery
     // step CANNOT finish the previous pending attempt (the shared finalizer
     // returned `Pending` — locks contended / live state not finalizable
-    // right now), the attempt REMAINS pending and the push REFUSES — it
+    // right now — OR a degraded path's evidence-collection lock acquisition
+    // failed: a truthful degraded terminal cannot be built without the
+    // backend read), the attempt REMAINS pending and the push REFUSES — it
     // never plans a second intent on top while any previous intent lacks a
     // terminal (even for disjoint groups). Dry-run never reconciles (it
     // touches nothing).

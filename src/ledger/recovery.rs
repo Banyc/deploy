@@ -10,17 +10,39 @@
 //! `Degraded` (a non-empty Degraded terminal with the stale-plan source as
 //! its reason), never `Successful`: it can never become the head or overlay
 //! a newer head's inherited state.
+//!
+//! # Degraded terminals record BACKEND-OBSERVED facts, never plan desires
+//!
+//! The per-slot outcomes of a recovery-degraded terminal are built from
+//! per-slot EVIDENCE ([`RecoverySlotEvidence`]) collected — under the
+//! selected slots' mutation locks — by RE-READING each slot's live state
+//! (status + assignment) from its remote BEFORE the terminal is decided
+//! ([`collect_recovery_evidence`] / [`observe_recovery_slot`]). A `Known`
+//! observation appears ONLY when a successful backend read confirmed that
+//! generation; the intent's `resulting_snapshot` is a PLAN TIME DESIRED
+//! state, so the degraded terminal NEVER converts it into an observed fact
+//! (the plan may create desired facts, but only a successful backend read
+//! may create observed facts — a later rollback / `remaining_changes` /
+//! reference read must never treat a fabrication as live-server truth).
+//! `KnownAbsent` appears ONLY from a successful status read showing no
+//! `current`; `Unknown` preserves the read error. The collection runs ONLY
+//! on the degraded paths (membership mismatch, binding drift, finalizer
+//! `Refused`) — the `Successful` path keeps the finalizer's own
+//! lock-verified acquisition — and ONLY a TRANSIENT lock-acquisition
+//! failure during the collection yields [`RecoveryOutcome::StillPending`]
+//! (a truthful terminal cannot be built without the backend read).
 
 use crate::config::ProjectConfig;
 use crate::error::{Error, Result};
-use crate::identity::{OperationId, SlotId};
+use crate::identity::{GenerationId, OperationId, SlotId};
 use crate::kernel;
 use crate::ledger::finalize::{FinalizeOutcome, FinalizeSettings, finalize_successful_locked};
 use crate::ledger::records::{
     DegradedTerminal, DeploymentIntent, LedgerTerminal, NonEmptySlotTable, Observation,
-    ObservedGeneration, SlotOutcome, SlotTable, TerminalDisposition,
+    ObservationError, ObservedGeneration, PhysicalBinding, SlotOutcome, SlotTable,
+    TerminalDisposition,
 };
-use crate::remote::helper::RemoteHelper;
+use crate::remote::helper::{HeldSlotLock, RemoteHelper};
 use crate::store::local::LocalStore;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -45,9 +67,11 @@ pub(crate) enum RecoveryOutcome {
     /// silently ignored, never `Successful`.
     Degraded,
     /// The finalizer could not finish RIGHT NOW (locks contended / live
-    /// state not finalizable — a TRANSIENT non-finalization): the attempt
-    /// remains intent-only (pending). The push REFUSES to plan a new intent
-    /// on top.
+    /// state not finalizable — a TRANSIENT non-finalization), or the
+    /// degraded-path EVIDENCE collection could not acquire a selected
+    /// slot's mutation lock (a truthful degraded terminal cannot be built
+    /// without the backend read): the attempt remains intent-only
+    /// (pending). The push REFUSES to plan a new intent on top.
     StillPending,
 }
 
@@ -59,13 +83,19 @@ pub(crate) enum RecoveryOutcome {
 /// finalizer as the main success path. A recovered attempt that can no
 /// longer finalize `Successful` on the live state (membership mismatch,
 /// binding drift, or a drifted head — the finalizer's `Refused`) is
-/// finalized `Degraded` (a non-empty Degraded terminal with the refusal
+/// finalized `Degraded` (a non-empty Degraded terminal whose per-slot
+/// outcomes are built from the backend-re-read EVIDENCE
+/// ([`RecoverySlotEvidence`] — collected under the selected slots'
+/// mutation locks on the degraded path only, so the terminal records
+/// OBSERVED facts, never the plan's desired snapshot) with the refusal
 /// source as its reason), never `Successful`: it can never become the head
 /// or overlay a newer head's inherited state. ONLY a TRANSIENT
-/// non-finalization (the finalizer's [`FinalizeOutcome::Pending`]) yields
-/// [`RecoveryOutcome::StillPending`] — the caller (preflight) then REFUSES
-/// the push: a push that cannot finish the previous pending attempt never
-/// plans a second intent on top.
+/// non-finalization (the finalizer's [`FinalizeOutcome::Pending`], or a
+/// lock-acquisition failure during the degraded-path evidence collection
+/// — the new StillPending trigger, since a truthful terminal cannot be
+/// built without the backend read) yields [`RecoveryOutcome::StillPending`]
+/// — the caller (preflight) then REFUSES the push: a push that cannot
+/// finish the previous pending attempt never plans a second intent on top.
 pub(crate) fn reconcile_pending_commits(
     store: &LocalStore,
     config: &ProjectConfig,
@@ -100,7 +130,29 @@ pub(crate) fn reconcile_pending_commits(
             .iter()
             .all(|sid| members.contains(sid.as_str()));
         if !membership_ok {
-            append_degraded(store, target_name, &attempt, "membership mismatch")?;
+            // MEMBERSHIP MISMATCH (a selected slot is no longer a
+            // configured member): gather the per-slot EVIDENCE — acquiring
+            // the selected slots' mutation locks and re-reading each slot's
+            // live state; a slot that is no longer a configured member has
+            // no remote to read and records an `Unknown` evidence — then
+            // finalize `Degraded` with the TRUTHFUL per-slot observations
+            // (the plan's frozen snapshot is never converted into an
+            // observed fact). A lock-acquisition failure -> `StillPending`
+            // (a truthful terminal cannot be built without the backend
+            // read).
+            let Some(evidence) =
+                collect_recovery_evidence(&attempt, helpers, &live_bindings, op_id)?
+            else {
+                outcome = Some(RecoveryOutcome::StillPending);
+                continue;
+            };
+            append_degraded(
+                store,
+                target_name,
+                &attempt,
+                &evidence,
+                "membership mismatch",
+            )?;
             outcome = Some(RecoveryOutcome::Degraded);
             continue;
         }
@@ -113,7 +165,23 @@ pub(crate) fn reconcile_pending_commits(
             bindings_equal &= equal;
         }
         if !bindings_equal {
-            append_degraded(store, target_name, &attempt, "binding drift")?;
+            // BINDING DRIFT (a selected slot's current configured binding !=
+            // the intent's frozen binding): the binding check stays a
+            // pre-finalizer check, but when it fails recovery acquires the
+            // selected slots' guards, re-reads each slot's LIVE state, and
+            // finalizes `Degraded` with the truthful per-slot evidence
+            // (the binding the evidence records is the slot's CURRENT
+            // configured binding — a config fact — never the intent's
+            // frozen snapshot binding). A lock-acquisition failure ->
+            // `StillPending` (a truthful terminal cannot be built without
+            // the backend read).
+            let Some(evidence) =
+                collect_recovery_evidence(&attempt, helpers, &live_bindings, op_id)?
+            else {
+                outcome = Some(RecoveryOutcome::StillPending);
+                continue;
+            };
+            append_degraded(store, target_name, &attempt, &evidence, "binding drift")?;
             outcome = Some(RecoveryOutcome::Degraded);
             continue;
         }
@@ -143,7 +211,22 @@ pub(crate) fn reconcile_pending_commits(
                 outcome = Some(RecoveryOutcome::StillPending);
             }
             FinalizeOutcome::Refused { reason, .. } => {
-                append_degraded(store, target_name, &attempt, reason.as_str())?;
+                // The finalizer ran and dropped its guards; recovery then
+                // ACQUIRES the selected slots' guards, re-reads each slot's
+                // live state, and finalizes `Degraded` with the TRUTHFUL
+                // backend observations. A slot whose live state sits at the
+                // desired generation keeps `Known(desired)` — because the
+                // BACKEND READ confirmed it, never because the plan desired
+                // it. A lock-acquisition failure -> `StillPending` (a
+                // truthful terminal cannot be built without the backend
+                // read).
+                let Some(evidence) =
+                    collect_recovery_evidence(&attempt, helpers, &live_bindings, op_id)?
+                else {
+                    outcome = Some(RecoveryOutcome::StillPending);
+                    continue;
+                };
+                append_degraded(store, target_name, &attempt, &evidence, reason.as_str())?;
                 outcome = Some(RecoveryOutcome::Degraded);
             }
         }
@@ -151,27 +234,33 @@ pub(crate) fn reconcile_pending_commits(
     Ok(outcome)
 }
 
+/// Append the `Degraded` TERMINAL of a recovered attempt whose live state
+/// no longer admits `Successful`: one per-slot [`SlotOutcome::Failed`]
+/// outcome per SELECTED slot, with `compensated: false` — the causal-
+/// agnostic `AdvanceUnknown` shape (recovery never claims a slot was
+/// `Restored`/compensated or `Skipped`/never-started without transaction
+/// evidence). The outcome's OBSERVATION is copied from the per-slot
+/// EVIDENCE ([`RecoverySlotEvidence`]) that `reconcile_pending_commits`
+/// collected from the backends BEFORE deciding the terminal; this function
+/// NEVER reads a generation from `attempt.resulting_snapshot()` (the
+/// plan-time DESIRED state) to populate an observation — a plan may create
+/// desired facts, but only a successful BACKEND READ may create an
+/// OBSERVED fact, and a recovery-degraded terminal records observed facts
+/// only.
 fn append_degraded(
     store: &LocalStore,
     target_name: &str,
     attempt: &DeploymentIntent,
+    per_slot_evidence: &BTreeMap<SlotId, RecoverySlotEvidence>,
     reason: &str,
 ) -> Result<()> {
-    let snapshot = attempt.resulting_snapshot();
     let outcomes: BTreeMap<SlotId, SlotOutcome> = attempt
         .selected()
         .map(|(sid, _)| {
-            let entry = snapshot.get(&sid).expect("selected in snapshot");
-            (
-                sid.clone(),
-                SlotOutcome::Failed {
-                    observation: Observation::Known(ObservedGeneration {
-                        generation: entry.generation().clone(),
-                    }),
-                    compensated: false,
-                    error: None,
-                },
-            )
+            let evidence = per_slot_evidence.get(&sid).expect(
+                "recovery collects evidence for every selected slot before deciding the terminal",
+            );
+            (sid.clone(), failed_outcome_from_evidence(evidence))
         })
         .collect();
     let outcomes: SlotTable<SlotOutcome> = SlotTable::from_map(outcomes);
@@ -188,6 +277,253 @@ fn append_degraded(
     store.append_terminal(target_name, attempt.deployment_id(), &terminal)
 }
 
+/// The PER-SLOT EVIDENCE of a recovery-degraded terminal: the slot's
+/// OBSERVED state, collected from its BACKEND (under its mutation lock)
+/// BEFORE the degraded terminal is decided. `observation` is the live
+/// generation (or its lack / a read failure) the backend actually reported;
+/// `binding` is the slot's CURRENT CONFIGURED physical binding (a per-slot
+/// CONFIG fact, never a value from the intent's frozen snapshot); `error`
+/// preserves the read failure (the `Unknown` observation/binding carry the
+/// same preserved error). The degraded terminal's per-slot outcomes are
+/// built from this evidence ONLY: a plan may DESIRE a fact, but only a
+/// successful backend read may create an OBSERVED fact.
+pub(crate) struct RecoverySlotEvidence {
+    /// The slot's observed GENERATION, from the backend status + assignment
+    /// reads: `Known` ONLY on a successful read of that generation,
+    /// `KnownAbsent` ONLY on a successful status read showing no `current`,
+    /// `Unknown` on a read failure.
+    pub observation: Observation<ObservedGeneration>,
+    /// The slot's CURRENT CONFIGURED binding (the config fact the slot is
+    /// bound to today) under the same reads as `observation` — never the
+    /// intent's frozen snapshot binding. Not persisted (the wire outcome
+    /// carries no binding field); exposed for the assertion suite / the
+    /// spec contract that the evidence names the slot's live location.
+    #[allow(dead_code)]
+    pub binding: Observation<PhysicalBinding>,
+    /// The failed read's preserved error (when `observation`/`binding` are
+    /// `Unknown`); `None` when the reads succeeded.
+    pub error: Option<String>,
+}
+
+/// The PURE per-slot backend observation decision — the RESOLVED outcome of
+/// the TWO backend reads ([`observe_recovery_slot`] performs them: status,
+/// then assignment only when status reports a generation). The property
+/// tests drive this value directly to assert the evidence-construction
+/// semantics without heavyweight IO.
+pub(crate) enum BackendObservation {
+    /// status -> a current generation, assignment -> read successfully: the
+    /// generation is LIVE — the ONLY source of a `Known` observation.
+    Live(GenerationId),
+    /// status -> no current: the slot has no observed state.
+    Absent,
+    /// status -> read failed, or status succeeded but the assignment read
+    /// failed: the preserved error.
+    Failed(String),
+}
+
+/// THE ONLY remote-observation-constructed path to [`RecoverySlotEvidence`]
+/// (the governing rule: a plan may create desired facts, but only a
+/// successful backend read may create observed facts). `helper` is the
+/// selected slot's HELD mutation-lock guard; `configured_binding` is the
+/// slot's CURRENT configured binding (`None` when the slot is no longer a
+/// configured member). `Known` values appear ONLY from a successful
+/// status + assignment read; `KnownAbsent` ONLY from a successful status
+/// read showing no `current`; `Unknown` preserves the read error. The
+/// `Known` binding is the slot's live/config binding — never the intent's
+/// frozen snapshot binding; a non-member slot records an `Unknown` binding
+/// (no configured location exists to bind it to).
+fn observe_recovery_slot(
+    helper: &HeldSlotLock<'_>,
+    configured_binding: Option<&PhysicalBinding>,
+) -> RecoverySlotEvidence {
+    let backend = match helper.helper().status() {
+        Err(e) => BackendObservation::Failed(e.to_string()),
+        Ok(status) => match status.current_generation {
+            None => BackendObservation::Absent,
+            Some(generation) => match helper.helper().read_assignment(generation.as_str()) {
+                Ok(_) => BackendObservation::Live(generation),
+                Err(e) => BackendObservation::Failed(e.to_string()),
+            },
+        },
+    };
+    recovery_evidence_from_backend(backend, configured_binding)
+}
+
+/// The PURE evidence-construction decision: map the resolved backend
+/// observation to the per-slot evidence. A `Known` observation appears ONLY
+/// from [`BackendObservation::Live`]; a `KnownAbsent` observation ONLY from
+/// [`BackendObservation::Absent`]; an `Unknown` observation carries the read
+/// error. NO branch ever sources a `Known` value from the intent's desired
+/// snapshot.
+fn recovery_evidence_from_backend(
+    backend: BackendObservation,
+    configured_binding: Option<&PhysicalBinding>,
+) -> RecoverySlotEvidence {
+    match backend {
+        BackendObservation::Failed(e) => RecoverySlotEvidence {
+            observation: Observation::Unknown(ObservationError { message: e.clone() }),
+            binding: Observation::Unknown(ObservationError { message: e.clone() }),
+            error: Some(e),
+        },
+        BackendObservation::Absent => RecoverySlotEvidence {
+            observation: Observation::KnownAbsent,
+            binding: Observation::KnownAbsent,
+            error: None,
+        },
+        BackendObservation::Live(generation) => RecoverySlotEvidence {
+            observation: Observation::Known(ObservedGeneration { generation }),
+            binding: match configured_binding {
+                Some(b) => Observation::Known(b.clone()),
+                // The slot is not a configured member: there is no physical
+                // binding to record — the observation may still be Known
+                // (the backend read succeeded), but the binding has no
+                // source and is honestly `Unknown`.
+                None => Observation::Unknown(ObservationError {
+                    message: "slot is not a configured member — no physical binding".to_string(),
+                }),
+            },
+            error: None,
+        },
+    }
+}
+
+/// The causal-agnostic per-slot outcome a recovery-degraded terminal
+/// records for the given evidence: `Failed { compensated: false }` (deriving
+/// `AdvanceUnknown` — recovery never claims `Restored`/compensation or
+/// `Skipped`/never-started without transaction evidence). The observation is
+/// the evidence's TRUTHFUL backend observation; the `error` is the
+/// evidence's read error (the only operation-level error a non-mutating
+/// recovery carries). The plan's desired snapshot NEVER appears here.
+fn failed_outcome_from_evidence(evidence: &RecoverySlotEvidence) -> SlotOutcome {
+    SlotOutcome::Failed {
+        observation: evidence.observation.clone(),
+        compensated: false,
+        error: evidence.error.clone(),
+    }
+}
+
+/// Collect the per-slot recovery EVIDENCE of the attempt's SELECTED
+/// membership — on a DEGRADED path ONLY: acquire each selected slot's
+/// mutation lock (sorted-slot-id order, like the finalizer) and re-read its
+/// live state ([`observe_recovery_slot`]). A selected slot with NO helper
+/// (no configured remote — it is not a configured member) records an
+/// `Unknown` evidence (its state cannot be read at all). On a
+/// lock-acquisition failure the collection returns `Ok(None)`: the caller
+/// must choose [`RecoveryOutcome::StillPending`] — a truthful terminal
+/// cannot be built without the backend read. This path runs ONLY for the
+/// degraded paths (membership mismatch, binding drift, finalizer `Refused`),
+/// never for the `Successful` path, whose finalizer performs its own
+/// lock-verified acquisition (pre-acquiring the guards here would make the
+/// finalizer's own acquisition contend).
+fn collect_recovery_evidence(
+    attempt: &DeploymentIntent,
+    helpers: &HashMap<SlotId, RemoteHelper>,
+    live_bindings: &BTreeMap<SlotId, PhysicalBinding>,
+    op_id: &OperationId,
+) -> Result<Option<BTreeMap<SlotId, RecoverySlotEvidence>>> {
+    let mut evidence: BTreeMap<SlotId, RecoverySlotEvidence> = BTreeMap::new();
+    let mut selected: Vec<SlotId> = attempt.selected_membership().into_iter().collect();
+    selected.sort();
+    for sid in selected {
+        let Some(helper) = helpers.get(&sid) else {
+            // Not a configured member: no remote to observe — the slot's
+            // state is honestly UNKNOWN (a membership-mismatch degraded
+            // path).
+            let msg = format!("slot '{sid}' has no configured remote to observe");
+            evidence.insert(
+                sid,
+                RecoverySlotEvidence {
+                    observation: Observation::Unknown(ObservationError {
+                        message: msg.clone(),
+                    }),
+                    binding: Observation::Unknown(ObservationError {
+                        message: msg.clone(),
+                    }),
+                    error: Some(msg),
+                },
+            );
+            continue;
+        };
+        match helper.acquire_lock_guard(op_id) {
+            Err(_) => return Ok(None),
+            Ok(guard) => {
+                let configured_binding = live_bindings.get(&sid);
+                evidence.insert(
+                    sid.clone(),
+                    observe_recovery_slot(&guard, configured_binding),
+                );
+            }
+        }
+    }
+    Ok(Some(evidence))
+}
+
+/// THE DERIVED PER-SLOT RECOVERY CLASSIFICATION (test/assertion view — the
+/// degraded terminal itself stays the causal-agnostic `Failed` regardless;
+/// this is a derived view, never a stored field, and adds NO wire variant):
+/// compare the EVIDENCE's observed generation against the intent's DESIRED
+/// generation (the frozen snapshot entry) and the intent's PRE-PUSH
+/// generation (the plan's pre-push observation):
+///
+/// * [`SlotRecoveryClass::Advanced`] — the observed state IS the desired
+///   generation (backend-read confirmed);
+/// * [`SlotRecoveryClass::Unchanged`] — the observed state equals the
+///   pre-push generation, or the slot was observed absent with no known
+///   prior generation — the slot is back at its pre-push state WITHOUT
+///   claiming restored vs never-started (no transaction evidence proves
+///   which occurred);
+/// * [`SlotRecoveryClass::Diverged`] — the observed state is a THIRD
+///   generation, or absent while a prior generation was known;
+/// * [`SlotRecoveryClass::Unknown`] — the observation read failed.
+///
+/// The checked order is desired-first (the assumption: a real deploy
+/// advances the generation, so the desired generation differs from the
+/// pre-push one). Under that assumption the classification matches the
+/// kernel's `remaining_changes` exactly for the evidence-built `Failed`
+/// outcomes: a slot is a remaining change iff its class is not `Unchanged`.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SlotRecoveryClass {
+    /// The observed state is the DESIRED generation (backend-read
+    /// confirmed — a remaining change under desired != pre-push).
+    Advanced,
+    /// The observed state equals the pre-push state (or is absent with no
+    /// known prior generation) — never a remaining change.
+    Unchanged,
+    /// The observed state is a third generation / vanished prior state — a
+    /// remaining change.
+    Diverged,
+    /// The observation read failed — always a remaining change.
+    Unknown,
+}
+
+#[cfg(test)]
+pub(crate) fn classify_recovery_slot(
+    evidence: &RecoverySlotEvidence,
+    desired: &GenerationId,
+    pre_push: Option<&GenerationId>,
+) -> SlotRecoveryClass {
+    match &evidence.observation {
+        Observation::Unknown(_) => SlotRecoveryClass::Unknown,
+        Observation::KnownAbsent => match pre_push {
+            // Never deployed and still not deployed: nothing changed
+            // (never-started, observed).
+            None => SlotRecoveryClass::Unchanged,
+            // A known prior generation vanished — the state MOVED.
+            Some(_) => SlotRecoveryClass::Diverged,
+        },
+        Observation::Known(og) => {
+            if og.generation == *desired {
+                SlotRecoveryClass::Advanced
+            } else if Some(&og.generation) == pre_push {
+                SlotRecoveryClass::Unchanged
+            } else {
+                SlotRecoveryClass::Diverged
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,11 +534,15 @@ mod tests {
         test_tree_digest,
     };
     use crate::kernel::intent::{PlanInput, PlannedDeploy};
-    use crate::kernel::snapshot::SnapshotSlot;
+    use crate::kernel::snapshot::{PreviousGeneration, SnapshotSlot};
     use crate::ledger::{DeploymentStatus, PhysicalBinding};
     use crate::remote::helper::{ExpectedCurrent, GenerationAssignment, RemoteHelper};
     use crate::remote::transport::{LocalTransport, Remote};
     use crate::store::local::LocalStore;
+    #[cfg(test)]
+    use proptest::prelude::*;
+    #[cfg(test)]
+    use proptest::test_runner::RngSeed;
 
     fn p1() -> SlotId {
         SlotId::parse("p1").unwrap()
@@ -496,5 +836,379 @@ mod tests {
                 "op-mint",
             )
             .unwrap();
+    }
+
+    // ---- DEGRADED TERMINALS RECORD BACKEND-OBSERVED FACTS (the spec's
+    // acceptance gate) ------------------------------------------------------
+    //
+    // THE PROPERTY FAMILY: generate INDEPENDENTLY the desired generation D
+    // (the intent's frozen snapshot), the pre-push generation P, the backend
+    // result (in {P, D, a third generation X, absent, read error}) and the
+    // recovery failure (membership / binding / finalizer refusal), and drive
+    // the PURE evidence machinery — `recovery_evidence_from_backend`
+    // (evidence construction), `failed_outcome_from_evidence` (evidence →
+    // degraded outcome), `classify_recovery_slot` (the derived per-slot
+    // classification) and the REAL terminal construction (DegradedTerminal +
+    // [`LedgerTerminal::remaining_changes`]) — asserting:
+    //
+    // * the terminal's per-slot observations are the BACKEND's — a
+    //   `Known(G)` observation implies a successful backend read of G (the
+    //   terminal NEVER fabricates `Known(desired)` from the plan's frozen
+    //   snapshot: when the backend reports a third generation the terminal
+    //   records THIRD, never DESIRED);
+    // * the binding is `Known` under the same successful read (the slot's
+    //   CURRENT configured binding), `KnownAbsent` under an absent current,
+    //   `Unknown` under a read failure;
+    // * a slot verified at its desired generation through a backend read
+    //   PRESERVES that verified evidence (`Known(desired)` — the backend
+    //   confirmed it, `Advanced`);
+    // * `remaining_changes` contains exactly the honestly-changed slots
+    //   (the `Unchanged` class is never a remaining change; every
+    //   `Advanced`/`Diverged`/`Unknown` slot is), matching the kernel's
+    //   derivation for the causal-agnostic `Failed { compensated: false }`
+    //   outcomes.
+
+    /// A deterministic valid generation per tag (distinct tags yield
+    /// distinct ids). The desired/pre-push/third generations of every
+    /// generated case embed the case tag with DISTINCT suffixes, so the
+    /// three are pairwise distinct for ANY generated tag (shrinking-safe).
+    fn prop_gen(tag: &str) -> GenerationId {
+        test_generation_id(tag)
+    }
+
+    /// The BACKEND result of one slot's reads, relative to the generated
+    /// desired (D) and pre-push (P) generations.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum PropBackend {
+        /// The backend reported the DESIRED generation live.
+        AtDesired,
+        /// The backend reported the PRE-PUSH generation live.
+        AtPrePush,
+        /// The backend reported a THIRD generation (neither D nor P).
+        AtThird,
+        /// The backend reported NO current state.
+        Absent,
+        /// The backend read failed.
+        ReadError,
+    }
+
+    /// The RECOVERY failure that sent the attempt to the degraded path.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum PropFailure {
+        MembershipDrift,
+        BindingDrift,
+        FinalizerRefusal,
+    }
+
+    impl PropFailure {
+        fn reason(self) -> &'static str {
+            match self {
+                PropFailure::MembershipDrift => "membership mismatch",
+                PropFailure::BindingDrift => "binding drift",
+                PropFailure::FinalizerRefusal => "state diverged",
+            }
+        }
+    }
+
+    fn arbitrary_backend() -> impl Strategy<Value = PropBackend> {
+        prop_oneof![
+            Just(PropBackend::AtDesired),
+            Just(PropBackend::AtPrePush),
+            Just(PropBackend::AtThird),
+            Just(PropBackend::Absent),
+            Just(PropBackend::ReadError),
+        ]
+    }
+
+    fn arbitrary_failure() -> impl Strategy<Value = PropFailure> {
+        prop_oneof![
+            Just(PropFailure::MembershipDrift),
+            Just(PropFailure::BindingDrift),
+            Just(PropFailure::FinalizerRefusal),
+        ]
+    }
+
+    /// Build the generated case: D = prop_gen(tag), P = prop_gen(tag + "-p"),
+    /// X = prop_gen(tag + "-x") — pairwise DISTINCT for any generated tag
+    /// (deterministic distinct suffixes), pre-push = P (a KNOWN generation).
+    #[derive(Clone, Debug)]
+    struct EvidenceCase {
+        desired: GenerationId,
+        pre_push: GenerationId,
+        third: GenerationId,
+        backend: PropBackend,
+        failure: PropFailure,
+    }
+
+    fn arbitrary_evidence_case() -> impl Strategy<Value = EvidenceCase> {
+        ("[a-z0-9]{1,14}", arbitrary_backend(), arbitrary_failure()).prop_map(
+            |(tag, backend, failure)| EvidenceCase {
+                desired: prop_gen(&tag),
+                pre_push: prop_gen(&format!("{tag}-p")),
+                third: prop_gen(&format!("{tag}-x")),
+                backend,
+                failure,
+            },
+        )
+    }
+
+    /// A VALID first-push intent for the property: one selected slot (p1)
+    /// deploying `desired` over the KNOWN pre-push generation, planned
+    /// through the kernel's validated constructor.
+    fn evidence_prop_intent(
+        deploy_slot: &SlotId,
+        desired: &GenerationId,
+        pre_push: &GenerationId,
+        binding: &PhysicalBinding,
+        artifact: ArtifactRef,
+    ) -> DeploymentIntent {
+        crate::kernel::intent::plan(PlanInput {
+            deployment_id: test_deployment_id("deploy-evidence-prop"),
+            target: TargetName::parse("t1").unwrap(),
+            parent: None,
+            parent_snapshot: None,
+            group: None,
+            selection: vec![deploy_slot.clone()],
+            planned: vec![PlannedDeploy {
+                slot: deploy_slot.clone(),
+                result: SnapshotSlot::new(desired.clone(), artifact.clone(), binding.clone()),
+                pre_push: Observation::Known(PreviousGeneration {
+                    generation: pre_push.clone(),
+                    artifact,
+                }),
+            }],
+            behavior_digest: BehaviorDigest::parse(crate::identity::DIGEST_TEST_HEX_1).unwrap(),
+            attempted_at: Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
+        })
+        .expect("a valid evidence property intent plans")
+    }
+
+    /// Drive ONE generated case through the PURE evidence machinery and the
+    /// REAL terminal construction; assert the spec's acceptance assertions.
+    fn run_evidence_case(case: EvidenceCase) {
+        let EvidenceCase {
+            desired,
+            pre_push,
+            third,
+            backend,
+            failure,
+        } = case;
+        let slot = p1();
+        // The generated cases deploy a CONFIGURED member slot: the
+        // evidence's binding source is the slot's current configured binding
+        // (the non-member `None` arm is pinned by
+        // [`non_member_slot_evidence_has_unknown_binding_under_a_known_generation`]).
+        let config_binding = PhysicalBinding::default();
+
+        // The backend observation the reads resolve to (mirroring the
+        // production decision order: status, then assignment).
+        let backend_obs = match backend {
+            PropBackend::AtDesired => BackendObservation::Live(desired.clone()),
+            PropBackend::AtPrePush => BackendObservation::Live(pre_push.clone()),
+            PropBackend::AtThird => BackendObservation::Live(third.clone()),
+            PropBackend::Absent => BackendObservation::Absent,
+            PropBackend::ReadError => {
+                BackendObservation::Failed("status read failed: boom".to_string())
+            }
+        };
+        let evidence = recovery_evidence_from_backend(backend_obs, Some(&config_binding));
+        let class = classify_recovery_slot(&evidence, &desired, Some(&pre_push));
+
+        // (1) THE TERMINAL OBSERVATION IS THE BACKEND'S — `Known` appears
+        // ONLY from a successful backend read, NEVER from the plan's desired
+        // state; `KnownAbsent` ONLY from a successful status read showing no
+        // current; `Unknown` preserves the read error.
+        let expected_observation = match backend {
+            PropBackend::AtDesired => Observation::Known(ObservedGeneration {
+                generation: desired.clone(),
+            }),
+            PropBackend::AtPrePush => Observation::Known(ObservedGeneration {
+                generation: pre_push.clone(),
+            }),
+            PropBackend::AtThird => Observation::Known(ObservedGeneration {
+                generation: third.clone(),
+            }),
+            PropBackend::Absent => Observation::KnownAbsent,
+            PropBackend::ReadError => Observation::Unknown(ObservationError {
+                message: "status read failed: boom".to_string(),
+            }),
+        };
+        assert_eq!(
+            evidence.observation, expected_observation,
+            "the evidence observation is the BACKEND's fact ({backend:?}), never the plan's desired state"
+        );
+        // The desired-fabrication ban, stated explicitly (property-1750 the
+        // evidence path, including the desired != backend case): a `Known`
+        // observed generation equals EXACTLY the backend's reported
+        // generation — when the backend reports the third generation the
+        // terminal records THIRD, never the desired D.
+        if let Observation::Known(og) = &evidence.observation {
+            let backend_gen = match backend {
+                PropBackend::AtDesired => &desired,
+                PropBackend::AtPrePush => &pre_push,
+                PropBackend::AtThird => &third,
+                _ => unreachable!("non-Live backends never produce a Known observation"),
+            };
+            assert_eq!(
+                &og.generation, backend_gen,
+                "a Known observed generation implies a successful backend read OF THAT generation — the desired state is never converted into an observed fact"
+            );
+        }
+
+        // (2) THE BINDING is Known under the same successful read (the
+        // slot's CURRENT configured binding — a config fact, never the
+        // intent's frozen snapshot binding), KnownAbsent under an absent
+        // current, Unknown under a read failure.
+        let expected_binding = match backend {
+            PropBackend::AtDesired | PropBackend::AtPrePush | PropBackend::AtThird => {
+                Observation::Known(config_binding.clone())
+            }
+            PropBackend::Absent => Observation::KnownAbsent,
+            PropBackend::ReadError => Observation::Unknown(ObservationError {
+                message: "status read failed: boom".to_string(),
+            }),
+        };
+        assert_eq!(
+            evidence.binding, expected_binding,
+            "the binding is Known under the same read — the current configured binding, never the intent's frozen snapshot binding"
+        );
+
+        // (3) THE DERIVED CLASSIFICATION: actual == desired -> Advanced
+        // (the backend-confirmed verified slot), actual == pre-push ->
+        // Unchanged, third generation / vanished prior state -> Diverged,
+        // failed read -> Unknown.
+        let expected_class = match backend {
+            PropBackend::AtDesired => SlotRecoveryClass::Advanced,
+            PropBackend::AtPrePush => SlotRecoveryClass::Unchanged,
+            PropBackend::AtThird | PropBackend::Absent => SlotRecoveryClass::Diverged,
+            PropBackend::ReadError => SlotRecoveryClass::Unknown,
+        };
+        assert_eq!(
+            class, expected_class,
+            "the derived per-slot classification matches the evidence vs desired/pre-push ({backend:?})"
+        );
+
+        // (4) THE RECOVERED TERMINAL: the causal-agnostic Failed
+        // (AdvanceUnknown) outcome built from the evidence, carrying the
+        // case's recovery failure as the reason; the honest remaining set.
+        let artifact = art("rel-evidence");
+        let intent = evidence_prop_intent(&slot, &desired, &pre_push, &config_binding, artifact);
+        let outcome = failed_outcome_from_evidence(&evidence);
+        assert_eq!(
+            outcome.observation(),
+            &evidence.observation,
+            "the degraded outcome copies the BACKEND-observed fact from the evidence"
+        );
+        assert_eq!(
+            outcome.transition(),
+            crate::ledger::records::SlotTransition::AdvanceUnknown,
+            "the degraded terminal stays the causal-agnostic Failed {{ compensated: false }} (AdvanceUnknown) — never Restored/Skipped without transaction evidence"
+        );
+        let outcomes: SlotTable<SlotOutcome> =
+            SlotTable::from_map(BTreeMap::from([(slot.clone(), outcome)]));
+        let non_empty =
+            NonEmptySlotTable::build(outcomes.iter().map(|(k, v)| (k.clone(), v.clone())))
+                .expect("a single outcome builds a non-empty table");
+        let dt = DegradedTerminal::try_new(non_empty)
+            .expect("a Failed {{ compensated: false }} outcome is a valid degraded result");
+        let terminal = LedgerTerminal::new(
+            crate::remote::helper::now_rfc3339_ts(),
+            kernel::terminal::intent_digest(&intent),
+            TerminalDisposition::Degraded(dt),
+            Some(failure.reason().to_string()),
+        );
+        assert_eq!(terminal.status(), DeploymentStatus::Degraded);
+        assert_eq!(terminal.reason(), Some(failure.reason()));
+
+        // (5) ONLY THE HONESTLY-CHANGED SLOTS APPEAR AS remaining_changes:
+        // the Unchanged class (observed == pre-push) is never a remaining
+        // change; every Advanced/Diverged/Unknown slot is.
+        let remaining = terminal
+            .remaining_changes(&intent)
+            .expect("a Degraded terminal derives remaining changes");
+        let expected_remaining = if class == SlotRecoveryClass::Unchanged {
+            0
+        } else {
+            1
+        };
+        assert_eq!(
+            remaining.len(),
+            expected_remaining,
+            "remaining_changes contains exactly the honestly-changed slots: only the Unchanged class is never a remaining change ({class:?}, {backend:?})"
+        );
+        if class != SlotRecoveryClass::Unchanged {
+            assert!(
+                remaining.contains_key(&slot),
+                "a {class:?} slot is a remaining change (its observed state differs from pre-push or is unknown)"
+            );
+        } else {
+            assert!(
+                !remaining.contains_key(&slot),
+                "an Unchanged slot (observed == pre-push) is never a remaining change"
+            );
+        }
+    }
+
+    /// THE BINDING-JUDGMENT CALL, pinned: a selected slot that is NO LONGER
+    /// a configured member can have a KNOWN live generation (a successful
+    /// backend read) but NO physical binding source — the evidence records
+    /// `binding: Unknown` (never the intent's frozen snapshot binding, which
+    /// would claim a location that no longer exists). Under an ABSENT
+    /// current the non-member binding is `KnownAbsent` (consistent with the
+    /// same-read rule: the reads succeeded and showed no state at all).
+    #[test]
+    fn non_member_slot_evidence_has_unknown_binding_under_a_known_generation() {
+        let desired = test_generation_id("non-member-d");
+        let evidence =
+            recovery_evidence_from_backend(BackendObservation::Live(desired.clone()), None);
+        assert_eq!(
+            evidence.observation,
+            Observation::Known(ObservedGeneration {
+                generation: desired
+            }),
+            "a successful backend read still records the live generation for a non-member"
+        );
+        match &evidence.binding {
+            Observation::Unknown(e) => assert!(
+                e.message.contains("not a configured member"),
+                "a non-member slot has NO binding source — Unknown, got {e:?}"
+            ),
+            b => panic!("a non-member's binding must be Unknown, got {b:?}"),
+        }
+        assert_eq!(evidence.error, None);
+        // The consistent absent-current choice: a successful status read
+        // showing no current yields an absent binding too (nothing to bind).
+        let absent = recovery_evidence_from_backend(BackendObservation::Absent, None);
+        assert_eq!(absent.binding, Observation::KnownAbsent);
+        assert_eq!(absent.observation, Observation::KnownAbsent);
+    }
+
+    proptest! {
+        // THE SPEC'S ACCEPTANCE GATE (bounded cases, fixed seed, no failure
+        // persistence — house style): every generated (desired, pre-push,
+        // backend result, recovery failure) case yields a recovered degraded
+        // terminal whose per-slot observations are the BACKEND's facts — a
+        // `Known` observed generation implies a successful backend read of
+        // that generation (the terminal NEVER shows the desired state when
+        // the backend reports a different generation), an absent backend
+        // yields `KnownAbsent`, a failed read `Unknown(error)`; the binding
+        // is `Known` (the slot's current configured binding) under the same
+        // successful read; a slot verified at its desired generation through
+        // a backend read preserves that verified evidence; and only the
+        // honestly-changed (non-Unchanged) slots appear as remaining
+        // changes.
+        #![proptest_config(ProptestConfig {
+            cases: 64,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn degraded_terminal_records_backend_observed_facts_never_desired_state(
+            case in arbitrary_evidence_case(),
+        ) {
+            run_evidence_case(case);
+        }
     }
 }

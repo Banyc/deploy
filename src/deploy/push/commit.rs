@@ -739,6 +739,33 @@ pub(crate) mod commit_tests {
             Some(gen_v2.as_str()),
             "the conflict must not disturb the live deployment"
         );
+
+        // A VERIFIED SLOT PRESERVES ITS VERIFIED EVIDENCE: the degraded
+        // terminal's per-slot outcome records `Known(gen_v2)` — the live
+        // generation the BACKEND READ confirmed (the faulted push minted it
+        // and the server is still on it) — because the backend read
+        // returned it, never because the plan desired it (the old recovery
+        // fabricated `Known(desired)` from the intent's frozen snapshot).
+        let entries = h.store.read_ledger("t1").unwrap();
+        let entry = entries
+            .iter()
+            .find(|e| e.deployment_id == dep2)
+            .expect("the degraded entry exists");
+        let terminal = entry
+            .terminal
+            .as_ref()
+            .expect("the degraded attempt has a terminal");
+        let degraded_outcomes = terminal.outcomes();
+        let outcome = degraded_outcomes
+            .get(&SlotId::new("p1".to_string()))
+            .expect("the selected slot's outcome");
+        assert_eq!(
+            outcome.observation(),
+            &crate::ledger::Observation::Known(crate::ledger::ObservedGeneration {
+                generation: gen_v2
+            }),
+            "a slot at its desired generation through a backend read keeps Known(desired) — the backend confirmed it"
+        );
     }
 
     // ---- Intent persisted BEFORE remote mutation; InProgress recovery -----
@@ -965,6 +992,37 @@ pub(crate) mod commit_tests {
             "last-successful still points at the baseline deployment"
         );
         assert_eq!(h.store.read_attempts("t1").unwrap().len(), 2);
+
+        // THE TRUTHFUL DEGRADED OBSERVATION (the fabrication bug this
+        // feature fixes): the degraded terminal's per-slot outcome records
+        // the BACKEND's live generation — the baseline's, the remote's
+        // actual `current` — NEVER the crafted intent's DESIRED generation
+        // "a" the remote never reached (the old recovery fabricated
+        // `Known(desired)` from the plan's frozen snapshot without ever
+        // performing an observation).
+        let entries = h.store.read_ledger("t1").unwrap();
+        let entry = entries
+            .iter()
+            .find(|e| e.deployment_id == id_a)
+            .expect("the degraded entry exists");
+        let terminal = entry
+            .terminal
+            .as_ref()
+            .expect("the degraded attempt has a terminal");
+        let degraded_outcomes = terminal.outcomes();
+        let outcome = degraded_outcomes
+            .get(&SlotId::new("p1".to_string()))
+            .expect("the selected slot's outcome");
+        let live_p1 = baseline.desired[&SlotId::new("p1".to_string())]
+            .generation
+            .clone();
+        assert_eq!(
+            outcome.observation(),
+            &crate::ledger::Observation::Known(crate::ledger::ObservedGeneration {
+                generation: live_p1
+            }),
+            "the degraded terminal records the BACKEND-observed live generation (the baseline's), never the plan's desired generation"
+        );
     }
 
     // ---- Transition sequence, outcomes separation, no-op trace, mid-mutation
