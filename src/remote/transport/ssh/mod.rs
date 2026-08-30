@@ -92,6 +92,16 @@ const SIDECAR_FLOCK_INTERVAL_SECS: f64 = 0.005;
 /// `die "sidecar contended"`. The prelude reads `$fh` already opened by the
 /// caller and keeps the flock held through file fsync and parent-directory sync
 /// (the same perl process does the fsyncs while still holding the descriptor).
+///
+/// TEST-ONLY contention signal: when `DEPLOY_TEST_CONTENDED_FD` is set (a
+/// numeric fd a TEST hands the child — the env var must only ever be
+/// configured by tests), the prelude writes one `CONTENDED` line to that fd
+/// EXACTLY ONCE — right after the FIRST confirmed `EWOULDBLOCK`, before any
+/// deadline accounting — then deletes the env key, so later iterations
+/// (also EWOULDBLOCKs on a retained lock) stay silent. No timing/sleep is
+/// added to the signal path. With the env unset (production) the block is
+/// skipped entirely and the emitted behavior is byte-identical to a prelude
+/// without the signal.
 fn sidecar_flock_prelude(deadline_secs: f64, interval_secs: f64) -> String {
     format!(
         "use Fcntl qw(:flock);\n\
@@ -102,6 +112,12 @@ while (!flock($fh, LOCK_EX | LOCK_NB)) {{{{\n\
     my $errno = 0 + $!;\n\
     next if $errno == EINTR;\n\
     die \"sidecar flock failed: $!\" unless $errno == EAGAIN || $errno == EWOULDBLOCK;\n\
+    if (defined $ENV{{\"DEPLOY_TEST_CONTENDED_FD\"}}) {{\n\
+        open(my $ready, \">&=\" . $ENV{{\"DEPLOY_TEST_CONTENDED_FD\"}})\n\
+            or die \"open contention signal fd: $!\";\n\
+        print {{$ready}} \"CONTENDED\\n\";\n\
+        delete $ENV{{\"DEPLOY_TEST_CONTENDED_FD\"}};\n\
+    }}\n\
     my $remaining = $deadline - clock_gettime(CLOCK_MONOTONIC);\n\
     die \"sidecar contended\" if $remaining <= 0;\n\
     usleep(int(1_000_000 * ($remaining < {interval:?} ? $remaining : {interval:?})));\n\
@@ -1992,6 +2008,16 @@ mod tests_ssh {
             "missing contended die"
         );
         assert!(prelude.contains("usleep"), "missing usleep");
+        // test-only contention signal: env-gated (inert in production), fires
+        // exactly once after the first confirmed EWOULDBLOCK
+        assert!(
+            prelude.contains("DEPLOY_TEST_CONTENDED_FD"),
+            "missing test-only contention signal gate"
+        );
+        assert!(
+            prelude.contains("CONTENDED"),
+            "missing test-only contention signal"
+        );
         // production constants
         assert!(
             prelude.contains("2"),
@@ -2065,68 +2091,385 @@ mod tests_ssh {
         );
     }
 
-    proptest! {
-        #![proptest_config(ProptestConfig {
-            cases: crate::testutil::proptest_cases(16),
-            rng_seed: RngSeed::Fixed(0x5EED_5EED),
-            failure_persistence: None,
-            ..ProptestConfig::default()
-        })]
-        #[test]
-        fn sidecar_flock_prelude_runtime_with_short_deadline(hold_ms in prop_oneof![Just(0u64), Just(10u64), Just(20u64), Just(70u64), Just(90u64)]) {
-            use std::os::unix::io::AsRawFd;
-            let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
-            let sidecar = dir.path().join("sidecar");
-            std::fs::write(&sidecar, b"").unwrap();
-            let deadline = 0.05f64;
-            let interval = 0.005f64;
-            let prelude = sidecar_flock_prelude(deadline, interval);
-            let script = format!("open my $fh, \"+<\", $ARGV[0] or die \"open sidecar: $!\"; {prelude} print \"OK\\n\";");
-            let sidecar_str = sidecar.to_string_lossy().into_owned();
-            if hold_ms == 0 {
-                let out = std::process::Command::new("perl")
-                    .arg("-e")
-                    .arg(&script)
-                    .arg("--")
-                    .arg(&sidecar_str)
-                    .output()
-                    .expect("run perl");
-                prop_assert!(out.status.success(), "no contention should succeed: stderr={}", String::from_utf8_lossy(&out.stderr));
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                prop_assert_eq!(stdout.trim(), "OK");
-            } else {
-                let hold = std::time::Duration::from_millis(hold_ms);
-                let deadline_dur = std::time::Duration::from_millis((deadline * 1000.0) as u64);
-                let (tx, rx) = std::sync::mpsc::channel();
-                let sc = sidecar.clone();
-                let handle = std::thread::spawn(move || {
-                    let f = std::fs::OpenOptions::new().read(true).write(true).open(&sc).unwrap();
-                    let fd = f.as_raw_fd();
-                    unsafe { libc::flock(fd, libc::LOCK_EX); }
-                    tx.send(()).unwrap();
-                    std::thread::sleep(hold);
-                    unsafe { libc::flock(fd, libc::LOCK_UN); }
-                });
-                rx.recv().unwrap();
-                let out = std::process::Command::new("perl")
-                    .arg("-e")
-                    .arg(&script)
-                    .arg("--")
-                    .arg(&sidecar_str)
-                    .output()
-                    .expect("run perl");
-                handle.join().unwrap();
-                if hold < deadline_dur {
-                    prop_assert!(out.status.success(), "hold {hold:?} < deadline {deadline_dur:?} should succeed: stderr={}", String::from_utf8_lossy(&out.stderr));
-                    let stdout = String::from_utf8_lossy(&out.stdout);
-                    prop_assert_eq!(stdout.trim(), "OK");
-                } else {
-                    prop_assert!(!out.status.success(), "hold {hold:?} >= deadline {deadline_dur:?} should be contended");
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    prop_assert!(stderr.contains("sidecar contended"), "contended stderr missing: {stderr}");
-                }
-            }
+    // ------------------------------------------------------------------
+    // Synchronized flock-contention tests: process scheduling is exercised
+    // with DETERMINISTIC synchronization — a real OS pipe handshake — never
+    // elapsed-time guesses. The old `sidecar_flock_prelude_runtime_with_
+    // short_deadline` proptest slept a holder thread and compared wall
+    // clocks against a 50 ms deadline, which flaked under parallel load.
+    // The input space here is three discrete concurrency states, so these
+    // are plain deterministic `#[test]`s: the sidecar reports its FIRST
+    // confirmed EWOULDBLOCK through the prelude's env-gated
+    // `DEPLOY_TEST_CONTENDED_FD` signal, the parent is signal-driven off
+    // that pipe, and every assertion checks a STATE TRANSITION (deadline
+    // error vs success) — never an elapsed-millisecond comparison. The pure
+    // prelude-generation proptests stay.
+    // ------------------------------------------------------------------
+
+    /// The flock contention window the synchronized tests exercise (passed as
+    /// the prelude's deadline AND the sidecar's own contention window): 500 ms.
+    /// The tests assert only the state transitions, never elapsed
+    /// milliseconds, so this needn't match the 2 s production constant; the
+    /// outer harness cap below is meaningfully longer.
+    const SIDECAR_FLOCK_TEST_DEADLINE: Duration = Duration::from_millis(500);
+
+    /// The outer cap on every parent-side bounded wait (contention signal,
+    /// child exit): meaningfully longer than [`SIDECAR_FLOCK_TEST_DEADLINE`],
+    /// so the outcome is decided by the sidecar's OWN deadline — a harness
+    /// timeout would be a test failure, never the thing under test. 5 s also
+    /// leaves room for a wedged child to be killed and reaped.
+    const SIDECAR_FLOCK_TEST_OUTER_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// The typed sidecar exit contract, classified from the child's
+    /// stdout/stderr per the real sidecar protocol (`OK` / `sidecar contended`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SidecarErrorCode {
+        /// Exit 0 with `OK` on stdout: the sidecar acquired the flock.
+        Success,
+        /// Nonzero exit with `sidecar contended` on stderr: the deadline
+        /// elapsed while the flock stayed contended.
+        LockDeadlineExceeded,
+    }
+
+    /// Harness-side failure; every variant names the state transition that
+    /// did not happen (the tests assert transitions, never timings).
+    #[derive(Debug)]
+    // The variant payloads exist for `{:?}` diagnostics in assertion
+    // messages; equality is by variant, so the fields are never destructured.
+    #[allow(dead_code)]
+    enum TestError {
+        /// The outer cap elapsed before the child reported its contention
+        /// signal.
+        ContentionSignalTimeout,
+        /// The child exited without ever writing the contention signal
+        /// (EOF on the pipe, no data).
+        ChildExitedWithoutSignal,
+        /// The child wrote something else where `CONTENDED` was expected.
+        WrongContentionSignal(String),
+        /// The outer cap elapsed while the child still ran; the harness
+        /// killed and reaped it.
+        ChildExitTimeout,
+        /// The uncontended path produced an outcome other than `Success`.
+        UnexpectedSidecarCode(SidecarErrorCode),
+        /// The child exited with an outcome the contract does not cover
+        /// (nonzero without `sidecar contended`, or success without `OK`).
+        UnexpectedChildExit {
+            status: std::process::ExitStatus,
+            stderr: String,
+        },
+        Io(std::io::Error),
+    }
+
+    /// Equality by variant only: the tests compare an outcome against
+    /// `Ok(SidecarErrorCode::…)`, never the payloads of two errors, and
+    /// `std::io::Error` no longer carries a `PartialEq` impl on this
+    /// toolchain. `std::mem::discriminant` keeps the comparison meaningful
+    /// exactly where it is used.
+    impl PartialEq for TestError {
+        fn eq(&self, other: &Self) -> bool {
+            std::mem::discriminant(self) == std::mem::discriminant(other)
         }
+    }
+
+    impl From<std::io::Error> for TestError {
+        fn from(err: std::io::Error) -> Self {
+            TestError::Io(err)
+        }
+    }
+
+    type TestOutcome = std::result::Result<SidecarErrorCode, TestError>;
+
+    /// A Rust-side exclusive flock holder: opens the lock path read-write
+    /// (creating it like the real sidecar's mutex file) and takes `LOCK_EX`;
+    /// the `Drop` releases the lock deterministically — including on a test
+    /// panic — instead of a `sleep`-timed release.
+    struct HolderGuard {
+        file: std::fs::File,
+    }
+
+    /// Acquire the flock on `path` exclusively, creating the file if needed.
+    fn acquire_exclusive_lock(path: &Path) -> HolderGuard {
+        use std::os::unix::io::AsRawFd;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false) // the mutex file's (empty) content is untouched
+            .open(path)
+            .unwrap_or_else(|e| panic!("open lock path {path:?} for the holder: {e}"));
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        assert_eq!(
+            rc,
+            0,
+            "flock LOCK_EX on {path:?} failed: {}",
+            std::io::Error::last_os_error()
+        );
+        HolderGuard { file }
+    }
+
+    impl Drop for HolderGuard {
+        fn drop(&mut self) {
+            use std::os::unix::io::AsRawFd;
+            // Unlock is best-effort (the fd closes right after anyway).
+            let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+
+    /// An instrumented sidecar child plus the read end of the contention
+    /// pipe its perl holds (via `DEPLOY_TEST_CONTENDED_FD`, a raw `pipe(2)`
+    /// write end inherited without `FD_CLOEXEC`).
+    struct InstrumentedSidecar {
+        child: std::process::Child,
+        contention_rx: std::fs::File,
+    }
+
+    /// The full `perl -e` script the synchronized tests run: the shared
+    /// prelude (test deadline, production interval) preceded by the caller
+    /// side's `$fh` open and followed by the `OK` success line — the shape
+    /// of every real sidecar command.
+    fn sidecar_flock_script(deadline: Duration) -> String {
+        let prelude = sidecar_flock_prelude(deadline.as_secs_f64(), SIDECAR_FLOCK_INTERVAL_SECS);
+        format!(
+            "open my $fh, \"+<\", $ARGV[0] or die \"open sidecar: $!\"; {prelude} print \"OK\\n\";"
+        )
+    }
+
+    /// Spawn the instrumented sidecar: `perl -e <prelude-script> -- <path>`
+    /// with `DEPLOY_TEST_CONTENDED_FD` set to a fresh pipe's write end. The
+    /// raw `pipe(2)` fd carries no `FD_CLOEXEC`, so it survives the exec into
+    /// perl. The parent closes its write-end copy immediately after the
+    /// spawn, so the read end sees EOF the moment the child exits; the child
+    /// writes `CONTENDED` to that fd exactly once (the prelude deletes the
+    /// env key after the first signal).
+    fn spawn_instrumented_sidecar(path: &Path, deadline: Duration) -> InstrumentedSidecar {
+        use std::os::unix::io::FromRawFd;
+        let mut fds = [0i32; 2];
+        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(
+            rc,
+            0,
+            "pipe() for the contention handshake failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+        let child = std::process::Command::new("perl")
+            .arg("-e")
+            .arg(sidecar_flock_script(deadline))
+            .arg("--")
+            .arg(path)
+            .env("DEPLOY_TEST_CONTENDED_FD", write_fd.to_string())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn();
+        let child = match child {
+            Ok(child) => child,
+            Err(err) => {
+                // Do not leak the pipe on a spawn failure.
+                unsafe {
+                    libc::close(read_fd);
+                    libc::close(write_fd);
+                }
+                panic!("spawn instrumented sidecar: {err}");
+            }
+        };
+        unsafe { libc::close(write_fd) };
+        let contention_rx = unsafe { std::fs::File::from_raw_fd(read_fd) };
+        InstrumentedSidecar {
+            child,
+            contention_rx,
+        }
+    }
+
+    impl InstrumentedSidecar {
+        /// Block until the child reports its first CONFIRMED contention (the
+        /// prelude's env-gated signal, fired exactly once after the first
+        /// `EWOULDBLOCK`), or until `outer` elapses. `poll(2)` on the pipe
+        /// read end makes the wait signal-driven: the parent sleeps in the
+        /// kernel until the child writes — never on a timer.
+        fn read_confirmed_contention(&self, outer: Duration) -> std::result::Result<(), TestError> {
+            use std::io::{BufRead, BufReader};
+            use std::os::unix::io::AsRawFd;
+            let timeout_ms = i32::try_from(outer.as_millis()).unwrap_or(i32::MAX);
+            let mut pfd = libc::pollfd {
+                fd: self.contention_rx.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let rc = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, timeout_ms) };
+            if rc == 0 {
+                return Err(TestError::ContentionSignalTimeout);
+            }
+            if rc < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            if (pfd.revents & libc::POLLIN) == 0 {
+                // HUP/ERR with no data: the child exited without ever
+                // confirming contention.
+                return Err(TestError::ChildExitedWithoutSignal);
+            }
+            let mut line = String::new();
+            // dup the read end so the read consumes only the local clone.
+            let mut rx = BufReader::new(self.contention_rx.try_clone()?);
+            rx.read_line(&mut line)?;
+            if line.trim() != "CONTENDED" {
+                return Err(TestError::WrongContentionSignal(line));
+            }
+            Ok(())
+        }
+
+        /// Wait for the child with a hard `outer` cap, then classify its exit
+        /// against the sidecar contract (see [`bounded_wait_for_child`]).
+        fn wait_with_outer_timeout(&mut self, outer: Duration) -> TestOutcome {
+            bounded_wait_for_child(&mut self.child, outer)
+        }
+    }
+
+    /// Bounded, signal-driven wait for a sidecar child: the child closes its
+    /// stdout on exit, so `poll(2)` on the stdout pipe fires exactly when the
+    /// process is gone — on macOS a closed pipe write end is reported as
+    /// `POLLIN|POLLHUP` (never as a bare `POLLHUP` with `events: 0`, which
+    /// does not wake at all); a still-open write end with no data never
+    /// wakes the parent. `wait()` then reaps immediately and the (now-EOF)
+    /// streams are drained. No timer-based polling, no unbounded `wait()`.
+    fn bounded_wait_for_child(child: &mut std::process::Child, outer: Duration) -> TestOutcome {
+        use std::os::unix::io::AsRawFd;
+        let stdout_fd = child
+            .stdout
+            .as_ref()
+            .expect("sidecar stdout must be piped")
+            .as_raw_fd();
+        let timeout_ms = i32::try_from(outer.as_millis()).unwrap_or(i32::MAX);
+        let mut pfd = libc::pollfd {
+            fd: stdout_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, timeout_ms) };
+        if rc == 0 {
+            // Wedged child: kill and reap so the suite leaks nothing.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(TestError::ChildExitTimeout);
+        }
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let status = child.wait().map_err(TestError::Io)?;
+        let (stdout, stderr) = drain_output(child);
+        classify_sidecar_exit(status, stdout, stderr)
+    }
+
+    /// Drain the child's (now-EOF) stdout/stderr: the child has exited, so
+    /// both pipes are already closed by the kernel — no locking dance needed,
+    /// and the per-sidecar output is a few bytes, far below pipe capacity.
+    fn drain_output(child: &mut std::process::Child) -> (String, String) {
+        use std::io::Read;
+        let mut stdout = String::new();
+        if let Some(mut so) = child.stdout.take() {
+            let _ = so.read_to_string(&mut stdout);
+        }
+        let mut stderr = String::new();
+        if let Some(mut se) = child.stderr.take() {
+            let _ = se.read_to_string(&mut stderr);
+        }
+        (stdout, stderr)
+    }
+
+    /// Classify the child's exit against the sidecar protocol.
+    fn classify_sidecar_exit(
+        status: std::process::ExitStatus,
+        stdout: String,
+        stderr: String,
+    ) -> TestOutcome {
+        if status.success() && stdout.trim() == "OK" {
+            return Ok(SidecarErrorCode::Success);
+        }
+        if !status.success() && stderr.contains("sidecar contended") {
+            return Ok(SidecarErrorCode::LockDeadlineExceeded);
+        }
+        Err(TestError::UnexpectedChildExit { status, stderr })
+    }
+
+    /// The uncontended path (test 1): the PRODUCTION prelude — the
+    /// `DEPLOY_TEST_CONTENDED_FD` env is explicitly removed, so the signal
+    /// block is inert — against a fresh lock path, which is immediately
+    /// acquirable.
+    fn run_sidecar_with_deadline(
+        path: &Path,
+        deadline: Duration,
+    ) -> std::result::Result<(), TestError> {
+        let mut child = std::process::Command::new("perl")
+            .arg("-e")
+            .arg(sidecar_flock_script(deadline))
+            .arg("--")
+            .arg(path)
+            .env_remove("DEPLOY_TEST_CONTENDED_FD")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(TestError::Io)?;
+        match bounded_wait_for_child(&mut child, SIDECAR_FLOCK_TEST_OUTER_TIMEOUT) {
+            Ok(SidecarErrorCode::Success) => Ok(()),
+            Ok(other) => Err(TestError::UnexpectedSidecarCode(other)),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Test 1 (uncontended): a fresh lock path with NO holder — the sidecar
+    /// acquires immediately and reports OK.
+    #[test]
+    fn sidecar_flock_uncontended_acquisition_succeeds() {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let lock_path = dir.path().join("sidecar.flock");
+        std::fs::write(&lock_path, b"").unwrap();
+        let result = run_sidecar_with_deadline(&lock_path, SIDECAR_FLOCK_TEST_DEADLINE);
+        assert!(
+            result.is_ok(),
+            "an uncontended fresh lock must be acquired immediately, got: {result:?}"
+        );
+    }
+
+    /// Test 2 (confirmed contention, holder RETAINED): the sidecar must
+    /// report its production deadline error (`sidecar contended`). The holder
+    /// is released only during cleanup, AFTER the assertion — so the
+    /// assertion runs against a still-held lock; the guard also drops on a
+    /// panic.
+    #[test]
+    fn sidecar_flock_contention_times_out_while_retained() {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let lock_path = dir.path().join("sidecar.flock");
+        let holder = acquire_exclusive_lock(&lock_path);
+        let mut sidecar = spawn_instrumented_sidecar(&lock_path, SIDECAR_FLOCK_TEST_DEADLINE);
+        sidecar
+            .read_confirmed_contention(SIDECAR_FLOCK_TEST_OUTER_TIMEOUT)
+            .expect("child must report confirmed contention");
+        let outcome = sidecar.wait_with_outer_timeout(SIDECAR_FLOCK_TEST_OUTER_TIMEOUT);
+        assert_eq!(
+            outcome,
+            Ok(SidecarErrorCode::LockDeadlineExceeded),
+            "a retained lock must drive the sidecar to its deadline error"
+        );
+        drop(holder);
+    }
+
+    /// Test 3 (confirmed contention, holder RELEASED): the sidecar must
+    /// acquire the freed lock and report OK.
+    #[test]
+    fn sidecar_flock_contention_succeeds_after_release() {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let lock_path = dir.path().join("sidecar.flock");
+        let holder = acquire_exclusive_lock(&lock_path);
+        let mut sidecar = spawn_instrumented_sidecar(&lock_path, SIDECAR_FLOCK_TEST_DEADLINE);
+        sidecar
+            .read_confirmed_contention(SIDECAR_FLOCK_TEST_OUTER_TIMEOUT)
+            .expect("child must report confirmed contention");
+        drop(holder); // release happens BEFORE the wait
+        let outcome = sidecar.wait_with_outer_timeout(SIDECAR_FLOCK_TEST_OUTER_TIMEOUT);
+        assert_eq!(
+            outcome,
+            Ok(SidecarErrorCode::Success),
+            "the released lock must let the sidecar acquire and report OK"
+        );
     }
 
     /// Execute `sh -c "$command"` with `stdin` piped to the shell — the
