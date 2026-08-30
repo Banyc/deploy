@@ -3289,7 +3289,7 @@ exec /bin/mv "$@"
         let status = helper
             .status(&crate::remote::helper::test_owner("test-app", "s1"))
             .unwrap();
-        assert!(status.current_generation.is_none());
+        assert!(status.current_generation().is_none());
         assert!(status.inventory.is_empty());
         assert!(status.lock.is_none());
         // The pinned cache file was created on the LOCAL host.

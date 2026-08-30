@@ -27,6 +27,7 @@ use crate::error::{Error, Result};
 use crate::identity::{
     ArtifactRef, DeploymentId, GenerationId, ReleaseId, SlotId, TargetName, TreeDigest, VariantName,
 };
+use crate::remote::helper::GenerationOwner;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 /// The THREE-STATE OBSERVATION of a slot's remote state: `KnownAbsent` (the
@@ -210,11 +211,17 @@ impl TryFrom<ObservationWire<ObservedGenerationWire>> for Observation<ObservedGe
 /// * `Absent` — the live status read succeeded and showed NO state: the slot
 ///   has no assignment (never deployed, or rotated away). A live absence
 ///   REPLACES a stale physical record.
-/// * `Known { generation, artifact, last_deployment }` — a successful
-///   status + assignment read: the slot is running this generation/artifact,
-///   and `last_deployment` is the deployment that MINTED the live
-///   assignment — a fact of the KNOWN assignment ITSELF (never a parallel
-///   slot-level field a raw document could pair with a different variant).
+/// * `Known { generation, artifact, last_deployment, owner, version }` — a
+///   successful status + assignment read: the slot is running this
+///   generation/artifact, `last_deployment` is the deployment that MINTED the
+///   live assignment — a fact of the KNOWN assignment ITSELF (never a
+///   parallel slot-level field a raw document could pair with a different
+///   variant) — and `owner`/`version` are the ASSIGNMENT IDENTITY that
+///   produced the projection: the VERIFIED owner at observation time plus a
+///   read version/timestamp. A consumer comparing the projection against a
+///   live assignment treats an owner/generation MISMATCH as STALE
+///   ([`ObservedAssignment::is_stale_against`]) — a stale-owner or
+///   stale-generation observation is never authoritative.
 /// * `AssignmentUnknown { generation, error }` — the status read succeeded
 ///   (this generation EXISTS) but the ASSIGNMENT read failed: the generation
 ///   is known, the artifact is NOT — the preserved error records why. This
@@ -228,7 +235,11 @@ impl TryFrom<ObservationWire<ObservedGenerationWire>> for Observation<ObservedGe
 /// could smuggle stray keys into the record; the adjacently tagged wire
 /// rejects any key that is not `state`/`value` AND, together with
 /// `deny_unknown_fields`, any key inside the value that is not one of the
-/// variant's OWN fields.
+/// variant's OWN fields. The `owner`/`version` fields are OPTIONAL on the
+/// wire (`#[serde(default)]`): a legacy observed record written before the
+/// identity fields existed still loads (with `None` — and the FAIL-CLOSED
+/// staleness rule below treats an unverifiable identity as STALE, never
+/// authoritative).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "state",
@@ -249,6 +260,21 @@ pub enum ObservedAssignment {
         /// KNOWN assignment ONLY; there is no slot-level field a raw
         /// document could pair with another variant.
         last_deployment: DeploymentId,
+        /// THE ASSIGNMENT IDENTITY (owner half): the VERIFIED owner the
+        /// status/assignment read checked against at observation time. A read
+        /// comparing the projection against the live assignment treats an
+        /// owner mismatch as STALE ([`ObservedAssignment::is_stale_against`]).
+        /// `None` only on a LEGACY record written before the identity fields
+        /// existed — and an unverifiable identity is STALE (fail closed),
+        /// never authoritative.
+        #[serde(default)]
+        owner: Option<GenerationOwner>,
+        /// THE ASSIGNMENT IDENTITY (version half): the read version/timestamp
+        /// (RFC 3339) that produced this projection — the freshness link to
+        /// the remote source. `None` only on a legacy record (treated as
+        /// stale, fail closed).
+        #[serde(default)]
+        version: Option<String>,
     },
     /// The status read succeeded but the ASSIGNMENT read failed: the
     /// generation is known, the artifact is not — the error is preserved.
@@ -275,6 +301,71 @@ pub struct ObservedGeneration {
 #[serde(deny_unknown_fields)]
 pub struct ObservationError {
     pub message: String,
+}
+
+impl ObservedAssignment {
+    /// FRESHNESS CHECK against the LIVE assignment identity (the live
+    /// generation — `None` when the live status read shows absence — plus
+    /// the VERIFIED owner of the live read): is this projection STALE?
+    ///
+    /// A projection is STALE exactly when its recorded assignment identity
+    /// disagrees with the live one:
+    ///
+    /// * a `Known` projection whose recorded OWNER differs from the live
+    ///   owner, or whose recorded generation differs from the live
+    ///   generation, is STALE — a stale-owner or stale-generation
+    ///   observation is never authoritative;
+    /// * a `Known` projection with NO live generation (the slot is absent
+    ///   now) is STALE;
+    /// * an `Absent` projection with a LIVE generation is STALE;
+    /// * FAIL CLOSED: a `Known` projection WITHOUT a recorded owner identity
+    ///   (a legacy record written before the identity fields existed)
+    ///   cannot be verified against the live assignment — it is STALE,
+    ///   never authoritative; `AssignmentUnknown`/`Unknown` projections
+    ///   carry no assignable identity and are never ground truth — STALE.
+    ///
+    /// A consumer that finds a STALE projection must skip it / refresh it,
+    /// never decide on it.
+    pub fn is_stale_against(
+        &self,
+        live_generation: Option<&GenerationId>,
+        live_owner: &GenerationOwner,
+    ) -> bool {
+        match (self, live_generation) {
+            (
+                ObservedAssignment::Known {
+                    generation,
+                    owner: Some(recorded_owner),
+                    ..
+                },
+                Some(live_gen),
+            ) => recorded_owner != live_owner || generation != live_gen,
+            (ObservedAssignment::Known { .. }, None) => {
+                // The projection records state but the live assignment is
+                // absent: stale.
+                true
+            }
+            (ObservedAssignment::Absent, None) => {
+                // Both absent: the projection is current.
+                false
+            }
+            (ObservedAssignment::Absent, Some(_)) => {
+                // The projection says absent but the live assignment is
+                // present: stale.
+                true
+            }
+            (ObservedAssignment::Known { owner: None, .. }, _) => {
+                // A legacy record without a recorded owner identity cannot be
+                // verified — fail closed: stale.
+                true
+            }
+            (ObservedAssignment::AssignmentUnknown { .. }, _)
+            | (ObservedAssignment::Unknown { .. }, _) => {
+                // Uncertainty is never ground truth.
+                true
+            }
+        }
+    }
 }
 
 /// Observed remote state for one placement slot: the tagged assignment. The
@@ -304,6 +395,17 @@ impl ObservedSlot {
             } => Some(last_deployment),
             _ => None,
         }
+    }
+
+    /// FRESHNESS CHECK over the slot's projection: see
+    /// [`ObservedAssignment::is_stale_against`].
+    pub fn is_stale_against(
+        &self,
+        live_generation: Option<&GenerationId>,
+        live_owner: &GenerationOwner,
+    ) -> bool {
+        self.assignment
+            .is_stale_against(live_generation, live_owner)
     }
 }
 
@@ -349,9 +451,16 @@ mod tests {
         }
     }
 
+    /// A VALID owner for the tests' fixture assignments: the same owner the
+    /// status/read fixtures carry (`application` `test-app`, slot `s1`).
+    fn owner() -> GenerationOwner {
+        crate::remote::helper::test_owner("test-app", "s1")
+    }
+
     /// The EXACT wire representation of a valid `Known` assignment: the
     /// adjacently tagged value carrying generation + artifact +
-    /// last_deployment and NOTHING else.
+    /// last_deployment + the assignment identity (owner + version) and
+    /// NOTHING else.
     fn known_value(g: &str, art: &str, dep: &str) -> serde_json::Value {
         json!({
             "generation": test_generation_id(g).as_str(),
@@ -359,17 +468,21 @@ mod tests {
                 "release": test_release_id(art).as_str(),
                 "variant": "standard",
                 "tree": test_tree_digest(art).as_str()},
-            "last_deployment": test_deployment_id(dep).as_str()})
+            "last_deployment": test_deployment_id(dep).as_str(),
+            "owner": {"application": "test-app", "slot": "s1"},
+            "version": "2026-01-01T00:00:00Z"})
     }
 
     /// A RAW observed record as an arbitrary JSON-ish map: a `state` tag
     /// plus an OPTIONAL `value` object (adjacently tagged wire) whose OWN
-    /// fields — generation, artifact, error, last_deployment — are each
-    /// optionally present, plus possibly an extra key inside the value. The
-    /// tuple is (tag, value present, generation present, artifact present,
-    /// error present, last_deployment present, extra key in value); 4 tags x
-    /// 64 field combos = the 256-case space.
-    fn arbitrary_raw_combo() -> impl Strategy<Value = (u8, bool, bool, bool, bool, bool, bool)> {
+    /// fields — generation, artifact, error, last_deployment, owner,
+    /// version — are each optionally present, plus possibly an extra key
+    /// inside the value. The tuple is (tag, value present, generation
+    /// present, artifact present, error present, last_deployment present,
+    /// owner present, version present, extra key in value); 4 tags x 128
+    /// field combos = the 512-case space.
+    fn arbitrary_raw_combo()
+    -> impl Strategy<Value = (u8, bool, bool, bool, bool, bool, bool, bool, bool)> {
         (
             0u8..4,
             proptest::bool::ANY, // value present
@@ -377,25 +490,32 @@ mod tests {
             proptest::bool::ANY, // artifact present
             proptest::bool::ANY, // error present
             proptest::bool::ANY, // last_deployment present
+            proptest::bool::ANY, // owner present
+            proptest::bool::ANY, // version present
             proptest::bool::ANY, // extra key inside the value
         )
     }
 
     /// THE RAW-FIELD-COMBINATION PROPERTY: the wire accepts ONLY
     /// representations that correspond to EXACTLY ONE [`ObservedAssignment`]
-    /// variant — `Known` needs generation + artifact + last_deployment,
-    /// `AssignmentUnknown` needs generation + error, `Unknown` needs error,
-    /// `Absent` needs NO value at all. EVERY other combination is REJECTED
-    /// (fail closed): a raw document can never deserialize into a half-known
-    /// assignment (a generation without an artifact, an uncertainty without
-    /// its preserved error) and never into a self-contradictory one (a
-    /// `Known` carrying a stray `error`, an `Absent` carrying any fields at
-    /// all) — the adjacently tagged wire + `deny_unknown_fields` reject any
-    /// missing required field, any extra/unknown field, and any field from
-    /// another variant.
+    /// variant — `Known` needs generation + artifact + last_deployment +
+    /// the assignment identity (owner + version), `AssignmentUnknown` needs
+    /// generation + error, `Unknown` needs error, `Absent` needs NO value at
+    /// all. EVERY other combination is REJECTED (fail closed): a raw
+    /// document can never deserialize into a half-known assignment (a
+    /// generation without an artifact, an uncertainty without its preserved
+    /// error) and never into a self-contradictory one (a `Known` carrying a
+    /// stray `error`, an `Absent` carrying any fields at all) — the
+    /// adjacently tagged wire + `deny_unknown_fields` reject any missing
+    /// required field, any extra/unknown field, and any field from another
+    /// variant. NOTE: a `Known` without the identity fields (a LEGACY
+    /// record) still deserializes (owner/version default to `None` — the
+    /// fail-closed staleness rule treats it as STALE, never authoritative).
     fn run_raw_combo_case(
-        (tag_idx, value_present, gen_present, art, err, ld, extra): (
+        (tag_idx, value_present, gen_present, art, err, ld, owner_present, version_present, extra): (
             u8,
+            bool,
+            bool,
             bool,
             bool,
             bool,
@@ -444,6 +564,15 @@ mod tests {
                     json!(test_deployment_id("d").as_str()),
                 );
             }
+            if owner_present {
+                value.insert(
+                    "owner".to_string(),
+                    json!({ "application": "test-app", "slot": "s1" }),
+                );
+            }
+            if version_present {
+                value.insert("version".to_string(), json!("2026-01-01T00:00:00Z"));
+            }
             if extra {
                 value.insert("bogus".to_string(), json!(1));
             }
@@ -458,12 +587,40 @@ mod tests {
         // Accepted iff the value object carries EXACTLY the variant's OWN
         // fields — nothing missing, nothing extra (no other variant's field,
         // no unknown key). `Absent` accepts NO value at all (a unit cannot
-        // take an object).
+        // take an object). A `Known` may omit the identity fields (a legacy
+        // record loads with `None`); a `Known` that carries the identity
+        // fields must carry BOTH.
         let valid = match tag {
             "absent" => !value_present,
-            "known" => value_present && gen_present && art && ld && !err && !extra,
-            "assignment_unknown" => value_present && gen_present && err && !art && !ld && !extra,
-            _ => value_present && err && !gen_present && !art && !ld && !extra,
+            "known" => {
+                value_present
+                    && gen_present
+                    && art
+                    && ld
+                    && !err
+                    && !extra
+                    && (owner_present == version_present)
+            }
+            "assignment_unknown" => {
+                value_present
+                    && gen_present
+                    && err
+                    && !art
+                    && !ld
+                    && !extra
+                    && !owner_present
+                    && !version_present
+            }
+            _ => {
+                value_present
+                    && err
+                    && !gen_present
+                    && !art
+                    && !ld
+                    && !extra
+                    && !owner_present
+                    && !version_present
+            }
         };
         let result = serde_json::from_value::<ObservedSlot>(doc.clone());
         if valid {
@@ -474,6 +631,8 @@ mod tests {
                     generation: test_generation_id("g"),
                     artifact: artifact_ref("a"),
                     last_deployment: test_deployment_id("d"),
+                    owner: owner_present.then(owner),
+                    version: version_present.then(|| "2026-01-01T00:00:00Z".to_string()),
                 },
                 "assignment_unknown" => ObservedAssignment::AssignmentUnknown {
                     generation: test_generation_id("g"),
@@ -509,14 +668,17 @@ mod tests {
         let valid_known = json!({
             "state": "known",
             "value": known_value("g", "a", "d")});
-        // Positive control: the exact serialized shape round-trips.
+        // Positive control: the exact serialized shape round-trips (including
+        // the assignment identity — owner + version).
         let parsed: ObservedAssignment = serde_json::from_value(valid_known.clone()).unwrap();
         assert_eq!(
             parsed,
             ObservedAssignment::Known {
                 generation: test_generation_id("g"),
                 artifact: artifact_ref("a"),
-                last_deployment: test_deployment_id("d")
+                last_deployment: test_deployment_id("d"),
+                owner: Some(owner()),
+                version: Some("2026-01-01T00:00:00Z".to_string()),
             }
         );
         // An extra field NEXT TO the tag/content pair is rejected.
@@ -566,9 +728,9 @@ mod tests {
 
     /// A single LIVE observation: one of the four states the observed
     /// projection can record — `Known` (generation + artifact + the LIVE
-    /// assignment's minting deployment), `Absent` (a live read showing no
-    /// state), `AssignmentUnknown` (generation known, artifact NOT read),
-    /// `Unknown` (status read failed).
+    /// assignment's minting deployment + the assignment identity: owner +
+    /// version), `Absent` (a live read showing no state), `AssignmentUnknown`
+    /// (generation known, artifact NOT read), `Unknown` (status read failed).
     fn arbitrary_live_observation() -> impl Strategy<Value = ObservedSlot> {
         prop_oneof![
             Just(ObservedSlot {
@@ -578,7 +740,9 @@ mod tests {
                 assignment: ObservedAssignment::Known {
                     generation: test_generation_id(&format!("gen-seq-{i}")),
                     artifact: artifact_ref(&format!("art-seq-{i}-{j}")),
-                    last_deployment: test_deployment_id(&format!("dep-seq-{i}-{j}"))
+                    last_deployment: test_deployment_id(&format!("dep-seq-{i}-{j}")),
+                    owner: Some(owner()),
+                    version: Some(format!("2026-01-0{}T00:00:00Z", (i + j) % 9 + 1))
                 }
             }),
             (0..3usize, 0..3usize).prop_map(|(i, j)| ObservedSlot {
@@ -600,10 +764,11 @@ mod tests {
     }
 
     /// THE BIJECTIVITY PROPERTY for a VALID observation: every generated
-    /// [`ObservedAssignment`] (all four variants — `Known` with all three
-    /// fields, `Absent`, `AssignmentUnknown`, `Unknown`) and every
-    /// generated [`ObservedSlot`] round-trips EXACTLY: `to_value` then
-    /// `from_value` reproduces the identical value.
+    /// [`ObservedAssignment`] (all four variants — `Known` with all its
+    /// fields including the assignment identity, `Absent`,
+    /// `AssignmentUnknown`, `Unknown`) and every generated [`ObservedSlot`]
+    /// round-trips EXACTLY: `to_value` then `from_value` reproduces the
+    /// identical value.
     fn run_bijectivity_case(obs: ObservedSlot) {
         let assignment_json = serde_json::to_value(&obs.assignment).unwrap();
         let assignment_back: ObservedAssignment = serde_json::from_value(assignment_json.clone())
@@ -718,6 +883,123 @@ mod tests {
             sequence in prop::collection::vec(arbitrary_live_observation(), 1..=8),
         ) {
             run_sequence_case(sequence);
+        }
+    }
+
+    // ---- THE FRESHNESS/IDENTITY PROPERTY (the review's acceptance) --------
+
+    /// An arbitrary OBSERVED projection: all four [`ObservedAssignment`]
+    /// variants, with `Known` carrying the assignment identity (owner +
+    /// version) or NONE (a legacy record written before the identity fields
+    /// existed — the fail-closed staleness case).
+    fn arbitrary_assignment() -> impl Strategy<Value = ObservedAssignment> {
+        prop_oneof![
+            Just(ObservedAssignment::Absent),
+            (0..3usize, 0..3usize, proptest::bool::ANY).prop_map(|(i, j, with_identity)| {
+                ObservedAssignment::Known {
+                    generation: test_generation_id(&format!("gen-p-{i}")),
+                    artifact: artifact_ref(&format!("art-p-{i}-{j}")),
+                    last_deployment: test_deployment_id(&format!("dep-p-{i}-{j}")),
+                    owner: with_identity.then(owner),
+                    version: with_identity.then(|| "2026-01-01T00:00:00Z".to_string()),
+                }
+            }),
+            (0..3usize).prop_map(|j| ObservedAssignment::AssignmentUnknown {
+                generation: test_generation_id(&format!("gen-p-{j}")),
+                error: ObservationError {
+                    message: format!("assignment read failed: case {j}"),
+                },
+            }),
+            (0..3usize).prop_map(|j| ObservedAssignment::Unknown {
+                error: ObservationError {
+                    message: format!("status read failed: case {j}"),
+                },
+            }),
+        ]
+    }
+
+    /// An arbitrary LIVE assignment identity: the live generation (absent or
+    /// one of the same `gen-p-*` ids the projections use, so equal and
+    /// mismatched generations both occur) and the live VERIFIED owner (the
+    /// same owner, a different application, or a different slot — so
+    /// equal and mismatched owners both occur).
+    fn arbitrary_live_identity() -> impl Strategy<Value = (Option<GenerationId>, GenerationOwner)> {
+        (proptest::option::of(0..3usize), 0u8..3).prop_map(|(g, o)| {
+            let live_gen = g.map(|i| test_generation_id(&format!("gen-p-{i}")));
+            let owner = match o {
+                0 => crate::remote::helper::test_owner("test-app", "s1"),
+                1 => crate::remote::helper::test_owner("other-app", "s1"),
+                _ => crate::remote::helper::test_owner("test-app", "s2"),
+            };
+            (live_gen, owner)
+        })
+    }
+
+    /// THE STALENESS PROPERTY (the review's acceptance): generate an
+    /// observed projection + a live assignment identity and assert the
+    /// projection is STALE EXACTLY when its recorded assignment identity
+    /// disagrees with the live one — a mismatched OWNER or GENERATION makes
+    /// the projection STALE (the consumer refuses to treat it as current),
+    /// never a silently-accepted stale view; a legacy projection without a
+    /// recorded owner is STALE (fail closed — unverifiable, never
+    /// authoritative); `Absent` is current only against a live absence.
+    fn run_staleness_case(obs: ObservedAssignment, live: (Option<GenerationId>, GenerationOwner)) {
+        let (live_gen, live_owner) = live;
+        let stale = obs.is_stale_against(live_gen.as_ref(), &live_owner);
+        let expected_stale = match &obs {
+            ObservedAssignment::Known {
+                generation,
+                owner: Some(recorded_owner),
+                ..
+            } => live_gen.as_ref() != Some(generation) || recorded_owner != &live_owner,
+            // A legacy Known without a recorded owner cannot be verified.
+            ObservedAssignment::Known { owner: None, .. } => true,
+            ObservedAssignment::Absent => live_gen.is_some(),
+            ObservedAssignment::AssignmentUnknown { .. } | ObservedAssignment::Unknown { .. } => {
+                true
+            }
+        };
+        assert_eq!(
+            stale, expected_stale,
+            "a projection is STALE exactly when its recorded assignment identity (owner + \
+             generation) disagrees with the live identity, or cannot be verified — a stale-owner \
+             or stale-generation observation is never authoritative"
+        );
+        // The no-silent-stale-view corollary: whenever the projection is
+        // STALE, its recorded (generation, owner) disagree with the live
+        // identity — a consumer that compares them REFUSES the projection as
+        // current (it never accepts a stale view silently).
+        if stale {
+            let silent_accept = match &obs {
+                ObservedAssignment::Known {
+                    generation,
+                    owner: Some(recorded_owner),
+                    ..
+                } => live_gen.as_ref() == Some(generation) && recorded_owner == &live_owner,
+                _ => false,
+            };
+            assert!(
+                !silent_accept,
+                "a stale projection must never carry an identity identical to the live one"
+            );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 128,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+        // THE REVIEW'S STALENESS PROPERTY: every generated projection + live
+        // identity pair classifies STALE exactly on identity disagreement.
+        #[test]
+        fn projection_is_stale_exactly_on_identity_mismatch(
+            obs in arbitrary_assignment(),
+            live in arbitrary_live_identity(),
+        ) {
+            run_staleness_case(obs, live);
         }
     }
 

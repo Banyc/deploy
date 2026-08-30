@@ -739,8 +739,7 @@ pub(crate) mod commit_tests {
             RemoteHelper::new(&remote)
                 .status(&crate::remote::helper::test_owner("eng", "p1"))
                 .unwrap()
-                .current_generation
-                .as_ref()
+                .current_generation()
                 .map(|g| g.as_str()),
             Some(gen_v2.as_str()),
             "the conflict must not disturb the live deployment"
@@ -1441,7 +1440,7 @@ pub(crate) mod commit_tests {
                 .status(&crate::remote::helper::test_owner("eng", slot.as_str()))
                 .unwrap();
             let cur = status
-                .current_generation
+                .current_generation()
                 .expect("the rollback must advance the slot");
             let assignment: GenerationAssignment = serde_json::from_slice(
                 &remote
@@ -1952,9 +1951,7 @@ pub(crate) mod commit_tests {
                             ))
                             .ok()
                     })
-                    .is_some_and(|st| {
-                        st.current_generation.as_ref() == desired_gen
-                    })
+                    .is_some_and(|st| st.current_generation() == desired_gen)
             });
             let success_permitted = membership_ok && bindings_equal && gens_match;
 

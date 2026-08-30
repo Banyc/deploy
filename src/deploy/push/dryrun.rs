@@ -31,7 +31,7 @@ pub(crate) fn render_dry_run_plan(
     let mut msg = String::new();
     for a in assignments {
         let st = statuses.get(&a.placement_slot).expect("status present");
-        let cur = st.current_generation.clone();
+        let cur = st.current_generation().cloned();
         let want = new_gen[&a.placement_slot].as_str().to_string();
         let missing_locally = !store.object_exists(&a.artifact.tree);
         let note = match cur {

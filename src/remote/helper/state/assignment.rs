@@ -364,7 +364,7 @@ mod tests_assignment {
                 let st = helper
                     .status(&owner())
                     .expect("an exact owner match must status the generation");
-                assert_eq!(st.current_generation.as_ref(), Some(&gen_id));
+                assert_eq!(st.current_generation(), Some(&gen_id));
             } else {
                 remote
                     .create_dir_all(&crate::remote::layout::tree_root(

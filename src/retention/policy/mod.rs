@@ -67,9 +67,10 @@ pub fn compute_retained(
     // set. `status()` validates the complete symlink layout, so a missing or
     // corrupt `assignment.json` under the current generation already failed
     // closed above (an integrity error — nothing is swept); a successful
-    // status always carries the current tree.
-    if let Some(t) = &status.current_tree {
-        retained.insert(t.clone());
+    // status always carries the current tree (DERIVED from the ONE
+    // authoritative assignment — never a separate unvalidated field).
+    if let Some(t) = status.current_tree() {
+        retained.insert(t.as_str().to_string());
     }
 
     // Enumerate the server's generation records. Every record is evaluated
@@ -189,7 +190,7 @@ fn retained_for_policy(
     // prior is never silently unprotected. `prior_generation: None` is
     // legitimate: no prior exists, nothing to protect, no error.
     if retention.per_server.protect_previous
-        && let Some(cur) = &status.current_generation
+        && let Some(cur) = status.current_generation()
     {
         let cur_rec = gens.get(cur).ok_or_else(|| {
             Error::integrity(format!(
@@ -283,7 +284,7 @@ mod tests {
         ArtifactRef, DeploymentId, GenerationId, ReleaseId, ReleaseRecord, SlotId, TreeDigest,
         VariantName, test_deployment_id, test_generation_id, test_release_id, test_tree_digest,
     };
-    use crate::remote::helper::{GenerationAssignment, RemoteHelper};
+    use crate::remote::helper::{CurrentAssignment, GenerationAssignment, RemoteHelper};
     use crate::remote::layout;
     use crate::remote::transport::{
         CreateNewVerdict, LocalTransport, Remote, RemoteEntry, RemoteMeta,
@@ -2277,7 +2278,15 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 }
             }
             let status = RemoteStatus {
-                current_generation: Some(GenerationId::parse(&current_id).unwrap()),
+                current: CurrentAssignment::Known {
+                    generation: GenerationId::parse(&current_id).unwrap(),
+                    artifact: ArtifactRef {
+                        release: test_release_id("r"),
+                        variant: VariantName::parse("standard").unwrap(),
+                        tree: test_tree_digest("current"),
+                    },
+                    owner: crate::remote::helper::test_owner("eng", "p1"),
+                },
                 ..RemoteStatus::default()
             };
 
@@ -2287,7 +2296,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             // record's tree.
             let policy_retained = |st: &RemoteStatus, gs: &BTreeMap<GenerationId, GenRecord>| {
                 let mut retained = retained_for_policy(st, gs, &policy).unwrap();
-                if let Some(cur) = &st.current_generation
+                if let Some(cur) = st.current_generation()
                     && let Some(rec) = gs.get(cur)
                 {
                     retained.insert(rec.tree.clone());
@@ -2327,7 +2336,15 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     .map(|p| GenerationId::parse(p).unwrap());
             }
             let repaired_status = RemoteStatus {
-                current_generation: Some(GenerationId::parse(&last.id).unwrap()),
+                current: CurrentAssignment::Known {
+                    generation: GenerationId::parse(&last.id).unwrap(),
+                    artifact: ArtifactRef {
+                        release: test_release_id("r"),
+                        variant: VariantName::parse("standard").unwrap(),
+                        tree: test_tree_digest("current"),
+                    },
+                    owner: crate::remote::helper::test_owner("eng", "p1"),
+                },
                 ..RemoteStatus::default()
             };
             let expected = reference_retained(&history, last, &policy);

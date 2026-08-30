@@ -219,7 +219,7 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
         deploy::identity::SlotId::parse("app-1").unwrap(),
     ))?;
     assert_eq!(
-        status.current_generation.as_ref().map(|g| g.as_str()),
+        status.current_generation().map(|g| g.as_str()),
         Some(generation.as_str()),
         "current symlink points at the deployed generation"
     );

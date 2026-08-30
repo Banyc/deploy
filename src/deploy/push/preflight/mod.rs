@@ -563,11 +563,7 @@ pub(crate) fn run_preflight(
         let slot_id = &a.placement_slot;
         let expected = statuses
             .get(slot_id)
-            .and_then(|st| st.current_generation.clone());
-        let expected_tree = statuses
-            .get(slot_id)
-            .and_then(|st| st.current_tree.clone())
-            .map(|t| TreeDigest::parse(&t).expect("observed tree is a valid digest"));
+            .and_then(|st| st.current_generation().cloned());
         let gid = GenerationId::generate();
         new_gen.insert(slot_id.clone(), gid.clone());
         plan_servers.insert(
@@ -576,7 +572,6 @@ pub(crate) fn run_preflight(
                 slot_id: slot_id.clone(),
                 artifact: a.artifact.clone(),
                 expected_generation: expected.clone(),
-                expected_tree,
             },
         );
         // Record the slot's *actual* current assignment (read from the
@@ -1249,7 +1244,7 @@ pub(crate) mod preflight_tests {
             .status(&crate::remote::helper::test_owner("eng", "p1"))
             .unwrap();
         assert_eq!(
-            status.current_generation.as_ref().map(|g| g.as_str()),
+            status.current_generation().map(|g| g.as_str()),
             Some(s0_gen.as_str()),
             "the remote current still points at s0's generation"
         );

@@ -583,12 +583,11 @@ mod compensation_tests {
             "compensation must refuse when current no longer names the advanced generation"
         );
         // The foreign current (g3) survives untouched.
-        let current = h
+        let st = h
             .helper()
             .status(&crate::remote::helper::test_owner("eng", "p1"))
-            .unwrap()
-            .current_generation
             .unwrap();
+        let current = st.current_generation().unwrap();
         assert_eq!(
             current.as_str(),
             g3.as_str(),

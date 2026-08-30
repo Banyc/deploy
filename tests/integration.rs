@@ -1959,7 +1959,7 @@ fn historical_rollback_uses_historical_behavior() -> Result<()> {
         deploy::identity::SlotId::parse("p1").unwrap(),
     ))?;
     let gen_id = status
-        .current_generation
+        .current_generation()
         .expect("rollback produced a current generation");
     let assignment: GenerationAssignment = serde_json::from_slice(
         &remote

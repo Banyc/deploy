@@ -9,7 +9,7 @@ use crate::identity::GenerationId;
 use crate::remote::layout;
 use std::path::Path;
 
-use super::super::{GenerationOwner, LockRecord, RemoteHelper, RemoteStatus};
+use super::super::{CurrentAssignment, GenerationOwner, LockRecord, RemoteHelper, RemoteStatus};
 
 /// The ACTUAL resolved state of the top-level `current` link: genuine absence
 /// or the exact canonical generation it points at. Produced ONLY by
@@ -58,8 +58,10 @@ impl<'a> RemoteHelper<'a> {
     ///   the assignment's tree (the exact form `create_generation` writes);
     /// * the tree object directory `objects/sha256/<tree>/root` exists.
     ///
-    /// On full success `current_generation`/`current_tree` carry the
-    /// validated generation id and tree.
+    /// On full success `current` carries the ONE authoritative
+    /// [`CurrentAssignment::Known`] (generation + artifact + the verified
+    /// owner); the derived `current_generation`/`current_tree` accessors
+    /// resolve the validated generation id and tree from it.
     pub fn status(&self, owner: &GenerationOwner) -> Result<RemoteStatus> {
         let mut status = RemoteStatus::default();
 
@@ -135,8 +137,11 @@ impl<'a> RemoteHelper<'a> {
                     tree_root.display()
                 )));
             }
-            status.current_generation = Some(gid);
-            status.current_tree = Some(a.artifact.tree.as_str().to_string());
+            status.current = CurrentAssignment::Known {
+                generation: gid,
+                artifact: a.artifact.clone(),
+                owner: owner.clone(),
+            };
         }
 
         // Object inventory.
@@ -492,8 +497,8 @@ mod tests_current {
     fn status_reports_none_when_current_link_absent() {
         let spec = LayoutSpec::default();
         let st = run_on_layout(&spec, |h| h.status(&owner())).expect("absence is not an error");
-        assert!(st.current_generation.is_none());
-        assert!(st.current_tree.is_none());
+        assert!(st.current_generation().is_none());
+        assert!(st.current_tree().is_none());
     }
 
     /// A `current` entry that is NOT a symlink (a plain file) is a malformed
@@ -750,9 +755,9 @@ mod tests_current {
         let spec = LayoutSpec::canonical("gen-ok", "tree-a");
         let st = run_on_layout(&spec, |h| h.status(&owner()))
             .expect("a fully consistent chain must report the validated generation");
-        assert_eq!(st.current_generation, Some(gid));
+        assert_eq!(st.current_generation(), Some(&gid));
         assert_eq!(
-            st.current_tree.as_deref(),
+            st.current_tree().map(|t| t.as_str()),
             Some(test_tree_digest("tree-a").as_str())
         );
     }
@@ -1292,7 +1297,7 @@ mod tests_current {
                 Ok(st) => {
                     if layout.current.is_none() {
                         assert!(
-                            st.current_generation.is_none() && st.current_tree.is_none(),
+                            st.current_generation().is_none() && st.current_tree().is_none(),
                             "genuine absence must report no current generation, got {st:?}"
                         );
                     } else {
@@ -1301,12 +1306,12 @@ mod tests_current {
                             "status must not succeed on an inconsistent layout, got {st:?}"
                         );
                         assert_eq!(
-                            st.current_generation.as_ref().map(|g| g.as_str()),
+                            st.current_generation().map(|g| g.as_str()),
                             Some(current_gid.as_deref().unwrap()),
                             "the validated generation must be the canonical target's id"
                         );
                         assert_eq!(
-                            st.current_tree.as_deref(),
+                            st.current_tree().map(|t| t.as_str()),
                             Some(assignment_parsed.as_ref().unwrap().1.as_str()),
                             "the validated tree must be the assignment's tree"
                         );
@@ -1797,6 +1802,166 @@ mod tests_current {
                     }
                     Err(_) => panic!("{name}: the gate must never panic")}
             }
+        }
+    }
+
+    // ---- PROPERTY: NO half-known generation/tree combination --------------
+
+    /// An arbitrary [`CurrentAssignment`]: genuine absence or a COMPLETE
+    /// verified assignment (generation + artifact + verified owner carried
+    /// together).
+    fn arbitrary_current_assignment() -> impl Strategy<Value = CurrentAssignment> {
+        prop_oneof![
+            Just(CurrentAssignment::Absent),
+            ("[a-z0-9]{1,8}", "[a-z0-9]{1,8}").prop_map(|(g_tag, t_tag)| {
+                CurrentAssignment::Known {
+                    generation: test_generation_id(&g_tag),
+                    artifact: ArtifactRef {
+                        release: crate::identity::test_release_id("rel"),
+                        variant: crate::identity::VariantName::parse("standard").unwrap(),
+                        tree: test_tree_digest(&t_tag),
+                    },
+                    owner: owner(),
+                }
+            }),
+        ]
+    }
+
+    /// THE NO-HALF-KNOWN PROPERTY (the review's acceptance): every
+    /// [`CurrentAssignment`] is EXACTLY ONE of `Absent` or a complete
+    /// `Known { generation, artifact, owner }` — a `Known` ALWAYS carries
+    /// generation + artifact + owner TOGETHER (there is NO generation
+    /// without an artifact, NO artifact without an owner); the derived tree
+    /// accessor ALWAYS resolves on `Known` (the assignment's own artifact
+    /// tree) and NEVER on `Absent`; the derived generation/owner views
+    /// agree with the carried values.
+    fn run_no_half_known_case(a: CurrentAssignment) {
+        match &a {
+            CurrentAssignment::Absent => {
+                assert!(
+                    a.current_generation().is_none(),
+                    "Absent never has a generation"
+                );
+                assert!(a.current_tree().is_none(), "Absent never has a tree");
+                assert!(a.owner().is_none(), "Absent never has an owner");
+            }
+            CurrentAssignment::Known {
+                generation,
+                artifact,
+                owner,
+            } => {
+                // A Known ALWAYS carries the full triple together.
+                assert_eq!(a.current_generation(), Some(generation));
+                assert_eq!(a.owner(), Some(owner));
+                // The tree ALWAYS resolves on a Known — derived from the
+                // verified assignment's artifact, never a separate field.
+                assert_eq!(a.current_tree(), Some(&artifact.tree));
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 128,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+        // THE REVIEW'S NO-HALF-KNOWN PROPERTY: no generated assignment is a
+        // half-known generation/tree combination.
+        #[test]
+        fn no_half_known_generation_tree_combination(
+            a in arbitrary_current_assignment(),
+        ) {
+            run_no_half_known_case(a);
+        }
+    }
+
+    // ---- PROPERTY: the plan's expected tree is DERIVED --------------------
+
+    /// An arbitrary (plan, verified assignment) pair: the plan's expected
+    /// generation may or may not be the assignment's generation (a
+    /// half-known expected state — a plan whose expected generation has NO
+    /// verified assignment — is the `expected_generation: None` / mismatch
+    /// arm, fail closed).
+    fn arbitrary_plan_and_assignment()
+    -> impl Strategy<Value = (crate::ledger::SlotPlan, CurrentAssignment)> {
+        ("[a-z0-9]{1,8}", "[a-z0-9]{1,8}", proptest::bool::ANY).prop_map(|(g_tag, t_tag, same)| {
+            let plan_gen = test_generation_id(&g_tag);
+            let live_gen = if same {
+                plan_gen.clone()
+            } else {
+                test_generation_id(&format!("{g_tag}-other"))
+            };
+            let plan = crate::ledger::SlotPlan {
+                slot_id: crate::identity::SlotId::parse("p1").unwrap(),
+                artifact: ArtifactRef {
+                    release: crate::identity::test_release_id("rel"),
+                    variant: crate::identity::VariantName::parse("standard").unwrap(),
+                    tree: test_tree_digest(&t_tag),
+                },
+                expected_generation: Some(plan_gen),
+            };
+            let live = CurrentAssignment::Known {
+                generation: live_gen,
+                artifact: ArtifactRef {
+                    release: crate::identity::test_release_id("rel"),
+                    variant: crate::identity::VariantName::parse("standard").unwrap(),
+                    tree: test_tree_digest(&t_tag),
+                },
+                owner: owner(),
+            };
+            (plan, live)
+        })
+    }
+
+    /// THE DERIVED-EXPECTED-TREE PROPERTY (the review's acceptance): the
+    /// plan's expected tree is DERIVED from the VERIFIED assignment — it
+    /// equals the assignment's tree EXACTLY when the assignment's generation
+    /// IS the plan's expected generation; a mismatched generation yields
+    /// `None` (fail closed — the tree is never an independently-observed
+    /// field that can half-disagree with the expected generation).
+    fn run_expected_tree_case((plan, live): (crate::ledger::SlotPlan, CurrentAssignment)) {
+        let expected = plan.expected_tree(&live);
+        match (plan.expected_generation.as_ref(), &live) {
+            (
+                Some(exp),
+                CurrentAssignment::Known {
+                    generation,
+                    artifact,
+                    ..
+                },
+            ) if exp == generation => {
+                assert_eq!(
+                    expected,
+                    Some(&artifact.tree),
+                    "the derived expected tree equals the verified assignment's tree whenever \
+                     the expected generation is verified"
+                );
+            }
+            _ => {
+                assert_eq!(
+                    expected, None,
+                    "a plan whose expected generation has no matching verified assignment \
+                     derives NO tree (fail closed)"
+                );
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 128,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+        // THE REVIEW'S EXPECTED-TREE-DERIVATION PROPERTY.
+        #[test]
+        fn expected_tree_is_derived_from_the_verified_assignment(
+            pair in arbitrary_plan_and_assignment(),
+        ) {
+            run_expected_tree_case(pair);
         }
     }
 }

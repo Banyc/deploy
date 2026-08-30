@@ -385,10 +385,10 @@ fn observe_recovery_slot(
     // (fail closed — never observed as this slot's live state).
     let backend = match helper.helper().status(owner) {
         Err(e) => BackendObservation::Failed(e.to_string()),
-        Ok(status) => match status.current_generation {
+        Ok(status) => match status.current_generation() {
             None => BackendObservation::Absent,
             Some(generation) => match helper.helper().read_assignment(generation.as_str(), owner) {
-                Ok(_) => BackendObservation::Live(generation),
+                Ok(_) => BackendObservation::Live(generation.clone()),
                 Err(e) => BackendObservation::Failed(e.to_string()),
             },
         },

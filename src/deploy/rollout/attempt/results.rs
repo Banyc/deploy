@@ -159,7 +159,7 @@ pub(crate) fn observe_actual_servers(
         let owner = crate::remote::helper::GenerationOwner::new(application.clone(), sid.clone());
         let status = helper.status(&owner);
         let case = match status {
-            Ok(s) => match s.current_generation {
+            Ok(s) => match s.current_generation() {
                 Some(g) => match helper.read_assignment(g.as_str(), &owner) {
                     Ok(asn) => LiveObservationCase::Observed {
                         generation: g.clone(),

@@ -465,6 +465,8 @@ mod tests {
                     tree: test_tree_digest("evil"),
                 },
                 last_deployment: test_deployment_id("evil"),
+                owner: Some(crate::remote::helper::test_owner("test-app", "evil")),
+                version: Some("2026-01-01T00:00:00Z".to_string()),
             },
         };
         store.write_slot_observed(&ok_slot, &observed).unwrap();
@@ -703,6 +705,8 @@ mod tests {
                     tree: TreeDigest::new(tree.to_string()),
                 },
                 last_deployment: test_deployment_id(dep),
+                owner: Some(crate::remote::helper::test_owner("test-app", "p1")),
+                version: Some("2026-01-01T00:00:00Z".to_string()),
             },
         }
     }

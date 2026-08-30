@@ -254,13 +254,13 @@ fn verify_selected_locked(
         // (fail closed — never verified as the intent's planned result).
         let owner = crate::remote::helper::GenerationOwner::new(application.clone(), sid.clone());
         let st1 = helper.status(&owner)?;
-        let Some(live_gen) = st1.current_generation else {
+        let Some(live_gen) = st1.current_generation() else {
             return Ok(LockedObservation::Diverged(sid.clone()));
         };
         let asn = helper.read_assignment(live_gen.as_str(), &owner)?;
         let st2 = helper.status(&owner)?;
-        if st2.current_generation.as_ref() != Some(&live_gen)
-            || live_gen != *entry.generation()
+        if st2.current_generation() != Some(live_gen)
+            || live_gen != entry.generation()
             || asn.artifact != *entry.artifact()
         {
             return Ok(LockedObservation::Diverged(sid.clone()));
@@ -268,7 +268,7 @@ fn verify_selected_locked(
         observed.insert(
             sid.clone(),
             GenerationRef {
-                generation: live_gen,
+                generation: live_gen.clone(),
                 assignment: PlacementSlotAssignment {
                     placement_slot: sid,
                     artifact: asn.artifact,

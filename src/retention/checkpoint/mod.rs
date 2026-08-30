@@ -2331,6 +2331,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                             tree: test_tree_digest(PROPERTY_TREES[0]),
                         },
                         last_deployment: test_deployment_id(&format!("dep-t1-{at}")),
+                        owner: Some(crate::remote::helper::test_owner("test-app", "s-obs")),
+                        version: Some("2026-01-01T00:00:00Z".to_string()),
                     },
                 },
             )

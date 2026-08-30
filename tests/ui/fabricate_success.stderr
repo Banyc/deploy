@@ -1,5 +1,5 @@
 error[E0308]: mismatched types
-  --> /kache/home/code/deploy/tests/ui/fabricate_success.rs:19:50
+  --> tests/ui/fabricate_success.rs:19:50
    |
 19 |         LedgerTerminal::new(recorded_at, digest, TerminalDisposition::Successful, None);
    |         -------------------                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `NonSuccessfulDisposition`, found `TerminalDisposition`

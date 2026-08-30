@@ -284,9 +284,42 @@ pub(crate) fn refresh_observed_from_live(
             crate::remote::helper::GenerationOwner::new(application.clone(), slot_id.clone());
         let status = helpers[&slot_id].status(&owner);
         match status {
-            Ok(s) => match s.current_generation {
+            Ok(s) => match s.current_generation() {
                 Some(g) => match helpers[&slot_id].read_assignment(g.as_str(), &owner) {
                     Ok(asn) => {
+                        // The projection RECORDS THE ASSIGNMENT IDENTITY
+                        // that produced it: the VERIFIED owner at
+                        // observation time plus a read version/timestamp
+                        // (RFC 3339). A later consumer comparing the
+                        // projection against a live assignment treats an
+                        // owner/generation MISMATCH as STALE
+                        // ([`ObservedAssignment::is_stale_against`]) — a
+                        // stale-owner or stale-generation observation is
+                        // never authoritative.
+                        //
+                        // The version is VERSIONED WITH THE ASSIGNMENT
+                        // IDENTITY: a refresh that re-confirms the SAME
+                        // identity (same generation + same verified owner)
+                        // PRESERVES the recorded version (the projection is
+                        // re-confirmed, not re-stamped — a failed/no-op
+                        // push never rewrites an unchanged record); a
+                        // CHANGED identity stamps a FRESH version.
+                        let version = match store.read_slot_observed(&slot_id) {
+                            Ok(Some(ObservedSlot {
+                                assignment:
+                                    ObservedAssignment::Known {
+                                        generation: prior_generation,
+                                        owner: Some(prior_owner),
+                                        version: Some(prior_version),
+                                        ..
+                                    },
+                            })) if prior_generation == asn.generation_id
+                                && prior_owner == owner =>
+                            {
+                                prior_version.clone()
+                            }
+                            _ => crate::remote::helper::now_rfc3339(),
+                        };
                         observed_servers.insert(
                             slot_id.clone(),
                             ObservedSlot {
@@ -294,6 +327,8 @@ pub(crate) fn refresh_observed_from_live(
                                     generation: asn.generation_id.clone(),
                                     artifact: asn.artifact.clone(),
                                     last_deployment: asn.deployment_id.clone(),
+                                    owner: Some(owner.clone()),
+                                    version: Some(version),
                                 },
                             },
                         );
@@ -312,7 +347,7 @@ pub(crate) fn refresh_observed_from_live(
                             slot_id.clone(),
                             ObservedSlot {
                                 assignment: ObservedAssignment::AssignmentUnknown {
-                                    generation: g,
+                                    generation: g.clone(),
                                     error,
                                 },
                             },
@@ -918,10 +953,9 @@ mod tests {
             !inventory.contains(&"tree-garbage".to_string()),
             "the true garbage is removed by the retry"
         );
-        let cur = helper
-            .status(&owner)
-            .unwrap()
-            .current_generation
+        let st = helper.status(&owner).unwrap();
+        let cur = st
+            .current_generation()
             .expect("a current generation exists");
         let live = helper
             .read_assignment(cur.as_str(), &owner)

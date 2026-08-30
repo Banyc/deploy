@@ -793,6 +793,8 @@ interval_seconds = 0
                     tree: test_tree_digest("tree-obs"),
                 },
                 last_deployment: test_deployment_id("deploy-obs"),
+                owner: Some(crate::remote::helper::test_owner("test-app", "s1")),
+                version: Some("2026-01-01T00:00:00Z".to_string()),
             },
         };
         store

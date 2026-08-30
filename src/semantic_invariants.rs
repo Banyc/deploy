@@ -1068,7 +1068,7 @@ impl Fixture {
         let owner = crate::remote::helper::test_owner("si", "p1");
         self.with_helper(|helper| {
             let status = helper.status(&owner).ok()?;
-            let g = status.current_generation?;
+            let g = status.current_generation()?;
             helper.read_assignment(g.as_str(), &owner).ok()
         })
     }
@@ -1085,7 +1085,7 @@ impl Fixture {
             let owner = crate::remote::helper::test_owner("si", slot);
             let asn = self.with_slot_helper(slot, |helper| {
                 let status = helper.status(&owner).ok()?;
-                let g = status.current_generation?;
+                let g = status.current_generation()?;
                 helper.read_assignment(g.as_str(), &owner).ok()
             });
             if let Some(a) = asn {
@@ -2172,7 +2172,7 @@ impl Fixture {
             let owner = crate::remote::helper::test_owner("si", slot);
             self.with_helper_for(server, |helper| {
                 if let Ok(status) = helper.status(&owner)
-                    && let Some(g) = &status.current_generation
+                    && let Some(g) = status.current_generation()
                 {
                     let asn = helper
                         .read_assignment(g.as_str(), &owner)

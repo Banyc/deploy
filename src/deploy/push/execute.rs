@@ -532,7 +532,7 @@ pub(crate) mod execute_tests {
             .status(&crate::remote::helper::test_owner("eng", "p1"))
             .unwrap();
         let cur = status
-            .current_generation
+            .current_generation()
             .expect("compensation must restore current");
         assert_eq!(cur.as_str(), prior_gen.as_str());
         let assignment: crate::remote::helper::GenerationAssignment = serde_json::from_slice(
@@ -1251,7 +1251,7 @@ interval_seconds = 0
             .status(&crate::remote::helper::test_owner("eng", "p1"))
             .unwrap();
         let cur = status
-            .current_generation
+            .current_generation()
             .expect("compensation must restore current");
         assert_eq!(cur.as_str(), prior_gen.as_str());
         let assignment: crate::remote::helper::GenerationAssignment = serde_json::from_slice(
@@ -1448,7 +1448,7 @@ interval_seconds = 0
             .status(&crate::remote::helper::test_owner("eng", "p1"))
             .unwrap();
         assert_eq!(
-            status.current_generation.as_ref().map(|g| g.as_str()),
+            status.current_generation().map(|g| g.as_str()),
             Some(prior_gen.as_str()),
             "the compensation swap-back is visible on the remote current"
         );
@@ -1516,7 +1516,7 @@ interval_seconds = 0
             .status(&crate::remote::helper::test_owner("eng", "p1"))
             .unwrap();
         assert!(
-            status.current_generation.is_none(),
+            status.current_generation().is_none(),
             "no current generation may remain after first-deploy compensation"
         );
 

@@ -257,7 +257,7 @@ pub(crate) fn process_server(
         }
     };
     if let Some(exp) = expected_gen
-        && status.current_generation.as_ref().map(|g| g.as_str()) != Some(exp.as_str())
+        && status.current_generation().map(|g| g.as_str()) != Some(exp.as_str())
     {
         // A compare-and-swap skip: the attempt never started this slot (its
         // post-mutation observation is the live state, attached later).

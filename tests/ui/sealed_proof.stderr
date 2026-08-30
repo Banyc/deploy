@@ -1,5 +1,5 @@
 error[E0451]: field `_sealed` of struct `VerifiedExecution` is private
-  --> /kache/home/code/deploy/tests/ui/sealed_proof.rs:14:38
+  --> tests/ui/sealed_proof.rs:14:38
    |
 14 |     let _proof = VerifiedExecution { _sealed: () };
    |                                      ^^^^^^^ private field

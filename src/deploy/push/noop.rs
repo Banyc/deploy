@@ -93,8 +93,7 @@ pub(crate) fn check_up_to_date(
     for a in assignments {
         let st = statuses.get(&a.placement_slot).expect("status present");
         let matches = st
-            .current_generation
-            .as_ref()
+            .current_generation()
             .map(|g| {
                 // The assignment read verifies the generation's OWNER MARKER
                 // against this application + slot: a transplanted record is
@@ -209,6 +208,33 @@ pub(crate) fn check_up_to_date(
             // stays "Everything up to date".
             let mut observed_servers: BTreeMap<SlotId, ObservedSlot> = BTreeMap::new();
             for (slot_id, asn) in &existing {
+                // The no-op refresh records the ASSIGNMENT IDENTITY just
+                // like the real-push refresh: the verified owner (the
+                // assignment read above verified the owner marker) plus the
+                // read version/timestamp, so the projection carries the
+                // freshness link to its remote source. The version is
+                // VERSIONED WITH THE ASSIGNMENT IDENTITY: re-confirming the
+                // SAME identity preserves the recorded version (an
+                // up-to-date no-op never rewrites an unchanged record); a
+                // changed identity stamps a fresh one.
+                let owner = crate::remote::helper::GenerationOwner::new(
+                    config.application().clone(),
+                    slot_id.clone(),
+                );
+                let version = match store.read_slot_observed(slot_id) {
+                    Ok(Some(ObservedSlot {
+                        assignment:
+                            ObservedAssignment::Known {
+                                generation: prior_generation,
+                                owner: Some(prior_owner),
+                                version: Some(prior_version),
+                                ..
+                            },
+                    })) if prior_generation == asn.generation_id && prior_owner == owner => {
+                        prior_version.clone()
+                    }
+                    _ => crate::remote::helper::now_rfc3339(),
+                };
                 observed_servers.insert(
                     slot_id.clone(),
                     ObservedSlot {
@@ -216,6 +242,8 @@ pub(crate) fn check_up_to_date(
                             generation: asn.generation_id.clone(),
                             artifact: asn.artifact.clone(),
                             last_deployment: asn.deployment_id.clone(),
+                            owner: Some(owner),
+                            version: Some(version),
                         },
                     },
                 );
@@ -415,7 +443,7 @@ interval_seconds = 0
             .status(&crate::remote::helper::test_owner("eng", "p1"))
             .unwrap();
         let cur = status
-            .current_generation
+            .current_generation()
             .expect("first push must leave a current generation");
         let assignment: GenerationAssignment = serde_json::from_slice(
             &remote
@@ -777,7 +805,7 @@ interval_seconds = 0
             .status(&crate::remote::helper::test_owner("eng", "p1"))
             .unwrap();
         let cur = status
-            .current_generation
+            .current_generation()
             .expect("push 2 must advance the remote");
         assert_eq!(cur.as_str(), second_gen.as_str());
         let asn: crate::remote::helper::GenerationAssignment = serde_json::from_slice(

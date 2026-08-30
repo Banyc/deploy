@@ -559,14 +559,44 @@ pub enum PlanOrigin {
 }
 
 /// Per-slot plan for one placement slot: its slot identity, the artifact it
-/// should run, and the compare-and-swap preconditions.
+/// should run, and the compare-and-swap precondition. The expected TREE is
+/// deliberately NOT a field: the tree is DERIVED from the expected
+/// generation's VERIFIED assignment ([`SlotPlan::expected_tree`]) — there is
+/// no independently-observed `expected_tree` that could half-disagree with
+/// the expected generation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlotPlan {
     pub slot_id: SlotId,
     pub artifact: ArtifactRef,
     /// Pre-push generation that must match for the compare-and-swap precondition.
     pub expected_generation: Option<GenerationId>,
-    pub expected_tree: Option<TreeDigest>,
+}
+
+impl SlotPlan {
+    /// THE DERIVED expected tree: the tree of the VERIFIED assignment whose
+    /// generation is the plan's expected generation. The expected tree is
+    /// NEVER an independently-observed field — it is always resolved from a
+    /// verified assignment ([`crate::remote::helper::CurrentAssignment::Known`],
+    /// which carries generation + artifact + verified owner TOGETHER). A
+    /// plan whose expected generation has no verified assignment (or whose
+    /// verified assignment names a different generation) yields `None` (fail
+    /// closed — a tree is never fabricated for a half-known expected state).
+    pub fn expected_tree<'a>(
+        &self,
+        live: &'a crate::remote::helper::CurrentAssignment,
+    ) -> Option<&'a TreeDigest> {
+        match (&self.expected_generation, live) {
+            (
+                Some(exp),
+                crate::remote::helper::CurrentAssignment::Known {
+                    generation,
+                    artifact,
+                    ..
+                },
+            ) if exp == generation => Some(&artifact.tree),
+            _ => None,
+        }
+    }
 }
 
 /// The WIRE shape of a deployment plan (`deployments/<id>/plan.json`): the

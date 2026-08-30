@@ -131,8 +131,8 @@ pub use state::current::{CurrentState, ExpectedCurrent};
 use crate::deploy::lock::AdministrativeRecoveryGuard;
 use crate::error::{Error, Result};
 use crate::identity::{
-    AcquisitionId, ApplicationStoreKey, BehaviorContract, GenerationId, OperationId, ReleaseId,
-    ReleaseRecord, SlotId,
+    AcquisitionId, ApplicationStoreKey, ArtifactRef, BehaviorContract, GenerationId, OperationId,
+    ReleaseId, ReleaseRecord, SlotId, TreeDigest,
 };
 use crate::remote::layout;
 use crate::remote::transport::{CreateNewVerdict, Remote, RemoveIfVerdict, VerifiedExisting};
@@ -144,7 +144,13 @@ use serde::{Deserialize, Serialize};
 /// MARKER against. A generation whose record carries a different
 /// application/slot — transplanted/copied state — is refused (fail closed),
 /// never read as a valid deployment.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Serde derives: the owner is RECORDED inside the observed projections
+/// ([`crate::ledger::ObservedAssignment::Known`] — the assignment identity
+/// that produced the projection); the fields are validated identities
+/// ([`ApplicationStoreKey`], [`SlotId`]), so deserialization is gated by the
+/// same validation as every other wire identity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenerationOwner {
     pub application: ApplicationStoreKey,
     pub slot: SlotId,
@@ -169,21 +175,109 @@ pub(crate) fn test_owner(application: &str, slot: &str) -> GenerationOwner {
     }
 }
 
+/// ONE AUTHORITATIVE current-assignment state of a remote slot: either
+/// genuine absence or the COMPLETE verified assignment — generation +
+/// artifact + the VERIFIED owner — carried TOGETHER. There is NO
+/// half-known generation/tree combination: the tree is DERIVED from the
+/// verified assignment's artifact ([`CurrentAssignment::current_tree`]),
+/// never a separate unvalidated field that could half-disagree with the
+/// generation. A `Known` value ALWAYS carries generation + artifact + owner;
+/// `Absent` NEVER has a tree.
+///
+/// Produced ONLY by [`RemoteHelper::status`] (which verifies the complete
+/// symlink chain behind `current` AND the assignment's OWNER MARKER against
+/// the caller's expected [`GenerationOwner`]); the `owner` inside `Known` is
+/// the VERIFIED owner the status read checked against.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum CurrentAssignment {
+    /// Genuine absence: no `current` link at all. NEVER carries a tree.
+    #[default]
+    Absent,
+    /// The complete verified assignment: generation + artifact + the
+    /// VERIFIED owner — never a half-known generation/tree combination.
+    Known {
+        generation: GenerationId,
+        artifact: ArtifactRef,
+        /// The VERIFIED owner (the resource-identity owner marker the
+        /// status read verified the assignment against — a transplanted
+        /// record is refused before a `Known` value exists).
+        owner: GenerationOwner,
+    },
+}
+
+impl CurrentAssignment {
+    /// The validated current generation id — DERIVED from the ONE
+    /// authoritative assignment. `None` ONLY for genuine absence (`Absent`);
+    /// a `Known` assignment always carries its generation.
+    pub fn current_generation(&self) -> Option<&GenerationId> {
+        match self {
+            CurrentAssignment::Known { generation, .. } => Some(generation),
+            CurrentAssignment::Absent => None,
+        }
+    }
+
+    /// The current tree — DERIVED from the verified assignment's artifact.
+    /// A `Known` assignment ALWAYS resolves its tree; `Absent` NEVER has
+    /// one. There is no independent tree field that could disagree with the
+    /// generation.
+    pub fn current_tree(&self) -> Option<&TreeDigest> {
+        match self {
+            CurrentAssignment::Known { artifact, .. } => Some(&artifact.tree),
+            CurrentAssignment::Absent => None,
+        }
+    }
+
+    /// The VERIFIED owner of the current assignment — the resource-identity
+    /// owner marker the status read verified against. `None` ONLY for
+    /// genuine absence.
+    pub fn owner(&self) -> Option<&GenerationOwner> {
+        match self {
+            CurrentAssignment::Known { owner, .. } => Some(owner),
+            CurrentAssignment::Absent => None,
+        }
+    }
+}
+
+/// The read status of a remote slot. `current` is the ONE authoritative
+/// current-assignment state ([`CurrentAssignment`]); `current_generation` /
+/// `current_tree` are DERIVED ACCESSORS over it (consumers keep the same
+/// reads, but the underlying state can never represent a half-known
+/// generation/tree combination).
 #[derive(Clone, Debug, Default)]
 pub struct RemoteStatus {
-    /// The validated identity of the generation the `current` symlink names.
-    /// `None` ONLY when there is no `current` link at all (genuine absence).
+    /// THE ONE authoritative current-assignment state: genuine absence or the
+    /// complete verified assignment (generation + artifact + verified owner).
     /// Any PRESENT `current` must name the EXACT canonical
     /// `generations/<gen-id>/root` target and the whole chain behind it must
     /// validate; every deviation (non-canonical target, missing/corrupt
     /// assignment, mismatched generation id, missing/wrong generation `root`
     /// link, missing tree object) fails `status()` with an integrity error —
-    /// never a fabricated `None` and never a panic.
-    pub current_generation: Option<GenerationId>,
-    pub current_tree: Option<String>,
+    /// never a fabricated `Absent` and never a panic.
+    pub current: CurrentAssignment,
     pub inventory: Vec<String>,
     pub lock: Option<String>,
     pub pending_incoming: Vec<String>,
+}
+
+impl RemoteStatus {
+    /// The validated current generation id — DERIVED from the ONE
+    /// authoritative assignment ([`CurrentAssignment::current_generation`]).
+    /// `None` ONLY for genuine absence.
+    pub fn current_generation(&self) -> Option<&GenerationId> {
+        self.current.current_generation()
+    }
+
+    /// The current tree — DERIVED from the verified assignment's artifact
+    /// ([`CurrentAssignment::current_tree`]). A present generation always
+    /// resolves its tree; genuine absence never has one.
+    pub fn current_tree(&self) -> Option<&TreeDigest> {
+        self.current.current_tree()
+    }
+
+    /// The VERIFIED owner of the current assignment ([`CurrentAssignment::owner`]).
+    pub fn owner(&self) -> Option<&GenerationOwner> {
+        self.current.owner()
+    }
 }
 
 pub struct RemoteHelper<'a> {
