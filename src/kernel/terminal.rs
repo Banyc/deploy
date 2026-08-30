@@ -262,7 +262,7 @@ impl LedgerTerminal {
     /// any non-Degraded disposition.
     ///
     /// THE DERIVATION IS THE TRANSITION STATE, NOT THE OUTCOME'S GENERATION
-    /// FIELD: each slot's [`SlotTransition`] classifies it — a
+    /// FIELD: each slot's [`crate::ledger::records::SlotTransition`] classifies it — a
     /// `NeverAdvanced` slot (skipped) and a `Restored` slot (compensated
     /// back) are back at their pre-push state (never remaining changes); an
     /// `Advanced` slot is at the desired state (always a remaining change);
@@ -343,7 +343,7 @@ pub fn terminal_with_digest(
 /// lives at INTENT-APPEND time inside [`crate::kernel::transition::
 /// apply_event`] (one pending at a time, parent == head at intent append);
 /// this helper enforces the SAME equality at the WRITE boundaries: the
-/// plan-time gate ([`crate::deploy::push::preflight`] before mutation) and
+/// plan-time gate (`crate::deploy::push::preflight` before mutation) and
 /// the finalizer's explicit pre-check ([
 /// crate::ledger::finalize::finalize_successful_locked`] ALWAYS requires
 /// it, no flag, no bypass — recovery included). A drifted head means the

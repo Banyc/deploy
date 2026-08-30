@@ -276,12 +276,12 @@ impl SlotOutcomeRowWire {
     }
 }
 
-/// The COMPENSATION REPORT of a [`TerminalDisposition::FailedRolledBack`]
+/// The COMPENSATION REPORT of a [`crate::ledger::TerminalDisposition::FailedRolledBack`]
 /// terminal — the disposition's OWN per-slot outcomes table under the
 /// disposition's name: each slot's result during the failed-then-rolled-back
 /// attempt (which slots were compensated back and which compensation
 /// failed). The report IS the disposition's outcomes table
-/// ([`LedgerTerminal::compensation`]) — never a stored duplicate that could
+/// ([`crate::ledger::LedgerTerminal::compensation`]) — never a stored duplicate that could
 /// disagree with the outcomes.
 pub type CompensationReport = SlotTable<SlotOutcome>;
 

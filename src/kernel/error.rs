@@ -22,7 +22,7 @@
 //!   an invalid relationship (a plan whose selected slot is not a target
 //!   slot; a report whose outcome table contradicts its disposition).
 //!   Message-only: [`KernelErrorCode::Invariant`].
-//! * [`Conflict`](KernelError::Conflict) — a valid operation against stale
+//! * `Conflict`(KernelError::Conflict) — a valid operation against stale
 //!   or concurrently changed state: a stale plan whose parent is no longer
 //!   the target's successful head ([`ConflictError::ParentMismatch`]), a
 //!   still-pending attempt blocking the next one
@@ -45,7 +45,7 @@
 //!   [`KernelErrorCode::Transport`].
 //!
 //! The typed [`ConflictError`] / [`IntegrityError`] payloads implement
-//! [`Display`] generating the human sentences the refusals always carried
+//! `Display` generating the human sentences the refusals always carried
 //! (the same keywords — "stale plan", "still pending", "one intent per
 //! deployment", "must bind the EXACT canonical intent", "retained
 //! suffix" — so prose-based consumers and containment assertions keep
@@ -76,7 +76,7 @@ pub struct InvariantError {
 /// The [`KernelError::Conflict`] class: a valid operation against stale or
 /// concurrently changed state — TYPED variants per semantic rule. No
 /// message-only payload exists: every conflict refusal is one of the three
-/// rules below. [`Display`] generates the human sentence (keeping the
+/// rules below. `Display` generates the human sentence (keeping the
 /// "stale plan" / "still pending" / "state diverged" keywords).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConflictError {
@@ -170,7 +170,7 @@ pub struct TransportError {
     pub message: String,
 }
 
-/// The semantic kernel's error type: exactly five classes. [`class`]
+/// The semantic kernel's error type: exactly five classes. [`KernelError::class`]
 /// (KernelError::class) names the class; [`code`](KernelError::code) names
 /// the semantic rule; the typed payload carries the concrete evidence.
 /// Every class' errors may be converted to the [`crate::error::Error`]
@@ -256,7 +256,7 @@ impl KernelError {
 
     /// The structured context: the human sentence of this error. For the
     /// message-only classes it is the stored message; for the typed classes
-    /// it is the payload's [`Display`] (the same sentences the refusals
+    /// it is the payload's `Display` (the same sentences the refusals
     /// always carried). `finalize`/recovery consume this as the refused
     /// reason string.
     pub fn message(&self) -> String {
@@ -273,7 +273,7 @@ impl KernelError {
 /// The five error CLASSES — the lightweight "who should react"
 /// discriminator: [`Input`](Self::Input) (invalid CLI/configuration/scalar
 /// values), [`Invariant`](Self::Invariant) (internally invalid
-/// relationships), [`Conflict`](Self::Conflict) (valid ops against stale
+/// relationships), `Conflict`(Self::Conflict) (valid ops against stale
 /// state — the WRITE-boundary class), [`Integrity`](Self::Integrity)
 /// (impossible persisted sequences — the READ-boundary class),
 /// [`Transport`](Self::Transport) (backend I/O failures). Tests assert the
@@ -293,7 +293,7 @@ pub enum KernelErrorClass {
 /// classes fall back to their class-level code
 /// ([`Input`](Self::Input) / [`Invariant`](Self::Invariant) /
 /// [`Integrity`](Self::Integrity) / [`Transport`](Self::Transport)) so
-/// [`KernelError::code`] is TOTAL. No message-only [`Conflict`] code exists:
+/// [`KernelError::code`] is TOTAL. No message-only `Conflict` code exists:
 /// every [`ConflictError`] variant is a named semantic rule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum KernelErrorCode {
@@ -436,7 +436,7 @@ impl std::error::Error for KernelError {}
 impl From<KernelError> for crate::error::Error {
     /// The facade mapping PRESERVES the complete typed kernel error —
     /// [`Error::Kernel`](crate::error::Error::Kernel) — never flattened into
-    /// a class string. The kernel error's own [`Display`] (its five-class
+    /// a class string. The kernel error's own `Display` (its five-class
     /// prefix + the typed payload's sentence) becomes the facade error's
     /// text, so every consumer of the class and the prose keeps working
     /// while the typed evidence stays reachable end to end.

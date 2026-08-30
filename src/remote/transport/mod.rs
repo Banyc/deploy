@@ -501,7 +501,7 @@ pub enum RemoveIfVerdict {
     Absent,
 }
 
-/// The verdict of one canonical create-new attempt ([`durable_create_new`]).
+/// The verdict of one canonical create-new attempt (`durable_create_new`).
 /// `pub` because it crosses the [`Remote`] trait boundary: every transport's
 /// `try_write_new` returns it, and every caller (and external test crate)
 /// branches on it.
@@ -608,7 +608,7 @@ pub enum NotRegularFileKind {
 
 /// The TYPED result of verifying an EXISTING create-new destination against
 /// the intended content — the single DESCRIPTOR-BOUND verification shared by
-/// BOTH transports (the local [`durable_create_new`] verify-on-retry and the
+/// BOTH transports (the local `durable_create_new` verify-on-retry and the
 /// SSH transport's EEXIST verification): the entry is opened with `O_NOFOLLOW`
 /// and the type/mode AND the content all come from the ONE opened inode
 /// (fstat + read through the SAME descriptor — never an lstat followed by a

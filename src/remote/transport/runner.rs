@@ -351,7 +351,7 @@ pub enum RunOutcome {
 
 /// How a runner invocation failed. Every variant is returned only AFTER the
 /// runner cleaned up the child (kill + reap where possible) — an error can
-/// never leave a live, un-reaped child behind by contract (the [`OwnedChild`]
+/// never leave a live, un-reaped child behind by contract (the `OwnedChild`
 /// drop backstop covers the paths where even that is impossible).
 #[derive(Debug)]
 pub enum RunError {
@@ -440,7 +440,7 @@ impl Drop for OwnedChild {
 /// reap failure is an ERROR, never a successful timeout outcome.
 ///
 /// The runner is per-exec and owns nothing between calls: the child lives in
-/// [`OwnedChild`] inside [`ChildRunner::exec`] and is collected before the
+/// `OwnedChild` inside [`ChildRunner::exec`] and is collected before the
 /// call returns, so there are no leaked threads, handles, or processes across
 /// calls — the lifecycle is bounded.
 pub struct ChildRunner {

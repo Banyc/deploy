@@ -78,7 +78,7 @@ pub enum ServerConnection {
     /// transport root is the referencing slot's typed deploy_dir
     /// ([`crate::identity::AbsoluteDeployDir`]), the one authoritative physical root, so there
     /// is no endpoint for the transport to parse or compare. The raw
-    /// `address` marker is the literal `local` (see [`is_local_address`]); a
+    /// `address` marker is the literal `local` (see `is_local_address`); a
     /// legacy `local://<path>` address is rejected by the conversion with
     /// migration guidance. No host verification is ever performed. The
     /// identity is ALWAYS [`HostIdentity::Local`] by construction (the

@@ -44,7 +44,7 @@ use crate::remote::transport::{LocalTransport, Remote};
 ///   [`crate::identity::AbsoluteDeployDir`] scalar and roots [`LocalTransport`] exactly there
 ///   — the canonical form the raw -> domain conversion already stored in the
 ///   validated [`crate::config::ProjectConfig`] graph
-///   ([`crate::config::SlotConfig::with_canonical_deploy_dir`]).
+///   (`crate::config::SlotConfig::with_canonical_deploy_dir`).
 /// * the transport's [`Remote::root`] is that same canonical path, so
 ///   `create_remote(...).root() == PhysicalBinding.deploy_dir` for every
 ///   accepted local slot by construction.

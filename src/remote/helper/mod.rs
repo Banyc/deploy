@@ -284,7 +284,7 @@ impl<'a> RemoteHelper<'a> {
     }
 
     /// Release the mutation lock: atomic compare-and-delete with the record
-    /// returned by [`Self::acquire_lock_record`]. The file is removed ONLY if it
+    /// returned by `Self::acquire_lock_record`. The file is removed ONLY if it
     /// still carries EXACTLY this record — a STALE release (the lock now
     /// belongs to a successor, e.g. a recovery re-took the slot)
     /// FAILS explicitly and NEVER deletes the successor's lock. An
@@ -322,7 +322,7 @@ impl<'a> RemoteHelper<'a> {
     ///   holding controller is dead — a named, explicit recovery call (or
     ///   `--recover`-style command), NEVER automatic. The call is performed
     ///   WHILE HOLDING the controller's authoritative local application-store
-    ///   lock ([`crate::deploy::lock::FileLock`] on the store's
+    ///   lock (`crate::deploy::lock::FileLock` on the store's
     ///   `operation.lock`): a LIVE controller always holds that local lock
     ///   while it operates, so a recovery under it cannot race a live
     ///   controller on the same store.

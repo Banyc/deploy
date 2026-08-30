@@ -11,7 +11,7 @@
 //! The SHARED core comes first — the deployment-record fields
 //! ([`ActualSlotState`] / [`DeploymentStatus`]), the ROLLBACK records
 //! ([`TargetSnapshot`] / [`SnapshotEntry`] / [`PhysicalBinding`] /
-//! [`CompleteRollback`]), the PLAN/report records ([`BehaviorIndex`],
+//! [`FailedRolledBackTerminal`]), the PLAN/report records ([`BehaviorIndex`],
 //! [`SlotPlan`], [`DeploymentPlanWire`] / [`DeploymentPlan`], [`PlanSource`] /
 //! [`PlanOrigin`]), and the pins/server records ([`Pins`] /
 //! [`ServerState`]) — then the per-facet sections:

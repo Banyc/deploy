@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 /// slot ends on, the artifact bound to it, and the physical binding it was
 /// planned against. Exactly the per-slot facts a snapshot view needs —
 /// stored ONCE in the intent's slot table and never duplicated in any
-/// terminal payload. This is the ledger's [`SnapshotEntry`] (the alias
+/// terminal payload. This is the ledger's [`crate::ledger::records::SnapshotEntry`] (the alias
 /// keeps the record-name path resolving).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SnapshotSlot {

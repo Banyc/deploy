@@ -52,7 +52,7 @@
 //! here — noted so the inventory stays complete):
 //!
 //! * **commit markers** — the marker I/O lives in
-//!   [`crate::remote::helper::RemoteHelper::write_commit_marker`] and the
+//!   [`crate::remote::helper::HeldSlotLock::write_commit_marker`] and the
 //!   deterministic payload is built at the call sites; no marker SEMANTIC
 //!   TYPES live in records.rs, so there is no `markers` module.
 //! * **schema versions** — `LEDGER_SCHEMA_VERSION` and `PINS_SCHEMA_VERSION`
@@ -60,7 +60,7 @@
 //!   the wire-version gate lives in the store reader
 //!   ([`crate::store::local::LocalStore::read_ledger`]).
 //! * **transaction records** — the `transactions/<op-id>.json` I/O lives in
-//!   [`crate::remote::helper::RemoteHelper::transaction_record`]; no
+//!   [`crate::remote::helper::HeldSlotLock::transaction_record`]; no
 //!   transaction-record SEMANTIC TYPES live in records.rs, so there is no
 //!   `transactions` module.
 //!

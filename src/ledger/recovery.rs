@@ -14,10 +14,10 @@
 //! # Degraded terminals record BACKEND-OBSERVED facts, never plan desires
 //!
 //! The per-slot outcomes of a recovery-degraded terminal are built from
-//! per-slot EVIDENCE ([`RecoverySlotEvidence`]) collected — under the
+//! per-slot EVIDENCE (`RecoverySlotEvidence`) collected — under the
 //! selected slots' mutation locks — by RE-READING each slot's live state
 //! (status + assignment) from its remote BEFORE the terminal is decided
-//! ([`collect_recovery_evidence`] / [`observe_recovery_slot`]). A `Known`
+//! (`collect_recovery_evidence` / `observe_recovery_slot`). A `Known`
 //! observation appears ONLY when a successful backend read confirmed that
 //! generation; the intent's `resulting_snapshot` is a PLAN TIME DESIRED
 //! state, so the degraded terminal NEVER converts it into an observed fact
@@ -29,7 +29,7 @@
 //! on the degraded paths (membership mismatch, binding drift, finalizer
 //! `Refused`) — the `Successful` path keeps the finalizer's own
 //! lock-verified acquisition — and ONLY a TRANSIENT lock-acquisition
-//! failure during the collection yields [`RecoveryOutcome::StillPending`]
+//! failure during the collection yields `RecoveryOutcome::StillPending`
 //! (a truthful terminal cannot be built without the backend read).
 
 use crate::config::ProjectConfig;

@@ -225,7 +225,7 @@ impl LocalStore {
     /// lose the deployment (the intent is already durable and the next push
     /// reconciles it). The append is a CRASH-ATOMIC whole-ledger rewrite
     /// (temp + fsync + chmod + rename + parent-dir fsync, see
-    /// [`LocalStore::append_ledger_atomic`]). Fail-closed keying: the
+    /// `LocalStore::append_ledger_atomic`). Fail-closed keying: the
     /// deployment id keys the entry, so a second intent for the same id (a
     /// corrupted duplicate) is refused rather than silently merged. The
     /// duplicate guard scans EVERY parsed ledger entry (`read_ledger`), not

@@ -79,7 +79,7 @@ macro_rules! id_newtype {
         // NOTE: deliberately NO `Default` — a `Default` identity would be an
         // EMPTY string, a malformed durable record constructible by anyone
         // (the exact gap this hardening closes). An identity can only be
-        // built through the validated [`parse`] (or `FromStr`/`TryFrom`).
+        // built through the validated `parse` (or `FromStr`/`TryFrom`).
         #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
         #[serde(transparent)]
         pub struct $name(String);
@@ -110,7 +110,7 @@ macro_rules! id_newtype {
             }
 
             /// UNCHECKED constructor — TEST FIXTURES ONLY. Production code
-            /// must construct through [`parse`] (or `FromStr`/`TryFrom`), so
+            /// must construct through [`Self::parse`] (or `FromStr`/`TryFrom`), so
             /// an invalid identity can never be built outside tests.
             pub fn new(s: impl Into<String>) -> Self {
                 $name(s.into())

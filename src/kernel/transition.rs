@@ -46,14 +46,14 @@
 //! unresolved (pending) intent exists at any time; every ORDINARY intent's
 //! parent must equal the current successful head AT INTENT-APPEND TIME; a
 //! terminal must belong to the pending intent; and a push that cannot
-//! finish a previous pending attempt is REFUSED with a [`Conflict`]
+//! finish a previous pending attempt is REFUSED with a [`Conflict`](KernelError::Conflict)
 //! (KernelError::Conflict) — never planning a second intent on top (even
 //! for disjoint groups). [`apply_event`] owns the accept/reject decisions:
 //!
 //! * an ORDINARY intent is refused with
 //!   [`Integrity`](KernelError::Integrity) when a pending attempt already
-//!   exists ([`LineageViolation::PendingAttemptExists`]) or when its parent
-//!   is not the successful head ([`LineageViolation::ParentMismatch`]),
+//!   exists ([`LineageViolation::PendingAttemptExists`](crate::kernel::lineage::LineageViolation::PendingAttemptExists)) or when its parent
+//!   is not the successful head ([`LineageViolation::ParentMismatch`](crate::kernel::lineage::LineageViolation::ParentMismatch)),
 //!   and when an inherited slot disagrees with the head's snapshot
 //!   ([`validate_inherited_slots`]);
 //! * a TERMINAL must belong to the pending intent — ANY terminal clears the

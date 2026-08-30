@@ -334,9 +334,9 @@ impl From<&DeploymentIntent> for LedgerIntentWire {
 /// and keeps the split shape: the display `desired` map re-expands each
 /// SELECTED slot's result from the full slot table, the `pre_push` map is
 /// the intent's OWN observed pre-push observations (the three-state
-/// [`Observation<PreviousGeneration>`] — used DIRECTLY, never re-wrapped),
+/// [`crate::ledger::Observation<crate::ledger::PreviousGeneration>`] — used DIRECTLY, never re-wrapped),
 /// and the actuals are the observed post-mutation states
-/// ([`ActualSlotState`]).
+/// ([`crate::ledger::ActualSlotState`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LedgerIntentReport {
     pub deployment_id: DeploymentId,

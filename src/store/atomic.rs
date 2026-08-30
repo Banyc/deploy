@@ -5,7 +5,7 @@
 //! chmod it private (0o600) BEFORE it can become visible under its final
 //! name, fsync it, rename it into place (atomic on POSIX — a reader never
 //! sees a torn record), then fsync the parent directory. The replace has
-//! TWO DISTINCT COMMIT POINTS and [`write_atomic_replace`] reports them
+//! TWO DISTINCT COMMIT POINTS and `write_atomic_replace` reports them
 //! EXPLICITLY ([`ReplaceOutcome`]): the RENAME is commit point 1 (the new
 //! content becomes VISIBLE under its final name), and the PARENT-DIRECTORY
 //! FSYNC is commit point 2 (the rename becomes DURABLE across power loss).
@@ -115,7 +115,7 @@ pub(crate) fn temp_name_for(path: &Path) -> PathBuf {
 /// (the rename — new content VISIBLE — and the parent-directory fsync —
 /// new content DURABLE) are reported distinctly, so a caller can always
 /// tell "the rename never happened" from "the rename happened but
-/// durability is unconfirmed" (see [`write_atomic_replace`]).
+/// durability is unconfirmed" (see `write_atomic_replace`).
 #[derive(Debug)]
 pub enum ReplaceOutcome {
     /// BOTH commit points confirmed: the new content is visible under its
