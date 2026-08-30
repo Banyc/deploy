@@ -559,7 +559,22 @@ pub(crate) fn push_inner(
                 "push {deployment_id}: the kernel refused the preflight-failure disposition: {e}"
             ))
         })?;
-        let _ = store.append_terminal(
+        // Best-effort incoming cleanup runs FIRST (the partial staging upload
+        // is disposable — the review keeps it best-effort), then THE
+        // TERMINAL-APPEND FAILURE IS PROPAGATED (the review's P1 fix — a
+        // swallowed preflight-append failure can no longer exist): when the
+        // FailedPreflight terminal append fails, the attempt stays
+        // intent-only (recoverable-pending — a later push's recovery settles
+        // it through [`crate::ledger::recovery`]) and THIS push surfaces the
+        // append failure instead of silently continuing and returning the
+        // original preflight error as if the attempt had settled. The caller
+        // must see the persistence boundary failed.
+        for a in &preflight.assignments {
+            helpers[&a.placement_slot]
+                .remove_incoming(deployment_id.as_str())
+                .ok();
+        }
+        store.append_terminal(
             target_name,
             deployment_id,
             &LedgerTerminal::new(
@@ -568,12 +583,7 @@ pub(crate) fn push_inner(
                 disposition,
                 Some(failure.reason.to_string()),
             ),
-        );
-        for a in &preflight.assignments {
-            helpers[&a.placement_slot]
-                .remove_incoming(deployment_id.as_str())
-                .ok();
-        }
+        )?;
         return Err(failure.source);
     }
 

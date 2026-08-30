@@ -1415,6 +1415,123 @@ pub(crate) mod preflight_tests {
         );
     }
 
+    /// THE PREFLIGHT TERMINAL-APPEND FAILURE IS PROPAGATED (the review's
+    /// P1 fix — the acceptance's "a swallowed preflight-append failure can
+    /// no longer exist"): a capacity preflight fails, and the
+    /// `FailedPreflight` terminal append is faulted
+    /// ([`FaultKind::AppendTerminal`]). The push MUST report the append
+    /// failure (the caller sees the persistence boundary failed — never the
+    /// original capacity error as if the attempt had settled), the attempt
+    /// stays intent-only (recoverable-pending), and NOTHING advanced on the
+    /// remote, so a later clean push's recovery settles the attempt
+    /// `FailedRolledBack` — the EXACT PRE-PUSH STATE settles rolled-back,
+    /// never `Degraded` (the review's exact fix: recovery decides through
+    /// the SAME [`crate::kernel::transition::decide_terminal`] path as
+    /// normal execution).
+    #[test]
+    fn preflight_terminal_append_failure_is_propagated_and_recovery_rolls_back() {
+        let h = RecoveryHarness::new();
+        let id = test_deployment_id("deploy-preflight-append-fault");
+        // Deterministic capacity failure (mirrors
+        // [`capacity_preflight_failure_records_failed_preflight_status`]).
+        let mut config = ProjectConfig::load(&h.cfg_path).unwrap();
+        config = config
+            .with_server_capacity(
+                "s1",
+                crate::config::CapacityConfig {
+                    reserve_bytes: 1024 * 1024,
+                    reserve_percent: crate::identity::CapacityPercent::new(0)
+                        .expect("0 is in range"),
+                },
+            )
+            .unwrap();
+        let project_root = config.project_root(&h.cfg_path);
+        let target = config.target("t1").expect("harness target");
+        let op_id = OperationId::new(format!("op-{}", id.as_str()));
+        // The preflight terminal append fails once (one-shot, id-qualified).
+        h.store.fault_registry().arm_append_terminal(id.as_str());
+        let rf = h.remotes_base.clone();
+        let factory = move |s: &crate::config::ServerDef,
+                            _slot: &crate::config::SlotConfig|
+              -> Result<Box<dyn Remote>> {
+            FakeCapacityRemote::build(rf.join(s.id.as_str()), 100)
+        };
+        let err = push_inner(
+            &project_root,
+            &h.store,
+            &factory,
+            "t1",
+            &crate::deploy::plan::SlotSelection::normalize(&config, "t1", None).unwrap(),
+            &RefExpr::Head,
+            None,
+            &id,
+            &op_id,
+            &config,
+            target,
+            &PushOptions {
+                dry_run: false,
+                ref_token: None,
+                group: None,
+            },
+        )
+        .expect_err("the preflight terminal-append failure must fail the push");
+        assert!(
+            err.to_string().contains("append_terminal"),
+            "the append failure must be PROPAGATED — never swallowed in favor of the capacity error, got: {err}"
+        );
+        assert!(
+            !err.to_string().contains("insufficient capacity"),
+            "the append failure REPLACES the preflight error — the attempt never settled, got: {err}"
+        );
+        // The attempt stays intent-only (recoverable-pending): no terminal,
+        // no snapshot, nothing advanced on the remote.
+        assert_eq!(
+            h.store.read_attempts("t1").unwrap().len(),
+            1,
+            "the intent is durable before the preflight terminal append"
+        );
+        assert_eq!(
+            latest_status(&h, id.as_str()),
+            None,
+            "the attempt stays intent-only (pending) when the FailedPreflight terminal append fails"
+        );
+        assert!(h.store.read_snapshots("t1").unwrap().is_empty());
+        let remote =
+            LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1"))
+                .unwrap();
+        assert!(
+            !remote.exists(crate::remote::layout::current()),
+            "nothing advanced on the remote — the preflight failed before any `current` change"
+        );
+
+        // A LATER CLEAN PUSH: recovery sees the intent-only attempt whose
+        // live state is EXACTLY the original pre-push state (nothing
+        // changed — the retry observes the pre-push state the review's
+        // sequence described) and settles it `FailedRolledBack` — never
+        // `Degraded` (a Degraded terminal with NO remaining change is
+        // unrepresentable). The retry then proceeds with its OWN fresh
+        // deployment (the original push never advanced anything), which
+        // succeeds.
+        let r2 = push_clean(&h).unwrap();
+        assert_eq!(
+            r2.status,
+            Some(DeploymentStatus::Successful),
+            "the retry push proceeds with a fresh deployment after recovery settled the old attempt"
+        );
+        assert_eq!(
+            latest_status(&h, id.as_str()),
+            Some(DeploymentStatus::FailedRolledBack),
+            "the exact pre-push state settles FailedRolledBack — never Degraded (the review's fix)"
+        );
+        let transitions = h.store.read_transitions(id.as_str()).unwrap();
+        let last = transitions.last().expect("transition stream non-empty");
+        assert!(
+            last.reason().is_some_and(|r| r.contains("state diverged")),
+            "the recovery's refusal reason explains the disposition, got: {:?}",
+            last.reason()
+        );
+    }
+
     /// A STAGING failure (after the intent is durable, before any `current`
     /// change) must end the attempt `FailedPreflight` — the same terminal
     /// status as a capacity failure — never a stranded `InProgress`.

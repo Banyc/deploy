@@ -6,10 +6,14 @@
 //! same replay-safe finalizer as the main success path, which appends
 //! through the PURE STATE MACHINE's one-parent gate (no recovery bypass). A
 //! recovered attempt whose parent is no longer the successful head — a
-//! later deployment already succeeded on that parent — is finalized
-//! `Degraded` (a non-empty Degraded terminal with the stale-plan source as
-//! its reason), never `Successful`: it can never become the head or overlay
-//! a newer head's inherited state.
+//! later deployment already succeeded on that parent — is finalized through
+//! the SAME terminal decision as normal execution
+//! ([`crate::kernel::transition::decide_terminal`], fed the backend-re-read
+//! per-slot EVIDENCE): a non-empty `Degraded` terminal with the stale-plan
+//! source as its reason when at least one slot's delta is
+//! `Desired`/`Diverged`/`Unknown`, `FailedRolledBack` when every slot is
+//! back at its pre-push state — never `Successful`: it can never become the
+//! head or overlay a newer head's inherited state.
 //!
 //! # Degraded terminals record BACKEND-OBSERVED facts, never plan desires
 //!
@@ -38,9 +42,8 @@ use crate::identity::{GenerationId, OperationId, SlotId};
 use crate::kernel;
 use crate::ledger::finalize::{FinalizeOutcome, FinalizeSettings, finalize_successful_locked};
 use crate::ledger::records::{
-    DegradedTerminal, DeploymentIntent, FailedRolledBackTerminal, LedgerTerminal,
-    NonEmptySlotTable, Observation, ObservationError, ObservedGeneration, PhysicalBinding,
-    SlotOutcome, SlotTable, TerminalDisposition,
+    DeploymentIntent, LedgerTerminal, NonEmptySlotTable, Observation, ObservationError,
+    ObservedGeneration, PhysicalBinding, SlotOutcome,
 };
 use crate::remote::helper::{HeldSlotLock, RemoteHelper};
 use crate::store::local::LocalStore;
@@ -83,13 +86,16 @@ pub(crate) enum RecoveryOutcome {
 /// finalizer as the main success path. A recovered attempt that can no
 /// longer finalize `Successful` on the live state (membership mismatch,
 /// binding drift, or a drifted head — the finalizer's `Refused`) is
-/// finalized `Degraded` (a non-empty Degraded terminal whose per-slot
-/// outcomes are built from the backend-re-read EVIDENCE
-/// ([`RecoverySlotEvidence`] — collected under the selected slots'
+/// finalized through the SAME terminal decision as normal execution
+/// ([`crate::kernel::transition::decide_terminal`] — fed the per-slot
+/// EVIDENCE [`RecoverySlotEvidence`] collected under the selected slots'
 /// mutation locks on the degraded path only, so the terminal records
-/// OBSERVED facts, never the plan's desired snapshot) with the refusal
-/// source as its reason), never `Successful`: it can never become the head
-/// or overlay a newer head's inherited state. ONLY a TRANSIENT
+/// OBSERVED facts, never the plan's desired snapshot): a non-empty
+/// `Degraded` terminal (at least one `Desired`/`Diverged`/`Unknown` delta)
+/// or `FailedRolledBack` (every slot back at its pre-push state — the
+/// exact-pre-push state NEVER settles `Degraded`, the review's fix) with
+/// the refusal source as its reason, never `Successful`: it can never
+/// become the head or overlay a newer head's inherited state. ONLY a TRANSIENT
 /// non-finalization (the finalizer's [`FinalizeOutcome::Pending`], or a
 /// lock-acquisition failure during the degraded-path evidence collection
 /// — the new StillPending trigger, since a truthful terminal cannot be
@@ -135,11 +141,12 @@ pub(crate) fn reconcile_pending_commits(
             // the selected slots' mutation locks and re-reading each slot's
             // live state; a slot that is no longer a configured member has
             // no remote to read and records an `Unknown` evidence — then
-            // finalize `Degraded` with the TRUTHFUL per-slot observations
-            // (the plan's frozen snapshot is never converted into an
-            // observed fact). A lock-acquisition failure -> `StillPending`
-            // (a truthful terminal cannot be built without the backend
-            // read).
+            // finalize through the SHARED decision
+            // ([`crate::kernel::transition::decide_terminal`]) with the
+            // TRUTHFUL per-slot observations (the plan's frozen snapshot
+            // is never converted into an observed fact). A lock-acquisition
+            // failure -> `StillPending` (a truthful terminal cannot be
+            // built without the backend read).
             let Some(evidence) =
                 collect_recovery_evidence(&attempt, helpers, &live_bindings, op_id)?
             else {
@@ -169,12 +176,13 @@ pub(crate) fn reconcile_pending_commits(
             // the intent's frozen binding): the binding check stays a
             // pre-finalizer check, but when it fails recovery acquires the
             // selected slots' guards, re-reads each slot's LIVE state, and
-            // finalizes `Degraded` with the truthful per-slot evidence
-            // (the binding the evidence records is the slot's CURRENT
-            // configured binding — a config fact — never the intent's
-            // frozen snapshot binding). A lock-acquisition failure ->
-            // `StillPending` (a truthful terminal cannot be built without
-            // the backend read).
+            // finalizes through the SHARED decision
+            // ([`crate::kernel::transition::decide_terminal`]) with the
+            // truthful per-slot evidence (the binding the evidence records
+            // is the slot's CURRENT configured binding — a config fact —
+            // never the intent's frozen snapshot binding). A lock-
+            // acquisition failure -> `StillPending` (a truthful terminal
+            // cannot be built without the backend read).
             let Some(evidence) =
                 collect_recovery_evidence(&attempt, helpers, &live_bindings, op_id)?
             else {
@@ -190,8 +198,9 @@ pub(crate) fn reconcile_pending_commits(
         // replay-safe finalizer as the main success path — with NO lineage
         // carve-out: the finalizer requires `intent.parent == current
         // successful head` (a drifted head is REFUSED and the attempt is
-        // finalized `Degraded` below — it can never overlay a newer head's
-        // inherited state on the logical history). A TRANSIENT
+        // finalized through the SHARED decision below — it can never
+        // overlay a newer head's inherited state on the logical history). A
+        // TRANSIENT
         // non-finalization (locks contended / live state not finalizable
         // right now) reports [`RecoveryOutcome::StillPending`] — the
         // attempt stays intent-only and the push REFUSES to plan on top.
@@ -213,13 +222,16 @@ pub(crate) fn reconcile_pending_commits(
             FinalizeOutcome::Refused { reason, .. } => {
                 // The finalizer ran and dropped its guards; recovery then
                 // ACQUIRES the selected slots' guards, re-reads each slot's
-                // live state, and finalizes `Degraded` with the TRUTHFUL
-                // backend observations. A slot whose live state sits at the
-                // desired generation keeps `Known(desired)` — because the
-                // BACKEND READ confirmed it, never because the plan desired
-                // it. A lock-acquisition failure -> `StillPending` (a
-                // truthful terminal cannot be built without the backend
-                // read).
+                // live state, and finalizes through the SHARED decision
+                // ([`crate::kernel::transition::decide_terminal`]) with the
+                // TRUTHFUL backend observations. A slot whose live state
+                // sits at the desired generation keeps `Known(desired)` —
+                // because the BACKEND READ confirmed it, never because the
+                // plan desired it; a slot whose live state is exactly its
+                // pre-push state settles `FailedRolledBack`, never
+                // `Degraded` (the review's fix). A lock-acquisition failure
+                // -> `StillPending` (a truthful terminal cannot be built
+                // without the backend read).
                 let Some(evidence) =
                     collect_recovery_evidence(&attempt, helpers, &live_bindings, op_id)?
                 else {
@@ -247,17 +259,22 @@ pub(crate) fn reconcile_pending_commits(
 /// BACKEND READ may create an OBSERVED fact, and a recovery terminal
 /// records observed facts only.
 ///
-/// THE DISPOSITION IS DECIDED BY THE ONE CLASSIFIER (the shared-type-
-/// forced recovery adjustment — the review's P1 rule): the evidence's
-/// deltas (vs the attempt's pre-push and DESIRED generations) decide — AT
-/// LEAST ONE `Desired`/`Diverged`/`Unknown` delta → `Degraded` (nonempty
-/// deltas); EVERY slot `Unchanged` (e.g. a binding drift whose live
-/// generations all still match pre-push) → `FailedRolledBack` — a Degraded
+/// THE DISPOSITION IS DECIDED BY THE ONE CLASSIFIER — the review's exact
+/// fix: the evidence-built outcomes are handed to
+/// [`crate::kernel::transition::decide_terminal`] — the SAME decision path
+/// uninterrupted execution uses, so recovery and normal execution produce
+/// the SAME terminal classification for the SAME evidence (never a direct
+/// `DegradedTerminal::try_new` construction that could manufacture a
+/// `Degraded` disposition for an exact-pre-push state). The decision
+/// derives the disposition from the evidence's deltas (vs the attempt's
+/// pre-push and DESIRED generations): EVERY slot `Unchanged` (the exact
+/// pre-push state — e.g. a binding drift whose live generations all still
+/// match pre-push, or a recovered attempt whose preflight-terminal append
+/// failed before anything mutated) → `FailedRolledBack` — a Degraded
 /// terminal with NO remaining change is unrepresentable (exactly the
 /// review's finding a Degraded disposition could contain no remaining
-/// changes). The follow-up feature formalizes recovery's decision through
-/// the same path; this is the minimal classification the shared type
-/// requires.
+/// changes); AT LEAST ONE `Desired`/`Diverged`/`Unknown` delta →
+/// `Degraded`.
 fn append_degraded(
     store: &LocalStore,
     target_name: &str,
@@ -265,7 +282,6 @@ fn append_degraded(
     per_slot_evidence: &BTreeMap<SlotId, RecoverySlotEvidence>,
     reason: &str,
 ) -> Result<()> {
-    use crate::kernel::terminal::{SlotDelta, outcome_slot_delta};
     let outcomes: BTreeMap<SlotId, SlotOutcome> = attempt
         .selected()
         .map(|(sid, _)| {
@@ -275,25 +291,30 @@ fn append_degraded(
             (sid.clone(), failed_outcome_from_evidence(evidence))
         })
         .collect();
-    let outcomes: SlotTable<SlotOutcome> = SlotTable::from_map(outcomes);
-    let has_remaining = outcomes
-        .iter()
-        .any(|(sid, o)| outcome_slot_delta(attempt, sid, o) != SlotDelta::Unchanged);
-    let disposition = if has_remaining {
-        let non_empty =
-            NonEmptySlotTable::build(outcomes.iter().map(|(k, v)| (k.clone(), v.clone())))
-                .map_err(|e| Error::integrity(format!("recovery degraded outcomes: {e}")))?;
-        let dt = DegradedTerminal::try_new(non_empty, attempt)
-            .map_err(|e| Error::integrity(format!("recovery degraded terminal: {e}")))?;
-        TerminalDisposition::Degraded(dt)
-    } else {
-        // Every slot is back at its pre-push state: the truthful
-        // disposition is FailedRolledBack (all-Unchanged deltas), never a
-        // Degraded terminal with no remaining change.
-        let frb = FailedRolledBackTerminal::try_new(outcomes, attempt)
-            .map_err(|e| Error::integrity(format!("recovery rolled-back terminal: {e}")))?;
-        TerminalDisposition::FailedRolledBack(frb)
-    };
+    // THE DECISION IS THE SINGLE CLASSIFICATION AUTHORITY: recovery builds
+    // the SAME `ExecutionReport::Failed` the engine's failure path builds
+    // (outcome keys EXACTLY covering the selected membership) and calls the
+    // SAME [`crate::kernel::transition::decide_terminal`]. The kernel owns
+    // the key-set check and the delta derivation; recovery never decides a
+    // disposition itself.
+    let non_empty = NonEmptySlotTable::build(outcomes).map_err(|e| {
+        Error::integrity(format!(
+            "recovery for '{}' failed-outcomes must cover the selected membership (nonempty): {e}",
+            attempt.deployment_id()
+        ))
+    })?;
+    let disposition = crate::kernel::transition::decide_terminal(
+        attempt,
+        crate::kernel::transition::ExecutionReport::Failed {
+            outcomes: non_empty,
+        },
+    )
+    .map_err(|e| {
+        Error::integrity(format!(
+            "recovery for '{}' refused a terminal disposition: {e}",
+            attempt.deployment_id()
+        ))
+    })?;
     let terminal = LedgerTerminal::new(
         crate::remote::helper::now_rfc3339_ts(),
         kernel::terminal::intent_digest(attempt),
@@ -516,7 +537,7 @@ mod tests {
     };
     use crate::kernel::intent::{PlanInput, PlannedDeploy};
     use crate::kernel::snapshot::{PreviousGeneration, SnapshotSlot};
-    use crate::kernel::terminal::SlotDelta;
+    use crate::kernel::terminal::{SlotDelta, TerminalDisposition};
     use crate::ledger::{DeploymentStatus, PhysicalBinding};
     use crate::remote::helper::{ExpectedCurrent, GenerationAssignment, RemoteHelper};
     use crate::remote::transport::{LocalTransport, Remote};
@@ -920,18 +941,69 @@ mod tests {
         third: GenerationId,
         backend: PropBackend,
         failure: PropFailure,
+        boundary: PropBoundary,
+    }
+
+    /// THE PERSISTENCE BOUNDARY whose failure left the attempt intent-only
+    /// (the review's acceptance dimension — generate failures at EVERY
+    /// persistence boundary crossed with the live-state evidence).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum PropBoundary {
+        /// The PREFLIGHT TERMINAL append failed — NOW PROPAGATED (the
+        /// review's fix): the push surfaces the append failure, the attempt
+        /// stays intent-only, and NOTHING was mutated, so the truthful
+        /// evidence is EXACTLY the original pre-push state (the review's P1
+        /// finding — this boundary's recovery MUST settle `FailedRolledBack`,
+        /// never `Degraded`).
+        PreflightTerminalAppend,
+        /// The COMMIT-MARKER write failed: the attempt's mutations are
+        /// visible on the live state, so the evidence follows the backend
+        /// read.
+        MarkerWrite,
+        /// The FINALIZER refused (a drifted head / diverged live state): the
+        /// evidence follows the backend read.
+        FinalizeRefusal,
+    }
+
+    fn arbitrary_boundary() -> impl Strategy<Value = PropBoundary> {
+        prop_oneof![
+            Just(PropBoundary::PreflightTerminalAppend),
+            Just(PropBoundary::MarkerWrite),
+            Just(PropBoundary::FinalizeRefusal),
+        ]
     }
 
     fn arbitrary_evidence_case() -> impl Strategy<Value = EvidenceCase> {
-        ("[a-z0-9]{1,14}", arbitrary_backend(), arbitrary_failure()).prop_map(
-            |(tag, backend, failure)| EvidenceCase {
-                desired: prop_gen(&tag),
-                pre_push: prop_gen(&format!("{tag}-p")),
-                third: prop_gen(&format!("{tag}-x")),
-                backend,
-                failure,
-            },
+        (
+            "[a-z0-9]{1,14}",
+            arbitrary_backend(),
+            arbitrary_failure(),
+            arbitrary_boundary(),
         )
+            .prop_map(|(tag, backend, failure, boundary)| {
+                // THE PREFLIGHT-TERMINAL-APPEND BOUNDARY (the review's P1
+                // scenario): the attempt never mutated a remote — the
+                // preflight failed before any `current` change and the
+                // FailedPreflight terminal append then failed, so the
+                // truthful evidence on the retry is EXACTLY the original
+                // pre-push state. The generated backend is pinned to
+                // `AtPrePush` for this boundary (its semantics, not an
+                // independent choice); the other boundaries keep the
+                // generated evidence.
+                let backend = if boundary == PropBoundary::PreflightTerminalAppend {
+                    PropBackend::AtPrePush
+                } else {
+                    backend
+                };
+                EvidenceCase {
+                    desired: prop_gen(&tag),
+                    pre_push: prop_gen(&format!("{tag}-p")),
+                    third: prop_gen(&format!("{tag}-x")),
+                    backend,
+                    failure,
+                    boundary,
+                }
+            })
     }
 
     /// A VALID first-push intent for the property: one selected slot (p1)
@@ -965,8 +1037,11 @@ mod tests {
         .expect("a valid evidence property intent plans")
     }
 
-    /// Drive ONE generated case through the PURE evidence machinery and the
-    /// REAL terminal construction; assert the spec's acceptance assertions.
+    /// Drive ONE generated case through the PURE evidence machinery, the
+    /// REAL terminal DECISION (the SAME [`crate::kernel::transition::
+    /// decide_terminal`] path recovery's `append_degraded` and normal
+    /// execution both use), and the REAL terminal construction; assert the
+    /// spec's acceptance assertions.
     fn run_evidence_case(case: EvidenceCase) {
         let EvidenceCase {
             desired,
@@ -974,6 +1049,7 @@ mod tests {
             third,
             backend,
             failure,
+            boundary,
         } = case;
         let slot = p1();
         // The generated cases deploy a CONFIGURED member slot: the
@@ -1090,55 +1166,116 @@ mod tests {
             ),
             "the degraded terminal stays the causal-agnostic Indeterminate — never Restored/Skipped without transaction evidence"
         );
-        let outcomes: SlotTable<SlotOutcome> =
-            SlotTable::from_map(BTreeMap::from([(slot.clone(), outcome)]));
-        let non_empty =
-            NonEmptySlotTable::build(outcomes.iter().map(|(k, v)| (k.clone(), v.clone())))
-                .expect("a single outcome builds a non-empty table");
+        let non_empty = NonEmptySlotTable::build(BTreeMap::from([(slot.clone(), outcome)]))
+            .expect("a single outcome builds a non-empty table");
 
-        // (5) THE NONEMPTY-DELTAS INVARIANT (the shared type's rule — the
-        // review's P1 fix): a Degraded terminal requires at least one
-        // `Desired`/`Diverged`/`Unknown` delta. An ALL-UNCHANGED evidence
-        // case (the backend reports every slot at its pre-push state) is
-        // REFUSED by the validator — a Degraded terminal can no longer
-        // contain NO remaining change (recovery's own decision rework — how
-        // the all-unchanged case must be disposed — is a FOLLOW-UP feature;
-        // the shared classifier/constructor rule is what THIS feature
-        // formalizes).
-        if class == SlotDelta::Unchanged {
-            let err = DegradedTerminal::try_new(non_empty, &intent).unwrap_err();
-            assert!(
-                err.to_string().contains("remaining change"),
-                "an all-Unchanged evidence set is refused as Degraded, got: {err}"
+        // (0) THE BOUNDARY SEMANTICS (the review's acceptance dimension): a
+        // PREFLIGHT-TERMINAL-APPEND failure left the attempt intent-only
+        // with NOTHING mutated — the truthful evidence is EXACTLY the
+        // original pre-push state (the generator pinned the backend to
+        // `AtPrePush`), so this boundary's recovery MUST settle
+        // `FailedRolledBack`, never `Degraded` (asserted below).
+        if boundary == PropBoundary::PreflightTerminalAppend {
+            assert_eq!(
+                backend,
+                PropBackend::AtPrePush,
+                "the preflight-terminal-append boundary never mutated the remote — the evidence is the original pre-push state"
             );
-            return;
         }
-        let dt = DegradedTerminal::try_new(non_empty, &intent)
-            .expect("a non-Unchanged evidence set builds a valid degraded terminal");
+
+        // (5) THE RECOVERY DISPOSITION IS DECIDED BY THE ONE CLASSIFIER —
+        // the SAME [`crate::kernel::transition::decide_terminal`] path as
+        // uninterrupted execution (the review's fix: recovery's
+        // `append_degraded` builds the outcomes from this evidence and hands
+        // them to the decision — never a direct `DegradedTerminal::try_new`
+        // construction that could manufacture a `Degraded` disposition for
+        // an exact-pre-push state). The decision derives the disposition
+        // from the evidence's deltas vs the intent's pre-push and DESIRED
+        // generations:
+        //
+        // * EVERY slot `Unchanged` — the EXACT PRE-PUSH STATE (including
+        //   the review's preflight-terminal-append-boundary scenario) →
+        //   `FailedRolledBack`, never `Degraded`;
+        // * AT LEAST ONE `Desired`/`Diverged`/`Unknown` delta → `Degraded`
+        //   (nonempty deltas).
+        let disposition = crate::kernel::transition::decide_terminal(
+            &intent,
+            crate::kernel::transition::ExecutionReport::Failed {
+                outcomes: non_empty,
+            },
+        )
+        .expect(
+            "recovery evidence covers exactly the selected membership — the decision accepts it",
+        );
+        match &disposition {
+            TerminalDisposition::FailedRolledBack(_) => {
+                assert_eq!(
+                    class,
+                    SlotDelta::Unchanged,
+                    "the exact pre-push state settles FailedRolledBack — never Degraded (backend {backend:?}, boundary {boundary:?})"
+                );
+                assert_eq!(
+                    disposition.status(),
+                    DeploymentStatus::FailedRolledBack,
+                    "an all-Unchanged evidence set decides FailedRolledBack (backend {backend:?}, boundary {boundary:?})"
+                );
+            }
+            TerminalDisposition::Degraded(_) => {
+                assert_ne!(
+                    class,
+                    SlotDelta::Unchanged,
+                    "a Degraded terminal requires at least one Desired/Diverged/Unknown delta (backend {backend:?}, boundary {boundary:?})"
+                );
+                assert_eq!(
+                    disposition.status(),
+                    DeploymentStatus::Degraded,
+                    "a non-Unchanged evidence set decides Degraded (backend {backend:?}, boundary {boundary:?})"
+                );
+            }
+            _ => panic!("a failure report never decides Successful/FailedPreflight"),
+        }
+
+        // (6) THE RECOVERED TERMINAL — what `append_degraded` appends (the
+        // decision's disposition, the case's recovery failure as the
+        // reason): SAME status and reason; ONLY the honestly-changed slots
+        // appear as remaining changes — the Unchanged class (observed ==
+        // pre-push) is never a remaining change, every
+        // Desired/Diverged/Unknown slot is.
+        let expected_status = disposition.status();
         let terminal = LedgerTerminal::new(
             crate::remote::helper::now_rfc3339_ts(),
             kernel::terminal::intent_digest(&intent),
-            TerminalDisposition::Degraded(dt),
+            disposition,
             Some(failure.reason().to_string()),
         );
-        assert_eq!(terminal.status(), DeploymentStatus::Degraded);
-        assert_eq!(terminal.reason(), Some(failure.reason()));
-
-        // (6) ONLY THE HONESTLY-CHANGED SLOTS APPEAR AS remaining_changes:
-        // the Unchanged class (observed == pre-push) is never a remaining
-        // change; every Desired/Diverged/Unknown slot is.
-        let remaining = terminal
-            .remaining_changes(&intent)
-            .expect("a Degraded terminal derives remaining changes");
         assert_eq!(
-            remaining.len(),
-            1,
-            "a non-Unchanged slot is the one remaining change ({class:?}, {backend:?})"
+            terminal.status(),
+            expected_status,
+            "the recovered terminal carries the DECISION's status (backend {backend:?}, boundary {boundary:?})"
         );
-        assert!(
-            remaining.contains_key(&slot),
-            "a {class:?} slot is a remaining change (its observed state differs from pre-push or is unknown)"
-        );
+        assert_eq!(terminal.reason(), Some(failure.reason()));
+        match &terminal.disposition() {
+            TerminalDisposition::Degraded(_) => {
+                let remaining = terminal
+                    .remaining_changes(&intent)
+                    .expect("a Degraded terminal derives remaining changes");
+                assert_eq!(
+                    remaining.len(),
+                    1,
+                    "a non-Unchanged slot is the one remaining change ({class:?}, {backend:?})"
+                );
+                assert!(
+                    remaining.contains_key(&slot),
+                    "a {class:?} slot is a remaining change (its observed state differs from pre-push or is unknown)"
+                );
+            }
+            _ => {
+                assert!(
+                    terminal.remaining_changes(&intent).is_none(),
+                    "a FailedRolledBack terminal derives no remaining changes"
+                );
+            }
+        }
     }
 
     /// THE BINDING-JUDGMENT CALL, pinned: a selected slot that is NO LONGER
@@ -1178,7 +1315,15 @@ mod tests {
     proptest! {
         // THE SPEC'S ACCEPTANCE GATE (bounded cases, fixed seed, no failure
         // persistence — house style): every generated (desired, pre-push,
-        // backend result, recovery failure) case yields a recovered degraded
+        // backend result, recovery failure, persistence boundary) case —
+        // failures at EVERY persistence boundary (the preflight terminal
+        // append — NOW PROPAGATED, the marker writes, the finalize refusal;
+        // the intent-append boundary is the fourth: it leaves NO pending
+        // attempt to classify and the push reports the append failure —
+        // pinned by the integration fault test
+        // [`intent_persist_fault_leaves_remote_untouched`]) crossed with the
+        // live-state evidence (original pre-push / desired /
+        // third generation / absent / read-error) — yields a recovered
         // terminal whose per-slot observations are the BACKEND's facts — a
         // `Known` observed generation implies a successful backend read of
         // that generation (the terminal NEVER shows the desired state when
@@ -1186,9 +1331,13 @@ mod tests {
         // yields `KnownAbsent`, a failed read `Unknown(error)`; the binding
         // is `Known` (the slot's current configured binding) under the same
         // successful read; a slot verified at its desired generation through
-        // a backend read preserves that verified evidence; and only the
-        // honestly-changed (non-Unchanged) slots appear as remaining
-        // changes.
+        // a backend read preserves that verified evidence; and the terminal
+        // class follows THE ONE DECISION — recovery and uninterrupted
+        // execution produce the SAME classification for the SAME evidence:
+        // the EXACT PRE-PUSH state (including the preflight-terminal-append
+        // boundary) settles `FailedRolledBack` (never `Degraded`), any
+        // Desired/Diverged/Unknown delta settles `Degraded` with exactly
+        // those slots as remaining changes.
         #![proptest_config(ProptestConfig {
             cases: 64,
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
