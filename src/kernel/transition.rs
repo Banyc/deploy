@@ -72,7 +72,7 @@
 //! the head by construction), and it still guards the checkpoint window.
 
 use crate::identity::{DeploymentId, SlotId, TargetName, Timestamp};
-use crate::kernel::error::{KernelError, KernelResult};
+use crate::kernel::error::{ConflictError, IntegrityError, KernelError, KernelResult};
 use crate::kernel::intent::DeploymentIntent;
 use crate::kernel::terminal::{
     DegradedTerminal, FailedRolledBackTerminal, LedgerTerminal, TerminalDisposition,
@@ -222,9 +222,9 @@ impl DeploymentState {
             return Ok(None);
         };
         let pos = self.by_id.get(head).ok_or_else(|| {
-            KernelError::integrity(format!(
+            KernelError::Integrity(IntegrityError::Message(format!(
                 "the maintained successful head '{head}' has no entry in the state — the state machine invariant is broken"
-            ))
+            )))
         })?;
         crate::kernel::snapshot::resolve_snapshot(&self.entries[*pos]).map(Some)
     }
@@ -243,11 +243,12 @@ impl DeploymentState {
             return Ok(());
         };
         let Some(&pos) = self.by_id.get(&cp.retained_from) else {
-            return Err(KernelError::integrity(format!(
-                "a checkpointed ledger's retained suffix must start at the checkpoint deployment '{retained}' — discarding {discarded} entries — but no entry for it exists in the retained suffix",
-                retained = cp.retained_from,
-                discarded = cp.discarded,
-            )));
+            return Err(KernelError::Integrity(
+                IntegrityError::CheckpointAnchorMismatch {
+                    retained_from: cp.retained_from.clone(),
+                    first_intent: None,
+                },
+            ));
         };
         let entry = &self.entries[pos];
         let success = entry
@@ -255,10 +256,12 @@ impl DeploymentState {
             .as_ref()
             .is_some_and(|t| t.status() == DeploymentStatus::Successful);
         if !success {
-            return Err(KernelError::integrity(format!(
-                "a checkpointed ledger's retained suffix starts at deployment '{}' but it was never finalized `Successful` — a checkpoint requires its anchor (the oldest retained entry) to be a successful deployment",
-                entry.deployment_id
-            )));
+            return Err(KernelError::Integrity(
+                IntegrityError::CheckpointAnchorMismatch {
+                    retained_from: cp.retained_from.clone(),
+                    first_intent: Some(entry.deployment_id.clone()),
+                },
+            ));
         }
         Ok(())
     }
@@ -278,11 +281,11 @@ pub fn apply_event(
             // ledger (the atomic suffix replacement produces a ledger whose
             // first line is the checkpoint event).
             if !state.entries.is_empty() || state.checkpoint.is_some() {
-                return Err(KernelError::integrity(format!(
+                return Err(KernelError::Integrity(IntegrityError::Message(format!(
                     "a checkpoint event must be the first event of a ledger — deployment '{}' retained at position {}",
                     cp.retained_from,
                     state.entries.len()
-                )));
+                ))));
             }
             state.checkpoint = Some(cp);
             state.lines += 1;
@@ -291,18 +294,19 @@ pub fn apply_event(
         LedgerEvent::Intent(IntentEvent { intent }) => {
             // ONE INTENT PER DEPLOYMENT (event-store rule).
             if intent.target() != &state.target {
-                return Err(KernelError::integrity(format!(
+                return Err(KernelError::Integrity(IntegrityError::Message(format!(
                     "an intent for deployment '{}' names target '{}' but the ledger is for target '{}'",
                     intent.deployment_id(),
                     intent.target(),
                     state.target
-                )));
+                ))));
             }
-            if state.by_id.contains_key(intent.deployment_id()) {
-                return Err(KernelError::integrity(format!(
-                    "two intent events for deployment '{}' — the ledger is keyed by deployment id (one intent per deployment)",
-                    intent.deployment_id()
-                )));
+            if let Some(&first_pos) = state.by_id.get(intent.deployment_id()) {
+                return Err(KernelError::Integrity(IntegrityError::DuplicateIntent {
+                    deployment: intent.deployment_id().clone(),
+                    first_line: state.entries[first_pos].seq as usize + 1,
+                    duplicate_line: state.next_seq() as usize + 1,
+                }));
             }
             // THE STRICT-LINEAR LINEAGE GATE (intent-append time — the
             // spec's authoritative check; the terminal-time one-parent scan
@@ -319,9 +323,9 @@ pub fn apply_event(
             if anchor {
                 // The anchor is the FIRST intent of the retained suffix.
                 if !state.entries.is_empty() {
-                    return Err(KernelError::integrity(format!(
+                    return Err(KernelError::Integrity(IntegrityError::Message(format!(
                         "the checkpoint anchor deployment '{deployment_id}' must be the first intent of the retained suffix — the checkpointed ledger's history starts at it"
-                    )));
+                    ))));
                 }
             } else {
                 // The first intent after a checkpoint MUST be the anchor
@@ -329,10 +333,10 @@ pub fn apply_event(
                 if let Some(cp) = &state.checkpoint
                     && state.entries.is_empty()
                 {
-                    return Err(KernelError::integrity(format!(
+                    return Err(KernelError::Integrity(IntegrityError::Message(format!(
                         "the first intent after a checkpoint must be the checkpoint deployment '{retained}' (retained_from) — the retained suffix starts at it, got deployment '{deployment_id}'",
                         retained = cp.retained_from
-                    )));
+                    ))));
                 }
                 // AT MOST ONE PENDING ATTEMPT AT ANY TIME: an unresolved
                 // (terminal-less) intent exists — an ordinary intent is
@@ -340,25 +344,24 @@ pub fn apply_event(
                 // the previous pending attempt NEVER plans a second intent
                 // on top, even for disjoint groups.
                 if let Some(pending) = &state.pending {
-                    return Err(KernelError::integrity(format!(
+                    return Err(KernelError::Integrity(IntegrityError::Message(format!(
                         "intent for deployment '{}' of target '{}' refused: {:?} — a pending deployment '{pending}' already exists with no terminal; the successful history is strictly linear (at most one unresolved intent at a time)",
                         deployment_id,
                         state.target,
                         crate::kernel::LineageViolation::PendingAttemptExists,
-                    )));
+                    ))));
                 }
                 // THE PARENT MUST BE THE CURRENT SUCCESSFUL HEAD AT INTENT-
                 // APPEND TIME (item 4 of the spec). `None == None` for a
                 // fresh target's first intent.
                 if intent.parent() != state.successful_head.as_ref() {
-                    return Err(KernelError::integrity(format!(
-                        "intent for deployment '{}' of target '{}' refused: {:?} — it derives from parent {:?} but the target's successful head is {:?}; every ordinary intent's parent must equal the current successful head at intent-append time",
-                        deployment_id,
-                        state.target,
-                        crate::kernel::LineageViolation::ParentMismatch,
-                        intent.parent(),
-                        state.successful_head,
-                    )));
+                    return Err(KernelError::Integrity(
+                        IntegrityError::ParentLineageMismatch {
+                            deployment: deployment_id.clone(),
+                            parent: intent.parent().cloned(),
+                            expected_head: state.successful_head.clone(),
+                        },
+                    ));
                 }
                 // INHERITED-SLOT CONGRUENCE (item 4 of the spec): every
                 // slot NOT in the intent's selected membership must equal the
@@ -395,22 +398,28 @@ pub fn apply_event(
             // equality rule, validated HERE as the semantic transition).
             let digest = terminal.intent_digest().clone();
             let pos = state.by_id.get(&deployment_id).copied().ok_or_else(|| {
-                KernelError::integrity(format!(
-                    "a terminal event for deployment '{deployment_id}' has no intent line — a terminal requires its durable intent"
-                ))
+                KernelError::Integrity(IntegrityError::TerminalWithoutIntent {
+                    deployment: deployment_id.clone(),
+                    line: state.next_seq() as usize + 1,
+                })
             })?;
             let entry = &state.entries[pos];
             if crate::kernel::terminal::intent_digest(&entry.intent) != digest {
-                return Err(KernelError::integrity(format!(
-                    "terminal for deployment '{deployment_id}' binds intent digest {digest} but the intent's canonical digest is {} — a terminal must bind the EXACT canonical intent",
-                    crate::kernel::terminal::intent_digest(&entry.intent)
-                )));
+                return Err(KernelError::Integrity(
+                    IntegrityError::IntentDigestMismatch {
+                        deployment: deployment_id.clone(),
+                        expected: crate::kernel::terminal::intent_digest(&entry.intent),
+                        recorded: digest,
+                    },
+                ));
             }
             // AT MOST ONE TERMINAL PER INTENT (event-store rule).
             if entry.terminal.is_some() {
-                return Err(KernelError::integrity(format!(
-                    "two terminal events for deployment '{deployment_id}' — the terminal event is written exactly once"
-                )));
+                return Err(KernelError::Integrity(IntegrityError::DuplicateTerminal {
+                    deployment: deployment_id.clone(),
+                    first_line: entry.seq as usize + 2,
+                    duplicate_line: state.next_seq() as usize + 1,
+                }));
             }
             validate_terminal_vs_intent(entry, &terminal)?;
             // THE TERMINAL MUST BELONG TO THE PENDING ATTEMPT (item 5 of the
@@ -419,10 +428,10 @@ pub fn apply_event(
             // terminal for any other deployment is corruption (a strictly
             // linear ledger settles exactly the pending attempt).
             if state.pending.as_ref() != Some(&deployment_id) {
-                return Err(KernelError::integrity(format!(
+                return Err(KernelError::Integrity(IntegrityError::Message(format!(
                     "terminal for deployment '{deployment_id}' does not belong to the outstanding pending attempt ({:?}) — the successful history is strictly linear: a terminal must settle the one pending intent",
                     state.pending
-                )));
+                ))));
             }
             // THE CHECKPOINT ANCHOR MUST BE FINALIZED `Successful` (item 7
             // of the spec): a checkpointed ledger's retained suffix starts at
@@ -435,9 +444,12 @@ pub fn apply_event(
                 .is_some_and(|cp| cp.retained_from == deployment_id)
                 && !terminal.disposition().is_successful()
             {
-                return Err(KernelError::integrity(format!(
-                    "the checkpoint anchor deployment '{deployment_id}' must be finalized `Successful` — a checkpointed ledger's retained suffix starts at a successful deployment"
-                )));
+                return Err(KernelError::Integrity(
+                    IntegrityError::CheckpointAnchorMismatch {
+                        retained_from: deployment_id.clone(),
+                        first_intent: Some(deployment_id.clone()),
+                    },
+                ));
             }
             // THE ONE-PARENT RULE (the state machine's `Successful` gate —
             // now a DEFENSIVE re-check, subsumed by the intent-append gates
@@ -458,10 +470,11 @@ pub fn apply_event(
                         })
                 });
                 if already {
-                    return Err(KernelError::conflict(format!(
-                        "stale plan: deployment '{}' of target '{}' derives from parent {:?}, which already produced a successful deployment — at most ONE Successful per parent; a stale plan is refused, never reconciled implicitly",
-                        entry.deployment_id, state.target, parent
-                    )));
+                    return Err(KernelError::Conflict(ConflictError::ParentMismatch {
+                        deployment: entry.deployment_id.clone(),
+                        recorded_parent: parent,
+                        actual_head: state.successful_head.clone(),
+                    }));
                 }
             }
             let mut entry = state.entries[pos].clone();
@@ -505,29 +518,29 @@ pub fn validate_terminal_vs_intent(
     let outcome_keys: BTreeSet<SlotId> = terminal.outcomes().keys().cloned().collect();
     for key in &outcome_keys {
         if !selected.contains(key) {
-            return Err(KernelError::integrity(format!(
+            return Err(KernelError::Integrity(IntegrityError::Message(format!(
                 "terminal for deployment '{}' records an outcome for slot '{key}' outside the intent's selected membership — every outcome must name a selected slot",
                 entry.deployment_id
-            )));
+            ))));
         }
     }
     match terminal.disposition() {
         TerminalDisposition::Successful | TerminalDisposition::FailedPreflight => {
             if !outcome_keys.is_empty() {
-                return Err(KernelError::integrity(format!(
+                return Err(KernelError::Integrity(IntegrityError::Message(format!(
                     "terminal {:?} for deployment '{}' carries outcomes for slots {outcome_keys:?} — a payload-free disposition records none",
                     terminal.status(),
                     entry.deployment_id
-                )));
+                ))));
             }
         }
         TerminalDisposition::FailedRolledBack(_) | TerminalDisposition::Degraded(_) => {
             if outcome_keys != selected {
-                return Err(KernelError::integrity(format!(
+                return Err(KernelError::Integrity(IntegrityError::Message(format!(
                     "terminal {:?} for deployment '{}' carries outcomes for slots {outcome_keys:?} but its intent's selected membership is {selected:?} — every selected slot has exactly one outcome, no extras",
                     terminal.status(),
                     entry.deployment_id
-                )));
+                ))));
             }
         }
     }
@@ -558,22 +571,24 @@ pub fn validate_inherited_slots(
             continue;
         }
         let inherited = resulting.get(&slot).ok_or_else(|| {
-            KernelError::integrity(format!(
+            KernelError::Integrity(IntegrityError::Message(format!(
                 "intent for deployment '{}' carries no resulting entry for inherited slot '{slot}' — the resulting snapshot must cover its full membership",
                 intent.deployment_id()
-            ))
+            )))
         })?;
         let head_entry = head_snapshot.get(&slot).ok_or_else(|| {
-            KernelError::integrity(format!(
+            KernelError::Integrity(IntegrityError::Message(format!(
                 "intent for deployment '{}' inherits slot '{slot}' but the successful head's snapshot has no entry for it — an inherited slot must reproduce an existing head entry",
                 intent.deployment_id()
-            ))
+            )))
         })?;
         if inherited != head_entry {
-            return Err(KernelError::integrity(format!(
-                "intent for deployment '{}' inherits slot '{slot}' with an entry that differs from the successful head's snapshot — an intent's inherited entries must equal the head it claims (stale plan or tampered wire)",
-                intent.deployment_id()
-            )));
+            return Err(KernelError::Integrity(
+                IntegrityError::InheritedSnapshotMismatch {
+                    deployment: intent.deployment_id().clone(),
+                    slot,
+                },
+            ));
         }
     }
     Ok(())
@@ -645,9 +660,9 @@ pub fn decide_terminal(
             let selected: BTreeSet<SlotId> = intent.selected_membership();
             let keys: BTreeSet<SlotId> = outcomes.keys().cloned().collect();
             if keys != selected {
-                return Err(KernelError::integrity(format!(
+                return Err(KernelError::Integrity(IntegrityError::Message(format!(
                     "the failure outcomes cover slots {keys:?} but the intent's selected membership is {selected:?} — the failed evidence must EXACTLY cover the selected membership"
-                )));
+                ))));
             }
             // 2. DERIVE the disposition from the outcomes' DERIVED
             // transitions (NO all_restored boolean): rolled-back iff NO

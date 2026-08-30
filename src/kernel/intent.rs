@@ -37,7 +37,7 @@
 use crate::identity::{
     BehaviorDigest, DeploymentId, RolloutGroupName, SlotId, TargetName, Timestamp,
 };
-use crate::kernel::error::{KernelError, KernelResult};
+use crate::kernel::error::{IntegrityError, KernelError, KernelResult};
 use crate::kernel::snapshot::{PreviousGeneration, SnapshotSlot};
 use crate::ledger::{NonEmptySlotTable, Observation, TargetSnapshot};
 use std::collections::{BTreeMap, BTreeSet};
@@ -420,14 +420,14 @@ pub(crate) fn from_wire(
         .map(|(k, _)| k.clone())
         .collect();
     if selected.is_empty() {
-        return Err(KernelError::integrity(
-            "an intent must carry at least one Deploy slot",
-        ));
+        return Err(KernelError::Integrity(IntegrityError::Message(
+            "an intent must carry at least one Deploy slot".to_string(),
+        )));
     }
     if group.is_none() && slots.iter().any(|(_, p)| !p.is_deploy()) {
-        return Err(KernelError::integrity(
-            "a full push (group None) requires every slot to be Deploy",
-        ));
+        return Err(KernelError::Integrity(IntegrityError::Message(
+            "a full push (group None) requires every slot to be Deploy".to_string(),
+        )));
     }
     Ok(DeploymentIntent {
         deployment_id,

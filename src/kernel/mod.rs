@@ -40,7 +40,12 @@
 //!   advances the head; the checkpoint anchor is the one exception) with NO
 //!   bypass — recovery is a caller of the same transition, so a stale plan
 //!   can never append `Successful`.
-//! * **[`error`]** — the five error classes every kernel error belongs to.
+//! * **[`error`]** — the five error classes every kernel error belongs to,
+//!   the stable [`KernelErrorCode`] naming WHICH semantic rule failed, and
+//!   the typed evidence fields (deployment ids, physical line numbers,
+//!   digests, slot ids) each typed variant carries — class = who should
+//!   react, code = which semantic rule failed, typed fields = the concrete
+//!   evidence.
 //!
 //! The LEDGER LAYER is reduced to a strict event store (strict parsing,
 //! duplicate-key rejection, event ordering, one intent per deployment, at
@@ -58,7 +63,7 @@ pub mod transition;
 
 pub use error::{
     ConflictError, InputError, IntegrityError, InvariantError, KernelError, KernelErrorClass,
-    KernelResult, TransportError,
+    KernelErrorCode, KernelResult, TransportError,
 };
 pub use intent::{DeploymentIntent, PlanInput, PlannedDeploy, PlannedSlot, SlotAction, plan};
 pub use lineage::LineageViolation;

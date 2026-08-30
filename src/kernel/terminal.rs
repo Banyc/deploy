@@ -24,7 +24,7 @@
 //!   non-restored/unknown result.
 
 use crate::identity::Timestamp;
-use crate::kernel::error::{KernelError, KernelResult};
+use crate::kernel::error::{ConflictError, IntegrityError, KernelError, KernelResult};
 use crate::kernel::intent::DeploymentIntent;
 use crate::ledger::NonEmptySlotTable;
 use crate::ledger::records::{Observation, SlotOutcome, SlotTable};
@@ -48,9 +48,9 @@ impl FailedRolledBackTerminal {
     pub fn try_new(outcomes: SlotTable<SlotOutcome>) -> KernelResult<Self> {
         for (slot, o) in outcomes.iter() {
             if o.transition() == crate::ledger::records::SlotTransition::Advanced {
-                return Err(KernelError::integrity(format!(
+                return Err(KernelError::Integrity(IntegrityError::Message(format!(
                     "a FailedRolledBack terminal cannot carry slot '{slot}' with an Advanced outcome — every attempted mutation must be restored or never advanced"
-                )));
+                ))));
             }
         }
         Ok(Self { outcomes })
@@ -83,9 +83,10 @@ impl DegradedTerminal {
                 || matches!(o.observation(), Observation::Unknown(_))
         });
         if !has_remaining {
-            return Err(KernelError::integrity(
-                "a Degraded terminal requires at least one non-restored/unknown result — an all-restored attempt is FailedRolledBack, never Degraded",
-            ));
+            return Err(KernelError::Integrity(IntegrityError::Message(
+                "a Degraded terminal requires at least one non-restored/unknown result — an all-restored attempt is FailedRolledBack, never Degraded"
+                    .to_string(),
+            )));
         }
         Ok(Self { outcomes })
     }
@@ -355,13 +356,11 @@ pub fn assert_parent_is_head(
 ) -> KernelResult<()> {
     let parent = intent.parent();
     if parent.is_some() != current_head.is_some() || parent != current_head {
-        return Err(KernelError::conflict(format!(
-            "stale plan: deployment '{}' of target '{}' derives from parent {:?} but the target's successful head is {:?} — replan against the current head; concurrent group plans are never merged automatically",
-            intent.deployment_id(),
-            intent.target(),
-            parent,
-            current_head
-        )));
+        return Err(KernelError::Conflict(ConflictError::ParentMismatch {
+            deployment: intent.deployment_id().clone(),
+            recorded_parent: parent.cloned(),
+            actual_head: current_head.cloned(),
+        }));
     }
     Ok(())
 }

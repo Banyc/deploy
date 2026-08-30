@@ -88,10 +88,12 @@ pub fn resolve_snapshot(
     use crate::kernel::terminal::TerminalDisposition;
     match entry.terminal.as_ref().map(|t| t.disposition()) {
         Some(TerminalDisposition::Successful) => Ok(entry.intent.resulting_snapshot()),
-        _ => Err(crate::kernel::error::KernelError::integrity(format!(
-            "deployment '{}' of target '{}' is not successful — only a successful deployment carries a resolving snapshot",
-            entry.deployment_id, entry.target
-        ))),
+        _ => Err(crate::kernel::error::KernelError::Integrity(
+            crate::kernel::error::IntegrityError::Message(format!(
+                "deployment '{}' of target '{}' is not successful — only a successful deployment carries a resolving snapshot",
+                entry.deployment_id, entry.target
+            )),
+        )),
     }
 }
 

@@ -18,6 +18,7 @@
 
 use crate::error::{Error, Result};
 use crate::identity::{GenerationRef, OperationId, PlacementSlotAssignment, SlotId};
+use crate::kernel::error::{ConflictError, KernelError};
 // The re-exports keep the pre-kernel `crate::ledger::finalize::X` paths
 // resolving for consumers: the wire intent/terminal shapes, the derived
 // snapshot value, and the physical binding.
@@ -88,7 +89,7 @@ pub fn finalize_successful_locked(
             .next()
             .unwrap_or_else(|| SlotId::new("no-slot".to_string()));
         return Ok(FinalizeOutcome::Refused {
-            reason: parent_error.message().to_string(),
+            reason: parent_error.message(),
             slot,
         });
     }
@@ -98,7 +99,7 @@ pub fn finalize_successful_locked(
     for sid in &selected {
         let Some(helper) = helpers.get(sid) else {
             return Ok(FinalizeOutcome::Refused {
-                reason: "state diverged".to_string(),
+                reason: state_diverged_reason(sid),
                 slot: sid.clone(),
             });
         };
@@ -110,7 +111,7 @@ pub fn finalize_successful_locked(
     match verify_selected_locked(helpers, attempt)? {
         LockedObservation::Diverged(slot) => {
             return Ok(FinalizeOutcome::Refused {
-                reason: "state diverged".to_string(),
+                reason: state_diverged_reason(&slot),
                 slot,
             });
         }
@@ -141,7 +142,7 @@ pub fn finalize_successful_locked(
         LockedObservation::Verified(o) => o,
         LockedObservation::Diverged(slot) => {
             return Ok(FinalizeOutcome::Refused {
-                reason: "state diverged".to_string(),
+                reason: state_diverged_reason(&slot),
                 slot,
             });
         }
@@ -177,8 +178,13 @@ pub fn finalize_successful_locked(
         &terminal,
     ) {
         Ok(()) => Ok(FinalizeOutcome::Finalized),
-        Err(Error::Conflict(message)) => Ok(FinalizeOutcome::Refused {
-            reason: message,
+        // The store mirror routes the stale-plan refusal through the TYPED
+        // facade error ([`Error::Kernel`] carrying the complete
+        // [`ConflictError::ParentMismatch`] evidence); the structured
+        // refusal reason stays the kernel's Display sentence (the stale-plan
+        // source the caller records on the degraded terminal).
+        Err(Error::Kernel(KernelError::Conflict(conflict))) => Ok(FinalizeOutcome::Refused {
+            reason: conflict.to_string(),
             slot: selected
                 .first()
                 .cloned()
@@ -205,6 +211,15 @@ pub enum FinalizeOutcome {
 enum LockedObservation {
     Verified(BTreeMap<SlotId, GenerationRef>),
     Diverged(SlotId),
+}
+
+/// THE FINALIZER'S "STATE DIVERGED" REASON: a selected slot's live state no
+/// longer matches the plan is a [`ConflictError::TopologyChanged`] refusal
+/// (the CONFLICT class — a valid operation against concurrently changed
+/// state), its Display sentence (keeping the "state diverged" keyword) is
+/// the refused reason the caller records on the degraded terminal.
+fn state_diverged_reason(slot: &SlotId) -> String {
+    KernelError::Conflict(ConflictError::TopologyChanged { slot: slot.clone() }).message()
 }
 fn verify_selected_locked(
     helpers: &HashMap<SlotId, RemoteHelper>,

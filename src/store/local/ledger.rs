@@ -12,6 +12,7 @@
 
 use crate::error::{Error, Result};
 use crate::identity::{DeploymentId, TargetName};
+use crate::kernel::error::{ConflictError, IntegrityError, KernelError};
 use crate::kernel::terminal;
 use crate::kernel::transition::{
     CheckpointEvent, DeploymentState, IntentEvent, LedgerEvent, TerminalEvent,
@@ -36,42 +37,48 @@ use crate::testutil::test_faults::FaultKind;
 /// immediately readable. `entries` is the ledger WITHOUT the terminal being
 /// validated (its entry is still terminal-less).
 fn validate_terminal_append(
-    target: &str,
+    _target: &str,
     entries: &[LedgerEntry],
     entry: &LedgerEntry,
     terminal: &LedgerTerminal,
 ) -> Result<()> {
     // THE INTENT_DIGEST BINDING (event-store rule): the terminal must bind
-    // the EXACT canonical intent.
+    // the EXACT canonical intent. Refused with the typed
+    // [`IntegrityError::IntentDigestMismatch`] through the [`Error::Kernel`]
+    // facade (the complete typed error preserved, class + code + the
+    // expected vs recorded digests).
     if terminal.intent_digest().as_str() != terminal::intent_digest(&entry.intent).as_str() {
-        return Err(Error::integrity(format!(
-            "ledger of target '{target}': terminal for deployment '{}' binds intent digest {} but the intent's canonical digest is {} — a terminal must bind the exact canonical intent",
-            entry.deployment_id,
-            terminal.intent_digest(),
-            terminal::intent_digest(&entry.intent)
+        return Err(Error::Kernel(KernelError::Integrity(
+            IntegrityError::IntentDigestMismatch {
+                deployment: entry.deployment_id.clone(),
+                expected: terminal::intent_digest(&entry.intent),
+                recorded: terminal.intent_digest().clone(),
+            },
         )));
     }
     // THE SEMANTIC TRANSITION (delegated to the kernel): the disposition's
     // outcome payload must agree with the entry's intent (outcome keys ⊆
-    // selected; suspicion-specific coverage).
-    crate::kernel::transition::validate_terminal_vs_intent(entry, terminal).map_err(|e| {
-        Error::integrity(format!(
-            "ledger of target '{target}' refuses a terminal event: {e}"
-        ))
-    })?;
+    // selected; suspicion-specific coverage). The kernel refusal is
+    // preserved through the facade (an Integrity-class message-only
+    // refusal), never flattened.
+    crate::kernel::transition::validate_terminal_vs_intent(entry, terminal)
+        .map_err(Error::Kernel)?;
     // THE STRICTLY-LINEAR TERMINAL MIRROR (item 5 of the spec): a terminal
     // must settle the ONE pending intent — no OTHER entry may still be
     // terminal-less (a second unresolved attempt would make this terminal an
     // impossible event). Refused at the write boundary as a Conflict (a valid
     // append against an impossible state is refused before any write; the
-    // ledger bytes stay unchanged).
-    let others_pending = entries
+    // ledger bytes stay unchanged) with the typed
+    // [`ConflictError::PendingAttemptExists`] evidence (the still-pending
+    // deployment).
+    let pending = entries
         .iter()
-        .any(|e| e.deployment_id != entry.deployment_id && e.terminal.is_none());
-    if others_pending {
-        return Err(Error::conflict(format!(
-            "ledger of target '{target}' refuses the terminal for deployment '{}': another deployment in this ledger is still pending — the successful history is strictly linear (at most one unresolved intent at a time), and a terminal must settle the outstanding pending attempt",
-            entry.deployment_id
+        .find(|e| e.deployment_id != entry.deployment_id && e.terminal.is_none());
+    if let Some(pending) = pending {
+        return Err(Error::Kernel(KernelError::Conflict(
+            ConflictError::PendingAttemptExists {
+                pending: pending.deployment_id.clone(),
+            },
         )));
     }
     // THE ONE-PARENT RULE, mirroring the kernel's state machine
@@ -82,7 +89,7 @@ fn validate_terminal_append(
     // pending at a time and `parent == head` at intent-append time — but it
     // remains the ATOMIC last line of defense under the target lock: for any
     // given parent at most ONE plan can ever append `Successful`, and a stale
-    // finalizer is refused with the kernel's [`KernelError::Conflict`]
+    // finalizer is refused with the kernel's [`ConflictError::ParentMismatch`]
     // (StalePlan), never reconciled implicitly, never successful.
     if terminal.disposition().is_successful() {
         let already = entries.iter().any(|e| {
@@ -93,10 +100,21 @@ fn validate_terminal_append(
                 })
         });
         if already {
-            return Err(Error::conflict(format!(
-                "ledger of target '{target}' refuses the Successful terminal for deployment '{}': stale plan: its parent {:?} already produced a successful deployment — at most ONE Successful per parent; a stale plan is refused, never reconciled implicitly",
-                entry.deployment_id,
-                entry.intent.parent()
+            let actual_head = entries
+                .iter()
+                .rev()
+                .find(|e| {
+                    e.terminal
+                        .as_ref()
+                        .is_some_and(|t| t.status() == DeploymentStatus::Successful)
+                })
+                .map(|e| e.deployment_id.clone());
+            return Err(Error::Kernel(KernelError::Conflict(
+                ConflictError::ParentMismatch {
+                    deployment: entry.deployment_id.clone(),
+                    recorded_parent: entry.intent.parent().cloned(),
+                    actual_head,
+                },
             )));
         }
     }
@@ -118,22 +136,28 @@ fn validate_terminal_append(
 /// * [`validate_inherited_slots`]: every inherited slot must equal the
 ///   head's snapshot entry.
 ///
-/// At the WRITE boundary these are [`Error::conflict`] refusals (a valid
-/// operation against stale or concurrently changed state); the READ path (the
-/// fold in `read_ledger`) classifies the same violations as persisted-data
-/// corruption ([`Error::integrity`]).
+/// At the WRITE boundary these are [`Error::Kernel`] **Conflict** refusals
+/// (a valid operation against stale or concurrently changed state) carrying
+/// the typed evidence ([`ConflictError::PendingAttemptExists`] /
+/// [`ConflictError::ParentMismatch`]); the READ path (the fold in
+/// `read_ledger`) classifies the same violations as persisted-data
+/// corruption (Integrity). The inherited-slot congruence is the one
+/// exception: [`ConflictError`] carries no inherited variant (the typed
+/// [`IntegrityError::InheritedSnapshotMismatch`] is a READ form), so the
+/// write mirror keeps the message-form Conflict for that refusal — the
+/// class mapping and prose preserved exactly as before; the typed form
+/// surfaces on the read path and in the semantic-mutation property.
 fn validate_intent_append(
-    target: &str,
+    _target: &str,
     entries: &[LedgerEntry],
     intent: &DeploymentIntent,
 ) -> Result<()> {
     // (1) PendingAttemptExists: at most ONE unresolved intent at a time.
     if let Some(pending) = entries.iter().find(|e| e.terminal.is_none()) {
-        return Err(Error::conflict(format!(
-            "ledger of target '{target}' refuses the intent for deployment '{}': {:?} — a previous deployment '{}' is still pending (its intent has no terminal); the successful history is strictly linear, so a push cannot plan a second intent while an earlier attempt is unresolved — reconcile the pending attempt first",
-            intent.deployment_id(),
-            crate::kernel::LineageViolation::PendingAttemptExists,
-            pending.deployment_id,
+        return Err(Error::Kernel(KernelError::Conflict(
+            ConflictError::PendingAttemptExists {
+                pending: pending.deployment_id.clone(),
+            },
         )));
     }
     // (2) ParentMismatch: the parent must be the current successful head.
@@ -147,12 +171,12 @@ fn validate_intent_append(
         })
         .map(|e| &e.deployment_id);
     if intent.parent() != head {
-        return Err(Error::conflict(format!(
-            "ledger of target '{target}' refuses the intent for deployment '{}': {:?} — it derives from parent {:?} but the target's successful head is {:?}; every intent's parent must equal the current successful head at append time",
-            intent.deployment_id(),
-            crate::kernel::LineageViolation::ParentMismatch,
-            intent.parent(),
-            head,
+        return Err(Error::Kernel(KernelError::Conflict(
+            ConflictError::ParentMismatch {
+                deployment: intent.deployment_id().clone(),
+                recorded_parent: intent.parent().cloned(),
+                actual_head: head.cloned(),
+            },
         )));
     }
     // (3) Inherited-slot congruence: the intent's inherited entries must
@@ -162,13 +186,17 @@ fn validate_intent_append(
     if let Some(head_entry) = head_entry {
         let head_snapshot = crate::kernel::snapshot::resolve_snapshot(head_entry).map_err(|e| {
             Error::integrity(format!(
-                "ledger of target '{target}' cannot resolve the successful head's snapshot: {e}"
+                "ledger of target '{_target}' cannot resolve the successful head's snapshot: {e}"
             ))
         })?;
+        // The kernel refusal (the READ form is the typed
+        // [`IntegrityError::InheritedSnapshotMismatch`]) is rendered into the
+        // write-boundary Conflict message form (see the fn doc — ConflictError
+        // carries no inherited variant).
         crate::kernel::transition::validate_inherited_slots(intent, &head_snapshot).map_err(
             |e| {
                 Error::conflict(format!(
-                    "ledger of target '{target}' refuses the intent for deployment '{}': {e}",
+                    "ledger of target '{_target}' refuses the intent for deployment '{}': {e}",
                     intent.deployment_id()
                 ))
             },
@@ -339,7 +367,7 @@ impl LocalStore {
             std::fs::read_to_string(&p).map_err(|e| Error::store(format!("read ledger: {e}")))?;
         let target_name = TargetName::parse(target).expect("ledger target is a safe segment");
         let mut state = DeploymentState::new(target_name);
-        for (seq, line) in text.lines().enumerate() {
+        for line in text.lines() {
             if line.trim().is_empty() {
                 continue;
             }
@@ -405,12 +433,13 @@ impl LocalStore {
                     })
                 }
             };
-            state = crate::kernel::transition::apply_event(state, event).map_err(|e| {
-                Error::integrity(format!(
-                    "ledger for target '{target}' rejects line {}: {e}",
-                    seq + 1
-                ))
-            })?;
+            // A refused event carries the TYPED kernel error through the
+            // facade ([`Error::Kernel`]), preserving the class / code /
+            // evidence — the physical line numbers of the violated rule live
+            // in the typed variants (each accepted event knows its own
+            // position inside the state machine), so the outer text needs no
+            // store-side "rejects line N" flattening.
+            state = crate::kernel::transition::apply_event(state, event).map_err(Error::Kernel)?;
         }
         // THE STRUCTURAL COMPLETENESS GATE (item 8 of the spec): after the
         // full fold, a checkpointed ledger must carry its SUCCESSFUL ANCHOR
@@ -418,12 +447,10 @@ impl LocalStore {
         // `Successful`); a non-checkpointed ledger passes trivially. A
         // structurally incomplete checkpoint prefix (a checkpoint with no
         // following anchor, or an anchor that never reached its `Successful`
-        // terminal) is corruption.
-        state.finish().map_err(|e| {
-            Error::integrity(format!(
-                "ledger for target '{target}' fails structural validation: {e}"
-            ))
-        })?;
+        // terminal) is corruption — the typed
+        // [`IntegrityError::CheckpointAnchorMismatch`], preserved through the
+        // facade.
+        state.finish().map_err(Error::Kernel)?;
         Ok(state.into_entries())
     }
 
@@ -592,9 +619,12 @@ impl LocalStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::{SlotId, test_deployment_id};
+    use crate::identity::{SlotId, Timestamp, test_deployment_id};
+    use crate::kernel::error::{KernelErrorClass, KernelErrorCode};
+    use crate::kernel::intent::{DeploymentIntent, PlanInput, PlannedDeploy};
+    use crate::kernel::snapshot::SnapshotSlot;
     use crate::ledger::records::{DeploymentStatus, LedgerIntentWire, LedgerTerminal};
-    use crate::ledger::{LEDGER_SCHEMA_VERSION, LedgerLine};
+    use crate::ledger::{LEDGER_SCHEMA_VERSION, LedgerLine, Observation, TargetSnapshot};
     use crate::testutil::fixtures;
     #[cfg(test)]
     use proptest::prelude::*;
@@ -1226,5 +1256,464 @@ mod tests {
             before,
             "a refused duplicate intent leaves the ledger bytes unchanged"
         );
+    }
+
+    // =====================================================================
+    // THE SEMANTIC-MUTATION PROPERTY (spec item 5 — ONE mutation per
+    // semantic Integrity code) ------------------------------------------
+    //
+    // Every named semantic rule is a TYPED [`IntegrityError`] variant
+    // bearing its concrete evidence. Each mutation below starts from a VALID
+    // ledger (a settled strictly-linear chain, or the checkpointed form for
+    // the anchor rule) and violates EXACTLY ONE rule: insert a second
+    // intent line for the same deployment; append a second terminal line; a
+    // terminal with no intent; tamper the intent digest; re-parent an
+    // intent off the head; mutate an inherited slot's entry; replace the
+    // checkpoint anchor's terminal with a non-Successful one. The property
+    // asserts, for every generated mutation:
+    //
+    // * the refusal's [`KernelError::class`] is Integrity and its
+    //   [`KernelError::code`] is the expected semantic code;
+    // * the refusal happens at EXACTLY the mutation line (the invalid
+    //   event is the only refused one);
+    // * the rejected event NEVER partially modifies the read state:
+    //   folding the ledger up to the mutation point equals folding the
+    //   VALID prefix up to the same point (same entries / pending /
+    //   successful head / checkpoint / line count).
+
+    fn slot_p2() -> SlotId {
+        SlotId::new("p2".to_string())
+    }
+
+    /// A FULL-push intent planned OVER the given successful head (parent ==
+    /// the head, both slots deployed) — the strictly-linear seed.
+    fn full_intent_over(head: &DeploymentIntent, tag: &str) -> DeploymentIntent {
+        crate::kernel::intent::plan(PlanInput {
+            deployment_id: test_deployment_id(tag),
+            target: TargetName::parse("t1").unwrap(),
+            parent: Some(head.deployment_id().clone()),
+            parent_snapshot: Some(head.resulting_snapshot()),
+            group: None,
+            selection: vec![slot_p1(), slot_p2()],
+            planned: vec![
+                PlannedDeploy {
+                    slot: slot_p1(),
+                    result: fixtures::snapshot_slot(&slot_p1()),
+                    pre_push: Observation::KnownAbsent,
+                },
+                PlannedDeploy {
+                    slot: slot_p2(),
+                    result: fixtures::snapshot_slot(&slot_p2()),
+                    pre_push: Observation::KnownAbsent,
+                },
+            ],
+            behavior_digest: fixtures::behavior_digest(),
+            attempted_at: Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
+        })
+        .expect("a valid parented full intent plans")
+    }
+
+    /// A GROUP intent over the head whose INHERITED p2 entry disagrees with
+    /// the head's actual snapshot (a tampered base) — refused by the
+    /// inherited-slot congruence with `InheritedSnapshotMismatch`.
+    fn tampered_group_over(head: &DeploymentIntent, tag: &str) -> DeploymentIntent {
+        let mut entries = head.resulting_snapshot().into_entries();
+        let p2e = entries
+            .get(&slot_p2())
+            .cloned()
+            .expect("the head covers p2");
+        let tampered = SnapshotSlot::new(
+            crate::identity::test_generation_id("tampered-p2"),
+            p2e.artifact().clone(),
+            p2e.binding().clone(),
+        );
+        entries.insert(slot_p2(), tampered);
+        let base = TargetSnapshot::from_entries(entries);
+        fixtures::group_intent(
+            tag,
+            "t1",
+            "g",
+            head.deployment_id(),
+            &base,
+            &[slot_p1(), slot_p2()],
+            &[slot_p1()],
+        )
+    }
+
+    /// A checkpointed VALID ledger: the checkpoint event + the anchor's
+    /// intent + its `Successful` terminal (the retained suffix starts at a
+    /// successful deployment).
+    fn valid_checkpointed_ledger() -> Vec<LedgerEvent> {
+        let anchor = fixtures::full_intent("deploy-anchor", "t1", &[slot_p1(), slot_p2()], &[]);
+        vec![
+            LedgerEvent::Checkpoint(CheckpointEvent {
+                retained_from: test_deployment_id("deploy-anchor"),
+                discarded: 1,
+                recorded_at: crate::remote::helper::now_rfc3339_ts(),
+            }),
+            LedgerEvent::Intent(IntentEvent {
+                intent: anchor.clone(),
+            }),
+            LedgerEvent::Terminal(TerminalEvent {
+                deployment_id: anchor.deployment_id().clone(),
+                terminal: fixtures::successful_terminal(&anchor),
+            }),
+        ]
+    }
+
+    /// The valid settled chain behind the non-anchor mutations: H → A → B,
+    /// all full pushes finalized `Successful` (both slots).
+    fn valid_chain_events() -> Vec<LedgerEvent> {
+        let h = fixtures::full_intent("deploy-h", "t1", &[slot_p1(), slot_p2()], &[]);
+        let a = full_intent_over(&h, "deploy-a");
+        let b = full_intent_over(&a, "deploy-b");
+        vec![
+            LedgerEvent::Intent(IntentEvent { intent: h.clone() }),
+            LedgerEvent::Terminal(TerminalEvent {
+                deployment_id: h.deployment_id().clone(),
+                terminal: fixtures::successful_terminal(&h),
+            }),
+            LedgerEvent::Intent(IntentEvent { intent: a.clone() }),
+            LedgerEvent::Terminal(TerminalEvent {
+                deployment_id: a.deployment_id().clone(),
+                terminal: fixtures::successful_terminal(&a),
+            }),
+            LedgerEvent::Intent(IntentEvent { intent: b.clone() }),
+            LedgerEvent::Terminal(TerminalEvent {
+                deployment_id: b.deployment_id().clone(),
+                terminal: fixtures::successful_terminal(&b),
+            }),
+        ]
+    }
+
+    /// ONE mutation per semantic code: `(valid ledger, mutated ledger)` —
+    /// the mutated ledger is the valid one with EXACTLY ONE violating event
+    /// appended (the checkpoint-anchor mutation replaces the anchor's
+    /// terminal).
+    fn mutated_ledger(mutation: SemanticMutation) -> (Vec<LedgerEvent>, Vec<LedgerEvent>) {
+        if matches!(mutation, SemanticMutation::CheckpointAnchorMismatch) {
+            let valid = valid_checkpointed_ledger();
+            let mut mutated = valid.clone();
+            let anchor = fixtures::full_intent("deploy-anchor", "t1", &[slot_p1(), slot_p2()], &[]);
+            let last = mutated
+                .last_mut()
+                .expect("the anchored ledger has a terminal");
+            // Replace the anchor's `Successful` terminal with a Degraded one
+            // — the ONE violation (the checkpoint requires its anchor to be
+            // finalized `Successful`).
+            *last = LedgerEvent::Terminal(TerminalEvent {
+                deployment_id: anchor.deployment_id().clone(),
+                terminal: fixtures::degraded_terminal(&anchor, &[slot_p1(), slot_p2()]),
+            });
+            return (valid, mutated);
+        }
+        let valid = valid_chain_events();
+        let mutation_event = match mutation {
+            SemanticMutation::DuplicateIntent => {
+                // A second intent for deploy-h (already in the ledger).
+                let dup = fixtures::full_intent("deploy-h", "t1", &[slot_p1(), slot_p2()], &[]);
+                LedgerEvent::Intent(IntentEvent { intent: dup })
+            }
+            SemanticMutation::DuplicateTerminal => {
+                // A second terminal line for the settled deploy-h.
+                let h = fixtures::full_intent("deploy-h", "t1", &[slot_p1(), slot_p2()], &[]);
+                LedgerEvent::Terminal(TerminalEvent {
+                    deployment_id: h.deployment_id().clone(),
+                    terminal: fixtures::successful_terminal(&h),
+                })
+            }
+            SemanticMutation::TerminalWithoutIntent => {
+                // A terminal binding a valid digest for a deployment with NO
+                // intent line.
+                let orphan = fixtures::full_intent("deploy-orphan", "t1", &[slot_p1()], &[]);
+                LedgerEvent::Terminal(TerminalEvent {
+                    deployment_id: orphan.deployment_id().clone(),
+                    terminal: fixtures::successful_terminal(&orphan),
+                })
+            }
+            SemanticMutation::IntentDigestMismatch => {
+                // A terminal for the settled deploy-h bound to a DIFFERENT
+                // (valid) intent's digest.
+                let h = fixtures::full_intent("deploy-h", "t1", &[slot_p1(), slot_p2()], &[]);
+                let other = fixtures::full_intent("deploy-other", "t1", &[slot_p1()], &[]);
+                LedgerEvent::Terminal(TerminalEvent {
+                    deployment_id: h.deployment_id().clone(),
+                    terminal: fixtures::successful_terminal(&other),
+                })
+            }
+            SemanticMutation::ParentLineageMismatch => {
+                // An ordinary intent re-parented off the OLD head H while the
+                // ledger's successful head has moved on to B (a fork: parent
+                // ≠ the head).
+                let h = fixtures::full_intent("deploy-h", "t1", &[slot_p1(), slot_p2()], &[]);
+                LedgerEvent::Intent(IntentEvent {
+                    intent: full_intent_over(&h, "deploy-fork"),
+                })
+            }
+            SemanticMutation::InheritedSnapshotMismatch => {
+                // A group intent over the head whose inherited p2 entry
+                // disagrees with the head's snapshot.
+                let b = full_intent_over(
+                    &full_intent_over(
+                        &fixtures::full_intent("deploy-h", "t1", &[slot_p1(), slot_p2()], &[]),
+                        "deploy-a",
+                    ),
+                    "deploy-b",
+                );
+                LedgerEvent::Intent(IntentEvent {
+                    intent: tampered_group_over(&b, "deploy-g"),
+                })
+            }
+            SemanticMutation::CheckpointAnchorMismatch => {
+                unreachable!("handled above")
+            }
+        };
+        let mut mutated = valid.clone();
+        mutated.push(mutation_event);
+        (valid, mutated)
+    }
+
+    /// The read-state facts the "no partial modification" comparisons see:
+    /// the accepted entries (with their physical seqs), the ONE pending
+    /// attempt, the maintained successful head, the checkpoint prefix, and
+    /// the physical line counter.
+    fn state_facts(
+        state: &DeploymentState,
+    ) -> (
+        Vec<LedgerEntry>,
+        Option<DeploymentId>,
+        Option<DeploymentId>,
+        Option<CheckpointEvent>,
+        u64,
+    ) {
+        (
+            state.entries().to_vec(),
+            state.pending().cloned(),
+            state.successful_head().cloned(),
+            state.checkpoint().cloned(),
+            state.next_seq(),
+        )
+    }
+
+    /// THE PROPERTY BODY: fold the mutated ledger; the mutation event (the
+    /// LAST one) is refused with the expected class + code, and the read
+    /// state at the refusal equals folding the VALID prefix up to the same
+    /// point — the rejected event never partially modifies the state.
+    fn run_semantic_mutation(mutation: SemanticMutation, expected_code: KernelErrorCode) {
+        let (valid, mutated) = mutated_ledger(mutation);
+        let mut state = DeploymentState::new(TargetName::parse("t1").unwrap());
+        for (index, event) in mutated.iter().enumerate() {
+            match crate::kernel::transition::apply_event(state.clone(), event.clone()) {
+                Ok(next) => state = next,
+                Err(err) => {
+                    assert_eq!(
+                        index,
+                        mutated.len() - 1,
+                        "{mutation:?}: the mutation event must be the ONLY refused line (event {index} refused out of {} mutated events)",
+                        mutated.len()
+                    );
+                    assert_eq!(
+                        err.class(),
+                        KernelErrorClass::Integrity,
+                        "{mutation:?}: a semantic mutation at READ is an Integrity refusal, got: {err}"
+                    );
+                    assert_eq!(
+                        err.code(),
+                        expected_code,
+                        "{mutation:?}: the refusal's code must name the violated semantic rule, got: {err}"
+                    );
+                    // The rejected event never partially modifies the read
+                    // state: folding the ledger up to the mutation point
+                    // equals folding the VALID prefix up to the same point.
+                    let mut prefix = DeploymentState::new(TargetName::parse("t1").unwrap());
+                    for valid_event in &valid[..index] {
+                        prefix =
+                            crate::kernel::transition::apply_event(prefix, valid_event.clone())
+                                .expect("the valid prefix folds");
+                    }
+                    assert_eq!(
+                        state_facts(&state),
+                        state_facts(&prefix),
+                        "{mutation:?}: folding the ledger up to the mutation point must equal the pre-mutation fold (the refused event left no trace)"
+                    );
+                    return;
+                }
+            }
+        }
+        panic!(
+            "{mutation:?}: the mutation event must be refused, but the mutated ledger folded completely"
+        )
+    }
+
+    /// THE EXPLICIT EXHAUSTIVE TABLE — every semantic Integrity rule EXACTLY
+    /// once (the spec's canonical list, in order).
+    const COVERED_MUTATIONS: &[(SemanticMutation, KernelErrorCode)] = &[
+        (
+            SemanticMutation::DuplicateIntent,
+            KernelErrorCode::DuplicateIntent,
+        ),
+        (
+            SemanticMutation::DuplicateTerminal,
+            KernelErrorCode::DuplicateTerminal,
+        ),
+        (
+            SemanticMutation::TerminalWithoutIntent,
+            KernelErrorCode::TerminalWithoutIntent,
+        ),
+        (
+            SemanticMutation::IntentDigestMismatch,
+            KernelErrorCode::IntentDigestMismatch,
+        ),
+        (
+            SemanticMutation::ParentLineageMismatch,
+            KernelErrorCode::ParentLineageMismatch,
+        ),
+        (
+            SemanticMutation::InheritedSnapshotMismatch,
+            KernelErrorCode::InheritedSnapshotMismatch,
+        ),
+        (
+            SemanticMutation::CheckpointAnchorMismatch,
+            KernelErrorCode::CheckpointAnchorMismatch,
+        ),
+    ];
+
+    /// THE TABLE IS EXHAUSTIVE: every semantic Integrity rule appears
+    /// EXACTLY once, in the spec's canonical order, and each entry agrees
+    /// with the mutation's own class/code expectation (no drift between the
+    /// property and the table).
+    #[test]
+    fn covered_mutations_are_exhaustive() {
+        let expected: [KernelErrorCode; 7] = [
+            KernelErrorCode::DuplicateIntent,
+            KernelErrorCode::DuplicateTerminal,
+            KernelErrorCode::TerminalWithoutIntent,
+            KernelErrorCode::IntentDigestMismatch,
+            KernelErrorCode::ParentLineageMismatch,
+            KernelErrorCode::InheritedSnapshotMismatch,
+            KernelErrorCode::CheckpointAnchorMismatch,
+        ];
+        let codes: Vec<KernelErrorCode> = COVERED_MUTATIONS.iter().map(|(_, c)| *c).collect();
+        assert_eq!(
+            codes, expected,
+            "the covered table must list every semantic Integrity code exactly once, in the spec's order"
+        );
+        for (mutation, code) in COVERED_MUTATIONS {
+            assert_eq!(
+                *code,
+                mutation.expected_code(),
+                "the table's mapping for {mutation:?} must agree with the mutation's own expectation"
+            );
+            assert_eq!(
+                mutation.expected_class(),
+                KernelErrorClass::Integrity,
+                "{mutation:?} is an Integrity semantic rule"
+            );
+        }
+    }
+
+    /// THE FACADE SHAPE, end to end: a rejected ledger line surfaces as
+    /// [`Error::Kernel`] carrying the COMPLETE typed kernel error — the
+    /// class, the code, and the concrete line evidence are reachable, not
+    /// flattened into a message string.
+    #[test]
+    fn rejected_ledger_line_preserves_the_typed_kernel_error() {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let target = "t1";
+        let keys = vec![slot_p1(), slot_p2()];
+        let h = fixtures::full_intent("deploy-h", target, &keys, &[]);
+        let a = full_intent_over(&h, "deploy-a");
+        store.append_intent(target, &h).unwrap();
+        store
+            .append_terminal(
+                target,
+                h.deployment_id(),
+                &fixtures::successful_terminal(&h),
+            )
+            .unwrap();
+        store.append_intent(target, &a).unwrap();
+        // A duplicate intent line for deploy-h append AFTER the valid chain
+        // (the strict reader's by_id gate fires): the store read must return
+        // the typed DuplicateIntent evidence through Error::Kernel.
+        store.read_ledger(target).unwrap();
+        let dup = fixtures::full_intent("deploy-h", target, &keys, &[]);
+        let line =
+            serde_json::to_string(&LedgerLine::Intent(LedgerIntentWire::from(&dup))).unwrap();
+        std::fs::write(store.ledger_path(target), {
+            let mut text = std::fs::read_to_string(store.ledger_path(target)).unwrap();
+            text.push_str(&line);
+            text.push('\n');
+            text
+        })
+        .unwrap();
+        let err = store.read_ledger(target).unwrap_err();
+        match err {
+            Error::Kernel(KernelError::Integrity(IntegrityError::DuplicateIntent {
+                deployment,
+                first_line,
+                duplicate_line,
+            })) => {
+                assert_eq!(deployment, test_deployment_id("deploy-h"));
+                assert_eq!(first_line, 1, "the first intent line is line 1 (1-based)");
+                assert_eq!(
+                    duplicate_line, 4,
+                    "the duplicate intent line is the appended line 4 (1-based)"
+                );
+            }
+            other => panic!(
+                "the read path must surface the typed DuplicateIntent through Error::Kernel, got: {other:?}"
+            ),
+        }
+    }
+
+    // The one mutation per semantic code: the generated case drives the
+    // property over the exhaustive table (house style: bounded cases,
+    // deterministic seed, no failure persistence).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum SemanticMutation {
+        DuplicateIntent,
+        DuplicateTerminal,
+        TerminalWithoutIntent,
+        IntentDigestMismatch,
+        ParentLineageMismatch,
+        InheritedSnapshotMismatch,
+        CheckpointAnchorMismatch,
+    }
+
+    impl SemanticMutation {
+        fn expected_code(self) -> KernelErrorCode {
+            match self {
+                Self::DuplicateIntent => KernelErrorCode::DuplicateIntent,
+                Self::DuplicateTerminal => KernelErrorCode::DuplicateTerminal,
+                Self::TerminalWithoutIntent => KernelErrorCode::TerminalWithoutIntent,
+                Self::IntentDigestMismatch => KernelErrorCode::IntentDigestMismatch,
+                Self::ParentLineageMismatch => KernelErrorCode::ParentLineageMismatch,
+                Self::InheritedSnapshotMismatch => KernelErrorCode::InheritedSnapshotMismatch,
+                Self::CheckpointAnchorMismatch => KernelErrorCode::CheckpointAnchorMismatch,
+            }
+        }
+        fn expected_class(self) -> KernelErrorClass {
+            KernelErrorClass::Integrity
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: crate::testutil::proptest_cases(24),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        /// THE SEMANTIC-MUTATION PROPERTY (spec item 5): EVERY mutation of
+        /// the exhaustive table is refused with the expected Integrity
+        /// class + semantic code, at exactly the mutation line, and the
+        /// rejected event never partially modifies the read state.
+        #[test]
+        fn semantic_mutation_class_and_code(idx in 0u32..COVERED_MUTATIONS.len() as u32) {
+            let (mutation, code) = COVERED_MUTATIONS[idx as usize];
+            run_semantic_mutation(mutation, code);
+        }
     }
 }

@@ -13,19 +13,24 @@
 //!   parent must equal the successful head AT INTENT-APPEND TIME.
 //!
 //! [`LineageViolation`] is the DOMAIN refusal (the pure state machine's
-//! decision). It is mapped onto the existing [`KernelError`] taxonomy at
-//! each boundary: at the WRITE boundary (planning/append — the store's
-//! pre-write intent validation, recovery, preflight) a refusal is a
-//! [`Conflict`](KernelError::Conflict) — a valid operation against stale or
-//! concurrently changed state; when READ from persisted bytes
-//! ([`crate::kernel::transition::apply_event`] folding a ledger) it is
-//! corruption → [`Integrity`](KernelError::Integrity).
+//! decision). It is mapped onto the typed [`KernelError`] taxonomy at each
+//! boundary: at the WRITE boundary (planning/append — the store's pre-write
+//! intent validation, recovery, preflight) a refusal is a
+//! [`Conflict`](KernelError::Conflict) carrying the typed evidence —
+//! [`ConflictError::ParentMismatch`] (a stale plan whose parent ≠ the
+//! successful head) / [`ConflictError::PendingAttemptExists`]; when READ
+//! from persisted bytes ([`crate::kernel::transition::apply_event`] folding
+//! a ledger) it is corruption → [`Integrity`](KernelError::Integrity), where
+//! the parent ≠ head rule is the typed
+//! [`IntegrityError::ParentLineageMismatch`] and the still-pending rule
+//! stays message-only (the write boundary owns its typed Conflict form).
 //!
 //! The inherited-slot congruence (an intent's inherited entries must match
 //! the successful head it claims) is validated separately by
 //! [`crate::kernel::transition::validate_inherited_slots`] — it refuses a
 //! wire intent whose frozen `Inherit` entries disagree with the head's
-//! snapshot, in the same taxonomies.
+//! snapshot with the typed [`IntegrityError::InheritedSnapshotMismatch`] in
+//! the same taxonomies.
 
 use std::fmt;
 

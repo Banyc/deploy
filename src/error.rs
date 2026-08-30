@@ -2,6 +2,8 @@
 
 use thiserror::Error;
 
+use crate::kernel::KernelError;
+
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("io error: {0}")]
@@ -48,6 +50,15 @@ pub enum Error {
 
     #[error("conflict: {0}")]
     Conflict(String),
+
+    /// The COMPLETE typed semantic-kernel error, preserved through the
+    /// facade (never flattened into a class string): the kernel error's own
+    /// [`Display`](std::fmt::Display) (its five-class prefix + the typed
+    /// payload's sentence) is the text, and the typed class / code /
+    /// evidence remain reachable — consumers react on the kernel error's
+    /// structure, not its prose.
+    #[error("{0}")]
+    Kernel(KernelError),
 
     #[error("not found: {0}")]
     NotFound(String),
@@ -103,6 +114,9 @@ impl Error {
     }
     pub fn conflict(msg: impl Into<String>) -> Self {
         Error::Conflict(msg.into())
+    }
+    pub fn kernel(err: KernelError) -> Self {
+        Error::Kernel(err)
     }
     pub fn not_found(msg: impl Into<String>) -> Self {
         Error::NotFound(msg.into())
