@@ -1,5 +1,5 @@
 error[E0277]: the trait bound `VerifiedReleaseRebinding: serde::Deserialize<'de>` is not satisfied
-  --> tests/ui/rebinding_deserialize.rs:13:9
+  --> /kache/home/code/deploy/tests/ui/rebinding_deserialize.rs:13:9
    |
 13 |         serde_json::from_str("{}").expect("this line must not compile");
    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `serde_core::de::Deserialize<'_>` is not implemented for `VerifiedReleaseRebinding`
