@@ -231,9 +231,20 @@ pub(crate) fn run_preflight(
     // only). A recovered attempt finalizes through the SHARED finalizer
     // (`ledger::finalize_successful_locked`), which APPENDS its snapshot
     // entry to the target's chain — the very append the relative refs below
-    // must see. Dry-run never reconciles (it touches nothing).
+    // must see. THE STRICT-LINEAR REFUSAL (spec item 6): when the recovery
+    // step CANNOT finish the previous pending attempt (the shared finalizer
+    // returned `Pending` — locks contended / live state not finalizable
+    // right now), the attempt REMAINS pending and the push REFUSES — it
+    // never plans a second intent on top while any previous intent lacks a
+    // terminal (even for disjoint groups). Dry-run never reconciles (it
+    // touches nothing).
     if !opts.dry_run {
-        reconcile_pending_commits(store, config, target_name, op_id, helpers)?;
+        use crate::ledger::recovery::RecoveryOutcome;
+        if let Some(RecoveryOutcome::StillPending) =
+            reconcile_pending_commits(store, config, target_name, op_id, helpers)?
+        {
+            return Err(Error::conflict("a previous deployment is still pending"));
+        }
     }
 
     // RESOLUTION POINT — a REAL push's parsed ref is resolved ONLY NOW:
@@ -2109,13 +2120,80 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             let h = RecoveryHarness::new();
             let slot = SlotId::parse("p1").unwrap();
 
-            // (c) A concurrent/reconciled append: a pending-commit attempt
-            // whose reconciliation will append EXACTLY ONE snapshot during
-            // the ref push. The push itself is real (it deploys to the remote
-            // and records the attempt) but the commit marker write fails
-            // once, so no snapshot is appended yet. It also persists the
-            // release record + behavior snapshot + tree the synthetic chain
-            // below reuses.
+            // (c) A concurrent/reconciled append: the chain is seeded FIRST
+            // (the strictly-linear model — a pending attempt can only ever be
+            // the NEWEST entry, so the synthetic chain descends from the
+            // store's OWN head, never from the pending attempt). Entry 0 is a
+            // REAL push (it persists the release record + behavior snapshot +
+            // tree the synthetic entries below reuse), and entries 1..=latest
+            // are synthetic snapshots chaining onto the current head with the
+            // SAME durable artifact.
+            let r0 = push_main_with_id(
+                &h,
+                &test_deployment_id(&format!("deploy-relative-chain-{latest}-0")),
+            )
+            .unwrap();
+            assert_eq!(r0.status, Some(DeploymentStatus::Successful));
+            let chain_artifact = known_artifact(&r0.attempt.as_ref().expect("attempt").slots[&slot])
+                .clone();
+            let bindings = crate::ledger::PhysicalBinding {
+                server: crate::identity::ServerId::parse("s1").unwrap(),
+                deploy_dir: "/srv/eng".to_string(),
+            };
+            for i in 1..=latest {
+                crate::deploy::testsupport::seed_snapshot(
+                    &h.store,
+                    "t1",
+                    &format!("deploy-relative-chain-{latest}-{i}"),
+                    "b",
+                    BTreeMap::from([(
+                        slot.clone(),
+                        GenerationRef {
+                            generation: test_generation_id(&format!("gen-relative-{latest}-{i}")),
+                            assignment: crate::identity::PlacementSlotAssignment {
+                                placement_slot: slot.clone(),
+                                artifact: chain_artifact.clone(),
+                            },
+                        },
+                    )]),
+                    BTreeMap::from([(slot.clone(), bindings.clone())]),
+                );
+            }
+            assert_eq!(
+                h.store.read_snapshots("t1").unwrap().len() as u64,
+                latest + 1,
+                "the seeded chain holds latest + 1 snapshots"
+            );
+
+            // The PENDING attempt: the target gets NEW content first (a
+            // distinct release R2), then a real HEAD push OVER the chain head
+            // (`chain-latest`) records it — its commit marker write fails
+            // once, so the intent is durable and no snapshot/terminal was
+            // appended yet.
+            let project_root = h.config.project_root(&h.cfg_path);
+            let variant_path = project_root
+                .join("releases")
+                .join("v1")
+                .join("standard.toml");
+            let v2 = std::fs::read_to_string(&variant_path)
+                .unwrap()
+                .replace("argv = [\"true\"]", "argv = [\"true\", \"b\"]");
+            assert_ne!(
+                v2,
+                std::fs::read_to_string(&variant_path).unwrap(),
+                "the fixture must actually change the verification argv"
+            );
+            std::fs::write(&variant_path, v2).unwrap();
+            std::fs::write(
+                project_root
+                    .join("releases")
+                    .join("v1")
+                    .join("artifacts")
+                    .join("build/output/app/server"),
+                "v2\n",
+            )
+            .unwrap();
+            let config2 = ProjectConfig::load(&h.cfg_path).unwrap();
             let armed = Arc::new(AtomicBool::new(true));
             let armed_for_factory = armed.clone();
             let rf = h.remotes_base.clone();
@@ -2129,61 +2207,24 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &h.store,
                 &fault_factory,
                 "t1",
-                &h.config,
+                &config2,
                 &PushOptions {
                     dry_run: false,
                     ref_token: None,
-                group: None},
+                    group: None,
+                },
             )
             .unwrap();
-            assert_eq!(rp.status, None, "the failed-marker push leaves the attempt pending (intent-only)");
+            assert_eq!(
+                rp.status, None,
+                "the failed-marker push leaves the attempt pending (intent-only)"
+            );
             let pending = rp.attempt.as_ref().expect("the pending push records an attempt");
             let pending_id = pending.deployment_id.clone();
-            let pending_artifact = known_artifact(&pending.slots[&slot]).clone();
-            assert!(
-                h.store.read_snapshots("t1").unwrap().is_empty(),
-                "the pending attempt appends no snapshot yet"
-            );
-
-            // (a) Initial chain: synthetic snapshots 0..=latest (length L+1),
-            // all referencing the pending push's REAL release + tree (which
-            // are durable in the store), each with the harness's exact
-            // physical binding so `plan_assignments` accepts the rollback.
-            let bindings = crate::ledger::PhysicalBinding {
-                server: crate::identity::ServerId::parse("s1").unwrap(),
-                deploy_dir: "/srv/eng".to_string()};
-            // The synthetic chain descends from the PENDING attempt (entry
-            // position 0): the lineage invariant (at most one `Successful`
-            // per parent) lets the pending A recover `Successful` ONLY as
-            // the first None-parented success, so the concurrent chain's
-            // FIRST entry must chain onto A — later entries derive the
-            // current head from the store.
-            let pending_intent = h.store.read_ledger("t1").unwrap()[0].intent.clone();
-            for i in 0..=latest {
-                let (slots, bindings, parent) = (BTreeMap::from([(
-                    slot.clone(),
-                    GenerationRef {
-                        generation: test_generation_id(&format!("gen-relative-{latest}-{i}")),
-                        assignment: crate::identity::PlacementSlotAssignment {
-                            placement_slot: slot.clone(),
-                            artifact: pending_artifact.clone()}},
-                )]),
-                BTreeMap::from([(slot.clone(), bindings.clone())]),
-                (i == 0).then(|| pending_intent.clone()));
-                crate::deploy::testsupport::seed_snapshot_over(
-                    &h.store,
-                    "t1",
-                    &format!("deploy-relative-chain-{latest}-{i}"),
-                    pending.behavior_sha256.as_str(),
-                    slots,
-                    bindings,
-                    parent,
-                );
-            }
             assert_eq!(
                 h.store.read_snapshots("t1").unwrap().len() as u64,
                 latest + 1,
-                "the initial chain holds latest + 1 snapshots"
+                "the pending attempt appends no snapshot yet"
             );
 
             // The ref is RELATIVE: `@-` for depth 1, `parent(@, d)` else.
@@ -2193,50 +2234,49 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 format!("parent(@, {depth})")
             };
             // The PRE-FIX behavior resolved BEFORE reconciliation: against the
-           // pre-append chain it selected position latest - depth (stale) or
-           // failed outright when the chain was too short for the walk.
+            // seeded chain (latest + 1 successful entries) `parent(@, depth)`
+            // selects position latest - depth (stale), or fails outright when
+            // the chain is too short (latest == 0). The pending attempt is
+            // NOT yet a successful entry, so it cannot be selected.
             let pre_reconcile = ledger::resolve_ref_expr(
                 &ledger::parse_ref_expr(&token).unwrap(),
                 "t1",
                 &h.store,
             );
-           // The POST-reconciliation chain: the pending attempt's ENTRY sits
-           // at position 0 (its intent line was appended BEFORE the seeded
-           // chain — the ledger's append order IS the history order), and
-           // the seeded chain fills positions 1..=latest+1. The ref
-           // `parent(@, depth)` selects chain position (latest + 1) - depth:
-           // 0 -> the pending attempt, p>0 -> the chain entry at p - 1.
+            // THE POST-RECONCILIATION chain: the pending attempt is the
+            // NEWEST entry (the strictly-linear model — it was appended LAST,
+            // at chain position latest + 1), and the ref push's reconcile
+            // appends its Successful terminal, so the successful chain becomes
+            // chain-0..chain-latest, pending (latest + 2 entries). The ref
+            // `parent(@, depth)` selects successful position (latest + 1) -
+            // depth from the newest: depth 1 -> chain-latest, depth latest ->
+            // chain-1 (never the pending itself for depth >= 1).
             let selected = (latest + 1) - depth;
-           let selected_deployment: String = if selected == 0 {
-               pending_id.as_str().to_string()
-           } else {
-               test_deployment_id(&format!("deploy-relative-chain-{latest}-{}", selected - 1))
-                   .as_str()
-                   .to_string()
-           };
-           // The PRE-reconcile resolution (against the seeded chain only):
-           // `parent(@, depth)` walks to position (latest - depth) — the
-           // stale selection — or fails outright when the chain is too short
-           // (latest == 0 with depth 1 underflows). The pending attempt is
-           // NOT yet a successful entry, so it cannot be selected.
+            let selected_deployment: String =
+                test_deployment_id(&format!("deploy-relative-chain-{latest}-{selected}"))
+                    .as_str()
+                    .to_string();
+            // The PRE-reconcile resolution (against the seeded chain only):
+            // `parent(@, depth)` walks to position (latest - depth) — the
+            // stale selection — or fails outright when the chain is too short
+            // (latest == 0 with depth 1 underflows).
             match pre_reconcile {
-               Ok(PushRef::Deployment { deployment_id, .. }) => {
-                   assert!(
-                       latest > 0,
-                       "a non-empty chain must resolve pre-reconcile"
-                   );
-                   assert_eq!(
-                       deployment_id.as_str(),
-                       test_deployment_id(&format!(
-                           "deploy-relative-chain-{latest}-{}",
-                           latest - depth
-                       ))
-                       .as_str(),
-                       "the stale pre-fix selection"
-                   );
+                Ok(PushRef::Deployment { deployment_id, .. }) => {
+                    assert!(latest > 0, "a non-empty chain must resolve pre-reconcile");
+                    assert_eq!(
+                        deployment_id.as_str(),
+                        test_deployment_id(&format!(
+                            "deploy-relative-chain-{latest}-{}",
+                            latest - depth
+                        ))
+                        .as_str(),
+                        "the stale pre-fix selection"
+                    );
                 }
                 Ok(_) => {
-                    panic!("a relative deployment ref must not resolve to a non-deployment pre-reconcile")
+                    panic!(
+                        "a relative deployment ref must not resolve to a non-deployment pre-reconcile"
+                    )
                 }
                 Err(_) => {
                     assert_eq!(
@@ -2245,21 +2285,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     );
                 }
             }
-           // The POST-reconcile chain keeps the pending entry at its INTENT
-           // position 0 (the ledger's append order is the history order), so
-           // for latest >= 1 the relative walk from `@` lands on the SAME
-           // chain entry pre- and post-reconcile; only the latest==0 case
-           // (depth 1 == latest + 1) selects the reconciled pending itself.
-           // The essential claim is unchanged: the ref is resolved against
-           // the POST-reconciliation chain, which INCLUDES the pending.
-
             // The fixed flow: the engine reconciles FIRST (appending the
-           // pending attempt's TERMINAL EVENT — it becomes the successful
-           // entry at position latest + 1), THEN resolves the ref against the
-           // post-reconciliation chain, then plans. The push is faulted at
-           // its FIRST store write after `plan.json` — the INTENT append —
-           // so the plan's resolved source is observable without the (slow)
-           // mutation loop.
+            // pending attempt's TERMINAL EVENT — it becomes the successful
+            // entry at position latest + 1), THEN resolves the ref against
+            // the post-reconciliation chain, then plans. The push is faulted
+            // at its FIRST store write after `plan.json` — the INTENT append
+            // — so the plan's resolved source is observable without the
+            // (slow) mutation loop.
             let rf2 = h.remotes_base.clone();
             let script = h.script.clone();
             let clean_factory = move |s: &crate::config::ServerDef,
@@ -2274,7 +2306,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             let ref_id = test_deployment_id(&format!("deploy-relative-ref-{latest}-{depth}"));
             h.store
                 .fault_registry()
-               .arm_append_attempt(ref_id.as_str());
+                .arm_append_attempt(ref_id.as_str());
             let err = push_ref_with_id(
                 &h.cfg_path,
                 &h.store,
@@ -2284,46 +2316,50 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &PushOptions {
                     dry_run: false,
                     ref_token: Some(token.clone()),
-                group: None},
+                    group: None,
+                },
                 &ref_id,
             )
-           .expect_err("the plan is durable before the first intent write, so the faulted push must Err");
+            .expect_err(
+                "the plan is durable before the first intent write, so the faulted push must Err",
+            );
             assert!(
-               err.to_string().contains("append_attempt"),
-               "the injected intent fault must be the failure, got: {err}"
+                err.to_string().contains("append_attempt"),
+                "the injected intent fault must be the failure, got: {err}"
             );
 
-           // (c) The reconciled append happened: the pending attempt's entry
-           // (intent line at position 0) now carries its Successful terminal
-           // — it is the successful-chain entry at position 0, and the
-           // seeded chain fills positions 1..=latest+1.
+            // (c) The reconciled append happened: the pending attempt's entry
+            // (the NEWEST — its intent line was appended LAST) now carries
+            // its Successful terminal — the successful chain is
+            // chain-0..chain-latest, pending (latest + 2 entries).
             let snapshots = h.store.read_snapshots("t1").unwrap();
             assert_eq!(
                 snapshots.len() as u64,
                 latest + 2,
-               "seeded (latest+1) + reconciled (1); the faulted ref push appends nothing"
+                "seeded (latest+1) + reconciled (1); the faulted ref push appends nothing"
             );
-           let reconciled = snapshots.first().expect("the reconciled entry must exist");
+            let reconciled = snapshots.last().expect("the reconciled entry must exist");
             assert_eq!(
                 reconciled.deployment_id.as_str(),
                 pending_id.as_str(),
-               "the reconciled entry is the pending attempt (its intent line was first)"
-           );
-           assert_eq!(
-               ledger::successful_index(
-                   &h.store,
-                   "t1",
-                   &DeploymentId::parse(pending_id.as_str()).expect("canonical pending id"),
-               )
-               .unwrap()
-               .unwrap(),
-               0,
-               "the pending attempt's successful position is s0"
+                "the reconciled entry is the pending attempt (its intent line was newest)"
+            );
+            assert_eq!(
+                ledger::successful_index(
+                    &h.store,
+                    "t1",
+                    &DeploymentId::parse(pending_id.as_str()).expect("canonical pending id"),
+                )
+                .unwrap()
+                .unwrap(),
+                latest + 1,
+                "the pending attempt's successful position is s{latest_plus_one}",
+                latest_plus_one = latest + 1,
             );
 
-           // THE ASSERTION: the SELECTED deployment recorded in the plan
-           // equals post-reconciliation position (latest + 1) - depth — the
-           // deployment id at that chain position.
+            // THE ASSERTION: the SELECTED deployment recorded in the plan
+            // equals post-reconciliation position (latest + 1) - depth from
+            // the newest — the deployment id at that chain position.
             let plan: DeploymentPlan = serde_json::from_str(
                 &std::fs::read_to_string(h.store.deployment_dir(ref_id.as_str()).join("plan.json"))
                     .unwrap(),
@@ -2334,8 +2370,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 crate::ledger::PlanOrigin::Deployment(
                     DeploymentId::parse(&selected_deployment).expect("canonical selected id")
                 ),
-
-               "'{token}' must select the entry at successful-chain position {selected} =                  s{}(latest + 1) - {depth} — the POST-reconciliation selection, not the                  pre-reconcile s{}(latest) - {depth}",
+                "'{token}' must select the entry at successful-chain position {selected} = s{}(latest + 1) - {depth} — the POST-reconciliation selection (the pending reconciled at the top), not the pre-reconcile s{}(latest) - {depth}",
                 latest + 1,
                 latest
             );

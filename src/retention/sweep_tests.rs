@@ -202,18 +202,6 @@ fn list_generations(helper: &RemoteHelper) -> Vec<String> {
 
 // ---- pusher (checkpoint) fixture helpers -----------------------------------
 
-fn intent(id: &str, target: &str) -> DeploymentIntent {
-    crate::testutil::fixtures::full_intent(id, target, &[SlotId::parse("p1").unwrap()], &[])
-}
-
-/// A FULL-push intent with the given release + tree baked into its ONE slot
-/// table (the complete result stored once; the successful terminal is
-/// payload-free and bound by digest).
-/// A single-slot (`p1`) VALID successful intent: the frozen snapshot entry
-/// (generation gen-1, the given artifact release/tree, plan-time physical
-/// binding). The seed chains onto the current successful head — the lineage
-/// invariant (at most one `Successful` per parent) requires every seeded
-/// successful to chain onto the previous one.
 fn success_intent_over(
     id: &str,
     target: &str,
@@ -310,7 +298,20 @@ fn seed_history(store: &LocalStore, target: &str, prefix: &str, history: &[bool]
                 .unwrap();
             successful.push(canonical.as_str().to_string());
         } else {
-            let it = intent(&id, target);
+            // A FAILED (settled) entry is also STRICTLY LINEAR: it descends
+            // from the CURRENT successful head (the same parenting as a
+            // success), so it appends after the previous entry's terminal and
+            // never introduces a second pending attempt. It references a
+            // SHARED fixture release/tree that the per-id assertions below
+            // never seed or check (a failed entry contributes no reachable
+            // content the sweep must keep).
+            let it = success_intent_over(
+                &id,
+                target,
+                crate::identity::test_release_id("p1").as_str(),
+                "p1",
+                head.as_ref(),
+            );
             store.append_intent(target, &it).unwrap();
             store
                 .append_terminal(target, it.deployment_id(), &failed_terminal(&it))

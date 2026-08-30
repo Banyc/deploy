@@ -76,12 +76,27 @@ mod tests_entry {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
 
         let i1 = fixtures::full_intent("deploy-x", "t1", &[p1()], &[]);
-        let i2 = fixtures::full_intent("deploy-y", "t1", &[p1()], &[]);
+        // The second intent is STRICTLY LINEAR: it descends from i1 (whose
+        // Successful terminal lands before i2 is appended — one pending
+        // intent at a time, parent == the head).
+        let i2 = crate::testutil::fixtures::group_intent(
+            "deploy-y",
+            "t1",
+            "g",
+            i1.deployment_id(),
+            &i1.resulting_snapshot(),
+            &[p1()],
+            &[p1()],
+        );
         store.append_intent(target, &i1).unwrap();
+        let tx = fixtures::successful_terminal(&i1);
+        store
+            .append_terminal(target, i1.deployment_id(), &tx)
+            .unwrap();
         store.append_intent(target, &i2).unwrap();
 
-        // The reference machine's accepted sequence: intent x, intent y,
-        // terminal x (Successful).
+        // The reference machine's accepted sequence: intent x, terminal x
+        // (Successful), intent y (parent == the head).
         let mut state = DeploymentState::new(TargetName::parse("t1").unwrap());
         state = kernel::transition::apply_event(
             state,
@@ -90,23 +105,19 @@ mod tests_entry {
         .unwrap();
         state = kernel::transition::apply_event(
             state,
-            LedgerEvent::Intent(IntentEvent { intent: i2.clone() }),
-        )
-        .unwrap();
-        let tx = fixtures::successful_terminal(&i1);
-        state = kernel::transition::apply_event(
-            state,
             LedgerEvent::Terminal(TerminalEvent {
                 deployment_id: i1.deployment_id().clone(),
                 terminal: tx.clone(),
             }),
         )
         .unwrap();
+        state = kernel::transition::apply_event(
+            state,
+            LedgerEvent::Intent(IntentEvent { intent: i2.clone() }),
+        )
+        .unwrap();
 
         // The store's strict reader accepts the same events.
-        store
-            .append_terminal(target, i1.deployment_id(), &tx)
-            .unwrap();
         let entries = store.read_ledger(target).unwrap();
         assert_eq!(entries.len(), 2, "one merged entry per deployment");
         assert_eq!(
@@ -121,7 +132,7 @@ mod tests_entry {
         assert_eq!(
             state.successful_head(),
             Some(i1.deployment_id()),
-            "the state machine derives the successful head"
+            "the state machine maintains the successful head"
         );
     }
 

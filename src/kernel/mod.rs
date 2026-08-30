@@ -25,17 +25,21 @@
 //! * **[`terminal`]** — successful terminals are PAYLOAD-FREE; the
 //!   [`terminal::IntentDigest`] binds a terminal to the exact canonical
 //!   intent; the terminal dispositions are structural (private validated
-//!   payloads); [`terminal::assert_parent_is_head`] is the ONE-parent rule
-//!   helper the state machine calls at every Successful terminal append.
+//!   payloads); [`terminal::assert_parent_is_head`] is the parent==head
+//!   rule helper used by the plan-time gate and the finalizer's explicit
+//!   pre-check.
 //! * **[`snapshot`]** — the snapshot resolution rule: a successful
 //!   deployment's snapshot IS `entry.intent.resulting_snapshot()`; there is
 //!   no `SnapshotId`.
 //! * **[`transition`]** — the pure ledger state machine + the terminal
-//!   truth table; [`transition::apply_event`] gates the `Intent-only →
-//!   Successful` transition on the one-parent rule (`intent.parent ==
-//!   current successful head` at terminal-append time) with NO bypass —
-//!   recovery is a caller of the same transition, so a stale plan can never
-//!   append `Successful`.
+//!   truth table; [`transition::apply_event`] owns the STRICTLY-LINEAR
+//!   lineage gates (at most one pending intent at a time; an ordinary
+//!   intent's parent must equal the current successful head at intent-append
+//!   time; inherited entries must reproduce the head's snapshot; a terminal
+//!   must belong to the pending attempt; only a `Successful` terminal
+//!   advances the head; the checkpoint anchor is the one exception) with NO
+//!   bypass — recovery is a caller of the same transition, so a stale plan
+//!   can never append `Successful`.
 //! * **[`error`]** — the five error classes every kernel error belongs to.
 //!
 //! The LEDGER LAYER is reduced to a strict event store (strict parsing,
@@ -47,6 +51,7 @@
 
 pub mod error;
 pub mod intent;
+pub mod lineage;
 pub mod snapshot;
 pub mod terminal;
 pub mod transition;
@@ -56,6 +61,7 @@ pub use error::{
     KernelResult, TransportError,
 };
 pub use intent::{DeploymentIntent, PlanInput, PlannedDeploy, PlannedSlot, SlotAction, plan};
+pub use lineage::LineageViolation;
 pub use snapshot::{PreviousGeneration, SnapshotSlot, resolve_snapshot};
 pub use terminal::{
     DegradedTerminal, FailedRolledBackTerminal, IntentDigest, LedgerTerminal, TerminalDisposition,
@@ -63,5 +69,5 @@ pub use terminal::{
 };
 pub use transition::{
     CheckpointEvent, DeploymentState, ExecutionReport, IntentEvent, LedgerEvent, TerminalEvent,
-    apply_event, decide_terminal, validate_terminal_vs_intent,
+    apply_event, decide_terminal, validate_inherited_slots, validate_terminal_vs_intent,
 };

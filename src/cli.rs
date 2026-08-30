@@ -787,14 +787,51 @@ mod tests {
         let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
 
         // Two deployments: the first succeeds (producing rollback ref s0);
-        // the second fails in preflight (producing NO rollback state).
+        // the second fails in preflight (producing NO rollback state). The
+        // failed attempt is STRICTLY LINEAR: it is planned OVER the
+        // successful head (parent == the head; the ledger settles one
+        // pending intent at a time).
         seed_successful(&store, "deploy-log-ok", "2026-01-01T00:00:00Z");
-        let a_failed = crate::testutil::fixtures::full_intent_at(
-            "deploy-log-failed",
-            "production",
-            &[SlotId::parse("p1").unwrap()],
-            "2026-01-02T00:00:00Z",
+        let head = store
+            .read_ledger("production")
+            .unwrap()
+            .into_iter()
+            .rev()
+            .find(|e| {
+                e.terminal
+                    .as_ref()
+                    .is_some_and(|t| t.status() == DeploymentStatus::Successful)
+            })
+            .map(|e| e.intent)
+            .expect("the seed is the head");
+        let (parent, parent_snapshot) = (
+            Some(head.deployment_id().clone()),
+            Some(head.resulting_snapshot()),
         );
+        let a_failed = {
+            use crate::kernel::intent::{PlanInput, PlannedDeploy};
+            use crate::ledger::Observation;
+            let p1 = SlotId::parse("p1").unwrap();
+            crate::kernel::intent::plan(PlanInput {
+                deployment_id: test_deployment_id("deploy-log-failed"),
+                target: crate::identity::TargetName::parse("production").unwrap(),
+                parent,
+                parent_snapshot,
+                group: None,
+                selection: vec![p1.clone()],
+                planned: vec![PlannedDeploy {
+                    slot: p1,
+                    result: crate::testutil::fixtures::snapshot_slot(&SlotId::parse("p1").unwrap()),
+                    pre_push: Observation::KnownAbsent,
+                }],
+                behavior_digest: crate::identity::BehaviorDigest::parse(
+                    crate::identity::DIGEST_TEST_HEX_1,
+                )
+                .unwrap(),
+                attempted_at: crate::identity::Timestamp::parse("2026-01-02T00:00:00Z").unwrap(),
+            })
+            .expect("a seeded parented intent plans")
+        };
         store.append_intent("production", &a_failed).unwrap();
         store
             .append_terminal(

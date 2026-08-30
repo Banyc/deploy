@@ -59,16 +59,31 @@ fn validate_terminal_append(
             "ledger of target '{target}' refuses a terminal event: {e}"
         ))
     })?;
+    // THE STRICTLY-LINEAR TERMINAL MIRROR (item 5 of the spec): a terminal
+    // must settle the ONE pending intent — no OTHER entry may still be
+    // terminal-less (a second unresolved attempt would make this terminal an
+    // impossible event). Refused at the write boundary as a Conflict (a valid
+    // append against an impossible state is refused before any write; the
+    // ledger bytes stay unchanged).
+    let others_pending = entries
+        .iter()
+        .any(|e| e.deployment_id != entry.deployment_id && e.terminal.is_none());
+    if others_pending {
+        return Err(Error::conflict(format!(
+            "ledger of target '{target}' refuses the terminal for deployment '{}': another deployment in this ledger is still pending — the successful history is strictly linear (at most one unresolved intent at a time), and a terminal must settle the outstanding pending attempt",
+            entry.deployment_id
+        )));
+    }
     // THE ONE-PARENT RULE, mirroring the kernel's state machine
-    // ([`crate::kernel::transition::apply_event`] gates the Intent-only →
-    // Successful transition on AT MOST ONE Successful PER PARENT): a
-    // Successful terminal requires that no OTHER entry in the ledger already
-    // carries a Successful terminal for the same parent. The check and the
-    // append are ATOMIC under the single-writer target lock, so for any
-    // given parent at most ONE plan can ever append `Successful` — the
-    // second one to finalize observes a drifted head and is refused with
-    // the kernel's [`KernelError::Conflict`] (StalePlan), never reconciled
-    // implicitly, never successful.
+    // ([`crate::kernel::transition::apply_event`]): a Successful terminal
+    // requires that no OTHER entry in the ledger already carries a Successful
+    // terminal for the same parent. Under the strictly-linear model this is now
+    // a DEFENSIVE re-check — the intent-append gates already enforce one
+    // pending at a time and `parent == head` at intent-append time — but it
+    // remains the ATOMIC last line of defense under the target lock: for any
+    // given parent at most ONE plan can ever append `Successful`, and a stale
+    // finalizer is refused with the kernel's [`KernelError::Conflict`]
+    // (StalePlan), never reconciled implicitly, never successful.
     if terminal.disposition().is_successful() {
         let already = entries.iter().any(|e| {
             e.deployment_id != entry.deployment_id
@@ -84,6 +99,80 @@ fn validate_terminal_append(
                 entry.intent.parent()
             )));
         }
+    }
+    Ok(())
+}
+
+/// THE PRE-WRITE INTENT VALIDATION — the STRICT-LINEAR lineage mirror of the
+/// kernel's intent-append gates ([`crate::kernel::transition::apply_event`]'s
+/// intent branch), run BEFORE any write (fail closed — the ledger bytes stay
+/// unchanged on rejection):
+///
+/// * [`LineageViolation::PendingAttemptExists`]: a terminal-less entry
+///   exists — a new intent cannot be appended until the pending attempt
+///   reaches a terminal (a push that cannot finish the previous pending
+///   attempt is REFUSED; it never plans a second intent on top, even for
+///   disjoint groups);
+/// * [`LineageViolation::ParentMismatch`]: the intent's parent must equal
+///   the target's current successful head (the newest `Successful` entry);
+/// * [`validate_inherited_slots`]: every inherited slot must equal the
+///   head's snapshot entry.
+///
+/// At the WRITE boundary these are [`Error::conflict`] refusals (a valid
+/// operation against stale or concurrently changed state); the READ path (the
+/// fold in `read_ledger`) classifies the same violations as persisted-data
+/// corruption ([`Error::integrity`]).
+fn validate_intent_append(
+    target: &str,
+    entries: &[LedgerEntry],
+    intent: &DeploymentIntent,
+) -> Result<()> {
+    // (1) PendingAttemptExists: at most ONE unresolved intent at a time.
+    if let Some(pending) = entries.iter().find(|e| e.terminal.is_none()) {
+        return Err(Error::conflict(format!(
+            "ledger of target '{target}' refuses the intent for deployment '{}': {:?} — a previous deployment '{}' is still pending (its intent has no terminal); the successful history is strictly linear, so a push cannot plan a second intent while an earlier attempt is unresolved — reconcile the pending attempt first",
+            intent.deployment_id(),
+            crate::kernel::LineageViolation::PendingAttemptExists,
+            pending.deployment_id,
+        )));
+    }
+    // (2) ParentMismatch: the parent must be the current successful head.
+    let head = entries
+        .iter()
+        .rev()
+        .find(|e| {
+            e.terminal
+                .as_ref()
+                .is_some_and(|t| t.status() == DeploymentStatus::Successful)
+        })
+        .map(|e| &e.deployment_id);
+    if intent.parent() != head {
+        return Err(Error::conflict(format!(
+            "ledger of target '{target}' refuses the intent for deployment '{}': {:?} — it derives from parent {:?} but the target's successful head is {:?}; every intent's parent must equal the current successful head at append time",
+            intent.deployment_id(),
+            crate::kernel::LineageViolation::ParentMismatch,
+            intent.parent(),
+            head,
+        )));
+    }
+    // (3) Inherited-slot congruence: the intent's inherited entries must
+    // match the head's snapshot (only when a head exists — there are no
+    // inherited slots to check against on a fresh target).
+    let head_entry = head.and_then(|h| entries.iter().find(|e| &e.deployment_id == h));
+    if let Some(head_entry) = head_entry {
+        let head_snapshot = crate::kernel::snapshot::resolve_snapshot(head_entry).map_err(|e| {
+            Error::integrity(format!(
+                "ledger of target '{target}' cannot resolve the successful head's snapshot: {e}"
+            ))
+        })?;
+        crate::kernel::transition::validate_inherited_slots(intent, &head_snapshot).map_err(
+            |e| {
+                Error::conflict(format!(
+                    "ledger of target '{target}' refuses the intent for deployment '{}': {e}",
+                    intent.deployment_id()
+                ))
+            },
+        )?;
     }
     Ok(())
 }
@@ -124,14 +213,14 @@ impl LocalStore {
             ));
         }
         self.ensure_target_dir_durable(target)?;
+        let entries = self.read_ledger(target)?;
         // The intent is the entry's durable key: a duplicate intent for the
         // same deployment id is corruption (deployment ids are unique per
         // push) and must fail closed rather than append a second entry. The
         // guard scans EVERY parsed entry (`read_ledger` is the source of
         // truth and fails closed on malformed lines) — a duplicate at any
         // position, not just the first entry, is refused.
-        if self
-            .read_ledger(target)?
+        if entries
             .iter()
             .any(|e| e.deployment_id == *intent.deployment_id())
         {
@@ -140,6 +229,16 @@ impl LocalStore {
                 intent.deployment_id()
             )));
         }
+        // THE PRE-WRITE STRICT-LINEAR LINEAGE VALIDATION (fail closed — item
+        // 6 of the spec): the new intent is verified against the SAME lineage
+        // gates the read path's state machine applies BEFORE any write (at
+        // most one pending attempt — a push that cannot finish the previous
+        // pending attempt is REFUSED with a Conflict and never plans a second
+        // intent; the parent must equal the current successful head; the
+        // inherited slots must match the head's snapshot). An intent the
+        // strict reader would reject is NEVER written (the append is atomic;
+        // the ledger bytes stay unchanged on rejection).
+        validate_intent_append(target, &entries, intent)?;
         let line = serde_json::to_string(&LedgerEventWire::Intent(LedgerIntentWire::from(intent)))
             .map_err(|e| Error::store(format!("serialize ledger intent: {e}")))?;
         self.append_ledger_atomic(target, intent.deployment_id().as_str(), &line)
@@ -313,6 +412,18 @@ impl LocalStore {
                 ))
             })?;
         }
+        // THE STRUCTURAL COMPLETENESS GATE (item 8 of the spec): after the
+        // full fold, a checkpointed ledger must carry its SUCCESSFUL ANCHOR
+        // (the checkpoint's `retained_from` entry present and finalized
+        // `Successful`); a non-checkpointed ledger passes trivially. A
+        // structurally incomplete checkpoint prefix (a checkpoint with no
+        // following anchor, or an anchor that never reached its `Successful`
+        // terminal) is corruption.
+        state.finish().map_err(|e| {
+            Error::integrity(format!(
+                "ledger for target '{target}' fails structural validation: {e}"
+            ))
+        })?;
         Ok(state.into_entries())
     }
 
@@ -499,6 +610,57 @@ mod tests {
         fixtures::full_intent(id, target, &[slot_p1()], &[])
     }
 
+    /// A valid FULL-push intent for the target planned OVER the given
+    /// successful head entry (parent == the head, one slot p1) — the
+    /// strictly-linear seed: an ordinary intent's parent must equal the
+    /// current successful head, and it may only be appended when no other
+    /// attempt is pending.
+    fn intent_over_head(
+        id: &str,
+        target: &str,
+        head: &crate::kernel::intent::DeploymentIntent,
+    ) -> crate::kernel::intent::DeploymentIntent {
+        use crate::kernel::intent::{PlanInput, PlannedDeploy};
+        use crate::ledger::Observation;
+        let p1 = slot_p1();
+        crate::kernel::intent::plan(PlanInput {
+            deployment_id: test_deployment_id(id),
+            target: TargetName::parse(target).expect("a test target"),
+            parent: Some(head.deployment_id().clone()),
+            parent_snapshot: Some(head.resulting_snapshot()),
+            group: None,
+            selection: vec![p1.clone()],
+            planned: vec![PlannedDeploy {
+                slot: p1,
+                result: crate::testutil::fixtures::snapshot_slot(&slot_p1()),
+                pre_push: Observation::KnownAbsent,
+            }],
+            behavior_digest: crate::identity::BehaviorDigest::parse(
+                crate::identity::DIGEST_TEST_HEX_1,
+            )
+            .unwrap(),
+            attempted_at: crate::identity::Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
+        })
+        .expect("a seeded parented intent plans")
+    }
+
+    /// The target's most recent SUCCESSFUL entry's intent (the successful
+    /// head) from the store.
+    fn head_intent(store: &LocalStore, target: &str) -> crate::kernel::intent::DeploymentIntent {
+        store
+            .read_ledger(target)
+            .unwrap()
+            .into_iter()
+            .rev()
+            .find(|e| {
+                e.terminal
+                    .as_ref()
+                    .is_some_and(|t| t.status() == DeploymentStatus::Successful)
+            })
+            .map(|e| e.intent)
+            .expect("the successful head entry exists")
+    }
+
     /// A Successful terminal BOUND to its intent (payload-free).
     fn successful_terminal(intent: &crate::kernel::intent::DeploymentIntent) -> LedgerTerminal {
         fixtures::successful_terminal(intent)
@@ -683,17 +845,37 @@ mod tests {
 
     /// `latest_status` derives from the ledger: the terminal's status for a
     /// settled entry, `None` (the PENDING state) for an intent-only
-    /// entry, and `None` for an unknown deployment.
+    /// entry, and `None` for an unknown deployment. The ledger is STRICTLY
+    /// LINEAR (one unresolved intent at a time; every intent's parent is the
+    /// head).
     #[test]
     fn latest_status_derives_from_the_ledger() {
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let target = "t1";
-        store
-            .append_intent(target, &intent("deploy-pending", target))
-            .unwrap();
         seed_successful(&store, target, "deploy-ok");
-        let deg_i = intent("deploy-deg", target);
+        let ok_head = head_intent(&store, target);
+        // A pending intent OVER the head: an intent-only entry IS the
+        // pending state.
+        let pending = intent_over_head("deploy-pending", target, &ok_head);
+        store.append_intent(target, &pending).unwrap();
+        assert_eq!(
+            store
+                .latest_status(test_deployment_id("deploy-pending").as_str())
+                .unwrap(),
+            None,
+            "an intent-only entry IS the pending state — no pending status on the terminal enum"
+        );
+        // The pending attempt reaches its Successful terminal (the head
+        // advances to it), then a Degraded entry descends from the NEW head.
+        store
+            .append_terminal(
+                target,
+                pending.deployment_id(),
+                &successful_terminal(&pending),
+            )
+            .unwrap();
+        let deg_i = intent_over_head("deploy-deg", target, &pending);
         store.append_intent(target, &deg_i).unwrap();
         store
             .append_terminal(
@@ -706,8 +888,7 @@ mod tests {
             store
                 .latest_status(test_deployment_id("deploy-pending").as_str())
                 .unwrap(),
-            None,
-            "an intent-only entry IS the pending state — no pending status on the terminal enum"
+            Some(DeploymentStatus::Successful)
         );
         assert_eq!(
             store
@@ -730,18 +911,28 @@ mod tests {
     }
 
     /// `read_last_successful` is derived from the ledger: ONLY the newest
-    /// SUCCESSFUL entry, never a failed/pending one.
+    /// SUCCESSFUL entry, never a failed/pending one. The ledger is STRICTLY
+    /// LINEAR (settle each intent before the next; every intent descends
+    /// from the head).
     #[test]
     fn last_successful_is_derived() {
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let target = "t1";
-        store
-            .append_intent(target, &intent("deploy-pending", target))
-            .unwrap();
         seed_successful(&store, target, "deploy-ok");
-        let fail_i = intent("deploy-fail", target);
+        let ok_head = head_intent(&store, target);
+        // A pending (intent-only) intent over the head: it is NOT successful,
+        // so the derived read still names deploy-ok.
+        let fail_i = intent_over_head("deploy-fail", target, &ok_head);
         store.append_intent(target, &fail_i).unwrap();
+        assert_eq!(
+            store.read_last_successful(target).as_deref(),
+            Some(test_deployment_id("deploy-ok").as_str()),
+            "a pending attempt is never the derived head"
+        );
+        // The pending attempt ends FailedPreflight (clears the pending; the
+        // head stays deploy-ok), then a second successful deployment chains
+        // onto deploy-ok and becomes the newest head.
         store
             .append_terminal(
                 target,
@@ -749,11 +940,6 @@ mod tests {
                 &fixtures::failed_preflight_terminal(&fail_i),
             )
             .unwrap();
-        assert_eq!(
-            store.read_last_successful(target).as_deref(),
-            Some(test_deployment_id("deploy-ok").as_str())
-        );
-        // A second successful deployment becomes the newest head.
         seed_successful(&store, target, "deploy-ok2");
         assert_eq!(
             store.read_last_successful(target).as_deref(),
@@ -779,9 +965,22 @@ mod tests {
         let target = "t1";
         let a_first = intent("deploy-a", target);
         store.append_intent(target, &a_first).unwrap();
-        // deploy-b chains onto deploy-a (the lineage invariant — at most one
-        // `Successful` per parent), so both can succeed once deploy-a's
-        // terminal lands.
+        // Fault deploy-a's terminal append ONCE: the terminal is NOT written
+        // and deploy-a stays pending.
+        store
+            .fault_registry()
+            .arm_append_terminal(test_deployment_id("deploy-a").as_str());
+        let a_i = intent("deploy-a", target);
+        let err = store
+            .append_terminal(target, a_i.deployment_id(), &successful_terminal(&a_i))
+            .unwrap_err();
+        assert!(err.to_string().contains("append_terminal"));
+        // The fault is consumed: a retry succeeds for deploy-a (becoming the
+        // head), and deploy-b (planned over the NEW head — strictly linear)
+        // is appended and finalized unaffected.
+        store
+            .append_terminal(target, a_i.deployment_id(), &successful_terminal(&a_i))
+            .unwrap();
         let b_i = crate::testutil::fixtures::group_intent(
             "deploy-b",
             target,
@@ -792,19 +991,6 @@ mod tests {
             &[slot_p1()],
         );
         store.append_intent(target, &b_i).unwrap();
-        store
-            .fault_registry()
-            .arm_append_terminal(test_deployment_id("deploy-a").as_str());
-        let a_i = intent("deploy-a", target);
-        let err = store
-            .append_terminal(target, a_i.deployment_id(), &successful_terminal(&a_i))
-            .unwrap_err();
-        assert!(err.to_string().contains("append_terminal"));
-        // The fault is consumed: a retry succeeds for deploy-a, and deploy-b
-        // was never affected.
-        store
-            .append_terminal(target, a_i.deployment_id(), &successful_terminal(&a_i))
-            .unwrap();
         store
             .append_terminal(target, b_i.deployment_id(), &successful_terminal(&b_i))
             .unwrap();
@@ -835,14 +1021,18 @@ mod tests {
 
     /// A checkpoint event: the atomic suffix replacement writes a
     /// checkpointed ledger whose FIRST line is the checkpoint event, and the
-    /// reader's state machine accepts it exactly as the first event.
+    /// reader's state machine accepts it exactly as the first event — the
+    /// retained suffix starts at the checkpoint deployment (the ANCHOR,
+    /// whose parent lies OUTSIDE the retained window — the strictly-linear
+    /// model's one exception).
     #[test]
     fn checkpoint_event_is_accepted_and_validated() {
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let target = "t1";
         // Seed entries, then compact to the LAST one with a checkpoint
-        // prefix.
+        // prefix: the checkpoint event line + the retained suffix (deploy-b's
+        // intent + terminal) become the new ledger.
         seed_successful(&store, target, "deploy-a");
         seed_successful(&store, target, "deploy-b");
         let lines = store.read_ledger_lines(target).unwrap();
@@ -852,11 +1042,21 @@ mod tests {
             discarded: 1,
             recorded_at: crate::remote::helper::now_rfc3339_ts(),
         };
-        store.append_checkpoint(target, &checkpoint).unwrap();
-        store.write_ledger_suffix(target, &keep).unwrap();
+        let checkpoint_line = serde_json::to_string(&LedgerEventWire::Checkpoint(
+            crate::ledger::CheckpointWire::new(
+                &checkpoint.retained_from,
+                checkpoint.discarded,
+                &checkpoint.recorded_at.to_string(),
+            ),
+        ))
+        .unwrap();
+        let mut new_ledger = vec![checkpoint_line];
+        new_ledger.extend(keep);
+        store.write_ledger_suffix(target, &new_ledger).unwrap();
         let entries = store.read_ledger(target).unwrap();
         assert_eq!(entries.len(), 1, "the retained suffix IS the ledger");
         assert_eq!(entries[0].deployment_id, test_deployment_id("deploy-b"));
+        assert!(entries[0].terminal.is_some());
     }
 
     #[derive(Clone, Copy, PartialEq, Debug)]

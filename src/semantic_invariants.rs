@@ -2647,13 +2647,20 @@ fn state_machine_mixed_sequence_invariants() {
 fn state_machine_checkpoint_floor_discards_below_pending_keeps_above() {
     // (a) BELOW the floor: a pending commit whose attempt precedes the
     // checkpoint deployment is discarded.
+    // (a) BELOW the floor: settled below-floor history is discarded with
+    // the checkpoint — and a below-floor PENDING commit can NEVER exist: a
+    // push that cannot finish the previous pending attempt (a transient
+    // non-finalization leaves it intent-only) is REFUSED (the strictly-
+    // linear model never plans a second intent on top). The crash attempt
+    // is reconciled by the next push's recovery and is then discarded by a
+    // LATER checkpoint with the rest of the below-floor history — no
+    // resurrection.
     let f = Fixture::new();
     // Push 1: a clean deployment (s0).
     let r1 = f.push_prop("t1", None, FailureClass::None);
     assert!(matches!(&r1, Outcome::Push(b) if b.is_ok()));
     // Push 2 (new content): a crash-window fault leaves a recoverable-pending
-    // commit with NO snapshot. (Build runs WITHOUT the invariant checks — a
-    // crash window is open and only a later push/no-op refreshes observed.)
+    // commit with NO snapshot.
     f.apply_no_checks(Action::Build(2));
     let p = f.push_prop("t1", None, FailureClass::SnapshotAppend);
     let pending_id = {
@@ -2665,21 +2672,50 @@ fn state_machine_checkpoint_floor_discards_below_pending_keeps_above() {
         system_has_pending(&f, "t1"),
         "the faulted push left a pending commit"
     );
-    // Push 3 (new content): the CHECKPOINT DEPLOYMENT — its commit-marker
-    // fault is consumed by the pending commit's reconcile (so the pending
-    // attempt STAYS pending while this deployment commits and mints s1).
+    // Push 3 (new content): a SECOND push while the crash attempt is still
+    // pending. The CommitMarker fault makes the RECOVERY's finalization
+    // transiently fail, so the attempt stays intent-only and the push is
+    // REFUSED with the spec's Conflict — NOTHING is recorded (no second
+    // intent, no mutation), and the pending attempt is left for a later
+    // push.
     f.apply_no_checks(Action::Build(3));
     let d = f.push_prop("t1", None, FailureClass::CommitMarker);
-    assert!(matches!(&d, Outcome::Push(b) if b.is_ok()));
-    // The checkpoint at the SECOND successful deployment (s1): the pending
-    // commit's attempt sits strictly BEFORE it, so it is below the floor.
-    let c = f.checkpoint_prop("t1", 1);
+    let Outcome::Push(dres) = d else {
+        panic!("expected a push outcome")
+    };
+    let derr =
+        dres.expect_err("a push while a previous deployment is still pending must be refused");
+    assert!(
+        derr.to_string()
+            .contains("a previous deployment is still pending"),
+        "the refusal must carry the spec's conflict message, got: {derr}"
+    );
+    assert!(
+        system_has_pending(&f, "t1"),
+        "the refused push leaves the crash attempt pending"
+    );
+    // Push 4 (clean, new content): the reconciliation FINALIZES the crash
+    // attempt (Successful, s1 — its parent is still the head), then the
+    // push itself deploys (Successful, s2). Nothing is pending anymore.
+    let e = f.push_prop("t1", None, FailureClass::None);
+    assert!(matches!(&e, Outcome::Push(b) if b.is_ok()));
+    assert!(
+        !system_has_pending(&f, "t1"),
+        "the clean push finalized the previous pending attempt"
+    );
+    // The successful chain is s0 (push 1), s1 (the reconciled crash attempt,
+    // now below the floor), s2 (push 4). The checkpoint at index 2 discards
+    // the ENTIRE below-floor history — push 1 AND the reconciled crash
+    // attempt (its attempt line, its snapshot, its deployment dir) — with
+    // the checkpoint, so no recovery can resurrect it.
+    let c = f.checkpoint_prop("t1", 2);
     let Outcome::Checkpoint(rep) = c else {
         panic!("expected a checkpoint outcome")
     };
     assert!(rep.established);
-    // The pending commit was BELOW the floor: its attempt line and dir are
-    // GONE from the raw logs and it is no longer pending — no resurrection.
+    // The below-floor attempts (push 1 and the reconciled crash attempt) are
+    // GONE from the raw logs, their deployment dirs deleted, and nothing is
+    // pending.
     let raw_att: Vec<String> = f
         .store
         .read_attempts_raw("t1")
@@ -2689,15 +2725,20 @@ fn state_machine_checkpoint_floor_discards_below_pending_keeps_above() {
         .collect();
     assert!(
         !raw_att.contains(&pending_id),
-        "the below-floor pending attempt line must be discarded"
+        "the below-floor attempt must be discarded"
     );
     assert!(
         !f.store.deployment_dir(&pending_id).exists(),
-        "the below-floor pending deployment dir must be deleted"
+        "the below-floor deployment dir must be deleted"
+    );
+    assert_eq!(
+        raw_att.len(),
+        1,
+        "only the checkpoint deployment's attempt survives"
     );
     assert!(
         !system_has_pending(&f, "t1"),
-        "the below-floor pending commit must never be resurrected"
+        "no pending commit survives the checkpoint"
     );
     // The checkpoint deployment's own entry + rollback survive; the
     // retained suffix is exactly it.
@@ -5151,7 +5192,10 @@ impl Model {
     /// armed [`FailureClass::CommitMarker`] is consumed there and the attempt
     /// stays pending; under [`FailureClass::LockContention`] the reconcile's
     /// lock acquisition fails BEFORE any write, so the attempt stays pending
-    /// and the fault is NOT consumed.
+    /// and the fault is NOT consumed. UNDER THE STRICTLY-LINEAR MODEL a
+    /// still-pending attempt after reconciliation makes the CALLER ([`deploy`]
+    /// /[`rollback`]) REFUSE the push — the engine never plans a second
+    /// intent on top of an unresolved attempt.
     /// commit marker. The marker write is a commit-path write, so an
     /// armed [`FailureClass::CommitMarker`] is consumed there and the attempt
     /// stays pending; under [`FailureClass::LockContention`] the reconcile's
@@ -5241,6 +5285,18 @@ impl Model {
         // reconcile would wrongly finalize an attempt the reconcile's OWN
         // faulted marker write left pending).
         self.reconcile(t);
+        // THE STRICTLY-LINEAR REFUSAL (same as the HEAD push): a rollback
+        // push whose recovery cannot finish the previous pending attempt is
+        // also REFUSED — it never plans a second intent on top.
+        if self.pending.contains_key(&t) {
+            return (
+                OutcomeClass::Push {
+                    boundary: ReturnBoundary::Err,
+                    disposition: Disposition::NoAttempt,
+                },
+                self.crash_window.get(t).copied().unwrap_or(false),
+            );
+        }
         let Some(v) = v else {
             return (
                 OutcomeClass::Push {
@@ -5257,9 +5313,27 @@ impl Model {
     /// in the fixture) under the step's failure class. The engine reconciles
     /// pending attempts once, then decides no-op-vs-deploy against the
     /// post-reconciliation state and enters the shared resolved-deploy stage.
+    ///
+    /// THE STRICTLY-LINEAR REFUSAL (mirroring the engine): when the recovery
+    /// step CANNOT finish the previous pending attempt (the finalizer could
+    /// not complete RIGHT NOW — its marker write or lock acquisition
+    /// transiently failed, so the attempt is still intent-only), the push is
+    /// REFUSED with a Conflict and records NOTHING — it never plans a second
+    /// intent on top of an unresolved attempt, even for disjoint groups.
     fn deploy(&mut self, t: &'static str) -> (OutcomeClass, bool) {
         let id = self.mint_id();
         self.reconcile(t);
+        // A still-unresolved attempt after reconciliation: the push refuses
+        // (`Err` + `NoAttempt`) — the attempt stays pending for a later push.
+        if self.pending.contains_key(&t) {
+            return (
+                OutcomeClass::Push {
+                    boundary: ReturnBoundary::Err,
+                    disposition: Disposition::NoAttempt,
+                },
+                self.crash_window.get(t).copied().unwrap_or(false),
+            );
+        }
         // HEAD push: deploy exactly when ANY of the target's OWN slots is no
         // longer at the materialized head (the engine's complete ArtifactRef
         // equality — a tampered current forces a fresh push). Slots of other

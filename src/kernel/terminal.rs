@@ -335,16 +335,18 @@ pub fn terminal_with_digest(
     ))
 }
 
-/// The one-parent rule enforcement — `intent.parent == current successful
-/// head`. The PURE STATE MACHINE calls this at every Successful terminal
-/// append inside [`crate::kernel::transition::apply_event`] (recovery
-/// included — recovery is a caller of the same transition, not a second
-/// authority), so the lineage invariant is STRUCTURAL: every Successful
-/// entry's parent equals its predecessor head. The plan-time gate
-/// ([`crate::deploy::push::preflight`]) uses it too, before mutation. A
-/// drifted head means the plan was computed against a snapshot that is no
-/// longer the head — refuse with [`KernelError::Conflict`] (StalePlan) —
-/// never reconcile implicitly, never let a stale plan append `Successful`.
+/// THE PARENT == HEAD CHECK — `intent.parent == current successful
+/// head`. Under the STRICTLY-LINEAR model the authoritative lineage gate
+/// lives at INTENT-APPEND time inside [`crate::kernel::transition::
+/// apply_event`] (one pending at a time, parent == head at intent append);
+/// this helper enforces the SAME equality at the WRITE boundaries: the
+/// plan-time gate ([`crate::deploy::push::preflight`] before mutation) and
+/// the finalizer's explicit pre-check ([
+/// crate::ledger::finalize::finalize_successful_locked`] ALWAYS requires
+/// it, no flag, no bypass — recovery included). A drifted head means the
+/// plan was computed against a snapshot that is no longer the head — refuse
+/// with [`KernelError::Conflict`] (StalePlan) — never reconcile implicitly,
+/// never let a stale plan append `Successful`.
 pub fn assert_parent_is_head(
     intent: &DeploymentIntent,
     current_head: Option<&crate::identity::DeploymentId>,

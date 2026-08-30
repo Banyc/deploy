@@ -1843,27 +1843,6 @@ pub(crate) mod fixtures {
         .expect("a valid test intent plans")
     }
 
-    /// [`full_intent`] with an explicit attempted_at (log-rendering tests).
-    pub(crate) fn full_intent_at(
-        dep: &str,
-        target: &str,
-        slots: &[SlotId],
-        attempted_at: &str,
-    ) -> crate::kernel::intent::DeploymentIntent {
-        let mut i = full_intent(dep, target, slots, &[]);
-        i = crate::kernel::intent::from_wire(
-            i.deployment_id().clone(),
-            i.target().clone(),
-            i.parent().cloned(),
-            i.group().cloned(),
-            i.slots().clone(),
-            i.behavior_digest().clone(),
-            Timestamp::parse(attempted_at).unwrap(),
-        )
-        .expect("the fixture intent stays valid under a new timestamp");
-        i
-    }
-
     /// Build a GROUP intent: a subset of slots deployed, the rest inherited
     /// from `base` (the parent snapshot). `base` must cover every slot in
     /// `slots`.

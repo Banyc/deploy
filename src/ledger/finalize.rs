@@ -2,18 +2,19 @@
 //! reduced to EVIDENCE GATHERING (the semantic decision lives in the
 //! kernel's [`crate::kernel::transition::decide_terminal`]).
 //!
-//! THE GATE LIVES IN THE PURE STATE MACHINE, NOT HERE: the finalizer
-//! appends the PAYLOAD-FREE `Successful` terminal through the store, whose
-//! pre-write validation mirrors the kernel's [`crate::kernel::transition::
-//! apply_event`] — and THAT gate requires `intent.parent == current
-//! successful head` at append time, with NO bypass (recovery is a caller
-//! of the same transition, not a second authority). The parent/head check
-//! and the append are ATOMIC under the target lock, so at most ONE plan
-//! per parent can ever append `Successful`; a finalizer that observes a
-//! drifted head is REFUSED ([`FinalizeOutcome::Refused`], the reason
-//! carrying the kernel's Conflict/StalePlan message) and its caller
-//! finalizes the stale plan `Degraded` — never stranded, never
-//! successful.
+//! THE LINEAR GATES ARE ALWAYS ON — THERE IS NO `enforce_parent` FLAG: the
+//! finalizer REQUIRES `intent.parent() == store.read_last_successful(target)`
+//! at finalization time (an explicit pre-check, spec item 2) AND appends the
+//! PAYLOAD-FREE `Successful` terminal through the store, whose pre-write
+//! validation mirrors the kernel's [`crate::kernel::transition::apply_event`]
+//! — THAT gate also requires `intent.parent == current successful head` at
+//! append time, with NO bypass (recovery is a caller of the same transition,
+//! not a second authority). The parent/head check and the append are ATOMIC
+//! under the target lock, so at most ONE plan per parent can ever append
+//! `Successful`; a finalizer that observes a drifted head is REFUSED
+//! ([`FinalizeOutcome::Refused`], the reason carrying the kernel's
+//! Conflict/StalePlan message) and its caller finalizes the stale plan
+//! `Degraded` — never stranded, never successful.
 
 use crate::error::{Error, Result};
 use crate::identity::{GenerationRef, OperationId, PlacementSlotAssignment, SlotId};
@@ -58,6 +59,38 @@ pub fn finalize_successful_locked(
         && e.terminal.is_some()
     {
         return Ok(FinalizeOutcome::Finalized);
+    }
+    // THE STRICTLY-LINEAR HEAD CHECK (the spec's item 2 — the finalizer
+    // ALWAYS requires `intent.parent() == store.read_last_successful(target)`,
+    // no flag, no bypass): the attempt's parent must be the target's current
+    // successful head, verified HERE against the same ledger read the append
+    // gate uses — BEFORE any lock or marker mutation. A drifted head (a later
+    // deployment already succeeded on this parent) makes the plan STALE and
+    // the finalizer REFUSES ([`FinalizeOutcome::Refused`], the reason
+    // carrying the kernel's Conflict/StalePlan message); the caller finalizes
+    // the stale plan `Degraded` — never stranded, never `Successful`. The
+    // ATOMIC store/kernel gate (the pre-write terminal validation in
+    // [`crate::store::local::ledger`]) remains the ultimate authority; this
+    // is the early, no-mutation check.
+    let head = entries
+        .iter()
+        .rev()
+        .find(|e| {
+            e.terminal
+                .as_ref()
+                .is_some_and(|t| t.status() == crate::ledger::records::DeploymentStatus::Successful)
+        })
+        .map(|e| &e.deployment_id);
+    if let Err(parent_error) = crate::kernel::terminal::assert_parent_is_head(attempt, head) {
+        let slot = attempt
+            .selected_membership()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| SlotId::new("no-slot".to_string()));
+        return Ok(FinalizeOutcome::Refused {
+            reason: parent_error.message().to_string(),
+            slot,
+        });
     }
     let mut selected: Vec<SlotId> = attempt.selected_membership().into_iter().collect();
     selected.sort();
@@ -163,6 +196,10 @@ pub fn finalize_successful_locked(
 pub struct FinalizeSettings<'a> {
     pub reason: &'a str,
     pub op_id: &'a OperationId,
+    // DELIBERATELY NO `enforce_parent` FLAG (spec item 1): the strictly-
+    // linear head check (`intent.parent == current successful head`) is
+    // ALWAYS required, in the explicit pre-check AND in the store's atomic
+    // append gate — no caller can opt out.
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FinalizeOutcome {

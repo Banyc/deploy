@@ -903,10 +903,13 @@ pub(crate) mod commit_tests {
 
         // Craft an InProgress intent (id A) whose desired generation the
         // remote never minted: intent durable, finalization never started,
-        // and the remote's current points elsewhere.
+        // and the remote's current points elsewhere. The intent is planned
+        // OVER the successful head (the strictly-linear model: parent == the
+        // head).
         let target_a = GenerationId::generate();
         let id_a = test_deployment_id("deploy-inprogress-diverged");
         let desired_ref = baseline.desired[&SlotId::new("p1")].clone();
+        let head = head_intent(&h, &id_b);
 
         let intent = crafted_intent(
             &id_a,
@@ -917,7 +920,7 @@ pub(crate) mod commit_tests {
                 deploy_dir: "/srv/eng".to_string(),
             },
             &baseline.behavior_sha256,
-            None,
+            Some(&head),
         );
         h.store.append_attempt("t1", &intent).unwrap();
         assert_eq!(
@@ -1027,15 +1030,16 @@ pub(crate) mod commit_tests {
         assert!(marker.exists(), "marker written for the original id");
     }
 
-    /// Multiple pending attempts are reconciled OLDEST FIRST (attempts.jsonl
-    /// order) so successful-chain indices stay monotonic, and the at-most-one
-    /// invariant wins the parent: two crafted pending intents appended
-    /// A-then-B, BOTH planned against the same head (the baseline), are
-    /// reconciled oldest first — A finalizes `Successful` (the first one to
-    /// finalize on the parent, index 1 after the baseline), and B — the
-    /// second plan on the SAME parent — is REFUSED by the state machine's
-    /// one-parent gate and finalized `Degraded`, never `Successful` (its
-    /// successful-chain position stays unassigned).
+    /// THE STRICTLY-LINEAR GUARANTEE (the new-model replacement for the old
+    /// two-pending reconciliation): a ledger NEVER holds two simultaneously
+    /// pending intents. The SECOND crafted pending intent on the SAME
+    /// parent is REFUSED at the store's pre-write lineage gate with a
+    /// Conflict (`PendingAttemptExists` — no bytes written); after the
+    /// first pending attempt reaches its `Successful` terminal (becoming
+    /// the head), a stale re-append of the second intent is refused too
+    /// (`ParentMismatch` — its old parent is no longer the head), and the
+    /// retry — planned over the NEW head — appends and finalizes linearly.
+    /// Successful positions stay monotonic (1, 2 beyond the baseline).
     #[test]
     fn reconcile_multiple_pending_oldest_first_with_monotonic_indices() {
         let h = RecoveryHarness::new();
@@ -1061,70 +1065,95 @@ pub(crate) mod commit_tests {
         };
         let a = mk("deploy-multi-a");
         let b = mk("deploy-multi-b");
-        // Two intent-only entries: eligible for reconciliation, oldest first,
-        // both planned against the SAME parent (the baseline head).
+        // A appends: the ONE pending intent, parent == the head.
         h.store.append_attempt("t1", &a).unwrap();
-        h.store.append_attempt("t1", &b).unwrap();
-
-        // One push reconciles both, oldest first: the OLDER pending (A)
-        // finalizes Successful on the parent; the younger (B) observes the
-        // drifted head and is refused — Degraded, never Successful.
-        let r2 = push_clean(&h).unwrap();
-        assert_eq!(r2.message, "Everything up to date");
-        let snapshots = h.store.read_snapshots("t1").unwrap();
         assert_eq!(
-            snapshots.len(),
-            2,
-            "baseline + the older reconciled attempt"
+            latest_status(&h, a.deployment_id().as_str()),
+            None,
+            "an intent-only entry IS the pending state"
         );
-        assert_eq!(snapshots[1].deployment_id, *a.deployment_id());
+        // B — the SECOND pending intent on the SAME parent — is REFUSED at
+        // intent-append time (strictly linear: at most one unresolved intent
+        // at a time). Conflict, and the ledger bytes are unchanged.
+        let ledger_path = h.store.ledger_path("t1");
+        let bytes_before = std::fs::read(&ledger_path).unwrap();
+        let err = h.store.append_attempt("t1", &b).unwrap_err();
+        assert!(
+            err.to_string().contains("still pending"),
+            "the second intent while the first is pending must be refused with a Conflict, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("conflict"),
+            "the write-boundary lineage refusal is a Conflict, got: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&ledger_path).unwrap(),
+            bytes_before,
+            "a refused second intent leaves the ledger bytes unchanged (no append)"
+        );
+        // A reaches its Successful terminal — the head advances to A.
+        h.store
+            .append_terminal(
+                "t1",
+                a.deployment_id(),
+                &crate::testutil::fixtures::successful_terminal(&a),
+            )
+            .unwrap();
+        assert_eq!(
+            h.store.read_last_successful("t1").as_deref(),
+            Some(a.deployment_id().as_str()),
+            "A is the head after its Successful terminal"
+        );
         assert_eq!(
             ledger::successful_index(&h.store, "t1", a.deployment_id())
                 .unwrap()
                 .unwrap(),
             1,
-            "successful-chain positions stay monotonic"
+            "A's successful position is s1 (monotonic past the baseline)"
         );
-        assert_eq!(
-            latest_status(&h, a.deployment_id().as_str()),
-            Some(DeploymentStatus::Successful),
-            "the OLDER pending (processed first) wins the parent"
-        );
-        assert_eq!(
-            latest_status(&h, b.deployment_id().as_str()),
-            Some(DeploymentStatus::Degraded),
-            "the SECOND pending on the same parent is refused — at most ONE Successful per parent"
-        );
-        let b_terminal_reason = h
-            .store
-            .read_ledger("t1")
-            .unwrap()
-            .into_iter()
-            .find(|e| e.deployment_id == *b.deployment_id())
-            .expect("B's entry exists")
-            .terminal
-            .as_ref()
-            .expect("B has a terminal")
-            .reason()
-            .expect("a reason")
-            .to_string();
+        // B with its OLD parent (the baseline) is now refused too: the head
+        // moved on — a retry must plan over the NEW head (A).
+        let err = h.store.append_attempt("t1", &b).unwrap_err();
         assert!(
-            b_terminal_reason.contains("stale plan"),
-            "B's Degraded terminal reason carries the stale-plan source, got: {b_terminal_reason}"
+            err.to_string().contains("ParentMismatch"),
+            "a stale-parent intent is refused at append time, got: {err}"
         );
+        let b2 = crafted_intent(
+            &test_deployment_id("deploy-multi-b"),
+            &desired_ref.generation,
+            &desired_ref.assignment.artifact,
+            crate::ledger::PhysicalBinding {
+                server: ServerId::parse("s1").unwrap(),
+                deploy_dir: "/srv/eng".to_string(),
+            },
+            &baseline.behavior_sha256,
+            Some(&a),
+        );
+        h.store.append_attempt("t1", &b2).unwrap();
+        h.store
+            .append_terminal(
+                "t1",
+                b2.deployment_id(),
+                &crate::testutil::fixtures::successful_terminal(&b2),
+            )
+            .unwrap();
         assert_eq!(
             h.store.read_last_successful("t1").as_deref(),
-            Some(a.deployment_id().as_str()),
-            "A remains the head after B's refused finalization"
+            Some(b2.deployment_id().as_str()),
+            "the replanned B becomes the head"
+        );
+        assert_eq!(
+            ledger::successful_index(&h.store, "t1", b2.deployment_id())
+                .unwrap()
+                .unwrap(),
+            2,
+            "successful-chain positions stay monotonic"
         );
         assert_eq!(h.store.read_attempts("t1").unwrap().len(), 3);
-        for id in [a.deployment_id().as_str(), b.deployment_id().as_str()] {
-            let marker = h
-                .remotes_base
-                .join("s1")
-                .join(crate::remote::layout::commit_marker(id));
-            assert!(marker.exists(), "marker present for {id}");
-        }
+        assert_eq!(
+            latest_status(&h, b2.deployment_id().as_str()),
+            Some(DeploymentStatus::Successful)
+        );
     }
 
     // ---- Verification-failure rollback + observed refresh -----------------

@@ -476,22 +476,11 @@ mod tests {
 
     const TARGET: &str = "t1";
 
-    fn intent(id: &str, target: &str) -> DeploymentIntent {
-        intent_for(id, target, "rel-1", "tree-1")
-    }
-
     /// A single-slot (`p1`) VALID intent over the given release/tree, whose
     /// frozen snapshot entry (generation gen-1, artifact, binding s1
     /// /srv/deploy/p1) MATCHES the rollback `terminal_for` builds (the new
     /// shared validator requires the match, and the old fixtures were wrong
     /// under the new contract).
-    fn intent_for(id: &str, target: &str, release: &str, tree: &str) -> DeploymentIntent {
-        intent_for_over(id, target, release, tree, None)
-    }
-
-    /// [`intent_for`] planned against a parent (the current successful head)
-    /// — the lineage invariant (at most one `Successful` per parent) requires
-    /// a seeded successful to chain onto the previous one.
     fn intent_for_over(
         id: &str,
         target: &str,
@@ -578,7 +567,12 @@ mod tests {
                     .unwrap();
                 successful.push(test_deployment_id(&id).as_str().to_string());
             } else {
-                let it = intent(&id, target);
+                // A FAILED (settled) entry is also STRICTLY LINEAR: it
+                // descends from the CURRENT successful head (the same
+                // parenting as a success), so it appends after the previous
+                // entry's terminal and never introduces a second pending
+                // attempt.
+                let it = intent_for_over(&id, target, "rel-1", "tree-1", head.as_ref());
                 store.append_intent(target, &it).unwrap();
                 store
                     .append_terminal(

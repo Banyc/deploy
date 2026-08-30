@@ -1215,9 +1215,14 @@ mod tests {
         );
 
         // An outcome for a NON-SELECTED slot is refused (a slot the
-        // deployment did not select never reports a result). Build a group
-        // intent selecting only slot-0; a Degraded outcome for slot-1 is
-        // outside the selected membership.
+        // deployment did not select never reports a result). Build a head (a
+        // valid full-push over both slots) + a group intent selecting only
+        // slot-0 over that head; a Degraded outcome for slot-1 is outside
+        // the selected membership. The head's own intent + Successful
+        // terminal must precede the group lines in the written ledger — the
+        // strictly-linear model (the group's parent IS the head, and the
+        // head must already be successful).
+        let head = valid_intent(&keys, "deploy-head");
         let base = TargetSnapshot::from_entries(BTreeMap::from([
             (keys[0].clone(), fixtures::snapshot_slot(&keys[0])),
             (keys[1].clone(), fixtures::snapshot_slot(&keys[1])),
@@ -1226,7 +1231,7 @@ mod tests {
             "deploy-g",
             "t1",
             "g",
-            &test_deployment_id("deploy-base"),
+            head.deployment_id(),
             &base,
             &keys,
             &[keys[0].clone()],
@@ -1272,7 +1277,14 @@ mod tests {
             &terminal,
         );
         let lines = format!(
-            "{}\n{}\n",
+            "{}\n{}\n{}\n{}\n",
+            serde_json::to_string(&LedgerLine::Intent(LedgerIntentWire::from(&head))).unwrap(),
+            serde_json::to_string(&LedgerLine::Terminal(LedgerTerminalWire::to_wire(
+                head.deployment_id(),
+                head.target(),
+                &fixtures::successful_terminal(&head),
+            )))
+            .unwrap(),
             serde_json::to_string(&LedgerLine::Intent(LedgerIntentWire::from(&group_intent)))
                 .unwrap(),
             serde_json::to_string(&LedgerLine::Terminal(wire)).unwrap(),
@@ -1325,24 +1337,34 @@ mod tests {
 
     /// The reference-model acceptance property (proptest 4, deterministic
     /// seeding): the full kernel state machine accepts the sequences its
-    /// small reference machine accepts.
+    /// small reference machine accepts. The sequence is STRICTLY LINEAR
+    /// (one pending intent at a time; the second intent's parent is the
+    /// first deployment after it succeeds).
     #[test]
     fn reference_state_machine_matches_apply_event() {
         let target = TargetName::parse("r1").unwrap();
         let mut reference = Vec::<(String, Option<DeploymentStatus>)>::new();
         let mut state = kernel::transition::DeploymentState::new(target.clone());
-        // Two intents, then their terminals, accepted by BOTH the reference
-        // fold and the kernel.
+        // The first intent succeeds, then the second intent (parent == the
+        // first) is accepted by BOTH the reference fold and the kernel.
         let i1 = fixtures::full_intent("deploy-r1", "r1", &[slot(0)], &[]);
-        let i2 = fixtures::full_intent("deploy-r2", "r1", &[slot(1)], &[]);
-        for intent in [i1.clone(), i2.clone()] {
-            reference.push((intent.deployment_id().as_str().to_string(), None));
-            state = kernel::transition::apply_event(
-                state,
-                kernel::transition::LedgerEvent::Intent(kernel::transition::IntentEvent { intent }),
-            )
-            .unwrap();
-        }
+        let i2 = fixtures::group_intent(
+            "deploy-r2",
+            "r1",
+            "g",
+            i1.deployment_id(),
+            &i1.resulting_snapshot(),
+            &[slot(1)],
+            &[slot(1)],
+        );
+        reference.push((i1.deployment_id().as_str().to_string(), None));
+        state = kernel::transition::apply_event(
+            state,
+            kernel::transition::LedgerEvent::Intent(kernel::transition::IntentEvent {
+                intent: i1.clone(),
+            }),
+        )
+        .unwrap();
         let t1 = fixtures::successful_terminal(&i1);
         reference.push((
             "terminal-r1".to_string(),
@@ -1356,26 +1378,41 @@ mod tests {
             }),
         )
         .unwrap();
+        reference.push((i2.deployment_id().as_str().to_string(), None));
+        state = kernel::transition::apply_event(
+            state,
+            kernel::transition::LedgerEvent::Intent(kernel::transition::IntentEvent {
+                intent: i2.clone(),
+            }),
+        )
+        .unwrap();
         assert_eq!(state.entries().len(), 2);
         assert_eq!(
             state.entries()[0].terminal.as_ref().unwrap().status(),
             DeploymentStatus::Successful
         );
         assert_eq!(
+            state.entries()[1].terminal,
+            None,
+            "the second intent is pending"
+        );
+        assert_eq!(
             state.successful_head(),
             Some(i1.deployment_id()),
-            "the successful head is derived from the state"
+            "the successful head is the maintained first successful entry"
         );
         let _ = reference;
     }
 
-    /// A stale parent can never produce Successful (proptest 8,
-    /// deterministic case): finalizing an intent whose parent is no longer
-    /// the head is refused by the kernel's parent-head assertion — AND the
-    /// PURE STATE MACHINE refuses the `Intent-only → Successful` transition
-    /// for such an intent (the RECOVERY path is the same transition, with NO
-    /// bypass: a recovered pending attempt whose parent drifted can never
-    /// append `Successful`).
+    /// A stale parent can never be the head (the strictly-linear model):
+    /// at the WRITE boundary the plan-time parent-head assertion refuses
+    /// with a [`Conflict`](KernelError::Conflict) (a stale plan against
+    /// concurrent state), and the STORE's pre-write intent validation
+    /// refuses a stale-parent intent with a Conflict too; at the READ
+    /// boundary [`apply_event`] refuses a persisted intent whose parent is
+    /// not the head as corruption ([`Integrity`](KernelError::Integrity)) —
+    /// a stale intent can never reach a `Successful` terminal because it can
+    /// never even be appended.
     #[test]
     fn stale_parent_cannot_be_head() {
         let i = fixtures::full_intent("deploy-stale", "t1", &[slot(0)], &[]);
@@ -1387,15 +1424,34 @@ mod tests {
         // The same intent plans against the actual head and passes.
         assert!(kernel::terminal::assert_parent_is_head(&i, None).is_ok());
 
-        // THE STATE MACHINE GATE (the recovery path's gate): a Successful
-        // terminal for the stale intent is REFUSED by `apply_event` with a
-        // Conflict — recovery appends through the same transition, so a
-        // later recovery of the pending intent can NEVER produce Successful
-        // once the head moved on (a newer head's inherited state can never
-        // be overlaid from logical history).
-        let target = TargetName::parse("t1").unwrap();
-        let mut state = kernel::transition::DeploymentState::new(target.clone());
+        // THE STORE MIRROR (the write boundary): appending a stale-parent
+        // intent to a ledger whose head is `deploy-head` is REFUSED with a
+        // Conflict BEFORE any write — the strictly-linear intent-append
+        // gate (a valid op against stale state).
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let head_intent = fixtures::full_intent("deploy-head", "t1", &[slot(0)], &[]);
+        store.append_intent("t1", &head_intent).unwrap();
+        store
+            .append_terminal(
+                "t1",
+                head_intent.deployment_id(),
+                &fixtures::successful_terminal(&head_intent),
+            )
+            .unwrap();
+        assert_eq!(
+            store.read_last_successful("t1").as_deref(),
+            Some(head_intent.deployment_id().as_str())
+        );
+        // The stale intent (parent None != head deploy-head) is refused at
+        // the store's pre-write intent validation (Conflict). The strict
+        // reader refuses the same persisted sequence as corruption
+        // (Integrity). A stale intent can never be appended, so it can never
+        // reach a Successful terminal.
+        let err = store.append_intent("t1", &i).unwrap_err();
+        assert!(err.to_string().contains("ParentMismatch"), "got: {err}");
+        assert!(err.to_string().contains("conflict"));
+        let mut state = kernel::transition::DeploymentState::new(TargetName::parse("t1").unwrap());
         state = kernel::transition::apply_event(
             state,
             kernel::transition::LedgerEvent::Intent(kernel::transition::IntentEvent {
@@ -1411,36 +1467,27 @@ mod tests {
             }),
         )
         .unwrap();
-        // The pending intent (parent None — stale against head `deploy-head`)
-        // is durably recorded; its Successful terminal is REFUSED.
-        state = kernel::transition::apply_event(
+        let read_err = kernel::transition::apply_event(
             state,
             kernel::transition::LedgerEvent::Intent(kernel::transition::IntentEvent {
                 intent: i.clone(),
             }),
         )
-        .unwrap();
-        let err = kernel::transition::apply_event(
-            state,
-            kernel::transition::LedgerEvent::Terminal(kernel::transition::TerminalEvent {
-                deployment_id: i.deployment_id().clone(),
-                terminal: fixtures::successful_terminal(&i),
-            }),
-        )
         .unwrap_err();
         assert_eq!(
-            err.class(),
-            crate::kernel::KernelErrorClass::Conflict,
-            "the stale Successful transition is a refused conflict, never reconciled implicitly"
+            read_err.class(),
+            crate::kernel::KernelErrorClass::Integrity,
+            "a persisted stale-parent intent is corruption on the read path"
         );
+        assert!(read_err.to_string().contains("ParentMismatch"));
     }
 
-    /// At most ONE plan per parent can ever append `Successful` (the
-    /// lineage invariant, structural): once A (parent H) appended
-    /// `Successful`, a second intent B with the SAME parent H is REFUSED at
-    /// its Successful terminal — the second one to finalize observes the
-    /// drifted head (A) and is refused ([`KernelError::Conflict`]), never
-    /// reconciled implicitly.
+    /// At most ONE plan per parent can ever append `Successful` — now
+    /// enforced at INTENT-append time (the strictly-linear model): once A
+    /// (parent H) is pending, a second intent B with the SAME parent H is
+    /// REFUSED — at most one unresolved intent may exist, so the second
+    /// plan is refused as a Conflict at the WRITE boundary (the store mirror)
+    /// and as corruption on the READ path.
     #[test]
     fn at_most_one_successful_per_parent() {
         let target = TargetName::parse("t1").unwrap();
@@ -1467,16 +1514,14 @@ mod tests {
             &[slot(1)],
         );
         let mut state = kernel::transition::DeploymentState::new(target.clone());
-        for intent in [&h_intent, &a, &b] {
-            state = kernel::transition::apply_event(
-                state,
-                kernel::transition::LedgerEvent::Intent(kernel::transition::IntentEvent {
-                    intent: intent.clone(),
-                }),
-            )
-            .unwrap();
-        }
-        // H succeeds (parent None == head None).
+        // H is appended and succeeds (parent None == head None).
+        state = kernel::transition::apply_event(
+            state,
+            kernel::transition::LedgerEvent::Intent(kernel::transition::IntentEvent {
+                intent: h_intent.clone(),
+            }),
+        )
+        .unwrap();
         state = kernel::transition::apply_event(
             state,
             kernel::transition::LedgerEvent::Terminal(kernel::transition::TerminalEvent {
@@ -1485,34 +1530,79 @@ mod tests {
             }),
         )
         .unwrap();
-        // A (parent H) succeeds FIRST: parent == head (H) at append time.
+        // A (parent H == the head) is appended — the ONE pending attempt.
         state = kernel::transition::apply_event(
             state,
-            kernel::transition::LedgerEvent::Terminal(kernel::transition::TerminalEvent {
-                deployment_id: a.deployment_id().clone(),
-                terminal: fixtures::successful_terminal(&a),
+            kernel::transition::LedgerEvent::Intent(kernel::transition::IntentEvent {
+                intent: a.clone(),
             }),
         )
         .unwrap();
-        assert_eq!(
-            state.successful_head(),
-            Some(a.deployment_id()),
-            "A became the head after its Successful append"
-        );
-        // B (parent H) finalizes SECOND: the head is now A, not H — the
-        // second Successful on the SAME parent is REFUSED.
+        assert_eq!(state.pending(), Some(a.deployment_id()));
+        // B (the SECOND plan on the SAME parent H) is REFUSED at its intent:
+        // A is still pending — at most ONE unresolved intent at a time
+        // (Integrity on the read path; a Conflict at the store's write
+        // boundary).
         let err = kernel::transition::apply_event(
-            state,
-            kernel::transition::LedgerEvent::Terminal(kernel::transition::TerminalEvent {
-                deployment_id: b.deployment_id().clone(),
-                terminal: fixtures::successful_terminal(&b),
+            state.clone(),
+            kernel::transition::LedgerEvent::Intent(kernel::transition::IntentEvent {
+                intent: b.clone(),
             }),
         )
         .unwrap_err();
         assert_eq!(
             err.class(),
-            crate::kernel::KernelErrorClass::Conflict,
-            "at most one Successful per parent — the second plan to finalize on H is a stale plan"
+            crate::kernel::KernelErrorClass::Integrity,
+            "a second intent while the first is pending is corruption on the read path"
+        );
+        assert!(err.to_string().contains("PendingAttemptExists"));
+        // THE WRITE BOUNDARY mirror: the store refuses B (Conflict).
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        store.append_intent("t1", &h_intent).unwrap();
+        store
+            .append_terminal(
+                "t1",
+                h_intent.deployment_id(),
+                &fixtures::successful_terminal(&h_intent),
+            )
+            .unwrap();
+        store.append_intent("t1", &a).unwrap();
+        let store_err = store.append_intent("t1", &b).unwrap_err();
+        assert!(store_err.to_string().contains("still pending"));
+        assert!(store_err.to_string().contains("conflict"));
+        // Once A reaches its Successful terminal (clearing the pending
+        // attempt and advancing the head to A), B can be appended ONLY over
+        // the NEW head: B's stale parent H is refused, and a replanned B
+        // over A appends fine.
+        store
+            .append_terminal("t1", a.deployment_id(), &fixtures::successful_terminal(&a))
+            .unwrap();
+        let store_err = store.append_intent("t1", &b).unwrap_err();
+        assert!(
+            store_err.to_string().contains("ParentMismatch"),
+            "got: {store_err}"
+        );
+        let b2 = fixtures::group_intent(
+            "deploy-b",
+            "t1",
+            "g",
+            a.deployment_id(),
+            &a.resulting_snapshot(),
+            &[slot(0), slot(1)],
+            &[slot(1)],
+        );
+        store.append_intent("t1", &b2).unwrap();
+        store
+            .append_terminal(
+                "t1",
+                b2.deployment_id(),
+                &fixtures::successful_terminal(&b2),
+            )
+            .unwrap();
+        assert_eq!(
+            store.read_last_successful("t1").as_deref(),
+            Some(b2.deployment_id().as_str())
         );
     }
 
