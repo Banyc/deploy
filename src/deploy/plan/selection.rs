@@ -7,7 +7,6 @@ use crate::error::Result;
 use crate::identity::DeploymentId;
 use crate::identity::NonEmptySlotSet;
 use crate::identity::ReleaseId;
-use crate::identity::ReleaseRecord;
 use crate::identity::SlotId;
 use crate::identity::TargetName;
 
@@ -118,18 +117,18 @@ impl SlotSelection {
     pub fn release_members<'a>(
         &self,
         config: &'a ProjectConfig,
-        rec: &ReleaseRecord,
+        vr: &crate::verify::release::ValidatedRelease,
     ) -> Result<Vec<(&'a crate::config::SlotConfig, &'a crate::config::ServerDef)>> {
-        let frozen_ids: Vec<SlotId> = rec
-            .slots
+        let frozen_ids: Vec<SlotId> = vr
+            .slots()
             .values()
-            .flat_map(|cs| cs.slots.iter())
-            .filter(|s| s.target == self.target.as_str())
+            .flat_map(|slots| slots.iter())
+            .filter(|s| s.target().as_str() == self.target.as_str())
             .filter(|s| match &self.group {
-                Some(g) => s.groups.iter().any(|x| x == g),
+                Some(g) => s.groups().iter().any(|x| x.as_str() == g),
                 None => true,
             })
-            .map(|s| SlotId::parse(s.id.as_str()).expect("validated slot id is a safe segment"))
+            .map(|s| s.id().clone())
             .collect();
         if self.group.is_some() && frozen_ids.is_empty() {
             return Err(Error::config(format!(
@@ -241,8 +240,8 @@ mod selection_tests {
     use crate::deploy::plan::plan_assignments;
     use crate::deploy::plan::*;
     use crate::identity::{
-        CanonicalSlot, CanonicalSlots, MatchingMembership, Provenance, ReleaseRecord, SlotId,
-        SlotSet, TargetName, test_tree_digest,
+        BehaviorContract, CanonicalSlot, CanonicalSlots, MatchingMembership, Provenance,
+        ReleaseRecord, SlotId, SlotSet, TargetName, test_tree_digest,
     };
     use crate::ledger::{PlanOrigin, PushRef, VerifiedReleaseRebinding};
     use crate::store::local::LocalStore;
@@ -383,6 +382,43 @@ interval_seconds = 0
             .expect("consistent record carries a validated release id")
     }
 
+    /// Seed a release record + its identity-verified behavior snapshot: the
+    /// record's provenance `behavior_sha256` is set to the canonical digest of
+    /// a per-variant contract set covering EXACTLY the record's variants, and
+    /// the `behavior.json` aux file carries that same set, so the plan's
+    /// [`crate::verify::release::ValidatedRelease`] construction (which reads
+    /// and verifies the behavior snapshot) succeeds. Returns the release id.
+    fn seed_release(store: &LocalStore, rec: &mut ReleaseRecord) -> ReleaseId {
+        let behaviors: BTreeMap<String, BehaviorContract> = rec
+            .variants
+            .keys()
+            .map(|v| {
+                (
+                    v.clone(),
+                    BehaviorContract {
+                        activation: crate::config::Activation::None,
+                        verification: crate::config::Verification::Command(
+                            crate::config::ValidatedCommand {
+                                argv: vec!["true".to_string()],
+                                timeout_seconds: 5,
+                                attempts: 1,
+                                interval_seconds: 0,
+                            },
+                        ),
+                    },
+                )
+            })
+            .collect();
+        rec.provenance.behavior_sha256 =
+            crate::verify::release::variant_behaviors_digest(&behaviors);
+        let rid = consistent(rec);
+        store.write_release(rec).unwrap();
+        store
+            .write_release_aux(&rid, "mapping", &serde_json::to_value(&behaviors).unwrap())
+            .unwrap();
+        rid
+    }
+
     /// THE DIRECT-RELEASE GROUP PROPERTY (deterministic form): a
     /// `release:<id>` push with `--group <g>` validates the release against
     /// the target's COMPLETE current membership and then plans ONLY the
@@ -510,8 +546,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 ],
             },
         )]);
-        let release = consistent(&mut rec);
-        store.write_release(&rec).unwrap();
+        let release = seed_release(&store, &mut rec);
 
         // EVERY single-slot and pair group plans EXACTLY its selected slots:
         // the membership gate passes on the FULL set (release froze 3, the
@@ -773,8 +808,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 ],
             },
         )]);
-        let release = consistent(&mut rec);
-        store.write_release(&rec).unwrap();
+        let release = seed_release(&store, &mut rec);
 
         let selection = SlotSelection::normalize(&config, "t1", Some("G")).unwrap();
         let local_release = crate::identity::test_release_id("unused-local");
@@ -967,8 +1001,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 ],
             },
         )]);
-        let release2 = consistent(&mut rec2);
-        store.write_release(&rec2).unwrap();
+        let release2 = seed_release(&store, &mut rec2);
         let err = plan_assignments(
             &selection,
             &PushRef::Release {
@@ -1076,8 +1109,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     .collect(),
             },
         )]);
-        let release = consistent(&mut rec);
-        store.write_release(&rec).unwrap();
+        let release = seed_release(&store, &mut rec);
         (dir, config, store, release)
     }
 

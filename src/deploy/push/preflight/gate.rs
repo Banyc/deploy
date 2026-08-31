@@ -8,6 +8,7 @@ use crate::error::Error;
 use crate::error::Result;
 use crate::identity::SlotId;
 use crate::store::local::LocalStore;
+use std::collections::BTreeSet;
 
 /// The DIRECT-RELEASE MEMBERSHIP GATE ([`push`] step
 /// 1c, both modes, immediately after the ref is parsed/resolved and BEFORE
@@ -35,6 +36,23 @@ pub(crate) fn gate_direct_release_membership(
         let rec = store
             .read_release(release)
             .map_err(|_| Error::rollback(format!("release {release} not available locally")))?;
+        // The TYPED, FULLY-VALIDATED release graph (the record + its own
+        // per-variant behavior contracts + the available server set): the
+        // membership gate consumes the typed slot projections, and the full
+        // semantic validation fails closed here — before any remote access.
+        let behaviors = store.read_release_behaviors(release).map_err(|e| {
+            Error::rollback(format!(
+                "release {release} behavior contracts unavailable: {e}"
+            ))
+        })?;
+        let server_ids: BTreeSet<String> = config
+            .servers()
+            .map(|s| s.id.as_str().to_string())
+            .collect();
+        let vr = crate::verify::release::ValidatedRelease::try_new(rec, behaviors, &server_ids)
+            .map_err(|e| {
+                Error::rollback(format!("release {release} fails semantic validation: {e}"))
+            })?;
         let current_slot_ids: Vec<SlotId> = config
             .target_slots(target_name)?
             .into_iter()
@@ -45,7 +63,7 @@ pub(crate) fn gate_direct_release_membership(
         crate::deploy::plan::validate_direct_release_membership(
             target_name,
             release,
-            &rec,
+            &vr,
             &current_slot_ids,
         )?;
     }

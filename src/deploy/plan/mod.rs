@@ -320,6 +320,26 @@ pub fn plan_assignments(
             let rec = store
                 .read_release(release)
                 .map_err(|_| Error::rollback(format!("release {release} not available locally")))?;
+            // THE TYPED, FULLY-VALIDATED RELEASE GRAPH: the record + its own
+            // per-variant behavior contracts + the available server set,
+            // validated ONCE into a [`crate::verify::release::ValidatedRelease`].
+            // Every downstream projection — the variant→tree bindings, the
+            // slot ids/servers/targets, the deploy_dirs, the canonical group
+            // sets — is consumed TYPED from this value, so no release-record
+            // leaf is ever re-parsed with `expect` downstream.
+            let behaviors = store.read_release_behaviors(release).map_err(|e| {
+                Error::rollback(format!(
+                    "release {release} behavior contracts unavailable: {e}"
+                ))
+            })?;
+            let server_ids: BTreeSet<String> = config
+                .servers()
+                .map(|s| s.id.as_str().to_string())
+                .collect();
+            let vr = crate::verify::release::ValidatedRelease::try_new(rec, behaviors, &server_ids)
+                .map_err(|e| {
+                    Error::rollback(format!("release {release} fails semantic validation: {e}"))
+                })?;
             // DIRECT-RELEASE MEMBERSHIP CHECK (before any remote access) — see
             // [`validate_direct_release_membership`]. The engine's `push()`
             // ALSO runs this gate before the remote factory is ever invoked
@@ -346,7 +366,7 @@ pub fn plan_assignments(
             let membership = validate_direct_release_membership(
                 selection.target.as_str(),
                 release,
-                &rec,
+                &vr,
                 &current_slot_ids,
             )?;
             // THE RELEASE'S FROZEN GROUP PARTITION GOVERNS: the selected
@@ -365,7 +385,7 @@ pub fn plan_assignments(
             // guarantees the frozen slot-ID set equals the target's COMPLETE
             // current membership, so every frozen id rebinds to a current
             // physical declaration.)
-            let members = selection.release_members(config, &rec)?;
+            let members = selection.release_members(config, &vr)?;
             // THE PROOF-BEARING RESOLUTION of the FROZEN-RELEASE reference:
             // the target, its declared temporal source (the release's frozen
             // topology), and the non-empty resolved slot set (the PLANNED
@@ -390,42 +410,25 @@ pub fn plan_assignments(
                 // slot declaration snapshot is distinct from a deployment
                 // snapshot's slot→SERVER bindings (the exact-rollback
                 // physical-host check): those remain a per-target deployment
-                // concern.
-                let variant_name = if rec.slots.is_empty() {
-                    // A record without a canonical slot snapshot is
-                    // unverifiable; the store rejects such records at read,
-                    // so this is a belt-and-braces refusal rather than a
-                    // reachable fallback to the current configuration.
-                    return Err(Error::rollback(format!(
-                        "release {release} carries no stored slot snapshot; cannot resolve slot '{slot_id}'"
-                    )));
-                } else {
-                    rec.slots
-                        .iter()
-                        .find_map(|(v, cs)| {
-                            cs.slots
-                                .iter()
-                                .any(|s| s.id == slot_id.as_str())
-                                .then(|| v.clone())
-                        })
-                        .ok_or_else(|| {
-                            Error::rollback(format!(
-                                "release {release} declares no slot '{slot_id}'"
-                            ))
-                        })?
-                };
-                let variant =
-                    VariantName::parse(&variant_name).expect("variant name is a safe segment");
-                let tree = rec.variants.get(&variant_name).cloned().ok_or_else(|| {
-                    Error::rollback(format!("release {release} lacks variant '{variant_name}'"))
+                // concern. The typed graph guarantees the snapshot is complete
+                // and every leaf valid, so the lookup is a typed projection —
+                // no parse, no `expect`.
+                let variant = vr
+                    .slots()
+                    .iter()
+                    .find_map(|(v, slots)| slots.iter().any(|s| s.id() == &slot_id).then_some(v))
+                    .ok_or_else(|| {
+                        Error::rollback(format!("release {release} declares no slot '{slot_id}'"))
+                    })?;
+                let tree = vr.variant_bindings().get(variant).ok_or_else(|| {
+                    Error::rollback(format!("release {release} lacks variant '{variant}'"))
                 })?;
                 out.push(PlannedAssignment {
                     placement_slot: slot_id,
                     artifact: ArtifactRef {
                         release: release.clone(),
-                        variant,
-                        tree: TreeDigest::parse(&tree)
-                            .expect("release record variant tree is a valid digest"),
+                        variant: variant.clone(),
+                        tree: tree.clone(),
                     },
                 });
             }
@@ -448,15 +451,18 @@ pub fn plan_assignments(
             // assignments — the membership check still covers the complete
             // set, composed with the engine's full-membership gate).
             let mut frozen_topology: BTreeMap<SlotId, FrozenSlotTopology> = BTreeMap::new();
-            for (variant, cs) in &rec.slots {
-                for slot in &cs.slots {
-                    if slot.target == selection.target.as_str() {
+            for (variant, slots) in vr.slots() {
+                for slot in slots {
+                    if slot.target().as_str() == selection.target.as_str() {
                         frozen_topology.insert(
-                            SlotId::parse(slot.id.as_str())
-                                .expect("validated slot id is a safe segment"),
+                            slot.id().clone(),
                             FrozenSlotTopology {
-                                variant: variant.clone(),
-                                groups: slot.groups.clone(),
+                                variant: variant.as_str().to_string(),
+                                groups: slot
+                                    .groups()
+                                    .iter()
+                                    .map(|g| g.as_str().to_string())
+                                    .collect(),
                             },
                         );
                     }
@@ -836,6 +842,43 @@ interval_seconds = 0
             .expect("consistent record carries a validated release id")
     }
 
+    /// Seed a release record + its identity-verified behavior snapshot: the
+    /// record's provenance `behavior_sha256` is set to the canonical digest of
+    /// a per-variant contract set covering EXACTLY the record's variants, and
+    /// the `behavior.json` aux file carries that same set, so the plan's
+    /// [`crate::verify::release::ValidatedRelease`] construction (which reads
+    /// and verifies the behavior snapshot) succeeds. Returns the release id.
+    fn seed_release(store: &LocalStore, rec: &mut ReleaseRecord) -> ReleaseId {
+        let behaviors: BTreeMap<String, BehaviorContract> = rec
+            .variants
+            .keys()
+            .map(|v| {
+                (
+                    v.clone(),
+                    BehaviorContract {
+                        activation: crate::config::Activation::None,
+                        verification: crate::config::Verification::Command(
+                            crate::config::ValidatedCommand {
+                                argv: vec!["true".to_string()],
+                                timeout_seconds: 5,
+                                attempts: 1,
+                                interval_seconds: 0,
+                            },
+                        ),
+                    },
+                )
+            })
+            .collect();
+        rec.provenance.behavior_sha256 =
+            crate::verify::release::variant_behaviors_digest(&behaviors);
+        let rid = consistent(rec);
+        store.write_release(rec).unwrap();
+        store
+            .write_release_aux(&rid, "mapping", &serde_json::to_value(&behaviors).unwrap())
+            .unwrap();
+        rid
+    }
+
     /// A `PushRef::Release` resolution against a release record that carries
     /// its OWN stored canonical snapshot: each slot's variant binding resolves
     /// from the snapshot, the tree from the record's own per-variant
@@ -863,8 +906,7 @@ interval_seconds = 0
                 }],
             },
         )]);
-        let release = consistent(&mut rec);
-        store.write_release(&rec).unwrap();
+        let release = seed_release(&store, &mut rec);
         // The current config declares p1 inside the `standard` variant file.
         assert_eq!(config.slot_variant("p1").unwrap(), "standard");
 
@@ -964,8 +1006,7 @@ interval_seconds = 0
                 }],
             },
         )]);
-        let release = consistent(&mut rec);
-        store.write_release(&rec).unwrap();
+        let release = seed_release(&store, &mut rec);
 
         let err = plan_assignments(
             &SlotSelection::normalize(&config, "t1", None).unwrap(),
@@ -1065,8 +1106,7 @@ interval_seconds = 0
                 }],
             },
         )]);
-        let release = consistent(&mut rec);
-        store.write_release(&rec).unwrap();
+        let release = seed_release(&store, &mut rec);
 
         let err = plan_assignments(
             &SlotSelection::normalize(&config, "t1", None).unwrap(),
@@ -1088,11 +1128,28 @@ interval_seconds = 0
 
     /// EXTRA-SLOT drift: the release's own snapshot pins a slot `p2` the
     /// current target does not have — direct release refuses (expected
-    /// [p1, p2] vs current [p1]).
+    /// [p1, p2] vs current [p1]). The config declares BOTH servers the
+    /// record binds (s1, s2), so the typed graph accepts the record and the
+    /// MEMBERSHIP gate produces the drift refusal.
     #[test]
     fn release_membership_drift_extra_slot_refuses() {
-        let (_dir, config) = project_with_config();
-        let store = LocalStore::with_base(_dir.path().join("store")).unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let release_dir = project.join("releases").join("v1");
+        std::fs::create_dir_all(&release_dir).unwrap();
+        std::fs::write(release_dir.join("standard.toml"), VARIANT_TOML).unwrap();
+        let cfg_path = project.join("deploy.toml");
+        std::fs::write(
+            &cfg_path,
+            DEPLOY_TOML.replace(
+                "[[servers]]\nid = \"s1\"",
+                "[[servers]]\nid = \"s2\"\naddress = \"a2\"\nuser = \"u\"\nhost_key_fingerprint = \"SHA256:test\"\n\n[[servers]]\nid = \"s1\"",
+            ),
+        )
+        .unwrap();
+        let config = ProjectConfig::load(&cfg_path).unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let mut rec = legacy_record("unused", "tree-x");
         // The release pins p1 AND a p2 the current t1 has no member for.
         rec.slots = BTreeMap::from([(
@@ -1116,8 +1173,7 @@ interval_seconds = 0
                 ],
             },
         )]);
-        let release = consistent(&mut rec);
-        store.write_release(&rec).unwrap();
+        let release = seed_release(&store, &mut rec);
 
         let err = plan_assignments(
             &SlotSelection::normalize(&config, "t1", None).unwrap(),
@@ -1203,8 +1259,7 @@ interval_seconds = 0
                 }],
             },
         )]);
-        let release = consistent(&mut rec);
-        store.write_release(&rec).unwrap();
+        let release = seed_release(&store, &mut rec);
 
         let (assignments, desired, origin) = plan_assignments(
             &SlotSelection::normalize(&config, "t1", None).unwrap(),
@@ -1226,7 +1281,9 @@ interval_seconds = 0
 
     /// The TREE must come from the release record's own variant bindings: a
     /// release whose bindings lack the snapshot-resolved variant fails closed
-    /// with a rollback error naming the release.
+    /// — the typed graph refuses the record at semantic validation (the slot
+    /// snapshot names a variant the bindings do not declare), so the plan
+    /// never reaches a variant-tree lookup.
     #[test]
     fn release_missing_variant_tree_fails_rollback() {
         let (_dir, config) = project_with_config();
@@ -1247,8 +1304,7 @@ interval_seconds = 0
         rec.variants.clear(); // no variant bindings at all
         // Recompute the identity from the ACTUAL stored content (empty
         // bindings + snapshot) so the record verifies on write and read.
-        let release = consistent(&mut rec);
-        store.write_release(&rec).unwrap();
+        let release = seed_release(&store, &mut rec);
 
         let err = plan_assignments(
             &SlotSelection::normalize(&config, "t1", None).unwrap(),
@@ -1262,8 +1318,9 @@ interval_seconds = 0
         )
         .expect_err("a release without the resolved variant's tree must refuse");
         assert!(
-            err.to_string().contains("lacks variant 'standard'"),
-            "error must name the missing variant tree, got: {err}"
+            err.to_string().contains("fails semantic validation")
+                && err.to_string().contains("slot snapshot"),
+            "the typed graph must refuse the dangling snapshot at validation, got: {err}"
         );
     }
 
@@ -1276,20 +1333,38 @@ interval_seconds = 0
         let (_dir, config) = project_with_config();
         let store = LocalStore::with_base(_dir.path().join("store")).unwrap();
         // Current config declares p1 under `standard`; the stored snapshot
-        // instead records p1 under `other` (as if the slot later moved).
+        // instead records p1 under `other` (as if the slot later moved). The
+        // typed graph requires COMPLETE slot declarations, so the `standard`
+        // variant declares its own slot (`p9`, owning the OTHER target `t2` —
+        // a slot has exactly one owning target, so t1's membership stays
+        // `{p1}` and the snapshot still wins p1's variant binding).
         let mut rec = legacy_record("unused", "tree-x");
-        rec.slots = BTreeMap::from([(
-            "other".to_string(),
-            CanonicalSlots {
-                slots: vec![CanonicalSlot {
-                    id: "p1".to_string(),
-                    server: "s1".to_string(),
-                    deploy_dir: "/srv/plan".to_string(),
-                    target: "t1".to_string(),
-                    groups: Vec::new(),
-                }],
-            },
-        )]);
+        rec.slots = BTreeMap::from([
+            (
+                "other".to_string(),
+                CanonicalSlots {
+                    slots: vec![CanonicalSlot {
+                        id: "p1".to_string(),
+                        server: "s1".to_string(),
+                        deploy_dir: "/srv/plan".to_string(),
+                        target: "t1".to_string(),
+                        groups: Vec::new(),
+                    }],
+                },
+            ),
+            (
+                "standard".to_string(),
+                CanonicalSlots {
+                    slots: vec![CanonicalSlot {
+                        id: "p9".to_string(),
+                        server: "s1".to_string(),
+                        deploy_dir: "/srv/other".to_string(),
+                        target: "t2".to_string(),
+                        groups: Vec::new(),
+                    }],
+                },
+            ),
+        ]);
         rec.variants = BTreeMap::from([
             (
                 "standard".to_string(),
@@ -1300,8 +1375,7 @@ interval_seconds = 0
                 test_tree_digest("tree-other").as_str().to_string(),
             ),
         ]);
-        let release = consistent(&mut rec);
-        store.write_release(&rec).unwrap();
+        let release = seed_release(&store, &mut rec);
 
         let (assignments, _, origin) = plan_assignments(
             &SlotSelection::normalize(&config, "t1", None).unwrap(),
@@ -1368,8 +1442,7 @@ interval_seconds = 0
                 }],
             },
         )]);
-        let release = consistent(&mut rec);
-        store.write_release(&rec).unwrap();
+        let release = seed_release(&store, &mut rec);
         append_successful_snapshot(
             &store,
             "deploy-snapshot-histvar",
@@ -1562,8 +1635,7 @@ interval_seconds = 0
                 ],
             },
         )]);
-        let release = consistent(&mut rec);
-        store.write_release(&rec).unwrap();
+        let release = seed_release(&store, &mut rec);
 
         // The SOURCE deployment's snapshot records the OLD binding.
         append_successful_snapshot(
@@ -2333,8 +2405,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 slots: frozen_slots,
             },
         )]);
-        let release = consistent(&mut rec);
-        store.write_release(&rec).unwrap();
+        let release = seed_release(&store, &mut rec);
 
         // The DEPLOYMENT's exact per-slot snapshot: its own artifact
         // (release `rel-deploy`, variant `standard`, tree `tree-deploy`) and

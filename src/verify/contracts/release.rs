@@ -22,8 +22,8 @@ use crate::digest::sha256_bytes;
 use crate::error::{Error, Result};
 use crate::identity::{
     AbsoluteDeployDir, BehaviorContract, CanonicalReleasePayload, CanonicalSlot, CanonicalSlots,
-    Identifier, Provenance, ReleaseDigest, ReleaseId, ReleaseRecord, RolloutGroupName, TreeDigest,
-    VariantName,
+    Provenance, ReleaseDigest, ReleaseId, ReleaseRecord, RolloutGroupName, ServerId, SlotId,
+    TargetName, TreeDigest, VariantName,
 };
 use jiff::Timestamp;
 use std::collections::{BTreeMap, BTreeSet};
@@ -342,6 +342,13 @@ pub fn verify_release_identity(rec: &ReleaseRecord) -> Result<()> {
 /// through [`ValidatedRelease::try_new`], with no unchecked public
 /// constructor — a record that fails any rule here cannot become a
 /// [`ValidatedRelease`].
+///
+/// The domain value carries the TYPED release graph: every leaf of the wire
+/// record (variant names, tree digests, slot ids/servers/targets, deploy_dirs,
+/// group names) is parsed ONCE at [`ValidatedRelease::try_new`] into a
+/// validated identity (fail closed on any invalid leaf), so the "fully typed
+/// release" claim is PROVEN by the type — a consumer reads the typed
+/// accessors and never re-parses a release-record leaf with `expect`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValidatedRelease {
     /// The identity-verified, semantically validated frozen record (the
@@ -350,6 +357,51 @@ pub struct ValidatedRelease {
     /// The per-variant behavior contracts (closed enums), coverage-complete
     /// and digest-consistent with the record's provenance.
     behaviors: BTreeMap<String, BehaviorContract>,
+    /// The TYPED `variant -> tree digest` bindings, parsed once at
+    /// [`ValidatedRelease::try_new`] (fail closed on any invalid variant name
+    /// or tree digest).
+    variant_bindings: BTreeMap<VariantName, TreeDigest>,
+    /// The TYPED per-variant slot projections (each variant's slots in the
+    /// canonical slot order), parsed once at [`ValidatedRelease::try_new`].
+    slots: BTreeMap<VariantName, Vec<ValidatedSlot>>,
+}
+
+/// A TYPED slot projection: every leaf of one canonical slot declaration
+/// parsed ONCE at [`ValidatedRelease::try_new`] into a validated identity,
+/// so downstream consumers read the typed values directly — no parse, no
+/// `expect`. The group set is CANONICAL: a `BTreeSet` is sorted and
+/// deduplicated by construction, so the typed set is exactly the record's
+/// deduplicated membership.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidatedSlot {
+    id: SlotId,
+    server: ServerId,
+    deploy_dir: AbsoluteDeployDir,
+    target: TargetName,
+    groups: BTreeSet<RolloutGroupName>,
+}
+
+impl ValidatedSlot {
+    /// The slot's validated id.
+    pub fn id(&self) -> &SlotId {
+        &self.id
+    }
+    /// The slot's validated server id.
+    pub fn server(&self) -> &ServerId {
+        &self.server
+    }
+    /// The slot's validated, normalized absolute deploy_dir.
+    pub fn deploy_dir(&self) -> &AbsoluteDeployDir {
+        &self.deploy_dir
+    }
+    /// The slot's validated owning target.
+    pub fn target(&self) -> &TargetName {
+        &self.target
+    }
+    /// The slot's CANONICAL rollout group set (sorted, deduplicated).
+    pub fn groups(&self) -> &BTreeSet<RolloutGroupName> {
+        &self.groups
+    }
 }
 
 impl ValidatedRelease {
@@ -400,7 +452,9 @@ impl ValidatedRelease {
 
         // 2. SLOT SNAPSHOT AS A GRAPH: complete declarations, parseable
         // slots, unique slot ids, and every slot's server inside the
-        // available-server set.
+        // available-server set. Every leaf is parsed ONCE into its typed
+        // identity (fail closed on any invalid leaf): the typed graph is
+        // built HERE, so a consumer never re-parses a release-record leaf.
         if !rec.variants.keys().eq(rec.slots.keys()) {
             let missing: Vec<&String> = rec
                 .variants
@@ -417,40 +471,68 @@ impl ValidatedRelease {
                 rec.release_id, missing, extra
             )));
         }
+        // The TYPED variant -> tree bindings: every variant name and every
+        // tree digest must be a valid leaf (fail closed — an invalid name or
+        // digest can never become a [`ValidatedRelease`]).
+        let mut variant_bindings: BTreeMap<VariantName, TreeDigest> = BTreeMap::new();
+        for (name, tree) in &rec.variants {
+            let name = VariantName::parse(name).map_err(|e| {
+                Error::integrity(format!(
+                    "release {} variant name {:?} is not a valid variant name: {e}",
+                    rec.release_id, name
+                ))
+            })?;
+            let tree = TreeDigest::parse(tree).map_err(|e| {
+                Error::integrity(format!(
+                    "release {} variant '{}' tree digest {:?} is not a valid tree digest: {e}",
+                    rec.release_id, name, tree
+                ))
+            })?;
+            variant_bindings.insert(name, tree);
+        }
         let mut seen_ids: BTreeSet<String> = BTreeSet::new();
-        for cs in rec.slots.values() {
+        let mut slots: BTreeMap<VariantName, Vec<ValidatedSlot>> = BTreeMap::new();
+        for (variant, cs) in &rec.slots {
+            let variant = VariantName::parse(variant).map_err(|e| {
+                Error::integrity(format!(
+                    "release {} slot snapshot names invalid variant {:?}: {e}",
+                    rec.release_id, variant
+                ))
+            })?;
+            let mut typed_slots = Vec::with_capacity(cs.slots.len());
             for s in &cs.slots {
-                Identifier::parse(&s.id).map_err(|e| {
+                let id = SlotId::parse(&s.id).map_err(|e| {
                     Error::integrity(format!(
                         "release {} slot id {:?} is not a valid identifier: {e}",
                         rec.release_id, s.id
                     ))
                 })?;
-                Identifier::parse(&s.server).map_err(|e| {
+                let server = ServerId::parse(&s.server).map_err(|e| {
                     Error::integrity(format!(
                         "release {} slot '{}' server {:?} is not a valid identifier: {e}",
                         rec.release_id, s.id, s.server
                     ))
                 })?;
-                Identifier::parse(&s.target).map_err(|e| {
-                    Error::integrity(format!(
-                        "release {} slot '{}' owning target {:?} is not a valid identifier: {e}",
-                        rec.release_id, s.id, s.target
-                    ))
-                })?;
-                AbsoluteDeployDir::parse(&s.deploy_dir).map_err(|e| {
+                let deploy_dir = AbsoluteDeployDir::parse(&s.deploy_dir).map_err(|e| {
                     Error::integrity(format!(
                         "release {} slot '{}' deploy_dir {:?} is not an absolute valid path: {e}",
                         rec.release_id, s.id, s.deploy_dir
                     ))
                 })?;
+                let target = TargetName::parse(&s.target).map_err(|e| {
+                    Error::integrity(format!(
+                        "release {} slot '{}' owning target {:?} is not a valid identifier: {e}",
+                        rec.release_id, s.id, s.target
+                    ))
+                })?;
+                let mut groups: BTreeSet<RolloutGroupName> = BTreeSet::new();
                 for g in &s.groups {
-                    RolloutGroupName::parse(g).map_err(|e| {
+                    groups.insert(RolloutGroupName::parse(g).map_err(|e| {
                         Error::integrity(format!(
                             "release {} slot '{}' group {:?} is not a valid group name: {e}",
                             rec.release_id, s.id, g
                         ))
-                    })?;
+                    })?);
                 }
                 if !seen_ids.insert(s.id.clone()) {
                     return Err(Error::integrity(format!(
@@ -464,12 +546,22 @@ impl ValidatedRelease {
                         rec.release_id, s.id, s.server
                     )));
                 }
+                typed_slots.push(ValidatedSlot {
+                    id,
+                    server,
+                    deploy_dir,
+                    target,
+                    groups,
+                });
             }
+            slots.insert(variant, typed_slots);
         }
 
         Ok(ValidatedRelease {
             record: rec,
             behaviors,
+            variant_bindings,
+            slots,
         })
     }
 
@@ -483,6 +575,22 @@ impl ValidatedRelease {
     /// digest-consistent with the record's provenance).
     pub fn behaviors(&self) -> &BTreeMap<String, BehaviorContract> {
         &self.behaviors
+    }
+
+    /// The TYPED `variant -> tree digest` bindings (parsed once at
+    /// [`ValidatedRelease::try_new`]): every variant name and tree digest is
+    /// a validated identity, so a consumer reads the typed values directly —
+    /// no parse, no `expect`.
+    pub fn variant_bindings(&self) -> &BTreeMap<VariantName, TreeDigest> {
+        &self.variant_bindings
+    }
+
+    /// The TYPED per-variant slot projections (each variant's slots in the
+    /// canonical slot order): every slot's id/server/target is a validated
+    /// identity, its deploy_dir a validated absolute path, and its groups a
+    /// canonical (sorted, deduplicated) typed set.
+    pub fn slots(&self) -> &BTreeMap<VariantName, Vec<ValidatedSlot>> {
+        &self.slots
     }
 }
 
@@ -1963,7 +2071,9 @@ mod tests {
                             let mut slot_defs: BTreeMap<String, Vec<SlotConfig>> = BTreeMap::new();
                             let mut behaviors: BTreeMap<String, BehaviorContract> = BTreeMap::new();
                             for (i, name) in names.iter().enumerate() {
-                                variants.insert(name.clone(), hex::encode([0xAAu8; 8]));
+                                // A VALID 64-hex tree digest (the typed graph
+                                // gates tree digests at `try_new`).
+                                variants.insert(name.clone(), hex::encode([0xAAu8; 32]));
                                 slot_defs.insert(
                                     name.clone(),
                                     per_variant_slots[i]
@@ -2031,14 +2141,14 @@ mod tests {
             prop::collection::vec(
                 (
                     doc_variant_name_strategy(),
-                    any::<[u8; 8]>(),
+                    any::<[u8; 32]>(),
                     prop::collection::vec(canonical_slot_strategy(), 0..3),
                 ),
                 1..4,
             ),
             behavior_doc_strategy(),
-            any::<[u8; 8]>(),
-            any::<[u8; 8]>(),
+            any::<[u8; 32]>(),
+            any::<[u8; 32]>(),
             any::<bool>(),
             prop::sample::select(vec![0u8, 1, 2]),
             any::<bool>(),
@@ -2176,6 +2286,13 @@ mod tests {
         normal > 0
     }
 
+    /// The tree-digest rule: exactly 64 lowercase hex characters (the exact
+    /// form [`crate::digest::sha256_bytes`] produces) — the rule
+    /// [`crate::identity::TreeDigest::parse`] enforces.
+    fn ref_digest_ok(s: &str) -> bool {
+        s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    }
+
     /// The INDEPENDENT semantic reference validator: re-implements the
     /// release-graph + closed-behavior rules without calling
     /// [`ValidatedRelease`]. The only shared machinery is the digest
@@ -2213,6 +2330,15 @@ mod tests {
         }
         // Complete slot declarations (both directions).
         if rec.variants.keys().ne(rec.slots.keys()) {
+            return false;
+        }
+        // Every variant name and every tree digest must be a valid leaf (the
+        // typed graph's gate: an invalid name or digest is refused at
+        // `try_new`).
+        if !rec.variants.keys().all(|v| ref_name_ok(v)) {
+            return false;
+        }
+        if !rec.variants.values().all(|t| ref_digest_ok(t)) {
             return false;
         }
         // Per-slot graph rules.
@@ -2301,6 +2427,188 @@ mod tests {
         }
     }
 
+    // -------------------------------------------------------------------
+    // TYPED-GRAPH PROJECTION (the review's property): every release the
+    // validator ACCEPTS must support ALL downstream projections — the typed
+    // variant→tree bindings, the typed slot projections, the canonical
+    // group sets — WITHOUT panic (no parse/expect anywhere downstream). The
+    // record is mutated at EVERY key/value (variant bindings, slot fields,
+    // groups, identity fields) and its identity RECOMPUTED from the mutated
+    // content, so the validator's SEMANTIC rules — not the identity check —
+    // decide acceptance, and every accepted mutation must still project.
+    // -------------------------------------------------------------------
+
+    /// Flip the first hex digit of a 64-hex digest to a DIFFERENT valid hex
+    /// digit, producing a distinct valid digest (the accepted-branch
+    /// mutation for a tree binding).
+    fn flip_hex_digit(s: &str) -> String {
+        let mut bytes = s.as_bytes().to_vec();
+        bytes[0] = if bytes[0] == b'0' { b'1' } else { b'0' };
+        String::from_utf8(bytes).expect("a valid digest is ASCII")
+    }
+
+    /// Every single key/value mutation of a release record's CONTENT, with
+    /// the identity RECOMPUTED from the mutated content (so the record is
+    /// self-consistent and the validator's SEMANTIC rules — not the identity
+    /// check — decide acceptance). The base record is included first.
+    fn mutated_records_with_recomputed_identity(rec: &ReleaseRecord) -> Vec<ReleaseRecord> {
+        let mut out = vec![rec.clone()];
+        // Variant binding VALUES: a valid different digest (accepted when the
+        // name is valid) and an invalid digest (refused).
+        for (name, tree) in &rec.variants {
+            let mut r = rec.clone();
+            r.variants.insert(name.clone(), flip_hex_digit(tree));
+            out.push(r);
+            let mut r = rec.clone();
+            r.variants.insert(name.clone(), format!("{tree}!tampered"));
+            out.push(r);
+        }
+        // Variant binding KEYS: add a new variant (refused: behavior
+        // coverage + slot completeness) and remove the first variant
+        // (refused: orphan contract + dangling snapshot).
+        let mut r = rec.clone();
+        let mut extra = "zzz-extra".to_string();
+        while r.variants.contains_key(&extra) {
+            extra.push('x');
+        }
+        r.variants.insert(extra, hex::encode([0xAAu8; 32]));
+        out.push(r);
+        let mut r = rec.clone();
+        if let Some(first) = r.variants.keys().next().cloned() {
+            r.variants.remove(&first);
+        }
+        out.push(r);
+        // EVERY slot field of EVERY slot of EVERY variant.
+        for (variant, cs) in &rec.slots {
+            for (i, _slot) in cs.slots.iter().enumerate() {
+                // id: a valid different id (accepted when no duplicate) and
+                // an invalid id (refused).
+                let mut r = rec.clone();
+                r.slots.get_mut(variant).unwrap().slots[i].id = "p9".to_string();
+                out.push(r);
+                let mut r = rec.clone();
+                r.slots.get_mut(variant).unwrap().slots[i].id = "".to_string();
+                out.push(r);
+                // server: a known server (accepted) and an unknown server
+                // (refused).
+                let mut r = rec.clone();
+                r.slots.get_mut(variant).unwrap().slots[i].server = "server-01".to_string();
+                out.push(r);
+                let mut r = rec.clone();
+                r.slots.get_mut(variant).unwrap().slots[i].server = "server-99".to_string();
+                out.push(r);
+                // deploy_dir: a valid different path (accepted) and an
+                // invalid one (refused).
+                let mut r = rec.clone();
+                r.slots.get_mut(variant).unwrap().slots[i].deploy_dir = "/srv/other".to_string();
+                out.push(r);
+                let mut r = rec.clone();
+                r.slots.get_mut(variant).unwrap().slots[i].deploy_dir = "relative/path".to_string();
+                out.push(r);
+                // target: a valid different target (accepted).
+                let mut r = rec.clone();
+                r.slots.get_mut(variant).unwrap().slots[i].target = "staging".to_string();
+                out.push(r);
+                // groups: a valid extra group (accepted) and an invalid
+                // group (refused).
+                let mut r = rec.clone();
+                r.slots.get_mut(variant).unwrap().slots[i]
+                    .groups
+                    .push("wave-9".to_string());
+                out.push(r);
+                let mut r = rec.clone();
+                r.slots.get_mut(variant).unwrap().slots[i]
+                    .groups
+                    .push("a/b".to_string());
+                out.push(r);
+            }
+        }
+        // Identity fields: mapping digest (accepted — not checked against
+        // anything), behavior digest (refused — the behaviors no longer
+        // match), created_at (accepted — whitelisted).
+        let mut r = rec.clone();
+        r.provenance.mapping_sha256 = format!("{}!tampered", r.provenance.mapping_sha256);
+        out.push(r);
+        let mut r = rec.clone();
+        r.provenance.behavior_sha256 = format!("{}!tampered", r.provenance.behavior_sha256);
+        out.push(r);
+        let mut r = rec.clone();
+        r.created_at = "2099-12-31T23:59:59Z".to_string();
+        out.push(r);
+        // Recompute the identity from each mutated record's own content.
+        out.into_iter()
+            .map(|mut r| {
+                if let Some(d) = recompute_release_digest(&r) {
+                    r.release_sha256 = d.as_str().to_string();
+                    r.release_id = ReleaseId::from_digest(&d).as_str().to_string();
+                }
+                r
+            })
+            .collect()
+    }
+
+    /// THE TYPED-GRAPH PROJECTION CONTRACT for one generated document: for
+    /// the record and every single key/value mutation of it (with the
+    /// identity recomputed), EVERY release the validator ACCEPTS must
+    /// support ALL downstream projections — the typed variant→tree bindings,
+    /// the typed slot projections, the canonical group sets — WITHOUT panic.
+    fn run_typed_projection_contract(doc: &GraphDoc) {
+        let Ok(behaviors) = serde_json::from_value::<BTreeMap<String, BehaviorContract>>(
+            doc.behaviors_json.clone(),
+        ) else {
+            return; // unparseable behaviors: try_new refuses; nothing to project
+        };
+        for rec in mutated_records_with_recomputed_identity(&doc.rec) {
+            let Ok(vr) = ValidatedRelease::try_new(rec.clone(), behaviors.clone(), &doc.servers)
+            else {
+                continue; // refused: nothing to project
+            };
+            // (1) The TYPED variant→tree bindings: every record binding is
+            // typed and agrees with the wire record.
+            assert_eq!(
+                vr.variant_bindings().len(),
+                vr.record().variants.len(),
+                "every record variant binding is typed"
+            );
+            for (name, tree) in vr.variant_bindings() {
+                assert_eq!(
+                    vr.record().variants[name.as_str()],
+                    tree.as_str(),
+                    "the typed binding agrees with the wire binding"
+                );
+            }
+            // (2) The TYPED slot projections: every record slot leaf is
+            // typed and agrees with the wire record.
+            assert_eq!(vr.slots().len(), vr.record().slots.len());
+            for (variant, slots) in vr.slots() {
+                let cs = &vr.record().slots[variant.as_str()];
+                assert_eq!(slots.len(), cs.slots.len());
+                for (i, slot) in slots.iter().enumerate() {
+                    assert_eq!(slot.id().as_str(), cs.slots[i].id);
+                    assert_eq!(slot.server().as_str(), cs.slots[i].server);
+                    assert_eq!(
+                        slot.deploy_dir().as_path().to_string_lossy(),
+                        cs.slots[i].deploy_dir,
+                        "the typed deploy_dir is the normalized wire form"
+                    );
+                    assert_eq!(slot.target().as_str(), cs.slots[i].target);
+                    // (3) The CANONICAL group set: sorted, deduplicated,
+                    // typed — exactly the wire set's deduplicated membership.
+                    let typed: BTreeSet<String> = slot
+                        .groups()
+                        .iter()
+                        .map(|g| g.as_str().to_string())
+                        .collect();
+                    let wire: BTreeSet<String> = cs.slots[i].groups.iter().cloned().collect();
+                    assert_eq!(
+                        typed, wire,
+                        "the canonical group set is the deduplicated wire set"
+                    );
+                }
+            }
+        }
+    }
+
     /// The generator must actually REACH the accepted branch (otherwise the
     /// acceptance property would be vacuously agreeing on refusals only):
     /// under the pinned seed, drawing 400 documents yields at least one that
@@ -2360,6 +2668,11 @@ mod tests {
         fn validated_release_acceptance_property(doc in graph_doc_strategy()) {
             run_acceptance_contract(&doc);
         }
+
+        #[test]
+        fn validated_release_typed_projection_property(doc in graph_doc_strategy()) {
+            run_typed_projection_contract(&doc);
+        }
     }
 
     proptest! {
@@ -2385,6 +2698,13 @@ mod tests {
         #[test]
         fn validated_release_acceptance_property_fixed_seed_regression(doc in graph_doc_strategy()) {
             run_acceptance_contract(&doc);
+        }
+
+        #[test]
+        fn validated_release_typed_projection_property_fixed_seed_regression(
+            doc in graph_doc_strategy(),
+        ) {
+            run_typed_projection_contract(&doc);
         }
     }
 }

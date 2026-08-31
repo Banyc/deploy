@@ -6,7 +6,6 @@ use crate::error::Error;
 use crate::error::Result;
 use crate::identity::MatchingMembership;
 use crate::identity::ReleaseId;
-use crate::identity::ReleaseRecord;
 use crate::identity::SlotId;
 use crate::identity::SlotSet;
 
@@ -52,15 +51,15 @@ use crate::identity::SlotSet;
 pub(crate) fn validate_direct_release_membership(
     target_name: &str,
     release: &ReleaseId,
-    rec: &ReleaseRecord,
+    vr: &crate::verify::release::ValidatedRelease,
     current_slot_ids: &[SlotId],
 ) -> Result<MatchingMembership> {
     let frozen: SlotSet = SlotSet::new(
-        rec.slots
+        vr.slots()
             .values()
-            .flat_map(|cs| cs.slots.iter())
-            .filter(|s| s.target == target_name)
-            .map(|s| SlotId::parse(s.id.as_str()).expect("validated slot id is a safe segment")),
+            .flat_map(|slots| slots.iter())
+            .filter(|s| s.target().as_str() == target_name)
+            .map(|s| s.id().clone()),
     );
     let current: SlotSet = SlotSet::new(current_slot_ids.iter().cloned());
     MatchingMembership::verify(frozen.clone(), current.clone()).map_err(|_| {
@@ -81,7 +80,8 @@ mod groups_tests {
     use crate::deploy::plan::plan_assignments;
     use crate::deploy::plan::*;
     use crate::identity::{
-        CanonicalSlot, CanonicalSlots, Provenance, ReleaseRecord, SlotId, test_tree_digest,
+        BehaviorContract, CanonicalSlot, CanonicalSlots, Provenance, ReleaseRecord, SlotId,
+        test_tree_digest,
     };
     use crate::ledger::{PlanOrigin, PushRef, VerifiedReleaseRebinding};
     use crate::store::local::LocalStore;
@@ -136,6 +136,43 @@ mod groups_tests {
             .to_string();
         crate::identity::ReleaseId::parse(&rec.release_id)
             .expect("consistent record carries a validated release id")
+    }
+
+    /// Seed a release record + its identity-verified behavior snapshot: the
+    /// record's provenance `behavior_sha256` is set to the canonical digest of
+    /// a per-variant contract set covering EXACTLY the record's variants, and
+    /// the `behavior.json` aux file carries that same set, so the plan's
+    /// [`crate::verify::release::ValidatedRelease`] construction (which reads
+    /// and verifies the behavior snapshot) succeeds. Returns the release id.
+    fn seed_release(store: &LocalStore, rec: &mut ReleaseRecord) -> ReleaseId {
+        let behaviors: BTreeMap<String, BehaviorContract> = rec
+            .variants
+            .keys()
+            .map(|v| {
+                (
+                    v.clone(),
+                    BehaviorContract {
+                        activation: crate::config::Activation::None,
+                        verification: crate::config::Verification::Command(
+                            crate::config::ValidatedCommand {
+                                argv: vec!["true".to_string()],
+                                timeout_seconds: 5,
+                                attempts: 1,
+                                interval_seconds: 0,
+                            },
+                        ),
+                    },
+                )
+            })
+            .collect();
+        rec.provenance.behavior_sha256 =
+            crate::verify::release::variant_behaviors_digest(&behaviors);
+        let rid = consistent(rec);
+        store.write_release(rec).unwrap();
+        store
+            .write_release_aux(&rid, "mapping", &serde_json::to_value(&behaviors).unwrap())
+            .unwrap();
+        rid
     }
 
     /// Assert the planned origin is a Release origin naming the given
@@ -287,8 +324,7 @@ mod groups_tests {
         });
         canonical.sort_by(|a, b| a.id.cmp(&b.id));
         rec.slots = BTreeMap::from([("standard".to_string(), CanonicalSlots { slots: canonical })]);
-        let release = consistent(&mut rec);
-        store.write_release(&rec).unwrap();
+        let release = seed_release(&store, &mut rec);
 
         (dir, config, store, release, rec)
     }
