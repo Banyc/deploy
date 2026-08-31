@@ -4,12 +4,12 @@
 
 use crate::config::ProjectConfig;
 use crate::config::ServerDef;
-use crate::config::SlotConfig;
 use crate::deploy::maintenance::maintenance_warning;
 use crate::deploy::maintenance::refresh_observed;
 use crate::deploy::maintenance::retry_deferred_retentions;
 use crate::deploy::maintenance::retry_pending_sweep;
 use crate::deploy::plan::PlannedAssignment;
+use crate::deploy::project::ValidatedProject;
 use crate::deploy::push::PushReport;
 use crate::deploy::push::slot_vars;
 use crate::error::Result;
@@ -69,7 +69,8 @@ pub(crate) fn check_up_to_date(
     store: &LocalStore,
     config: &ProjectConfig,
     target_name: &str,
-    members: &[(&SlotConfig, &ServerDef)],
+    project: &ValidatedProject,
+    servers: &BTreeMap<SlotId, &ServerDef>,
     assignments: &[PlannedAssignment],
     statuses: &HashMap<SlotId, RemoteStatus>,
     helpers: &HashMap<SlotId, RemoteHelper>,
@@ -163,9 +164,10 @@ pub(crate) fn check_up_to_date(
                 break;
             };
             let vars = slot_vars(
-                members,
+                project,
+                servers,
+                remotes[&a.placement_slot].root(),
                 config,
-                target_name,
                 &a.placement_slot,
                 &asn.artifact,
                 Some(&asn.deployment_id),
@@ -257,7 +259,8 @@ pub(crate) fn check_up_to_date(
             refresh_observed(
                 store,
                 target_name,
-                members,
+                project,
+                servers,
                 &observed_servers,
                 &mut observed_warnings,
             );

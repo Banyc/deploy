@@ -41,6 +41,13 @@
 //!   operation and therefore a `HeldSlotLock` method (the assignment's
 //!   OWNER is bound by the guard itself).
 //!
+//! * `unlocked_store_writer.rs` — the store's RAW writers (`write_plan`,
+//!   `store_object`, `write_pins`, `write_slot_observed`, `write_server`,
+//!   the debt writers, `write_release`, `recover_if_missing`) and the
+//!   helper's `write_inventory` are CRATE-PRIVATE (point 7): a library
+//!   caller cannot mutate a persistent aggregate through a capability-less
+//!   public mutator.
+//!
 //! The `.pass()` case is the CONTRAST: the non-Successful dispositions are
 //! constructible by any caller (there is nothing to fabricate).
 
@@ -57,5 +64,6 @@ fn sealed_ledger_writes_are_compile_enforced() {
     t.compile_fail("tests/ui/rebinding_deserialize.rs");
     t.compile_fail("tests/ui/unguarded_rotate.rs");
     t.compile_fail("tests/ui/unguarded_create_generation.rs");
+    t.compile_fail("tests/ui/unlocked_store_writer.rs");
     t.pass("tests/ui/non_successful_terminal_ok.rs");
 }

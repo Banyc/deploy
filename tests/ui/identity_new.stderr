@@ -1,5 +1,5 @@
 error[E0599]: no associated function or constant named `new` found for struct `SlotId` in the current scope
-  --> /kache/home/code/deploy/tests/ui/identity_new.rs:12:24
+  --> tests/ui/identity_new.rs:12:24
    |
 12 |     let _bad = SlotId::new("..");
    |                        ^^^ associated function or constant not found in `SlotId`

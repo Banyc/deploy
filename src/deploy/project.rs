@@ -51,9 +51,10 @@ impl GroupSet {
     {
         let mut set = BTreeSet::new();
         for g in groups {
-            set.insert(RolloutGroupName::parse(&g).map_err(|e| {
-                Error::config(format!("invalid rollout group name {g:?}: {e}"))
-            })?);
+            set.insert(
+                RolloutGroupName::parse(&g)
+                    .map_err(|e| Error::config(format!("invalid rollout group name {g:?}: {e}")))?,
+            );
         }
         Ok(GroupSet(set))
     }
@@ -150,11 +151,11 @@ pub struct ValidatedProject {
 }
 
 impl ValidatedProject {
-    /// THE ONLY CONSTRUCTION PATH: the config (the slot/target/variant
-    /// declarations), the PROVISIONED receivers (read from the remotes
-    /// after provisioning — MANDATORY: a slot whose deploy_dir carries no
-    /// receiver UUID is REFUSED, fail closed), and the store's SEALED
-    /// [`OwnedRoot`]. Validates:
+    /// THE FULL-PROJECT CONSTRUCTION PATH: the config (the slot/target/
+    /// variant declarations of EVERY slot in the project), the PROVISIONED
+    /// receivers (read from the remotes after provisioning — MANDATORY: a
+    /// slot whose deploy_dir carries no receiver UUID is REFUSED, fail
+    /// closed), and the store's SEALED [`OwnedRoot`]. Validates:
     ///
     /// * every config slot is present in the topology exactly once (the
     ///   `BTreeMap<SlotId, _>` key makes duplicates unrepresentable);
@@ -170,41 +171,47 @@ impl ValidatedProject {
     ) -> Result<ValidatedProject> {
         let mut slots: BTreeMap<SlotId, ProvisionedSlot> = BTreeMap::new();
         for slot in config.slot_defs() {
-            let id = SlotId::parse(slot.id.as_str())
-                .map_err(|e| Error::config(format!("invalid slot id {:?}: {e}", slot.id)))?;
-            // The receiver is MANDATORY in the provisioned topology: a slot
-            // whose deploy_dir carries no receiver UUID is refused (fail
-            // closed — the physical identity is never unknown).
-            let receiver = receivers.get(&id).cloned().ok_or_else(|| {
-                Error::config(format!(
-                    "slot '{}' has no provisioned receiver UUID — the deploy_dir was never provisioned (or was provisioned before the receiver-UUID feature); refusing to build the provisioned topology",
-                    slot.id
-                ))
-            })?;
-            let owner = TargetName::parse(slot.target.as_str()).map_err(|e| {
-                Error::config(format!("invalid target name {:?}: {e}", slot.target))
-            })?;
-            if config.target(slot.target.as_str()).is_none() {
-                return Err(Error::config(format!(
-                    "slot '{}' owns target '{}' which is not declared in the config",
-                    slot.id, slot.target
-                )));
-            }
-            let variant_name = config.slot_variant(slot.id.as_str())?;
-            let variant = VariantName::parse(variant_name)
-                .map_err(|e| Error::config(format!("invalid variant name {variant_name:?}: {e}")))?;
-            let groups = GroupSet::try_new(slot.groups.clone())?;
-            slots.insert(
-                id.clone(),
-                ProvisionedSlot {
-                    id,
-                    owner,
-                    variant,
-                    receiver,
-                    root: root.clone(),
-                    groups,
-                },
-            );
+            validated_slot(config, receivers, &root, slot, &mut slots)?;
+        }
+        Ok(ValidatedProject { root, slots })
+    }
+
+    /// THE EXECUTION'S CONSTRUCTION PATH: the validated topology of EXACTLY
+    /// the SELECTED (executed) member slots of one push — the ONE topology
+    /// map the mutation phase consumes. `target` is the owning target of
+    /// the executed slots; every selected id must resolve to a member slot
+    /// of that target (a selected slot owned by another target is REFUSED)
+    /// and carry its MANDATORY provisioned receiver (read from the remotes
+    /// after phase-B provisioning — a selected slot whose deploy_dir has no
+    /// receiver UUID is REFUSED, fail closed: the intent can never be
+    /// persisted with an unknown physical identity). The selected slots are
+    /// keyed into the same canonical disjoint `BTreeMap<SlotId, _>` — no
+    /// duplicate topology maps, no optional receiver, no raw path.
+    pub(crate) fn for_selected(
+        config: &ProjectConfig,
+        target: &TargetName,
+        selected: &[SlotId],
+        receivers: &BTreeMap<SlotId, ReceiverUuid>,
+        root: OwnedRoot,
+    ) -> Result<ValidatedProject> {
+        let mut slots: BTreeMap<SlotId, ProvisionedSlot> = BTreeMap::new();
+        for id in selected {
+            // The executed slot must be a member of the OWNING target — a
+            // selected slot owned by another target is a torn execution
+            // topology (refused, never silently executed under the wrong
+            // target).
+            let slot = config
+                .target_slots(target.as_str())?
+                .into_iter()
+                .find(|(s, _)| s.id == id.as_str())
+                .ok_or_else(|| {
+                    Error::integrity(format!(
+                        "executed slot '{}' is not a member of target '{}' — the executed topology cannot name a slot the config does not own",
+                        id, target
+                    ))
+                })?
+                .0;
+            validated_slot(config, receivers, &root, slot, &mut slots)?;
         }
         Ok(ValidatedProject { root, slots })
     }
@@ -229,10 +236,7 @@ impl ValidatedProject {
     /// The provisioned slots owned by the given target, in deterministic
     /// (slot-id) order.
     pub fn target_slots(&self, target: &TargetName) -> Vec<&ProvisionedSlot> {
-        self.slots
-            .values()
-            .filter(|s| s.owner == *target)
-            .collect()
+        self.slots.values().filter(|s| s.owner == *target).collect()
     }
 
     /// The provisioned slots of the given target in the given rollout
@@ -249,6 +253,56 @@ impl ValidatedProject {
     pub fn receiver(&self, id: &SlotId) -> Option<&ReceiverUuid> {
         self.slots.get(id).map(|s| &s.receiver)
     }
+}
+
+/// Validate ONE config slot declaration into a typed [`ProvisionedSlot`]
+/// and insert it under its canonical id: the MANDATORY provisioned receiver
+/// (a slot whose deploy_dir carries no receiver UUID is refused — fail
+/// closed), the owning target (must exist in the config), the variant that
+/// declares the slot, and the validated [`GroupSet`]. The `BTreeMap` key
+/// makes a duplicate topology entry unrepresentable.
+fn validated_slot(
+    config: &ProjectConfig,
+    receivers: &BTreeMap<SlotId, ReceiverUuid>,
+    root: &OwnedRoot,
+    slot: &crate::config::SlotConfig,
+    slots: &mut BTreeMap<SlotId, ProvisionedSlot>,
+) -> Result<()> {
+    let id = SlotId::parse(slot.id.as_str())
+        .map_err(|e| Error::config(format!("invalid slot id {:?}: {e}", slot.id)))?;
+    // The receiver is MANDATORY in the provisioned topology: a slot whose
+    // deploy_dir carries no receiver UUID is refused (fail closed — the
+    // physical identity is never unknown).
+    let receiver = receivers.get(&id).cloned().ok_or_else(|| {
+        Error::config(format!(
+            "slot '{}' has no provisioned receiver UUID — the deploy_dir was never provisioned (or was provisioned before the receiver-UUID feature); refusing to build the provisioned topology",
+            slot.id
+        ))
+    })?;
+    let owner = TargetName::parse(slot.target.as_str())
+        .map_err(|e| Error::config(format!("invalid target name {:?}: {e}", slot.target)))?;
+    if config.target(slot.target.as_str()).is_none() {
+        return Err(Error::config(format!(
+            "slot '{}' owns target '{}' which is not declared in the config",
+            slot.id, slot.target
+        )));
+    }
+    let variant_name = config.slot_variant(slot.id.as_str())?;
+    let variant = VariantName::parse(variant_name)
+        .map_err(|e| Error::config(format!("invalid variant name {variant_name:?}: {e}")))?;
+    let groups = GroupSet::try_new(slot.groups.clone())?;
+    slots.insert(
+        id.clone(),
+        ProvisionedSlot {
+            id,
+            owner,
+            variant,
+            receiver,
+            root: root.clone(),
+            groups,
+        },
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -312,8 +366,11 @@ interval_seconds = 0
             std::ffi::OsString::from("XDG_DATA_HOME"),
             dir.path().join("store-root").into_os_string(),
         )]));
-        let store = LocalStore::new_in(&env, &crate::identity::ApplicationStoreKey::parse("proj").unwrap())
-            .expect("the production store owns its root");
+        let store = LocalStore::new_in(
+            &env,
+            &crate::identity::ApplicationStoreKey::parse("proj").unwrap(),
+        )
+        .expect("the production store owns its root");
         (dir, config, store)
     }
 
@@ -333,7 +390,11 @@ interval_seconds = 0
         assert_eq!(slot.id(), &p1);
         assert_eq!(slot.owner().as_str(), "t1");
         assert_eq!(slot.variant().as_str(), "standard");
-        assert_eq!(slot.receiver(), &recv, "the receiver is the provisioned one");
+        assert_eq!(
+            slot.receiver(),
+            &recv,
+            "the receiver is the provisioned one"
+        );
         assert!(slot.groups().contains("canary"));
         assert_eq!(slot.root().canonical(), root.canonical());
         // The typed views resolve from the ONE topology.
@@ -367,6 +428,50 @@ interval_seconds = 0
         assert!(
             err.to_string().contains("invalid rollout group name"),
             "the refusal must name the group rule, got: {err}"
+        );
+    }
+
+    /// THE EXECUTION'S topology ([`ValidatedProject::for_selected`]) is the
+    /// SAME canonical, typed, disjoint topology over exactly the SELECTED
+    /// members: one entry per executed slot, mandatory receiver, typed
+    /// leaves.
+    #[test]
+    fn executed_topology_is_typed_canonical_and_disjoint() {
+        let (_dir, config, store) = project();
+        let root = store.owned_root().expect("the store owns its root").clone();
+        let p1 = SlotId::parse("p1").unwrap();
+        let recv = ReceiverUuid::generate();
+        let receivers = BTreeMap::from([(p1.clone(), recv.clone())]);
+        let t1 = TargetName::parse("t1").unwrap();
+        let vp = ValidatedProject::for_selected(
+            &config,
+            &t1,
+            std::slice::from_ref(&p1),
+            &receivers,
+            root.clone(),
+        )
+        .unwrap();
+        assert_eq!(vp.slots().len(), 1, "exactly the executed slot");
+        let slot = vp.slot(&p1).expect("p1 is the executed slot");
+        assert_eq!(slot.owner(), &t1);
+        assert_eq!(slot.receiver(), &recv, "the receiver is MANDATORY");
+        assert_eq!(slot.root().canonical(), root.canonical());
+    }
+
+    /// A selected slot that is NOT a member of the owning target is REFUSED
+    /// (an executed topology can never name a slot the target does not own).
+    #[test]
+    fn executed_non_member_is_refused() {
+        let (_dir, config, store) = project();
+        let root = store.owned_root().expect("the store owns its root").clone();
+        let foreign = SlotId::parse("foreign").unwrap();
+        let receivers = BTreeMap::from([(foreign.clone(), ReceiverUuid::generate())]);
+        let t1 = TargetName::parse("t1").unwrap();
+        let err = ValidatedProject::for_selected(&config, &t1, &[foreign], &receivers, root)
+            .expect_err("a non-member executed slot must be refused");
+        assert!(
+            err.to_string().contains("not a member of target"),
+            "the refusal must name the member rule, got: {err}"
         );
     }
 }

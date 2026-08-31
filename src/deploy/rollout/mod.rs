@@ -8,7 +8,6 @@
 
 use crate::config::ProjectConfig;
 use crate::config::ServerDef;
-use crate::config::SlotConfig;
 use crate::deploy::plan::PlannedAssignment;
 use crate::deploy::push::slot_vars;
 use crate::error::Result;
@@ -237,9 +236,9 @@ pub(crate) struct BatchRun {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_batches(
     prepared: &crate::deploy::push::PreparedDeployment,
-    members: &[(&SlotConfig, &ServerDef)],
+    project: &crate::deploy::project::ValidatedProject,
+    servers: &BTreeMap<SlotId, &ServerDef>,
     config: &ProjectConfig,
-    target_name: &str,
     store: &LocalStore,
     remotes: &HashMap<SlotId, Box<dyn Remote>>,
     helpers: &HashMap<SlotId, RemoteHelper>,
@@ -271,10 +270,15 @@ pub(crate) fn run_batches(
         let end = (idx + batch_size).min(servers_order.len());
         for sid in &servers_order[idx..end] {
             let req = requests.iter().find(|r| &r.slot == sid).unwrap();
+            // The slot's template variables are DERIVED from the VALIDATED
+            // PROJECT's typed topology (the slot id and its owner target),
+            // the config's transport server, and the OPEN REMOTE's root (the
+            // deploy_dir) — never re-parsed from a config slot view.
             let vars = slot_vars(
-                members,
+                project,
+                servers,
+                remotes[sid].root(),
                 config,
-                target_name,
                 sid,
                 &req.artifact,
                 Some(deployment_id),
@@ -286,13 +290,13 @@ pub(crate) fn run_batches(
                 &helpers[sid],
                 op_id,
                 deployment_id,
-                target_name,
+                project,
                 sid,
                 &req.artifact,
                 &req.generation,
                 req.expected_generation.as_ref(),
                 &req.behavior,
-                &req.behavior_sha256,
+                &req.behavior_digest,
                 &vars,
                 config,
             )?;

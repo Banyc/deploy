@@ -59,7 +59,11 @@ pub struct OwnedRoot {
     /// The resolved endpoint this root is owned on.
     endpoint: EndpointKey,
     /// The REFCOUNTED registration token: the registration is released when
-    /// the LAST clone of this root drops (clones share the token).
+    /// the LAST clone of this root drops (clones share the token). This
+    /// field is a KEEP-ALIVE token — clones share the [`Arc`], and the
+    /// release happens in the token's own `Drop` (never by reading this
+    /// field), so the field is intentionally never read directly.
+    #[allow(dead_code)] // keep-alive token: its Drop releases the ownership registration
     registration: Arc<OwnedRootRegistration>,
 }
 

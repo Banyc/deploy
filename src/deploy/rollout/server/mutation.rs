@@ -31,8 +31,8 @@ use crate::error::Result;
 use crate::identity::{
     ArtifactRef, BehaviorDigest, DeploymentId, GenerationId, OperationId, TargetName, Timestamp,
 };
-use crate::remote::helper::{DurableCurrent, DurableGeneration, DurableRelease, ExpectedCurrent};
 use crate::remote::helper::HeldSlotLock;
+use crate::remote::helper::{DurableCurrent, DurableGeneration, DurableRelease, ExpectedCurrent};
 use crate::verify::release::ValidatedReleaseBundle;
 
 /// THE ONE PROOF-BEARING SLOT MUTATION: the complete, typed, validated
@@ -78,27 +78,30 @@ pub(crate) struct PreparedSlotMutation {
 
 impl PreparedSlotMutation {
     /// THE ONLY CONSTRUCTION PATH: every field is a typed, validated value
-    /// derived from the validated release, the verified tree, the verified
-    /// current state, and the persisted intent. The constructor validates
-    /// the relationships that make the mutation coherent:
+    /// derived from the validated release, the verified tree, and the
+    /// persisted intent — the mutation is built from the intent's OWN
+    /// per-slot execution projection ([`ExecutionRequest`]: the artifact,
+    /// the minted generation, the compare-and-swap expected pre-push
+    /// generation, the frozen behavior contract + its typed digest), the
+    /// typed owning target (from the validated project's topology), and the
+    /// VERIFIED evidence (the validated release bundle, the re-canonicalized
+    /// tree). The constructor validates the relationships that make the
+    /// mutation coherent:
     ///
     /// * the release bundle's identity equals the artifact's release;
-    /// * the tree digest equals the artifact's tree;
-    /// * the expected current state agrees with the prior generation
-    ///   (`Absent` iff no prior generation).
+    /// * the verified tree digest equals the artifact's tree;
+    /// * the expected current state is DERIVED from the request's prior
+    ///   generation, so a disagreement is unrepresentable by construction.
     pub(crate) fn new(
         op_id: OperationId,
         deployment_id: DeploymentId,
-        generation_id: GenerationId,
-        artifact: ArtifactRef,
-        behavior_digest: BehaviorDigest,
-        prior_generation: Option<GenerationId>,
+        request: &crate::deploy::push::ExecutionRequest,
         created_at: Timestamp,
         target: TargetName,
-        expected: ExpectedCurrent,
         release: ValidatedReleaseBundle,
         tree: crate::identity::TreeDigest,
     ) -> Result<Self> {
+        let artifact = request.artifact.clone();
         if release.release_id() != &artifact.release {
             return Err(crate::error::Error::integrity(format!(
                 "prepared slot mutation: the release bundle {} does not match the artifact's release {}",
@@ -112,23 +115,20 @@ impl PreparedSlotMutation {
                 tree, artifact.tree
             )));
         }
-        let expected_agrees = match (&expected, &prior_generation) {
-            (ExpectedCurrent::Absent, None) => true,
-            (ExpectedCurrent::Generation(g), Some(p)) => g == p,
-            _ => false,
+        // The expected current state is DERIVED from the request's prior
+        // generation (`Absent` for a first deployment) — the constructor can
+        // never receive a pair that disagrees.
+        let prior_generation = request.expected_generation.clone();
+        let expected = match &prior_generation {
+            Some(g) => ExpectedCurrent::Generation(g.clone()),
+            None => ExpectedCurrent::Absent,
         };
-        if !expected_agrees {
-            return Err(crate::error::Error::integrity(format!(
-                "prepared slot mutation: the expected current state {:?} disagrees with the prior generation {:?}",
-                expected, prior_generation
-            )));
-        }
         Ok(PreparedSlotMutation {
             op_id,
             deployment_id,
-            generation_id,
+            generation_id: request.generation.clone(),
             artifact,
-            behavior_digest,
+            behavior_digest: request.behavior_digest.clone(),
             prior_generation,
             created_at,
             target,

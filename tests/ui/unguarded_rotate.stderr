@@ -1,5 +1,5 @@
 warning: unreachable statement
-  --> /kache/home/code/deploy/tests/ui/unguarded_rotate.rs:11:5
+  --> tests/ui/unguarded_rotate.rs:11:5
    |
 10 |     let helper: RemoteHelper = unimplemented!();
    |                                ---------------- any code following this expression is unreachable
@@ -9,7 +9,7 @@ warning: unreachable statement
    = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
 
 error[E0599]: no method named `rotate` found for struct `RemoteHelper<'a>` in the current scope
-  --> /kache/home/code/deploy/tests/ui/unguarded_rotate.rs:15:12
+  --> tests/ui/unguarded_rotate.rs:15:12
    |
 15 |     helper.rotate(&std::collections::HashSet::new(), &std::collections::HashSet::new());
    |            ^^^^^^ method not found in `RemoteHelper<'_>`

@@ -374,7 +374,9 @@ impl<'a> crate::remote::helper::HeldSlotLock<'a> {
         // never a reported success — `current` reports success only after
         // its parent fsync succeeds.
         self.helper.remote.fsync_parent(layout::current())?;
-        Ok(crate::remote::helper::DurableCurrent::swapped(gen_id.clone()))
+        Ok(crate::remote::helper::DurableCurrent::swapped(
+            gen_id.clone(),
+        ))
     }
 
     /// Atomically move `current` to the given generation — the durable

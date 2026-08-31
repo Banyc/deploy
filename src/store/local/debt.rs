@@ -164,7 +164,7 @@ impl LocalStore {
     /// so a later read can verify the binding. The key IS the target
     /// argument — a mismatched write is structurally unrepresentable (the
     /// record is built from the key).
-    pub fn write_retention_debt(
+    pub(crate) fn write_retention_debt(
         &self,
         target: &TargetName,
         debt: &BTreeMap<String, String>,
@@ -253,7 +253,7 @@ impl LocalStore {
     /// Persist (or clear) the store-global sweep-debt marker. `None` removes
     /// the marker file, so a fully-serviced store leaves no trace; `Some`
     /// records the TYPED marker (the durability gate for the pending sweep).
-    pub fn write_sweep_debt(&self, debt: Option<&SweepDebt>) -> Result<()> {
+    pub(crate) fn write_sweep_debt(&self, debt: Option<&SweepDebt>) -> Result<()> {
         // Post-commit maintenance write fault, keyed by the empty global key.
         #[cfg(test)]
         if self.fault_registry.consume(FaultKind::WriteSweepDebt, "") {

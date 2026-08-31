@@ -13,5 +13,3 @@
 pub(crate) mod publish;
 mod rotate;
 mod transactions;
-
-pub use publish::copy_host_tree_to_remote;

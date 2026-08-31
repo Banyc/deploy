@@ -43,7 +43,11 @@ impl LocalStore {
     /// generation whose tree was never materialized locally); when the server
     /// no longer retains it either, recovery is a no-op and the later
     /// verification/staging steps surface the missing tree.
-    pub fn recover_if_missing(&self, remote: &dyn Remote, digest: &TreeDigest) -> Result<()> {
+    pub(crate) fn recover_if_missing(
+        &self,
+        remote: &dyn Remote,
+        digest: &TreeDigest,
+    ) -> Result<()> {
         if self.object_exists(digest) {
             return Ok(());
         }
@@ -101,7 +105,7 @@ impl LocalStore {
     /// removed and re-staged, never refused (the content-addressed store's
     /// contract: after `store_object` returns `Ok`, the object at
     /// `objects/sha256/<digest>/` verifies as `<digest>`).
-    pub fn store_object(&self, digest: &TreeDigest, src_root: &Path) -> Result<()> {
+    pub(crate) fn store_object(&self, digest: &TreeDigest, src_root: &Path) -> Result<()> {
         let obj_dir = self.base.join(layout::objects()).join(digest.as_str());
         // The final object is wholly absent or wholly present (the staged
         // publish renames the COMPLETE object dir into place atomically), so

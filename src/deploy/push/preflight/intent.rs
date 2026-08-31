@@ -29,12 +29,18 @@ use crate::store::local::ledger::TargetLedgerTxn;
 /// The binding recorded in the intent carries the deploy_dir's IMMUTABLE
 /// receiver UUID (read from the provisioned remote during preflight) — the
 /// PHYSICAL identity exact rollback compares. A real push's deploy_dir is
-/// always provisioned in phase B, so the UUID is present; a dry run never
-/// provisions, so the binding carries the config binding without a physical
-/// identity (the dry-run intent is never persisted).
+/// always provisioned in phase B, so the UUID is present — and it is
+/// consumed TYPED from the VALIDATED PROJECT's topology (`project` — the
+/// structural verdict's point 1): the project is constructed from the
+/// provisioned remotes' MANDATORY receivers (a selected slot without one
+/// is REFUSED before the intent is ever built, fail closed — there is NO
+/// bare-binding fallback for a real push). A dry run never provisions, so
+/// `project` is `None` and the run's binding carries the config binding
+/// without a physical identity (the dry-run intent is never persisted).
 pub(crate) fn build_intent(
     ctx: &PushContext,
     outcome: &PreflightOutcome,
+    project: Option<&crate::deploy::project::ValidatedProject>,
 ) -> Result<kernel::intent::DeploymentIntent> {
     let store = ctx.store;
     let target_name = ctx.target_name;
@@ -82,17 +88,21 @@ pub(crate) fn build_intent(
                     deployment_id, a.placement_slot
                 ))
             })?;
-        let binding = match outcome
-            .receiver_uuids
-            .get(&a.placement_slot)
-            .cloned()
-            .flatten()
-        {
-            Some(receiver_uuid) => config_binding.with_receiver_uuid(receiver_uuid),
-            // A dry run never provisions (its receiver UUIDs are all
-            // `None`), so the intent's binding carries the config binding
-            // without a physical identity; a real push's deploy_dir is
-            // always provisioned in phase B, so `None` is unreachable there.
+        // The PHYSICAL identity comes from the VALIDATED PROJECT's topology
+        // (mandatory — the project construction already refused a selected
+        // slot without a receiver, so every executed slot has one here); a
+        // dry run (`project: None`) records the config binding without a
+        // physical identity — it is never persisted.
+        let binding = match project {
+            Some(p) => {
+                let receiver = p.receiver(&a.placement_slot).ok_or_else(|| {
+                    crate::error::Error::integrity(format!(
+                        "intent {}: planned slot '{}' has no provisioned receiver in the validated project topology",
+                        deployment_id, a.placement_slot
+                    ))
+                })?;
+                config_binding.with_receiver_uuid(receiver.clone())
+            }
             None => config_binding,
         };
         let generation = outcome.new_gen[&a.placement_slot].clone();
@@ -163,11 +173,12 @@ pub(crate) fn persist_intent(
     ctx: &PushContext,
     txn: &mut TargetLedgerTxn<'_>,
     outcome: &PreflightOutcome,
+    project: &crate::deploy::project::ValidatedProject,
 ) -> Result<PreparedDeployment> {
     let store = ctx.store;
     let target_name = ctx.target_name;
     let deployment_id = ctx.deployment_id;
-    let attempt_intent = build_intent(ctx, outcome)?;
+    let attempt_intent = build_intent(ctx, outcome, Some(project))?;
     store.write_plan(deployment_id, &outcome.plan)?;
 
     // THE ONE-PARENT RULE (before mutation): the intent's parent must be the

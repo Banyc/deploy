@@ -73,7 +73,7 @@ impl LocalStore {
     /// reported as a maintenance warning by the engine, never a push error.
     /// The fault is keyed by (deployment id, SLOT id) — one write selects
     /// exactly one slot's physical record.
-    pub fn write_slot_observed(&self, slot: &SlotId, observed: &ObservedSlot) -> Result<()> {
+    pub(crate) fn write_slot_observed(&self, slot: &SlotId, observed: &ObservedSlot) -> Result<()> {
         #[cfg(test)]
         if let Some(d) = match &observed.assignment {
             ObservedAssignment::Known {
@@ -205,7 +205,7 @@ impl LocalStore {
 
     // ---- servers ----------------------------------------------------------
 
-    pub fn write_server(&self, state: &ServerState) -> Result<()> {
+    pub(crate) fn write_server(&self, state: &ServerState) -> Result<()> {
         // Post-commit observed-refresh fault injection, keyed by the recorded
         // deployment id AND target (see `write_slot_observed`).
         #[cfg(test)]

@@ -24,7 +24,6 @@ use crate::identity::DeploymentId;
 use crate::identity::GenerationId;
 use crate::identity::OperationId;
 use crate::identity::ReleaseId;
-use crate::identity::TargetName;
 use crate::ledger::Observation;
 use crate::ledger::ObservedGeneration;
 use crate::remote::canonical as tree;
@@ -229,13 +228,13 @@ pub(crate) fn process_server(
     helper: &RemoteHelper,
     op_id: &OperationId,
     deployment_id: &DeploymentId,
-    target_name: &str,
+    project: &crate::deploy::project::ValidatedProject,
     slot: &crate::identity::SlotId,
     artifact: &ArtifactRef,
     new_gen: &GenerationId,
     expected_gen: Option<&GenerationId>,
     behavior: &BehaviorContract,
-    behavior_sha256: &str,
+    behavior_digest: &BehaviorDigest,
     template_vars: &crate::remote::canonical::TemplateVars,
     config: &ProjectConfig,
 ) -> Result<ServerProc> {
@@ -334,6 +333,18 @@ pub(crate) fn process_server(
     //    strings, targets, timestamps, or behavior digests cross the
     //    mutation boundary: the mutation carries the typed [`BehaviorDigest`]
     //    and [`Timestamp`].
+    // The executed slot's typed owner target — consumed from the VALIDATED
+    // PROJECT's topology (the structural verdict's point 1), never a
+    // re-parsed target string: the mutation's owning target is the provisioned
+    // slot's typed [`TargetName`].
+    let provisioned = project.slot(slot).ok_or_else(|| {
+        Error::internal(format!(
+            "slot '{}' is not part of the validated project topology",
+            slot.as_str()
+        ))
+    })?;
+    let target = provisioned.owner();
+
     let bundle = REMOTE_RELEASE_JSON.with(|c| c.borrow().get(&artifact.release).cloned());
     let Some(bundle) = bundle else {
         return Ok(ServerProc::failed_before(format!(
@@ -341,27 +352,19 @@ pub(crate) fn process_server(
             artifact.release
         )));
     };
-    let behavior_digest = match BehaviorDigest::parse(behavior_sha256) {
-        Ok(d) => d,
-        Err(e) => {
-            return Ok(ServerProc::failed_before(format!(
-                "behavior digest invalid: {e}"
-            )));
-        }
-    };
     let mutation = match PreparedSlotMutation::new(
         op_id.clone(),
         deployment_id.clone(),
-        new_gen.clone(),
-        artifact.clone(),
-        behavior_digest,
-        expected_gen.cloned(),
-        crate::remote::helper::now_rfc3339_ts(),
-        TargetName::parse(target_name).expect("target name is a safe segment"),
-        match expected_gen {
-            Some(g) => crate::remote::helper::ExpectedCurrent::Generation(g.clone()),
-            None => crate::remote::helper::ExpectedCurrent::Absent,
+        &crate::deploy::push::ExecutionRequest {
+            slot: slot.clone(),
+            artifact: artifact.clone(),
+            generation: new_gen.clone(),
+            expected_generation: expected_gen.cloned(),
+            behavior: behavior.clone(),
+            behavior_digest: behavior_digest.clone(),
         },
+        crate::remote::helper::now_rfc3339_ts(),
+        target.clone(),
         bundle,
         artifact.tree.clone(),
     ) {
@@ -387,9 +390,7 @@ pub(crate) fn process_server(
                     Ok(crate::remote::helper::CurrentState::Generation(g))
                         if &g == mutation.generation_id() =>
                     {
-                        return Ok(ServerProc::indeterminate(format!(
-                            "commit failed: {e}"
-                        )));
+                        return Ok(ServerProc::indeterminate(format!("commit failed: {e}")));
                     }
                     _ => {}
                 }
@@ -503,11 +504,19 @@ pub(crate) fn process_server(
         };
         if let (Some(txn), Some(applied)) = (&mut activation_txn, &applied) {
             return Ok(ServerProc::restore_after_activation_failure(
-                &held, txn, applied, &request, mutation.generation_id(), failure,
+                &held,
+                txn,
+                applied,
+                &request,
+                mutation.generation_id(),
+                failure,
             ));
         }
         return Ok(ServerProc::compensate_after_activation_failure(
-            &held, &request, mutation.generation_id(), failure,
+            &held,
+            &request,
+            mutation.generation_id(),
+            failure,
         ));
     }
 
@@ -928,42 +937,76 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             REMOTE_RELEASE_JSON.with(|c| {
                 c.borrow_mut().insert(self.harness_release_id(), bundle);
             });
-            // Slot context from the harness config (one slot p1 on server s1,
-            // target t1, deploy_dir /srv/eng), built from the artifact being
-            // processed like the engine's `slot_vars`: release/variant/tree
-            // come from the ArtifactRef, never the config release name.
+            // Slot context from the VALIDATED PROJECT's topology (the
+            // engine path — one slot p1 target t1): the harness builds the
+            // executed topology exactly like `push_inner` does (config +
+            // MANDATORY provisioned receivers + the store's sealed root);
+            // the template variables are derived via the engine's
+            // [`crate::deploy::push::slot_vars`] from the topology, the
+            // config's transport server, and the OPEN REMOTE's root.
             let artifact = ArtifactRef {
                 release: self.harness_release_id(),
                 variant: VariantName::new("standard"),
                 tree: self.tree.clone(),
             };
-            let members = self.config.target_slots("t1").unwrap();
-            let (slot, server) = members[0];
-            let vars = crate::remote::canonical::TemplateVars::slot(
-                slot.deploy_dir(),
-                artifact.variant.as_str(),
-                self.config.application().as_str(),
-                artifact.release.as_str(),
-                "t1",
-                server.id.as_str(),
+            let p1 =
+                crate::identity::SlotId::parse("p1").expect("validated slot id is a safe segment");
+            let t1 =
+                crate::identity::TargetName::parse("t1").expect("target name is a safe segment");
+            let project = crate::deploy::project::ValidatedProject::for_selected(
+                &self.config,
+                &t1,
+                std::slice::from_ref(&p1),
+                &std::collections::BTreeMap::from([(
+                    p1.clone(),
+                    crate::identity::ReceiverUuid::generate(),
+                )]),
+                self.store
+                    .owned_root_for_project()
+                    .expect("the harness store provides its owned root"),
             )
-            .with_server(server.user(), server.address(), server.port())
-            .with_slot_id(&slot.id)
-            .with_deployment(Some(&deployment_id), Some(new_gen), Some(&artifact.tree));
+            .expect("the harness topology validates");
+            let servers: std::collections::BTreeMap<
+                crate::identity::SlotId,
+                &crate::config::ServerDef,
+            > = self
+                .config
+                .target_slots("t1")
+                .unwrap()
+                .into_iter()
+                .map(|(s, server)| {
+                    (
+                        crate::identity::SlotId::parse(s.id.as_str())
+                            .expect("validated slot id is a safe segment"),
+                        server,
+                    )
+                })
+                .collect();
+            let vars = crate::deploy::push::slot_vars(
+                &project,
+                &servers,
+                self.remote.root(),
+                &self.config,
+                &p1,
+                &artifact,
+                Some(&deployment_id),
+                Some(new_gen),
+            )
+            .expect("the harness slot variables resolve");
             process_server(
                 &self.store,
                 &self.remote,
                 &helper,
                 &op_id,
                 &deployment_id,
-                "t1",
-                &crate::identity::SlotId::parse(slot.id.as_str())
-                    .expect("validated slot id is a safe segment"),
+                &project,
+                &p1,
                 &artifact,
                 new_gen,
                 expected_gen,
                 &behavior,
-                &sha,
+                &crate::identity::BehaviorDigest::parse(&sha)
+                    .expect("behavior digest is 64 lowercase hex characters"),
                 &vars,
                 &self.config,
             )
@@ -1242,11 +1285,16 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             );
             // The installed unit's content proves staging read the artifact
             // through `generations/<gid>/root` and rendered it with the slot
-            // context (deploy_dir /srv/eng from the variant).
+            // context — the deploy_dir of the OPEN REMOTE (the slot's real
+            // deployment location, which in production is the config-declared
+            // deploy_dir itself).
             let installed = config_home.join("systemd/user/example.service");
             assert_eq!(
                 std::fs::read_to_string(&installed).unwrap(),
-                "[Service]\nExecStart=/srv/eng/current/app/server\n"
+                format!(
+                    "[Service]\nExecStart={}/current/app/server\n",
+                    h.remote.root().display()
+                )
             );
             Ok::<(), String>(())
         };

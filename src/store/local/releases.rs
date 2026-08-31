@@ -38,7 +38,7 @@ impl LocalStore {
     /// two content-verified identities (each record's `release_sha256` after
     /// recompute-and-verify): a same-id record with different content still
     /// fails, but never by trusting the stored digest fields.
-    pub fn write_release(&self, rec: &ReleaseRecord) -> Result<()> {
+    pub(crate) fn write_release(&self, rec: &ReleaseRecord) -> Result<()> {
         // (a) Verify the incoming record from its content before any write.
         crate::verify::release::verify_release_identity(rec)?;
         // THE EMBEDDED-IDENTITY BINDING (write side): the release record's
@@ -112,7 +112,7 @@ impl LocalStore {
         Ok(rec)
     }
 
-    pub fn write_release_aux(
+    pub(crate) fn write_release_aux(
         &self,
         id: &ReleaseId,
         mapping_toml: &str,

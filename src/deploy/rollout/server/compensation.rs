@@ -201,9 +201,7 @@ pub(crate) fn compensate_server_locked(
                 .map_err(|e| Error::remote(format!("compensation verification failed: {e}")))?;
             Ok(CompensationOutcome::Restored {
                 adapter_restored,
-                restoration: crate::remote::helper::RestorationProof::restored(Some(
-                    prior.clone(),
-                )),
+                restoration: crate::remote::helper::RestorationProof::restored(Some(prior.clone())),
             })
         }
         None => {

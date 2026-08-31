@@ -14,16 +14,19 @@
 //! * `dryrun` — the dry-run plan rendering.
 
 use crate::config::ProjectConfig;
-use crate::config::SlotConfig;
+use crate::config::ServerDef;
 use crate::deploy::plan::StagingCleanup;
 use crate::deploy::plan::cleanup_dry_run_staging;
+use crate::deploy::project::ValidatedProject;
 use crate::error::Error;
 use crate::error::Result;
 use crate::identity::ArtifactRef;
 use crate::identity::DeploymentId;
 use crate::identity::GenerationId;
 use crate::identity::OperationId;
+use crate::identity::ReceiverUuid;
 use crate::identity::SlotId;
+use crate::identity::TargetName;
 use crate::kernel::terminal::NonSuccessfulDisposition;
 use crate::ledger;
 use crate::ledger::DeploymentStatus;
@@ -35,6 +38,7 @@ use crate::remote::helper::RemoteHelper;
 use crate::remote::transport::Remote;
 use crate::store::local::LocalStore;
 use crate::store::local::ledger::TargetLedgerTxn;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -144,34 +148,52 @@ pub(crate) struct PushContext<'a> {
 /// only in the per-server activation/verification path; sites that do not know
 /// them (e.g. the reconciliation loop) pass `None`, and a template referencing
 /// such a variable there fails loudly.
+/// The slot's template variables — DERIVED from the VALIDATED PROJECT's
+/// typed topology (the slot's owner target — never a re-parsed target
+/// string), the slot's declared transport server (config connection
+/// metadata, never topology), and the OPEN REMOTE's root (the deploy_dir
+/// the remote was opened against — no raw path is re-parsed from a config
+/// slot view). `slot_vars` consumes the executed slot by id from the ONE
+/// topology map; a slot missing from it is an internal error.
+//
+// 8 parameters: the full per-slot template context (topology: project,
+// slot_id; transport: servers, remote_root; identity: config, artifact;
+// deployment: deployment_id, generation); bundling them would hide the
+// derivation contract this signature enforces, so the allow documents the
+// deliberate choice (mirrors `process_server` / `check_up_to_date`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn slot_vars(
-    members: &[(&crate::config::SlotConfig, &crate::config::ServerDef)],
+    project: &ValidatedProject,
+    servers: &BTreeMap<SlotId, &ServerDef>,
+    remote_root: &Path,
     config: &ProjectConfig,
-    target_name: &str,
     slot_id: &SlotId,
     artifact: &ArtifactRef,
     deployment_id: Option<&DeploymentId>,
     generation: Option<&GenerationId>,
 ) -> Result<crate::remote::canonical::TemplateVars> {
-    let (slot, server) = members
-        .iter()
-        .find(|(s, _)| s.id == slot_id.as_str())
-        .ok_or_else(|| {
-            Error::internal(format!(
-                "slot '{}' not found among target members",
-                slot_id.as_str()
-            ))
-        })?;
+    let slot = project.slot(slot_id).ok_or_else(|| {
+        Error::internal(format!(
+            "slot '{}' is not part of the validated project topology",
+            slot_id.as_str()
+        ))
+    })?;
+    let server = servers.get(slot_id).ok_or_else(|| {
+        Error::internal(format!(
+            "slot '{}' has no declared server in the config",
+            slot_id.as_str()
+        ))
+    })?;
     Ok(crate::remote::canonical::TemplateVars::slot(
-        slot.deploy_dir(),
+        remote_root,
         artifact.variant.as_str(),
         config.application().as_str(),
         artifact.release.as_str(),
-        target_name,
+        slot.owner().as_str(),
         server.id.as_str(),
     )
     .with_server(server.user(), server.address(), server.port())
-    .with_slot_id(&slot.id)
+    .with_slot_id(slot_id.as_str())
     .with_deployment(deployment_id, generation, Some(&artifact.tree)))
 }
 
@@ -477,7 +499,7 @@ pub(crate) fn push_inner<'a>(
         // run must never contact a remote, acquire a lock, or persist
         // anything — the render is pure plan data.
         let prepared = PreparedDeployment::new(
-            build_intent(&ctx, &preflight)?,
+            build_intent(&ctx, &preflight, None)?,
             preflight.behavior_index.clone(),
         )?;
         let msg = prepared.plan_rendering(store, &statuses);
@@ -501,28 +523,55 @@ pub(crate) fn push_inner<'a>(
         });
     }
 
-    // THE SELECTED (slot, server) pairs this push plans, mutates, and
-    // refreshes: derived from the plan's assignments against the target's
-    // CURRENT physical declarations — the same derivation `run_preflight`
-    // performed for phase B, re-derived here because the outcome owns the
-    // assignments while the members borrow the config.
-    let all_members = config.target_slots(target_name)?;
-    let members: Vec<(&SlotConfig, &crate::config::ServerDef)> = preflight
+    // THE VALIDATED PROJECT — the ONE authoritative, typed, canonical,
+    // DISJOINT provisioned topology of the EXECUTED members (the structural
+    // verdict's point 1): constructed from the config's slot declarations,
+    // the MANDATORY provisioned receivers (read from the provisioned
+    // remotes after phase B), and the store's SEALED [`OwnedRoot`]. A
+    // selected slot whose deploy_dir carries no receiver UUID is REFUSED
+    // here (fail closed — the old silent bare-binding fallback in the
+    // intent is gone: an intent can never be persisted with an unknown
+    // physical identity). The mutation + commit phases consume ONLY this
+    // topology — never a re-parse of the config's slot views.
+    let target_typed = TargetName::parse(target_name).expect("target name is a safe segment");
+    let selected_ids: Vec<SlotId> = preflight
         .assignments
         .iter()
-        .map(|a| {
-            all_members
-                .iter()
-                .find(|(s, _)| s.id == a.placement_slot.as_str())
-                .copied()
-                .ok_or_else(|| {
-                    Error::internal(format!(
-                        "planned slot '{}' has no current physical declaration",
-                        a.placement_slot
-                    ))
-                })
+        .map(|a| a.placement_slot.clone())
+        .collect();
+    let provisioned_receivers: BTreeMap<SlotId, ReceiverUuid> = preflight
+        .receiver_uuids
+        .iter()
+        .map(|(sid, r)| {
+            let r = r.as_ref().ok_or_else(|| {
+                Error::preflight(format!(
+                    "slot '{sid}' has no provisioned receiver UUID — the deploy_dir was never provisioned (or was provisioned before the receiver-UUID feature); refusing to build the provisioned topology"
+                ))
+            })?;
+            Ok((sid.clone(), r.clone()))
         })
-        .collect::<Result<_>>()?;
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let project = ValidatedProject::for_selected(
+        ctx.config,
+        &target_typed,
+        &selected_ids,
+        &provisioned_receivers,
+        ctx.store.owned_root_for_project()?,
+    )?;
+    // The TRANSPORT declarations of the executed slots: the config-driven
+    // slot → server connection metadata (id/user/address/port) the template
+    // variables and the observed records resolve — connection config, never
+    // topology (the topology itself is the validated project above).
+    let servers: BTreeMap<SlotId, &ServerDef> = config
+        .target_slots(target_name)?
+        .into_iter()
+        .map(|(slot, server)| {
+            (
+                SlotId::parse(slot.id.as_str()).expect("validated slot id is a safe segment"),
+                server,
+            )
+        })
+        .collect();
 
     // Early "Everything up to date" check for HEAD pushes, run BEFORE
     // persisting any plan/status record so an up-to-date no-op leaves no
@@ -535,7 +584,8 @@ pub(crate) fn push_inner<'a>(
         store,
         config,
         target_name,
-        &members,
+        &project,
+        &servers,
         &preflight.assignments,
         &statuses,
         &helpers,
@@ -570,7 +620,7 @@ pub(crate) fn push_inner<'a>(
     // TERMINAL EVENT. The mutation + commit phases consume ONLY the
     // prepared deployment's PROJECTIONS (never the preflight outcome). See
     // [`persist_intent`].
-    let prepared = persist_intent(&ctx, txn, &preflight)?;
+    let prepared = persist_intent(&ctx, txn, &preflight, &project)?;
 
     // 8 & 9. Capacity + staging preflight — capacity is the caller's CURRENT
     // per-server policy; every failure ends the attempt `FailedPreflight`
@@ -630,13 +680,17 @@ pub(crate) fn push_inner<'a>(
     // ACTUAL observation. The execution consumes ONLY the prepared
     // deployment's PROJECTIONS — the intent is the single source of truth;
     // nothing is re-derived from the preflight outcome.
-    let execution = run_execution(&ctx, &prepared, &members, &remotes, &helpers, &statuses)?;
+    let execution = run_execution(
+        &ctx, &prepared, &project, &servers, &remotes, &helpers, &statuses,
+    )?;
 
     // POST-MUTATION PHASES (steps 16-17) in [`crate::deploy::push`]: the
     // terminal event finalization (successful finalizer / plain terminal
     // append), the observed refresh + step-17 maintenance, and the report
     // assembly.
-    run_commit(&ctx, txn, &prepared, &execution, &members, &helpers)
+    run_commit(
+        &ctx, txn, &prepared, &execution, &project, &servers, &helpers,
+    )
 }
 
 #[cfg(test)]

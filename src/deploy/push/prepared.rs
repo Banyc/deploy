@@ -43,7 +43,7 @@
 
 use crate::deploy::plan::PlannedAssignment;
 use crate::error::{Error, Result};
-use crate::identity::{ArtifactRef, BehaviorContract, GenerationId, SlotId};
+use crate::identity::{ArtifactRef, BehaviorContract, BehaviorDigest, GenerationId, SlotId};
 use crate::kernel::intent::{DeploymentIntent, SlotAction};
 #[cfg(test)]
 use crate::ledger::LedgerIntentWire;
@@ -59,9 +59,10 @@ use std::collections::{BTreeMap, HashMap};
 /// the freshly minted generation, the compare-and-swap expected pre-push
 /// generation, and the slot's OWN frozen behavior contract (resolved from
 /// the intent's behavior index by the slot's (release, variant) binding)
-/// plus its canonical digest. DERIVED from the intent's slot table + the
-/// validated behavior index; the round-trip property asserts these are
-/// byte-identical before and after persistence.
+/// plus its TYPED canonical digest ([`BehaviorDigest`] — never a loose
+/// string). DERIVED from the intent's slot table + the validated behavior
+/// index; the round-trip property asserts these are byte-identical before
+/// and after persistence.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ExecutionRequest {
     pub slot: SlotId,
@@ -69,7 +70,7 @@ pub(crate) struct ExecutionRequest {
     pub generation: GenerationId,
     pub expected_generation: Option<GenerationId>,
     pub behavior: BehaviorContract,
-    pub behavior_sha256: String,
+    pub behavior_digest: BehaviorDigest,
 }
 
 /// THE SEALED PREPARED DEPLOYMENT: owns EXACTLY ONE [`DeploymentIntent`]
@@ -278,7 +279,15 @@ impl PreparedDeployment {
                 generation: generations[&a.placement_slot].clone(),
                 expected_generation: expected[&a.placement_slot].expected_generation.clone(),
                 behavior: behavior.clone(),
-                behavior_sha256: crate::verify::release::behavior_contract_digest(behavior),
+                behavior_digest: BehaviorDigest::parse(
+                    &crate::verify::release::behavior_contract_digest(behavior),
+                )
+                .map_err(|e| {
+                    Error::integrity(format!(
+                        "prepared deployment {}: the frozen behavior digest of slot '{}' is invalid: {e}",
+                        self.intent.deployment_id(), a.placement_slot
+                    ))
+                })?,
             });
         }
         Ok(out)

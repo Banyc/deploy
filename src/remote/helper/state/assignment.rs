@@ -313,7 +313,9 @@ impl<'a> HeldSlotLock<'a> {
             //    failed parent fsync is a propagated error, never a reported
             //    success.
             self.helper.remote.fsync_parent(&gen_dir)?;
-            Ok(crate::remote::helper::DurableGeneration::installed(assignment.generation_id))
+            Ok(crate::remote::helper::DurableGeneration::installed(
+                assignment.generation_id,
+            ))
         })();
         if res.is_err() {
             // Best-effort cleanup of the disposable staging dir (a failed

@@ -193,7 +193,9 @@ impl<'a> crate::remote::helper::HeldSlotLock<'a> {
         // silently replaced.
         if self.helper.remote.metadata_opt(&dir)?.is_some() {
             self.verify_installed_bundle(bundle, &dir)?;
-            return Ok(crate::remote::helper::DurableRelease::published(release_id.clone()));
+            return Ok(crate::remote::helper::DurableRelease::published(
+                release_id.clone(),
+            ));
         }
         // Stage: write ALL members into a unique sibling directory.
         let nonce = uuid::Uuid::now_v7().to_string();
@@ -228,7 +230,9 @@ impl<'a> crate::remote::helper::HeldSlotLock<'a> {
         // directory entry survives power loss. FAIL-CLOSED: a failed parent
         // fsync is a propagated error, never a reported success.
         self.helper.remote.fsync_parent(&dir)?;
-        Ok(crate::remote::helper::DurableRelease::published(release_id.clone()))
+        Ok(crate::remote::helper::DurableRelease::published(
+            release_id.clone(),
+        ))
     }
 
     /// Publish a release as ONE AGGREGATE BUNDLE
@@ -411,7 +415,9 @@ impl<'a> crate::remote::helper::HeldSlotLock<'a> {
         // content (under the slot lock).
         if self.helper.tree_exists(digest)? {
             if self.helper.verify_remote_tree(&to, digest)? {
-                return Ok(crate::remote::helper::DurableObject::published(digest.clone()));
+                return Ok(crate::remote::helper::DurableObject::published(
+                    digest.clone(),
+                ));
             }
             self.quarantine_object(digest)?;
         }
@@ -446,7 +452,9 @@ impl<'a> crate::remote::helper::HeldSlotLock<'a> {
         // content (under the slot lock).
         if self.helper.tree_exists(digest)? {
             if self.helper.verify_remote_tree(&to, digest)? {
-                return Ok(crate::remote::helper::DurableObject::published(digest.clone()));
+                return Ok(crate::remote::helper::DurableObject::published(
+                    digest.clone(),
+                ));
             }
             self.quarantine_object(digest)?;
         }
@@ -539,7 +547,9 @@ impl<'a> crate::remote::helper::HeldSlotLock<'a> {
         // may have been created by the `create_dir_all` above).
         self.helper.remote.fsync_parent(&to)?;
         self.helper.remote.fsync_parent(&to.parent().unwrap())?;
-        Ok(crate::remote::helper::DurableObject::published(digest.clone()))
+        Ok(crate::remote::helper::DurableObject::published(
+            digest.clone(),
+        ))
     }
 }
 
@@ -570,7 +580,7 @@ impl<'a> RemoteHelper<'a> {
 ///
 /// Modes are masked to the full 0o7777 (setuid/setgid/sticky included), not
 /// 0o777, so the uploaded tree matches the canonical tree digest exactly.
-pub fn copy_host_tree_to_remote(
+pub(crate) fn copy_host_tree_to_remote(
     host: &Path,
     rel_dest: &RootedRelativePath,
     remote: &dyn Remote,

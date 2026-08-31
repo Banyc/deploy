@@ -12,7 +12,6 @@
 use crate::config::FailurePolicy;
 use crate::config::ProjectConfig;
 use crate::config::ServerDef;
-use crate::config::SlotConfig;
 use crate::deploy::push::PreparedDeployment;
 use crate::deploy::push::slot_vars;
 use crate::deploy::rollout::SlotExecution;
@@ -48,9 +47,9 @@ use std::collections::HashMap;
 pub(crate) fn apply_failure_policy(
     failure_policy: FailurePolicy,
     prepared: &PreparedDeployment,
-    members: &[(&SlotConfig, &ServerDef)],
+    project: &crate::deploy::project::ValidatedProject,
+    servers: &BTreeMap<SlotId, &ServerDef>,
     config: &ProjectConfig,
-    target_name: &str,
     helpers: &HashMap<SlotId, RemoteHelper>,
     op_id: &OperationId,
     deployment_id: &DeploymentId,
@@ -87,9 +86,10 @@ pub(crate) fn apply_failure_policy(
                     }
                     let prior = plan_servers[sid].expected_generation.as_ref();
                     let vars = slot_vars(
-                        members,
+                        project,
+                        servers,
+                        helpers[sid].remote().root(),
                         config,
-                        target_name,
                         sid,
                         &plan_servers[sid].artifact,
                         Some(deployment_id),
@@ -112,7 +112,7 @@ pub(crate) fn apply_failure_policy(
                         adapter_restored,
                         restoration: _,
                     } = comp
-                {
+                    {
                         // Compensation is a TRANSITION between states: the
                         // compensated slot becomes `Restored` with the
                         // restored generation's observation (the observed

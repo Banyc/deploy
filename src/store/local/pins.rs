@@ -46,7 +46,12 @@ impl LocalStore {
     /// sweep must be deferred; a pins write has no such two-phase
     /// semantics — its caller has no facility to report "visible but
     /// unconfirmed", so failure is the only safe answer.)
-    pub fn write_pins(&self, pins: &Pins) -> Result<()> {
+    /// store writers become crate-private (point 7); this writer is the
+    /// pins aggregate's ONE writer ([`write_atomic_replace`]) — exercised by
+    /// the retention tests today (no production pin-write operation exists
+    /// yet: the GC reads the file and treats absence as the empty pin set).
+    #[allow(dead_code)] // test-exercised today; no production pin-write operation yet
+    pub(crate) fn write_pins(&self, pins: &Pins) -> Result<()> {
         if pins.schema_version() != crate::ledger::PINS_SCHEMA_VERSION {
             return Err(Error::integrity(format!(
                 "refusing to write pins with unsupported schema_version {} (expected {}): only PINS_SCHEMA_VERSION is accepted",

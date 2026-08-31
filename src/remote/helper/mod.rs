@@ -89,8 +89,10 @@
 //! from that owner, the `current` swap verifies the generation it installs,
 //! and rotation verifies the generation inventory before sweeping — a guard
 //! for slot A can never mutate slot B. Cross-slot mutation is structurally
-//! unrepresentable. The single documented non-guard state change is
-//! `write_inventory` (inventory bookkeeping, not a slot mutation).
+//! unrepresentable. The single non-guard state change is
+//! `write_inventory` (inventory bookkeeping, not a slot mutation) —
+//! CRATE-PRIVATE (point 7): a raw, unlocked remote mutation is never on the
+//! library's public surface.
 //!
 //! What the protocol GUARANTEES (under the dead-only-recovery precondition):
 //!
@@ -145,7 +147,6 @@ mod state;
 pub use evidence::{
     DurableCurrent, DurableGeneration, DurableObject, DurableRelease, RestorationProof,
 };
-pub use mutation::copy_host_tree_to_remote;
 pub use observed::{
     Observation, ObservationError, ObservedAssignment, ObservedGeneration, ObservedSlot,
     ObservedTarget,
@@ -651,8 +652,11 @@ impl<'a> RemoteHelper<'a> {
 
     /// Recompute and write `state/inventory.json`. This is NOT a slot
     /// mutation under the lock — it is inventory bookkeeping and does not
-    /// require the slot-mutation capability.
-    pub fn write_inventory(&self) -> Result<()> {
+    /// require the slot-mutation capability. CRATE-PRIVATE (structural
+    /// verdict point 7): a raw, unlocked remote mutation is never part of
+    /// the library's public surface — the only in-crate callers are the
+    /// guard's [`rotate`](Self::rotate) sweep and the retention machinery.
+    pub(crate) fn write_inventory(&self) -> Result<()> {
         let mut inv = Vec::new();
         let obj_root = layout::objects();
         if self.remote.metadata_opt(obj_root)?.is_some() {
@@ -2012,8 +2016,7 @@ mod cross_remote_guard_mutation {
                     .publish_from_incoming(
                         &crate::identity::DeploymentId::parse(deployment_id)
                             .expect("fixture deployment id"),
-                        &crate::identity::TreeDigest::parse(digest)
-                            .expect("fixture tree digest"),
+                        &crate::identity::TreeDigest::parse(digest).expect("fixture tree digest"),
                     )
                     .map(|_| ()),
                 GuardOp::TransactionRecord { op_id, state } => guard_a.transaction_record(
@@ -2098,8 +2101,7 @@ mod cross_remote_guard_mutation {
                     .publish_from_incoming(
                         &crate::identity::DeploymentId::parse(deployment_id)
                             .expect("fixture deployment id"),
-                        &crate::identity::TreeDigest::parse(digest)
-                            .expect("fixture tree digest"),
+                        &crate::identity::TreeDigest::parse(digest).expect("fixture tree digest"),
                     )
                     .map(|_| ()),
                 GuardOp::TransactionRecord { op_id, state } => guard_b.transaction_record(

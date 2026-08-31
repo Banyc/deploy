@@ -269,16 +269,20 @@ fn clear_retention_deferred(store: &LocalStore, target: &TargetName, slot: &Slot
 /// minting deployment). Refreshes each slot's ONE physical record and returns
 /// the projection with warning-only failures — NON-FALLIBLE, since the
 /// deployment already durably committed (lag converges next push, no marker).
+/// The executed slots come from the VALIDATED PROJECT's topology (the ONE
+/// map — point 1), with the config's transport servers for the observed
+/// records.
 pub(crate) fn refresh_observed_from_live(
     store: &LocalStore,
     target_name: &str,
-    members: &[(&crate::config::SlotConfig, &crate::config::ServerDef)],
+    project: &crate::deploy::project::ValidatedProject,
+    servers: &BTreeMap<SlotId, &crate::config::ServerDef>,
     helpers: &HashMap<SlotId, RemoteHelper>,
     application: &crate::identity::ApplicationStoreKey,
 ) -> (BTreeMap<SlotId, ObservedSlot>, Vec<String>) {
     let mut observed_servers: BTreeMap<SlotId, ObservedSlot> = BTreeMap::new();
-    for (slot, _sdef) in members {
-        let slot_id = SlotId::parse(slot.id.as_str()).expect("validated slot id is a safe segment");
+    for slot in project.slots().values() {
+        let slot_id = slot.id().clone();
 
         // The slot's LIVE remote assignment. `status` is a read; under the
         // one-shot pre-swap arm it has already fired and been consumed inside
@@ -406,7 +410,8 @@ pub(crate) fn refresh_observed_from_live(
     refresh_observed(
         store,
         target_name,
-        members,
+        project,
+        servers,
         &observed_servers,
         &mut observed_warnings,
     );
@@ -434,12 +439,17 @@ pub(crate) fn refresh_observed_from_live(
 pub(crate) fn refresh_observed(
     store: &LocalStore,
     target_name: &str,
-    members: &[(&crate::config::SlotConfig, &crate::config::ServerDef)],
+    project: &crate::deploy::project::ValidatedProject,
+    servers: &BTreeMap<SlotId, &crate::config::ServerDef>,
     observed_servers: &BTreeMap<SlotId, ObservedSlot>,
     observed_warnings: &mut Vec<String>,
 ) {
-    for (slot, sdef) in members {
-        let slot_id = SlotId::parse(slot.id.as_str()).expect("validated slot id is a safe segment");
+    for slot in project.slots().values() {
+        let slot_id = slot.id().clone();
+        let sdef = match servers.get(&slot_id) {
+            Some(s) => *s,
+            None => continue,
+        };
 
         let Some(observed_server) = observed_servers.get(&slot_id) else {
             continue;

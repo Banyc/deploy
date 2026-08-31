@@ -5,7 +5,7 @@
 //! coordinator and returns the [`ExecutionOutcome`] the commit phases
 //! consume.
 
-use crate::config::SlotConfig;
+use crate::deploy::project::ValidatedProject;
 use crate::deploy::push::PreparedDeployment;
 use crate::deploy::push::PushContext;
 use crate::deploy::rollout::BatchRun;
@@ -18,8 +18,7 @@ use crate::ledger::ObservedGeneration;
 use crate::ledger::SlotOutcome;
 use crate::remote::helper::RemoteHelper;
 use crate::remote::transport::Remote;
-use std::collections::BTreeMap;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 // MUTATION phases of the push transaction (steps 10-15): the deployment-order
 // batch loop, the failure-policy compensation + attempt-status derivation,
@@ -163,21 +162,25 @@ pub(crate) struct FailureEvidence {
 /// [`crate::deploy::rollout`]; the post-mutation observation in
 /// [`crate::deploy::rollout`].
 ///
-/// THE EXECUTION CONSUMES ONLY THE PREPARED DEPLOYMENT'S PROJECTIONS: the
-/// assignments, generations, expected states, and execution requirements
-/// are all DERIVED from the persisted intent ([`PreparedDeployment`]) —
-/// never re-derived from the preflight outcome — so the executed plan can
-/// never drift from the durable intent.
+/// THE EXECUTION CONSUMES ONLY THE PREPARED DEPLOYMENT'S PROJECTIONS AND
+/// THE VALIDATED PROJECT'S TOPOLOGY: the assignments, generations, expected
+/// states, and execution requirements are all DERIVED from the persisted
+/// intent ([`PreparedDeployment`]) — never re-derived from the preflight
+/// outcome — so the executed plan can never drift from the durable intent;
+/// the executed slots' typed topology (owner/variant/receiver) is consumed
+/// from the sealed [`ValidatedProject`] (point 1) — never re-parsed from
+/// the config's slot views. `servers` carries ONLY the config's
+/// connection metadata (never topology).
 pub(crate) fn run_execution(
     ctx: &PushContext,
     prepared: &PreparedDeployment,
-    members: &[(&SlotConfig, &crate::config::ServerDef)],
+    project: &ValidatedProject,
+    servers: &BTreeMap<SlotId, &crate::config::ServerDef>,
     remotes: &HashMap<SlotId, Box<dyn Remote>>,
     helpers: &HashMap<SlotId, RemoteHelper>,
     statuses: &HashMap<SlotId, crate::remote::helper::RemoteStatus>,
 ) -> Result<ExecutionOutcome> {
     let store = ctx.store;
-    let target_name = ctx.target_name;
     let config = ctx.config;
     let target = ctx.target;
     let deployment_id = ctx.deployment_id;
@@ -208,9 +211,9 @@ pub(crate) fn run_execution(
     // generations) — the intent is the single source of truth.
     let BatchRun { mut executions } = crate::deploy::rollout::run_batches(
         prepared,
-        members,
+        project,
+        servers,
         config,
-        target_name,
         store,
         remotes,
         helpers,
@@ -236,9 +239,9 @@ pub(crate) fn run_execution(
     crate::deploy::rollout::apply_failure_policy(
         failure_policy,
         prepared,
-        members,
+        project,
+        servers,
         config,
-        target_name,
         helpers,
         op_id,
         deployment_id,

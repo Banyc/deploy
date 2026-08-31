@@ -1,0 +1,237 @@
+warning: unreachable statement
+  --> tests/ui/unlocked_store_writer.rs:16:5
+   |
+15 |     let store: LocalStore = unimplemented!();
+   |                             ---------------- any code following this expression is unreachable
+16 |     let _ = store.write_plan(&unimplemented!(), &unimplemented!());
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ unreachable statement
+   |
+   = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+error[E0624]: method `write_plan` is private
+  --> tests/ui/unlocked_store_writer.rs:16:19
+   |
+16 |     let _ = store.write_plan(&unimplemented!(), &unimplemented!());
+   |                   ^^^^^^^^^^ private method
+   |
+  --> /kache/workspace/src/store/local/deployments.rs:44:4
+   |
+   = note: private method defined here
+
+warning: unreachable expression
+  --> tests/ui/unlocked_store_writer.rs:16:30
+   |
+16 |     let _ = store.write_plan(&unimplemented!(), &unimplemented!());
+   |                              ^----------------
+   |                              ||
+   |                              |any code following this expression is unreachable
+   |                              unreachable expression
+
+warning: unreachable expression
+  --> tests/ui/unlocked_store_writer.rs:16:49
+   |
+16 |     let _ = store.write_plan(&unimplemented!(), &unimplemented!());
+   |                                                 ^----------------
+   |                                                 ||
+   |                                                 |any code following this expression is unreachable
+   |                                                 unreachable expression
+
+error[E0624]: method `write_release` is private
+  --> tests/ui/unlocked_store_writer.rs:17:19
+   |
+17 |     let _ = store.write_release(&unimplemented!());
+   |                   ^^^^^^^^^^^^^ private method
+   |
+  --> /kache/workspace/src/store/local/releases.rs:41:4
+   |
+   = note: private method defined here
+
+warning: unreachable expression
+  --> tests/ui/unlocked_store_writer.rs:17:33
+   |
+17 |     let _ = store.write_release(&unimplemented!());
+   |                                 ^----------------
+   |                                 ||
+   |                                 |any code following this expression is unreachable
+   |                                 unreachable expression
+
+error[E0624]: method `store_object` is private
+  --> tests/ui/unlocked_store_writer.rs:18:19
+   |
+18 |     let _ = store.store_object(&unimplemented!(), &unimplemented!());
+   |                   ^^^^^^^^^^^^ private method
+   |
+  --> /kache/workspace/src/store/local/objects.rs:108:4
+   |
+   = note: private method defined here
+
+warning: unreachable expression
+  --> tests/ui/unlocked_store_writer.rs:18:32
+   |
+18 |     let _ = store.store_object(&unimplemented!(), &unimplemented!());
+   |                                ^----------------
+   |                                ||
+   |                                |any code following this expression is unreachable
+   |                                unreachable expression
+
+warning: unreachable expression
+  --> tests/ui/unlocked_store_writer.rs:18:51
+   |
+18 |     let _ = store.store_object(&unimplemented!(), &unimplemented!());
+   |                                                   ^----------------
+   |                                                   ||
+   |                                                   |any code following this expression is unreachable
+   |                                                   unreachable expression
+
+error[E0624]: method `recover_if_missing` is private
+  --> tests/ui/unlocked_store_writer.rs:19:19
+   |
+19 |     let _ = store.recover_if_missing(&unimplemented!(), &unimplemented!());
+   |                   ^^^^^^^^^^^^^^^^^^ private method
+   |
+  --> /kache/workspace/src/store/local/objects.rs:46:4
+  ::: /kache/workspace/src/store/local/objects.rs:50:19
+   |
+   = note: private method defined here
+
+warning: unreachable expression
+  --> tests/ui/unlocked_store_writer.rs:19:38
+   |
+19 |     let _ = store.recover_if_missing(&unimplemented!(), &unimplemented!());
+   |                                      ^----------------
+   |                                      ||
+   |                                      |any code following this expression is unreachable
+   |                                      unreachable expression
+
+warning: unreachable expression
+  --> tests/ui/unlocked_store_writer.rs:19:57
+   |
+19 |     let _ = store.recover_if_missing(&unimplemented!(), &unimplemented!());
+   |                                                         ^----------------
+   |                                                         ||
+   |                                                         |any code following this expression is unreachable
+   |                                                         unreachable expression
+
+error[E0624]: method `write_pins` is private
+  --> tests/ui/unlocked_store_writer.rs:20:19
+   |
+20 |     let _ = store.write_pins(&unimplemented!());
+   |                   ^^^^^^^^^^ private method
+   |
+  --> /kache/workspace/src/store/local/pins.rs:54:4
+   |
+   = note: private method defined here
+
+warning: unreachable expression
+  --> tests/ui/unlocked_store_writer.rs:20:30
+   |
+20 |     let _ = store.write_pins(&unimplemented!());
+   |                              ^----------------
+   |                              ||
+   |                              |any code following this expression is unreachable
+   |                              unreachable expression
+
+error[E0624]: method `write_slot_observed` is private
+  --> tests/ui/unlocked_store_writer.rs:21:19
+   |
+21 |     let _ = store.write_slot_observed(&unimplemented!(), &unimplemented!());
+   |                   ^^^^^^^^^^^^^^^^^^^ private method
+   |
+  --> /kache/workspace/src/store/local/observed.rs:76:4
+   |
+   = note: private method defined here
+
+warning: unreachable expression
+  --> tests/ui/unlocked_store_writer.rs:21:39
+   |
+21 |     let _ = store.write_slot_observed(&unimplemented!(), &unimplemented!());
+   |                                       ^----------------
+   |                                       ||
+   |                                       |any code following this expression is unreachable
+   |                                       unreachable expression
+
+warning: unreachable expression
+  --> tests/ui/unlocked_store_writer.rs:21:58
+   |
+21 |     let _ = store.write_slot_observed(&unimplemented!(), &unimplemented!());
+   |                                                          ^----------------
+   |                                                          ||
+   |                                                          |any code following this expression is unreachable
+   |                                                          unreachable expression
+
+error[E0624]: method `write_server` is private
+  --> tests/ui/unlocked_store_writer.rs:22:19
+   |
+22 |     let _ = store.write_server(&unimplemented!());
+   |                   ^^^^^^^^^^^^ private method
+   |
+  --> /kache/workspace/src/store/local/observed.rs:208:4
+   |
+   = note: private method defined here
+
+warning: unreachable expression
+  --> tests/ui/unlocked_store_writer.rs:22:32
+   |
+22 |     let _ = store.write_server(&unimplemented!());
+   |                                ^----------------
+   |                                ||
+   |                                |any code following this expression is unreachable
+   |                                unreachable expression
+
+error[E0624]: method `write_retention_debt` is private
+  --> tests/ui/unlocked_store_writer.rs:23:19
+   |
+23 |     let _ = store.write_retention_debt(&unimplemented!(), &unimplemented!());
+   |                   ^^^^^^^^^^^^^^^^^^^^ private method
+   |
+  --> /kache/workspace/src/store/local/debt.rs:167:4
+  ::: /kache/workspace/src/store/local/debt.rs:171:19
+   |
+   = note: private method defined here
+
+warning: unreachable expression
+  --> tests/ui/unlocked_store_writer.rs:23:40
+   |
+23 |     let _ = store.write_retention_debt(&unimplemented!(), &unimplemented!());
+   |                                        ^----------------
+   |                                        ||
+   |                                        |any code following this expression is unreachable
+   |                                        unreachable expression
+
+warning: unreachable expression
+  --> tests/ui/unlocked_store_writer.rs:23:59
+   |
+23 |     let _ = store.write_retention_debt(&unimplemented!(), &unimplemented!());
+   |                                                           ^----------------
+   |                                                           ||
+   |                                                           |any code following this expression is unreachable
+   |                                                           unreachable expression
+
+error[E0624]: method `write_sweep_debt` is private
+  --> tests/ui/unlocked_store_writer.rs:24:19
+   |
+24 |     let _ = store.write_sweep_debt(&unimplemented!());
+   |                   ^^^^^^^^^^^^^^^^ private method
+   |
+  --> /kache/workspace/src/store/local/debt.rs:256:4
+   |
+   = note: private method defined here
+
+warning: unreachable expression
+  --> tests/ui/unlocked_store_writer.rs:24:36
+   |
+24 |     let _ = store.write_sweep_debt(&unimplemented!());
+   |                                    ^----------------
+   |                                    ||
+   |                                    |any code following this expression is unreachable
+   |                                    unreachable expression
+
+error[E0624]: method `write_inventory` is private
+  --> tests/ui/unlocked_store_writer.rs:26:20
+   |
+26 |     let _ = helper.write_inventory();
+   |                    ^^^^^^^^^^^^^^^ private method
+   |
+  --> /kache/workspace/src/remote/helper/mod.rs:659:4
+   |
+   = note: private method defined here

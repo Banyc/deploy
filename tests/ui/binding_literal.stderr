@@ -1,5 +1,5 @@
 error: cannot construct `PhysicalBinding` with struct literal syntax due to private fields
-  --> /kache/home/code/deploy/tests/ui/binding_literal.rs:16:20
+  --> tests/ui/binding_literal.rs:16:20
    |
 16 |     let _binding = PhysicalBinding {
    |                    ^^^^^^^^^^^^^^^

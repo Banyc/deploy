@@ -41,7 +41,7 @@ impl LocalStore {
     /// must carry the deployment id of the key it is written under — a plan
     /// whose embedded `deployment_id` differs from `id` is refused with an
     /// integrity error naming both ids, never persisted.
-    pub fn write_plan(&self, id: &DeploymentId, plan: &DeploymentPlan) -> Result<()> {
+    pub(crate) fn write_plan(&self, id: &DeploymentId, plan: &DeploymentPlan) -> Result<()> {
         if plan.deployment_id() != id {
             return Err(Error::integrity(format!(
                 "refusing to write a plan declaring deployment_id {} under key {} at {}: the plan's embedded identity does not match its storage key",

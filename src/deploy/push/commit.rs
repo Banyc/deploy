@@ -5,7 +5,8 @@
 //! coordinator; everything here runs AFTER the mutation loop and is
 //! NON-FALLIBLE once the deployment durably committed.
 
-use crate::config::SlotConfig;
+use crate::config::ServerDef;
+use crate::deploy::project::ValidatedProject;
 use crate::deploy::push::ExecutionOutcome;
 use crate::deploy::push::PreparedDeployment;
 use crate::deploy::push::PushContext;
@@ -22,6 +23,7 @@ use crate::ledger::NonEmptySlotTable;
 use crate::ledger::SlotOutcome;
 use crate::remote::helper::RemoteHelper;
 use crate::store::local::ledger::TargetLedgerTxn;
+use std::collections::{BTreeMap, HashMap};
 
 // POST-MUTATION phases of the push transaction (steps 16-17): the terminal
 // event finalization (the `Successful` / `Degraded` / `FailedRolledBack`
@@ -49,8 +51,9 @@ pub(crate) fn run_commit(
     txn: &mut TargetLedgerTxn<'_>,
     prepared: &PreparedDeployment,
     execution: &ExecutionOutcome,
-    members: &[(&SlotConfig, &crate::config::ServerDef)],
-    helpers: &std::collections::HashMap<SlotId, RemoteHelper>,
+    project: &ValidatedProject,
+    servers: &BTreeMap<SlotId, &ServerDef>,
+    helpers: &HashMap<SlotId, RemoteHelper>,
 ) -> Result<PushReport> {
     let store = ctx.store;
     let target_name = ctx.target_name;
@@ -153,7 +156,8 @@ pub(crate) fn run_commit(
                 crate::deploy::maintenance::refresh_observed_from_live(
                     store,
                     target_name,
-                    members,
+                    project,
+                    servers,
                     helpers,
                     config.application(),
                 );
@@ -218,7 +222,8 @@ pub(crate) fn run_commit(
                     crate::deploy::maintenance::refresh_observed_from_live(
                         store,
                         target_name,
-                        members,
+                        project,
+                        servers,
                         helpers,
                         config.application(),
                     );
@@ -296,7 +301,8 @@ pub(crate) fn run_commit(
     let (_observed, observed_warnings) = crate::deploy::maintenance::refresh_observed_from_live(
         store,
         target_name,
-        members,
+        project,
+        servers,
         helpers,
         config.application(),
     );
