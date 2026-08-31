@@ -4,8 +4,7 @@
 use crate::error::{Error, Result};
 use crate::identity::DeploymentId;
 use crate::ledger::DeploymentPlan;
-use crate::store::atomic::ensure_private_dir;
-use crate::store::local::{LocalStore, sanitize, write_atomic_cas};
+use crate::store::local::{LocalStore, sanitize};
 use std::path::PathBuf;
 
 impl LocalStore {
@@ -52,10 +51,10 @@ impl LocalStore {
             )));
         }
         let dir = self.deployment_dir(id);
-        ensure_private_dir(&dir)?;
+        self.ensure_private_dir_at(&dir)?;
         let bytes = serde_json::to_vec_pretty(plan)
             .map_err(|e| Error::store(format!("serialize plan: {e}")))?;
-        write_atomic_cas(&dir.join("plan.json"), &bytes)
+        self.write_atomic_cas(&dir.join("plan.json"), &bytes)
     }
 }
 

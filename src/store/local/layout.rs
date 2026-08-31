@@ -6,7 +6,6 @@
 
 use crate::env::SysEnv;
 use crate::error::Result;
-use crate::store::atomic::ensure_private_dir_durable;
 use crate::store::local::{LocalStore, sanitize};
 use std::path::PathBuf;
 
@@ -74,7 +73,7 @@ impl LocalStore {
                 "test fault: the lock-path target-dir creation forced to fail once",
             ));
         }
-        let created = ensure_private_dir_durable(&self.target_dir(target))?;
+        let created = self.ensure_private_dir_durable_at(&self.target_dir(target))?;
         // Test-only: the two dir-sync boundaries of a FIRST append, keyed by
         // target. They fire after the durable helper returned (the directory
         // entries ARE created and synced — the modeled loss is the boundary
@@ -139,12 +138,18 @@ mod tests {
         let env = store_env(&dir.path().join("store-root"));
 
         // A clean name → Ok, and the store path is `<base>/<name>` with no
-        // traversal: exactly ONE component (the key) appended.
+        // traversal: exactly ONE component (the key) appended. The store's
+        // base is the CANONICAL form of `<base>/<name>` (the sealed
+        // [`OwnedRoot`] is constructed from a canonical directory), so the
+        // comparison canonicalizes the expected path (a temp root under a
+        // symlinked `TMPDIR` canonicalizes to the real directory).
         let key = ApplicationStoreKey::parse("my-app").expect("clean name parses");
         let store = LocalStore::new_in(&env, &key).expect("a valid store key constructs a store");
-        assert_eq!(store.base().parent(), Some(default_base(&env).as_path()));
+        let expected = std::fs::canonicalize(default_base(&env).join("my-app"))
+            .expect("the store base exists (new_in created it)");
+        assert_eq!(store.base(), expected);
+        assert_eq!(store.base().parent(), expected.parent());
         assert_eq!(store.base().file_name(), Some(OsStr::new("my-app")));
-        assert_eq!(store.base(), default_base(&env).join("my-app"));
 
         // Every escape class is rejected at the KEY parse — the store
         // construction takes the key type, so an invalid name can never

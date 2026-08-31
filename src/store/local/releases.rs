@@ -5,8 +5,8 @@
 use crate::error::{Error, Result};
 use crate::identity::{BehaviorContract, ReleaseId, ReleaseRecord};
 use crate::remote::layout;
-use crate::store::atomic::{ensure_private_dir, read_json};
-use crate::store::local::{LocalStore, write_atomic_cas};
+use crate::store::atomic::read_json;
+use crate::store::local::LocalStore;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -69,10 +69,10 @@ impl LocalStore {
             }
             return Ok(()); // idempotent
         }
-        ensure_private_dir(&dir)?;
+        self.ensure_private_dir_at(&dir)?;
         let bytes = serde_json::to_vec_pretty(rec)
             .map_err(|e| Error::store(format!("serialize release: {e}")))?;
-        write_atomic_cas(&dir.join("release.json"), &bytes)
+        self.write_atomic_cas(&dir.join("release.json"), &bytes)
     }
 
     /// Read and verify a release record by its canonical id.
@@ -119,11 +119,11 @@ impl LocalStore {
         behavior_json: &serde_json::Value,
     ) -> Result<()> {
         let dir = self.release_dir(id);
-        ensure_private_dir(&dir)?;
-        write_atomic_cas(&dir.join("mapping.toml"), mapping_toml.as_bytes())?;
+        self.ensure_private_dir_at(&dir)?;
+        self.write_atomic_cas(&dir.join("mapping.toml"), mapping_toml.as_bytes())?;
         let bytes = serde_json::to_vec_pretty(behavior_json)
             .map_err(|e| Error::store(format!("serialize behavior: {e}")))?;
-        write_atomic_cas(&dir.join("behavior.json"), &bytes)?;
+        self.write_atomic_cas(&dir.join("behavior.json"), &bytes)?;
         Ok(())
     }
 

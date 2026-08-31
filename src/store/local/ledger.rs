@@ -22,12 +22,12 @@ use crate::ledger::{
     CheckpointWire, DeploymentIntent, DeploymentStatus, LEDGER_SCHEMA_VERSION, LedgerEntry,
     LedgerEventWire, LedgerIntentWire, LedgerTerminal, LedgerTerminalWire,
 };
-use crate::store::atomic::{
-    ReplaceOutcome, path_state, set_private, sync_parent_dir, temp_name_for,
-};
+use crate::store::atomic::{ReplaceOutcome, openat_no_follow, path_state, temp_file_name};
 use crate::store::local::LocalStore;
 use std::io::Write;
-use std::path::PathBuf;
+use std::os::fd::OwnedFd;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 
 #[cfg(test)]
 use crate::testutil::test_faults::FaultKind;
@@ -503,6 +503,28 @@ impl LocalStore {
             buf.push_str(line);
             buf.push('\n');
         }
+        // The ledger write is DESCRIPTOR-RELATIVE: the parent directory is
+        // resolved component-wise relative to the owned root with
+        // `openat(O_NOFOLLOW)`, so a symlink injected into a path component
+        // can never redirect the append outside the owned root.
+        let rel = self.rel(&p)?;
+        let parent_rel = rel.parent().unwrap_or(Path::new(""));
+        let parent_fd: OwnedFd = if parent_rel.as_os_str().is_empty() {
+            self.root_fd
+                .try_clone()
+                .map_err(|e| Error::store(format!("dup root dir: {e}")))?
+        } else {
+            openat_no_follow(
+                &self.root_fd,
+                parent_rel,
+                libc::O_RDONLY | libc::O_DIRECTORY,
+                0,
+            )?
+        };
+        let file_name = rel
+            .file_name()
+            .ok_or_else(|| Error::store(format!("{} has no file name", p.display())))?;
+        let tmp_name = temp_file_name(file_name);
 
         // Stage 1: the temp write.
         #[cfg(test)]
@@ -514,15 +536,16 @@ impl LocalStore {
                 "test fault: ledger append (temp write) forced to fail once",
             ));
         }
-        let tmp = temp_name_for(&p);
         {
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp)
-                .map_err(|e| Error::store(format!("create {}: {e}", tmp.display())))?;
+            let tmp_fd = openat_no_follow(
+                &parent_fd,
+                Path::new(&tmp_name),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                0o600,
+            )?;
+            let mut f = std::fs::File::from(tmp_fd);
             f.write_all(buf.as_bytes())
-                .map_err(|e| Error::store(format!("write {}: {e}", tmp.display())))?;
+                .map_err(|e| Error::store(format!("write {}: {e}", p.display())))?;
         }
         // Stage 2: the temp fsync.
         #[cfg(test)]
@@ -535,13 +558,26 @@ impl LocalStore {
             ));
         }
         {
-            let f = std::fs::File::open(&tmp)
-                .map_err(|e| Error::store(format!("open {}: {e}", tmp.display())))?;
+            let f = std::fs::File::from(openat_no_follow(
+                &parent_fd,
+                Path::new(&tmp_name),
+                libc::O_RDONLY,
+                0,
+            )?);
             f.sync_all()
-                .map_err(|e| Error::store(format!("fsync {}: {e}", tmp.display())))?;
+                .map_err(|e| Error::store(format!("fsync {}: {e}", p.display())))?;
         }
         // Private BEFORE visible: the temp carries 0o600 before the rename.
-        set_private(&tmp)?;
+        {
+            let f = std::fs::File::from(openat_no_follow(
+                &parent_fd,
+                Path::new(&tmp_name),
+                libc::O_RDONLY,
+                0,
+            )?);
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| Error::store(format!("chmod {}: {e}", p.display())))?;
+        }
         // Stage 3: the atomic rename (the commit point).
         #[cfg(test)]
         if self
@@ -552,8 +588,7 @@ impl LocalStore {
                 "test fault: ledger append (rename) forced to fail once",
             ));
         }
-        std::fs::rename(&tmp, &p)
-            .map_err(|e| Error::store(format!("rename {}: {e}", p.display())))?;
+        crate::store::atomic::renameat_fd(&parent_fd, &tmp_name, &parent_fd, file_name)?;
         // Stage 4: the FAIL-CLOSED parent-directory fsync, AFTER the rename:
         // the new ledger is already visible, but not durable across power
         // loss until its directory entry is synced.
@@ -566,7 +601,7 @@ impl LocalStore {
                 "test fault: ledger append (parent-dir sync) forced to fail once",
             ));
         }
-        sync_parent_dir(&p)?;
+        crate::store::atomic::fsync_dir_fd(&parent_fd)?;
         Ok(())
     }
 }

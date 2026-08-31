@@ -34,19 +34,15 @@ use crate::env::SysEnv;
 use crate::error::{Error, Result};
 use crate::identity::ApplicationStoreKey;
 use crate::remote::layout as remote_layout;
-#[cfg(not(test))]
-use crate::store::atomic::write_atomic_replace;
-use crate::store::atomic::{
-    ReplaceOutcome, ensure_private_dir, read_json, set_private, sync_parent_dir,
-};
+use crate::store::atomic::{ReplaceOutcome, ensure_private_dir, read_json};
 use serde::Serialize;
-use std::io::Write;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 
 #[cfg(test)]
 use crate::identity::DeploymentId;
 #[cfg(test)]
-use crate::store::atomic::{ReplaceStage, write_atomic_replace_impl};
+use crate::store::atomic::ReplaceStage;
 #[cfg(test)]
 use crate::testutil::step17_hook::Step17Hook;
 #[cfg(test)]
@@ -55,6 +51,9 @@ use crate::testutil::test_faults::{FaultKind, FaultRegistry};
 use std::sync::Arc;
 
 pub(crate) use self::layout::default_base;
+
+mod owned_root;
+pub use owned_root::OwnedRoot;
 
 pub mod debt;
 pub mod deployments;
@@ -88,171 +87,127 @@ where
     Ok(rec)
 }
 
-/// Write a KEYED JSON record, refusing to persist a record whose embedded
-/// identity differs from the storage key it is being written under — the
-/// write-side half of the embedded-identity binding. The check is an
-/// [`Error::integrity`] failure naming BOTH identities, and it runs BEFORE
-/// any bytes are written (fail closed: a mismatched record is never
-/// persisted). The write itself goes through the same atomic-replace
-/// protocol as [`write_json`] (the test seam faults each replacement stage
-/// from the caller's per-fixture registry).
-pub(crate) fn write_keyed_json<T>(
-    path: &Path,
-    key: &str,
-    value: &T,
-    extract: impl Fn(&T) -> &str,
-    #[cfg(test)] fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
-) -> Result<()>
-where
-    T: Serialize,
-{
-    let embedded = extract(value);
-    if embedded != key {
-        return Err(Error::integrity(format!(
-            "refusing to write a record declaring identity {embedded:?} under key {key:?} at {}: the record's embedded identity does not match its storage key",
-            path.display()
-        )));
-    }
-    #[cfg(test)]
+impl LocalStore {
+    /// Write a KEYED JSON record, refusing to persist a record whose embedded
+    /// identity differs from the storage key it is being written under — the
+    /// write-side half of the embedded-identity binding. The check is an
+    /// [`Error::integrity`] failure naming BOTH identities, and it runs BEFORE
+    /// any bytes are written (fail closed: a mismatched record is never
+    /// persisted). The write itself goes through the same atomic-replace
+    /// protocol as [`LocalStore::write_json`] (the test seam faults each
+    /// replacement stage from the caller's per-fixture registry), resolved
+    /// DESCRIPTOR-RELATIVE to the store's owned root.
+    pub(crate) fn write_keyed_json<T>(
+        &self,
+        path: &Path,
+        key: &str,
+        value: &T,
+        extract: impl Fn(&T) -> &str,
+        #[cfg(test)] fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
+    ) -> Result<()>
+    where
+        T: Serialize,
     {
-        write_json_seam(path, value, fault)
-    }
-    #[cfg(not(test))]
-    {
-        write_json(path, value)
-    }
-}
-
-/// Durably write a MUTABLE JSON record via the atomic-replace protocol
-/// ([`crate::store::atomic::write_atomic_replace`]: unique temp in the
-/// same directory → write → fsync → chmod private → atomic rename →
-/// parent-directory fsync). A reader never observes a torn record (the
-/// rename is atomic on POSIX — wholly old or wholly new).
-///
-/// FAIL CLOSED ON UNCONFIRMED DURABILITY: a
-/// [`ReplaceOutcome::ReplacedDurabilityUnknown`] outcome — the new record
-/// IS visible but the parent-directory fsync failed — is DOWNGRADED to
-/// `Err`, never reported as success (the pins-write precedent
-/// [`LocalStore::write_pins`]): the caller has no facility to report
-/// "visible but unconfirmed", so failure is the only safe answer.
-#[cfg(not(test))]
-pub(crate) fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let bytes = serde_json::to_vec_pretty(value)
-        .map_err(|e| Error::store(format!("serialize {}: {e}", path.display())))?;
-    match write_atomic_replace(path, &bytes)? {
-        ReplaceOutcome::ReplacedDurable => Ok(()),
-        ReplaceOutcome::ReplacedDurabilityUnknown { error } => Err(error),
-    }
-}
-
-/// TEST-ONLY seam: the same atomic JSON-record write as [`write_json`] with
-/// a per-stage fault hook, so a per-fixture registry can inject a failure
-/// at EVERY atomic-replacement stage ([`ReplaceStage`]) of a mutable
-/// record write (the `write_slot_observed` / `write_server` /
-/// `write_retention_debt` / `write_sweep_debt` writers) and the property
-/// can assert the stage→outcome mapping. Not part of the production
-/// surface — production builds keep the exact `write_json` signature.
-#[cfg(test)]
-pub(crate) fn write_json_seam<T: Serialize>(
-    path: &Path,
-    value: &T,
-    fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
-) -> Result<()> {
-    let bytes = serde_json::to_vec_pretty(value)
-        .map_err(|e| Error::store(format!("serialize {}: {e}", path.display())))?;
-    match write_atomic_replace_impl(path, &bytes, fault)? {
-        ReplaceOutcome::ReplacedDurable => Ok(()),
-        ReplaceOutcome::ReplacedDurabilityUnknown { error } => Err(error),
-    }
-}
-
-/// Install immutable content-addressed file bytes (release records, mapping,
-/// and behavior snapshots) with create-or-compare semantics.
-///
-/// * If the file does not exist yet, the bytes are written to a temporary file
-///   in the same directory and atomically renamed into place, so a reader never
-///   observes a partially written snapshot.
-/// * If the file already exists, its contents must be byte-identical: an
-///   identical rewrite is an idempotent success, and any attempt to replace the
-///   existing snapshot with different content fails. Snapshots are bound to
-///   release identity by digest; they are never mutable in place.
-///
-/// Callers serialize writes per store with the application-store lock; the
-/// temporary name additionally carries the process id to stay collision-free.
-pub(crate) fn write_atomic_cas(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    if path.exists() {
-        let existing = std::fs::read(path)
-            .map_err(|e| Error::store(format!("read {}: {e}", path.display())))?;
-        if existing == bytes {
-            return Ok(());
-        }
-        return Err(Error::store(format!(
-            "refusing to replace existing {} with different content",
-            path.display()
-        )));
-    }
-    // Durability protocol for immutable records: write + fsync a UNIQUE temp
-    // file, install atomically WITHOUT replacement (link(2) fails on EEXIST,
-    // so a racing loser can never clobber a winner and no reader ever sees a
-    // torn record), unlink the temp name, then fsync the parent directory.
-    let tmp = path.with_file_name(format!(
-        ".{}.tmp.{}.{}",
-        path.file_name()
-            .map(|n| n.to_string_lossy())
-            .unwrap_or_default(),
-        std::process::id(),
-        TMP_COUNTER.fetch_add(1, Ordering::Relaxed),
-    ));
-    {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-            .map_err(|e| Error::store(format!("create {}: {e}", tmp.display())))?;
-        f.write_all(bytes)
-            .map_err(|e| Error::store(format!("write {}: {e}", tmp.display())))?;
-        f.sync_all()
-            .map_err(|e| Error::store(format!("fsync {}: {e}", tmp.display())))?;
-    }
-    let installed = match std::fs::hard_link(&tmp, path) {
-        Ok(()) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(Error::store(format!("install {}: {e}", path.display())));
-        }
-    };
-    let _ = std::fs::remove_file(&tmp);
-    if !installed {
-        // Lost the race: the winner's content must match ours or refuse.
-        let existing = std::fs::read(path)
-            .map_err(|e| Error::store(format!("read {}: {e}", path.display())))?;
-        if existing != bytes {
-            return Err(Error::store(format!(
-                "refusing to replace existing {} with different content",
+        let embedded = extract(value);
+        if embedded != key {
+            return Err(Error::integrity(format!(
+                "refusing to write a record declaring identity {embedded:?} under key {key:?} at {}: the record's embedded identity does not match its storage key",
                 path.display()
             )));
         }
-        return Ok(());
+        #[cfg(test)]
+        {
+            self.write_json_seam(path, value, fault)
+        }
+        #[cfg(not(test))]
+        {
+            self.write_json(path, value)
+        }
     }
-    set_private(path)?;
-    // THE DURABILITY COMMIT POINT — FAIL CLOSED: the parent-directory
-    // open/fsync failure must PROPAGATE (never a silent `Ok` — the new
-    // content IS installed under its final name, but its durability across
-    // power loss is UNCONFIRMED, and reporting durable success for an
-    // unsynced directory entry would be a false durability claim). The
-    // installed file stays (create-or-compare: a retry sees the identical
-    // content and is an idempotent success), exactly like the ledger
-    // append's post-rename dir-sync contract.
-    sync_parent_dir(path)?;
-    Ok(())
+
+    /// Durably write a MUTABLE JSON record via the atomic-replace protocol
+    /// ([`crate::store::atomic::write_atomic_replace_fd`]: unique temp in the
+    /// same directory → write → fsync → chmod private → atomic rename →
+    /// parent-directory fsync), resolved DESCRIPTOR-RELATIVE to the store's
+    /// owned root. A reader never observes a torn record (the rename is atomic
+    /// on POSIX — wholly old or wholly new).
+    ///
+    /// FAIL CLOSED ON UNCONFIRMED DURABILITY: a
+    /// [`ReplaceOutcome::ReplacedDurabilityUnknown`] outcome — the new record
+    /// IS visible but the parent-directory fsync failed — is DOWNGRADED to
+    /// `Err`, never reported as success (the pins-write precedent
+    /// [`LocalStore::write_pins`]): the caller has no facility to report
+    /// "visible but unconfirmed", so failure is the only safe answer.
+    #[cfg(not(test))]
+    pub(crate) fn write_json<T: Serialize>(&self, path: &Path, value: &T) -> Result<()> {
+        let bytes = serde_json::to_vec_pretty(value)
+            .map_err(|e| Error::store(format!("serialize {}: {e}", path.display())))?;
+        match self.write_atomic_replace_at(path, &bytes)? {
+            ReplaceOutcome::ReplacedDurable => Ok(()),
+            ReplaceOutcome::ReplacedDurabilityUnknown { error } => Err(error),
+        }
+    }
+
+    /// TEST-ONLY seam: the same atomic JSON-record write as [`LocalStore::write_json`]
+    /// with a per-stage fault hook, so a per-fixture registry can inject a failure
+    /// at EVERY atomic-replacement stage ([`ReplaceStage`]) of a mutable
+    /// record write (the `write_slot_observed` / `write_server` /
+    /// `write_retention_debt` / `write_sweep_debt` writers) and the property
+    /// can assert the stage→outcome mapping. Not part of the production
+    /// surface — production builds keep the exact `write_json` signature.
+    #[cfg(test)]
+    pub(crate) fn write_json_seam<T: Serialize>(
+        &self,
+        path: &Path,
+        value: &T,
+        fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
+    ) -> Result<()> {
+        let bytes = serde_json::to_vec_pretty(value)
+            .map_err(|e| Error::store(format!("serialize {}: {e}", path.display())))?;
+        match self.write_atomic_replace_seam_at(path, &bytes, fault)? {
+            ReplaceOutcome::ReplacedDurable => Ok(()),
+            ReplaceOutcome::ReplacedDurabilityUnknown { error } => Err(error),
+        }
+    }
+
+    /// Install immutable content-addressed file bytes (release records, mapping,
+    /// and behavior snapshots) with create-or-compare semantics.
+    ///
+    /// * If the file does not exist yet, the bytes are written to a temporary file
+    ///   in the same directory and atomically renamed into place, so a reader never
+    ///   observes a partially written snapshot.
+    /// * If the file already exists, its contents must be byte-identical: an
+    ///   identical rewrite is an idempotent success, and any attempt to replace the
+    ///   existing snapshot with different content fails. Snapshots are bound to
+    ///   release identity by digest; they are never mutable in place.
+    ///
+    /// Callers serialize writes per store with the application-store lock; the
+    /// temporary name additionally carries the process id to stay collision-free.
+    /// The write resolves DESCRIPTOR-RELATIVE to the store's owned root (a
+    /// symlink injected at the final component is refused, never followed).
+    pub(crate) fn write_atomic_cas(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+        let rel = self.rel(path)?;
+        crate::store::atomic::write_atomic_cas_fd(&self.root_fd, rel, bytes)
+    }
 }
 
 pub struct LocalStore {
     pub(crate) base: PathBuf,
+    /// The SEALED ownership root (production stores): holds the canonical
+    /// root's registration in the process-global ownership registry
+    /// ([`OwnedRoot`]), released when the store is dropped. `None` for
+    /// test-only [`LocalStore::with_base`] stores (which bypass ownership
+    /// registration). The field is never READ — its only job is to keep the
+    /// [`OwnedRoot`] alive so its `Drop` releases the registration.
+    #[allow(dead_code)]
+    root: Option<OwnedRoot>,
+    /// The open directory descriptor on the owned root, opened with
+    /// `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`. Every store mutation resolves
+    /// paths relative to this descriptor (component-wise `openat(O_NOFOLLOW)`,
+    /// see [`crate::store::atomic`]'s `_fd` primitives), so a symlink
+    /// injected into a path component can never redirect a mutation outside
+    /// the owned root.
+    root_fd: OwnedFd,
     /// Per-fixture one-shot fault registry (test-only). Created EMPTY by
     /// [`LocalStore::with_base`]; tests that want an injected store fault arm
     /// it via [`LocalStore::fault_registry`]. There are no process-global
@@ -293,14 +248,34 @@ impl LocalStore {
     /// STORE KEY is the ONLY way in (see [`LocalStore::new`]); the store
     /// base is resolved PURELY from the caller's environment snapshot —
     /// never from a live process read.
+    ///
+    /// The store is constructed from a SEALED [`OwnedRoot`] on the local
+    /// endpoint: the base tree is created first (idempotent — a second
+    /// store on an overlapping root creates nothing new), then the owned
+    /// root is constructed from the now-existing canonical directory. The
+    /// overlap refusal (equal / ancestor / descendant roots on the same
+    /// endpoint) happens at the [`OwnedRoot::parse`] construction, before
+    /// any store record is created or deleted.
     pub fn new_in(env: &SysEnv, application: &ApplicationStoreKey) -> Result<LocalStore> {
         let base = default_base(env).join(application.as_str());
-        Self::with_base(base)
+        // The ownership gate needs a real canonical directory: create the
+        // base tree first (idempotent), then construct the owned root from
+        // the now-existing canonical directory.
+        ensure_private_dir(&base)?;
+        let root = OwnedRoot::parse(&OwnedRoot::local_endpoint()?, &base)?;
+        Self::from_owned_root(root)
     }
 
-    /// Create a store rooted at an explicit base (used in tests).
-    pub fn with_base(base: PathBuf) -> Result<LocalStore> {
-        ensure_private_dir(&base)?;
+    /// The production constructor: from a validated, registered
+    /// [`OwnedRoot`]. The store's base is the root's canonical directory;
+    /// the store opens a descriptor on it (with `O_DIRECTORY | O_NOFOLLOW |
+    /// O_CLOEXEC`) and creates the private layout tree. Every subsequent
+    /// store mutation resolves paths relative to that descriptor
+    /// (component-wise `openat(O_NOFOLLOW)`), so a symlink injected into a
+    /// path component can never redirect a mutation outside the owned root.
+    pub fn from_owned_root(root: OwnedRoot) -> Result<LocalStore> {
+        let base = root.canonical().to_path_buf();
+        let root_fd = open_root_fd(&base)?;
         ensure_private_dir(&base.join(remote_layout::objects()))?;
         ensure_private_dir(&base.join(remote_layout::RELEASES))?;
         ensure_private_dir(&base.join("targets"))?;
@@ -310,11 +285,150 @@ impl LocalStore {
         ensure_private_dir(&base.join("staging"))?;
         Ok(LocalStore {
             base,
+            root: Some(root),
+            root_fd,
             #[cfg(test)]
             fault_registry: Arc::new(FaultRegistry::default()),
             #[cfg(test)]
             step17_hook: Arc::new(Step17Hook::default()),
         })
+    }
+
+    /// TEST-ONLY: create a store rooted at an explicit base (used in
+    /// tests). Bypasses the ownership registry (a test may create and
+    /// reopen stores over the same base freely); the store still opens a
+    /// descriptor on the base, so its mutations are descriptor-relative
+    /// like production stores. PRODUCTION CODE MUST NOT USE THIS — the
+    /// production constructors are [`LocalStore::new`] /
+    /// [`LocalStore::new_in`] / [`LocalStore::from_owned_root`], which
+    /// construct the store from a sealed [`OwnedRoot`]. This constructor is
+    /// `#[doc(hidden)]` because it exists only for test fixtures (the lib's
+    /// unit tests and the integration tests in `tests/`, which compile
+    /// against the library without `#[cfg(test)]`).
+    #[doc(hidden)]
+    pub fn with_base(base: PathBuf) -> Result<LocalStore> {
+        ensure_private_dir(&base)?;
+        ensure_private_dir(&base.join(remote_layout::objects()))?;
+        ensure_private_dir(&base.join(remote_layout::RELEASES))?;
+        ensure_private_dir(&base.join("targets"))?;
+        ensure_private_dir(&base.join("slots"))?;
+        ensure_private_dir(&base.join("servers"))?;
+        ensure_private_dir(&base.join("deployments"))?;
+        ensure_private_dir(&base.join("staging"))?;
+        let root_fd = open_root_fd(&base)?;
+        Ok(LocalStore {
+            base,
+            root: None,
+            root_fd,
+            #[cfg(test)]
+            fault_registry: Arc::new(FaultRegistry::default()),
+            #[cfg(test)]
+            step17_hook: Arc::new(Step17Hook::default()),
+        })
+    }
+
+    /// The path relative to the owned root (for descriptor-relative I/O).
+    /// Every store path is built from `self.base`, so the prefix strip is
+    /// exact; a path outside the root is a store error (fail closed).
+    fn rel<'a>(&self, path: &'a Path) -> Result<&'a Path> {
+        path.strip_prefix(&self.base).map_err(|_| {
+            Error::store(format!(
+                "path {} is outside the owned root {}",
+                path.display(),
+                self.base.display()
+            ))
+        })
+    }
+
+    /// The descriptor-relative atomic replace (see
+    /// [`crate::store::atomic::write_atomic_replace_fd`]).
+    fn write_atomic_replace_at(&self, path: &Path, bytes: &[u8]) -> Result<ReplaceOutcome> {
+        let rel = self.rel(path)?;
+        crate::store::atomic::write_atomic_replace_fd(&self.root_fd, rel, bytes, &mut |_| None)
+    }
+
+    /// The descriptor-relative atomic replace with the per-stage fault hook
+    /// (test seam).
+    #[cfg(test)]
+    fn write_atomic_replace_seam_at(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
+    ) -> Result<ReplaceOutcome> {
+        let rel = self.rel(path)?;
+        crate::store::atomic::write_atomic_replace_fd(&self.root_fd, rel, bytes, fault)
+    }
+
+    /// The descriptor-relative private-directory creation (see
+    /// [`crate::store::atomic::ensure_private_dir_fd`]).
+    fn ensure_private_dir_at(&self, path: &Path) -> Result<()> {
+        let rel = self.rel(path)?;
+        crate::store::atomic::ensure_private_dir_fd(&self.root_fd, rel)
+    }
+
+    /// The descriptor-relative DURABLE private-directory creation (see
+    /// [`crate::store::atomic::ensure_private_dir_durable_fd`]).
+    fn ensure_private_dir_durable_at(&self, path: &Path) -> Result<bool> {
+        let rel = self.rel(path)?;
+        crate::store::atomic::ensure_private_dir_durable_fd(&self.root_fd, rel)
+    }
+
+    /// The descriptor-relative parent-directory fsync (see
+    /// [`crate::store::atomic::sync_parent_dir_fd`]).
+    fn sync_parent_dir_at(&self, path: &Path) -> Result<()> {
+        let rel = self.rel(path)?;
+        crate::store::atomic::sync_parent_dir_fd(&self.root_fd, rel)
+    }
+
+    /// The descriptor-relative private chmod (see
+    /// [`crate::store::atomic::set_private_fd`]).
+    fn set_private_at(&self, path: &Path) -> Result<()> {
+        let rel = self.rel(path)?;
+        crate::store::atomic::set_private_fd(&self.root_fd, rel)
+    }
+
+    /// The descriptor-relative remove of a single file (see
+    /// [`crate::store::atomic::remove_file_fd`]).
+    fn remove_file_at(&self, path: &Path) -> Result<()> {
+        let rel = self.rel(path)?;
+        crate::store::atomic::remove_file_fd(&self.root_fd, rel)
+    }
+
+    /// The descriptor-relative rename of a path under the root (see
+    /// [`crate::store::atomic::renameat_paths`]).
+    fn rename_at(&self, from: &Path, to: &Path) -> Result<()> {
+        let from_rel = self.rel(from)?;
+        let to_rel = self.rel(to)?;
+        crate::store::atomic::renameat_paths(&self.root_fd, from_rel, to_rel)
+    }
+
+    /// The descriptor-relative recursive removal of a directory tree (see
+    /// [`crate::store::atomic::remove_dir_all_fd`]).
+    fn remove_dir_all_at(&self, path: &Path) -> Result<()> {
+        let rel = self.rel(path)?;
+        crate::store::atomic::remove_dir_all_fd(&self.root_fd, rel)
+    }
+
+    /// The descriptor-relative recursive tree copy (see
+    /// [`crate::store::atomic::copy_dir_recursive_fd`]).
+    fn copy_dir_recursive_at(&self, src: &Path, dst: &Path) -> Result<()> {
+        let dst_rel = self.rel(dst)?;
+        crate::store::atomic::copy_dir_recursive_fd(&self.root_fd, src, dst_rel)
+    }
+
+    /// The descriptor-relative recursive tree fsync (see
+    /// [`crate::store::atomic::fsync_tree_recursive_fd`]).
+    fn fsync_tree_recursive_at(&self, path: &Path) -> Result<()> {
+        let rel = self.rel(path)?;
+        crate::store::atomic::fsync_tree_recursive_fd(&self.root_fd, rel)
+    }
+
+    /// The descriptor-relative plain file write (see
+    /// [`crate::store::atomic::write_file_fd`]).
+    fn write_file_at(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+        let rel = self.rel(path)?;
+        crate::store::atomic::write_file_fd(&self.root_fd, rel, bytes)
     }
 
     /// The fixture's per-fixture one-shot fault registry. A test arms faults
@@ -392,6 +506,25 @@ impl LocalStore {
     pub fn staging_dir(&self) -> PathBuf {
         self.base.join("staging")
     }
+}
+
+/// Open a directory descriptor on `base` with `O_DIRECTORY | O_NOFOLLOW |
+/// O_CLOEXEC`: the descriptor pins the owned root, and every store mutation
+/// resolves paths relative to it (component-wise `openat(O_NOFOLLOW)`), so a
+/// symlink injected into a path component can never redirect a mutation
+/// outside the owned root. `O_NOFOLLOW` refuses a symlink at the FINAL
+/// component (the root itself must be a real directory); intermediate
+/// components are resolved normally (the root is canonical by construction
+/// in production, and test bases are real directories).
+fn open_root_fd(base: &Path) -> Result<OwnedFd> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    opts.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let f = opts
+        .open(base)
+        .map_err(|e| Error::store(format!("open root {}: {e}", base.display())))?;
+    Ok(f.into())
 }
 
 /// Sanitize a name for use as a directory/file component — retained ONLY

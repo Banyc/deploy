@@ -887,9 +887,17 @@ mod tests {
                 // open with a STORE error — fail closed, never an escape.
                 match LocalStore::new_in(&env, &key) {
                     Ok(store) => {
+                        // The store's base is the CANONICAL form of
+                        // `default_base(env).join(key)` (the sealed
+                        // [`OwnedRoot`] is constructed from a canonical
+                        // directory), so the comparison canonicalizes the
+                        // expected base (a temp root under a symlinked
+                        // `TMPDIR` canonicalizes to the real directory).
+                        let expected = std::fs::canonicalize(default_base(&env).join(key.as_str()))
+                            .expect("the store base exists (new_in created it)");
                         assert_eq!(
-                            store.base().parent(),
-                            Some(default_base(&env).as_path()),
+                            store.base(),
+                            expected,
                             "the store must sit directly under the base: {s:?}"
                         );
                         assert_eq!(

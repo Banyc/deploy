@@ -2,19 +2,17 @@
 //! (`targets/<target>/retention-debt.json`) and the store-global sweep
 //! marker (`sweep-debt.json`), both with tri-state read semantics.
 
-use crate::error::{Error, Result};
+#[cfg(test)]
+use crate::error::Error;
+use crate::error::Result;
 use crate::identity::{DeploymentId, TargetName};
-use crate::store::atomic::{path_state, read_json, sync_parent_dir};
-use crate::store::local::{LocalStore, read_keyed_json, write_keyed_json};
+use crate::store::atomic::{path_state, read_json};
+use crate::store::local::{LocalStore, read_keyed_json};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[cfg(test)]
 use crate::store::atomic::ReplaceStage;
-#[cfg(not(test))]
-use crate::store::local::write_json;
-#[cfg(test)]
-use crate::store::local::write_json_seam;
 #[cfg(test)]
 use crate::testutil::test_faults::FaultKind;
 
@@ -191,15 +189,13 @@ impl LocalStore {
             // directory-entry change; never report success while the entry
             // is unsynced).
             if path_state(&p)? {
-                std::fs::remove_file(&p).map_err(|e| {
-                    Error::store(format!("remove retention debt {}: {e}", p.display()))
-                })?;
-                sync_parent_dir(&p)?;
+                self.remove_file_at(&p)?;
+                self.sync_parent_dir_at(&p)?;
             }
             return Ok(());
         }
         // The marker is persisted WITH its own target identity (the storage
-        // key), replaced ATOMICALLY (see [`write_json`]); the test seam
+        // key), replaced ATOMICALLY (see [`LocalStore::write_json`]); the test seam
         // faults each replacement stage keyed by the target.
         let rec = RetentionDebt {
             target: target.clone(),
@@ -208,10 +204,10 @@ impl LocalStore {
         #[cfg(test)]
         {
             let mut hook = self.replace_stage_hook(target.as_str(), retention_debt_replace_kind);
-            write_keyed_json(&p, target.as_str(), &rec, |r| r.target.as_str(), &mut hook)
+            self.write_keyed_json(&p, target.as_str(), &rec, |r| r.target.as_str(), &mut hook)
         }
         #[cfg(not(test))]
-        write_keyed_json(&p, target.as_str(), &rec, |r| r.target.as_str())
+        self.write_keyed_json(&p, target.as_str(), &rec, |r| r.target.as_str())
     }
 
     // ---- the store-global sweep debt (checkpoint sweep maintenance) ------
@@ -275,24 +271,22 @@ impl LocalStore {
                 // a directory-entry change; never report success while the
                 // entry is unsynced).
                 if path_state(&p)? {
-                    std::fs::remove_file(&p).map_err(|e| {
-                        Error::store(format!("remove sweep debt {}: {e}", p.display()))
-                    })?;
-                    sync_parent_dir(&p)?;
+                    self.remove_file_at(&p)?;
+                    self.sync_parent_dir_at(&p)?;
                 }
                 Ok(())
             }
             Some(d) => {
                 // The mutable sweep-debt marker is replaced ATOMICALLY (see
-                // [`write_json`]); the test seam faults each replacement
+                // [`LocalStore::write_json`]); the test seam faults each replacement
                 // stage keyed by the empty global key.
                 #[cfg(test)]
                 {
                     let mut hook = self.replace_stage_hook("", sweep_debt_replace_kind);
-                    write_json_seam(&p, d, &mut hook)
+                    self.write_json_seam(&p, d, &mut hook)
                 }
                 #[cfg(not(test))]
-                write_json(&p, d)
+                self.write_json(&p, d)
             }
         }
     }

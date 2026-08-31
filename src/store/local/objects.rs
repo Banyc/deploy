@@ -8,9 +8,7 @@ use crate::error::{Error, Result};
 use crate::identity::{TreeDigest, TreeMetadata};
 use crate::remote::layout;
 use crate::remote::transport::Remote;
-use crate::store::atomic::{
-    copy_dir_recursive, fsync_tree_recursive, path_state, read_json, sync_parent_dir, temp_name_for,
-};
+use crate::store::atomic::{path_state, read_json};
 use crate::store::local::{LocalStore, read_keyed_json};
 use std::path::{Path, PathBuf};
 
@@ -117,10 +115,8 @@ impl LocalStore {
             // garbage: REPAIR by re-staging (never refuse — the digest names
             // the content, and the final location must end wholly present
             // with the right content).
-            std::fs::remove_dir_all(&obj_dir).map_err(|e| {
-                Error::store(format!("remove stale object {}: {e}", obj_dir.display()))
-            })?;
-            sync_parent_dir(&obj_dir)?;
+            self.remove_dir_all_at(&obj_dir)?;
+            self.sync_parent_dir_at(&obj_dir)?;
         }
         self.publish_object_staged(digest, &obj_dir, src_root)
     }
@@ -167,7 +163,7 @@ impl LocalStore {
         // location (never the final dir itself, never a reused name: a stale
         // staging dir from a crashed publish can never collide with or be
         // confused for a fresh attempt).
-        let staging = temp_name_for(obj_dir);
+        let staging = crate::store::atomic::temp_name_for(obj_dir);
         let staged_root = staging.join("root");
         // Stage 1: copy the complete source tree into staging. A fault here
         // (or a real copy failure) leaves the final location wholly ABSENT.
@@ -181,7 +177,7 @@ impl LocalStore {
             ));
         }
         let copy = (|| -> Result<()> {
-            copy_dir_recursive(src_root, &staged_root)?;
+            self.copy_dir_recursive_at(src_root, &staged_root)?;
             // VERIFY the complete staged tree BEFORE anything is published:
             // a tree that does not canonicalize to its digest is never made
             // visible under its digest name.
@@ -197,17 +193,12 @@ impl LocalStore {
             // that could leave a tree without its metadata).
             let bytes = serde_json::to_vec(&meta)
                 .map_err(|e| Error::store(format!("serialize tree.json: {e}")))?;
-            std::fs::write(staging.join("tree.json"), &bytes).map_err(|e| {
-                Error::store(format!(
-                    "write {}: {e}",
-                    staging.join("tree.json").display()
-                ))
-            })?;
-            crate::store::atomic::set_private(&staging.join("tree.json"))?;
+            self.write_file_at(&staging.join("tree.json"), &bytes)?;
+            self.set_private_at(&staging.join("tree.json"))?;
             Ok(())
         })();
         if let Err(e) = copy {
-            let _ = std::fs::remove_dir_all(&staging);
+            let _ = self.remove_dir_all_at(&staging);
             return Err(e);
         }
         // Stage 2: recursively fsync the COMPLETE staged tree (every file's
@@ -223,7 +214,7 @@ impl LocalStore {
                 "test fault: store_object (staged tree sync) forced to fail once",
             ));
         }
-        fsync_tree_recursive(&staging)?;
+        self.fsync_tree_recursive_at(&staging)?;
         // Stage 3: ATOMICALLY PUBLISH — rename the whole staging dir into
         // the final location (atomic on POSIX: the object appears wholly or
         // not at all; a crash between copy and rename leaves only the
@@ -238,8 +229,7 @@ impl LocalStore {
                 "test fault: store_object (publish rename) forced to fail once",
             ));
         }
-        std::fs::rename(&staging, obj_dir)
-            .map_err(|e| Error::store(format!("publish object {}: {e}", obj_dir.display())))?;
+        self.rename_at(&staging, obj_dir)?;
         // Stage 4: the PARENT-DIRECTORY fsync — the publish's durability
         // commit point, AFTER the rename (the object IS visible; its
         // durability is unconfirmed until the directory entry is synced).
@@ -255,7 +245,7 @@ impl LocalStore {
                 "test fault: store_object (publish parent-dir sync) forced to fail once",
             ));
         }
-        sync_parent_dir(obj_dir)?;
+        self.sync_parent_dir_at(obj_dir)?;
         Ok(())
     }
 

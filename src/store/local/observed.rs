@@ -5,8 +5,8 @@
 use crate::error::{Error, Result};
 use crate::identity::{ServerId, SlotId, TargetName};
 use crate::ledger::{ObservedSlot, ObservedTarget, ServerState};
-use crate::store::atomic::{ensure_private_dir, path_state};
-use crate::store::local::{LocalStore, read_keyed_json, write_keyed_json};
+use crate::store::atomic::path_state;
+use crate::store::local::{LocalStore, read_keyed_json};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -99,9 +99,9 @@ impl LocalStore {
                 p.display()
             ))
         })?;
-        ensure_private_dir(dir)?;
+        self.ensure_private_dir_at(dir)?;
         // The mutable observed record is replaced ATOMICALLY (temp + fsync +
-        // chmod + rename + parent-dir fsync — see [`write_json`]), so a
+        // chmod + rename + parent-dir fsync — see [`LocalStore::write_json`]), so a
         // crash never leaves a torn record: the slot reads wholly-old or
         // wholly-new. The test seam faults each replacement stage from the
         // fixture's OWN registry (keyed by the slot id), so the
@@ -109,10 +109,10 @@ impl LocalStore {
         #[cfg(test)]
         {
             let mut hook = self.replace_stage_hook(slot.as_str(), observed_replace_kind);
-            write_keyed_json(&p, slot.as_str(), observed, |o| o.slot.as_str(), &mut hook)
+            self.write_keyed_json(&p, slot.as_str(), observed, |o| o.slot.as_str(), &mut hook)
         }
         #[cfg(not(test))]
-        write_keyed_json(&p, slot.as_str(), observed, |o| o.slot.as_str())
+        self.write_keyed_json(&p, slot.as_str(), observed, |o| o.slot.as_str())
     }
 
     /// Read one placement slot's physical observed record. `None` when the
@@ -238,15 +238,15 @@ impl LocalStore {
             .base
             .join("servers")
             .join(format!("{}.json", state.id.as_str()));
-        // The mutable server record is replaced ATOMICALLY (see [`write_json`]);
+        // The mutable server record is replaced ATOMICALLY (see [`LocalStore::write_json`]);
         // the test seam faults each replacement stage keyed by the server id.
         #[cfg(test)]
         {
             let mut hook = self.replace_stage_hook(state.id.as_str(), server_replace_kind);
-            write_keyed_json(&p, state.id.as_str(), state, |s| s.id.as_str(), &mut hook)
+            self.write_keyed_json(&p, state.id.as_str(), state, |s| s.id.as_str(), &mut hook)
         }
         #[cfg(not(test))]
-        write_keyed_json(&p, state.id.as_str(), state, |s| s.id.as_str())
+        self.write_keyed_json(&p, state.id.as_str(), state, |s| s.id.as_str())
     }
 
     /// Read a server's local record by its typed [`ServerId`] (the storage

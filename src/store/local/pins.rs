@@ -3,7 +3,7 @@
 
 use crate::error::{Error, Result};
 use crate::ledger::Pins;
-use crate::store::atomic::{ReplaceOutcome, path_state, read_json, write_atomic_replace};
+use crate::store::atomic::{ReplaceOutcome, path_state, read_json};
 use crate::store::local::LocalStore;
 use std::path::PathBuf;
 
@@ -56,7 +56,7 @@ impl LocalStore {
         }
         let bytes = serde_json::to_vec_pretty(pins)
             .map_err(|e| Error::store(format!("serialize pins: {e}")))?;
-        match write_atomic_replace(&self.pins_path(), &bytes)? {
+        match self.write_atomic_replace_at(&self.pins_path(), &bytes)? {
             ReplaceOutcome::ReplacedDurable => Ok(()),
             ReplaceOutcome::ReplacedDurabilityUnknown { error } => Err(error),
         }
