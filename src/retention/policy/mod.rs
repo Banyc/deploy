@@ -118,17 +118,10 @@ pub fn compute_retained(
                     e.name, a.generation_id
                 )));
             }
-            // Timestamp: an unparseable `created_at` ABORTS (never the
-            // current time — a corrupt record must not be treated as
-            // brand-new).
-            let created = crate::identity::Timestamp::parse(&a.created_at)
-                .map(|t| *t.inner())
-                .map_err(|err| {
-                    Error::remote(format!(
-                        "generation {} has an unparseable created_at {:?}: {err}",
-                        e.name, a.created_at
-                    ))
-                })?;
+            // Timestamp: the typed `created_at` is already validated by
+            // construction (an unparseable wire timestamp fails
+            // deserialization — fail closed, never the current time).
+            let created = *a.created_at.inner();
             // Duplicate detection: two inventory entries with the same
             // `GenerationId` is an integrity error (the dirs are named by id,
             // so this fires only on corruption — it still fails closed rather
@@ -398,10 +391,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     variant: VariantName::new("standard"),
                     tree: test_tree_digest("t1"),
                 },
-                behavior_sha256: "b".into(),
+                behavior_sha256: crate::identity::test_behavior_digest("b"),
                 prior_generation: None,
-                created_at: "2020-01-01T00:00:00Z".into(),
-                target: None,
+                created_at: crate::identity::Timestamp::parse("2020-01-01T00:00:00Z").unwrap(),
+                target: crate::identity::TargetName::new("t1"),
             })
             .unwrap();
         crate::remote::helper::SlotRemote::new(&helper, owner())
@@ -415,10 +408,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     variant: VariantName::new("standard"),
                     tree: test_tree_digest("t2"),
                 },
-                behavior_sha256: "b".into(),
+                behavior_sha256: crate::identity::test_behavior_digest("b"),
                 prior_generation: Some(test_generation_id("g1")),
-                created_at: "2020-01-02T00:00:00Z".into(),
-                target: None,
+                created_at: crate::identity::Timestamp::parse("2020-01-02T00:00:00Z").unwrap(),
+                target: crate::identity::TargetName::new("t1"),
             })
             .unwrap();
         crate::remote::helper::SlotRemote::new(&helper, owner())
@@ -522,9 +515,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
     /// Create one generation record (tree + assignment) without touching
     /// `current`. `target` is the originating target recorded on the
-    /// assignment; `None` writes a legacy record without attribution (the
-    /// remote records still carry attribution — the slot's policy no longer
-    /// consults it).
+    /// assignment (the mutation input requires a MANDATORY owning target — a
+    /// generation-install without attribution is unrepresentable, so a
+    /// fixture must name its slot's owning target).
     fn make_gen(
         helper: &RemoteHelper,
         deployment_id: &str,
@@ -532,7 +525,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         tree: &str,
         created: &str,
         prior_generation: Option<&str>,
-        target: Option<&str>,
+        target: &str,
     ) {
         // The receiver's generation records are read back through the
         // validated parse, so the fixture writes the CANONICAL forms of its
@@ -553,10 +546,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     variant: VariantName::new("standard"),
                     tree: canonical_tree,
                 },
-                behavior_sha256: "b".into(),
+                behavior_sha256: crate::identity::test_behavior_digest("b"),
                 prior_generation: prior_generation.map(test_generation_id),
-                created_at: created.into(),
-                target: target.map(|t| crate::identity::TargetName::new(t.to_string())),
+                created_at: crate::identity::Timestamp::parse(created).unwrap(),
+                target: crate::identity::TargetName::new(target.to_string()),
             })
             .unwrap();
     }
@@ -579,7 +572,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "t1",
             "2020-01-01T00:00:00Z",
             None,
-            None,
+            "t1",
         );
         make_gen(
             &helper,
@@ -588,7 +581,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "t2",
             "2020-01-02T00:00:00Z",
             Some("g1"),
-            None,
+            "t1",
         );
         make_gen(
             &helper,
@@ -597,7 +590,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "t3",
             "2020-01-03T00:00:00Z",
             Some("g2"),
-            None,
+            "t1",
         );
         crate::remote::helper::SlotRemote::new(&helper, owner())
             .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
@@ -659,8 +652,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let now = jiff::Timestamp::now();
         let old = (now - jiff::SignedDuration::from_hours(60 * 24)).to_string();
         let recent = (now - jiff::SignedDuration::from_hours(5 * 24)).to_string();
-        make_gen(&helper, "d1", "g1", "t-old", &old, None, None);
-        make_gen(&helper, "d2", "g2", "t-recent", &recent, Some("g1"), None);
+        make_gen(&helper, "d1", "g1", "t-old", &old, None, "t1");
+        make_gen(&helper, "d2", "g2", "t-recent", &recent, Some("g1"), "t1");
         crate::remote::helper::SlotRemote::new(&helper, owner())
             .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
             .unwrap()
@@ -731,7 +724,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "t1",
             "2020-01-01T00:00:00Z",
             None,
-            None,
+            "t1",
         );
         make_gen(
             &helper,
@@ -740,7 +733,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "t2",
             "2020-01-02T00:00:00Z",
             Some("g1"),
-            None,
+            "t1",
         );
         make_gen(
             &helper,
@@ -749,7 +742,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "t3",
             "2020-01-03T00:00:00Z",
             Some("g2"),
-            None,
+            "t1",
         );
         crate::remote::helper::SlotRemote::new(&helper, owner())
             .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
@@ -815,7 +808,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "t1",
             "2020-01-01T00:00:00Z",
             None,
-            None,
+            "t1",
         );
         make_gen(
             &helper,
@@ -824,7 +817,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "t2",
             "2020-01-02T00:00:00Z",
             Some("g1"),
-            None,
+            "t1",
         );
         // current -> g2, whose assignment records g1 as prior.
         crate::remote::helper::SlotRemote::new(&helper, owner())
@@ -892,7 +885,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "t1",
             "2020-01-01T00:00:00Z",
             None,
-            None,
+            "t1",
         );
         crate::remote::helper::SlotRemote::new(&helper, owner())
             .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
@@ -981,7 +974,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "t1",
             "2020-01-01T00:00:00Z",
             None,
-            Some("production"),
+            "production",
         );
         make_gen(
             &helper,
@@ -990,7 +983,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "t2",
             "2020-01-02T00:00:00Z",
             Some("g1"),
-            Some("production"),
+            "production",
         );
         make_gen(
             &helper,
@@ -999,7 +992,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "t3",
             "2020-01-03T00:00:00Z",
             Some("g2"),
-            Some("production"),
+            "production",
         );
         crate::remote::helper::SlotRemote::new(&helper, owner())
             .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
@@ -1114,7 +1107,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "t1",
             "2020-01-01T00:00:00Z",
             None,
-            None,
+            "t1",
         );
         make_gen(
             &helper,
@@ -1123,7 +1116,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "t2",
             "2020-01-02T00:00:00Z",
             Some("g1"),
-            None,
+            "t1",
         );
         make_gen(
             &helper,
@@ -1132,7 +1125,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "t3",
             "2020-01-03T00:00:00Z",
             Some("g2"),
-            None,
+            "t1",
         );
         crate::remote::helper::SlotRemote::new(&helper, owner())
             .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
@@ -1215,7 +1208,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "t-prev",
             "2020-01-01T00:00:00Z",
             None,
-            None,
+            "t1",
         );
         make_gen(
             helper,
@@ -1224,7 +1217,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "t-cur",
             "2020-01-02T00:00:00Z",
             Some("g1"),
-            None,
+            "t1",
         );
         crate::remote::helper::SlotRemote::new(helper, owner())
             .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
@@ -1838,14 +1831,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                         release: test_release_id("r"),
                         variant: VariantName::new("standard"),
                         tree: TreeDigest::parse(&g.tree).unwrap()},
-                    behavior_sha256: "b".into(),
+                    behavior_sha256: crate::identity::test_behavior_digest("b"),
                     prior_generation: g.prior.as_ref().map(|p| GenerationId::parse(p).unwrap()),
-                    created_at: g.created_at.to_string(),
+                    created_at: crate::identity::Timestamp::parse(&g.created_at.to_string()).unwrap(),
                     application: crate::identity::ApplicationStoreKey::parse("rot").unwrap(),
                     slot: crate::identity::SlotId::parse("p1").unwrap(),
-                    target: None,
+                    target: Some(crate::identity::TargetName::new("t1")),
                 };
-                crate::remote::helper::SlotRemote::new(&helper, owner()).acquire_lock_guard(&crate::identity::OperationId::new("op".to_string())).unwrap().create_generation(&asn.spec()).unwrap();
+                crate::remote::helper::SlotRemote::new(&helper, owner()).acquire_lock_guard(&crate::identity::OperationId::new("op".to_string())).unwrap().create_generation(&asn.spec().unwrap()).unwrap();
                 assignments.push(asn);
             }
             let current = history.last().unwrap().clone();
@@ -1903,12 +1896,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     std::fs::write(dir.path().join("remote").join(p), b"{ corrupt !").unwrap();
                 }
                 3 => {
-                    let mut a = assignments[corrupt_idx].clone();
-                    a.created_at = "not-a-timestamp".into();
+                    let a = assignments[corrupt_idx].clone();
+                    // (the typed record cannot hold a bad timestamp; the corrupt wire is written directly)
+                    let mut wire = serde_json::to_value(&a).unwrap();
+                    wire["created_at"] = serde_json::json!("not-a-timestamp");
                     let p = layout::generation(&GenerationId::parse(&history[corrupt_idx].id).expect("fixture generation id")).join("assignment.json").unwrap();
                     std::fs::write(
                         dir.path().join("remote").join(p),
-                        serde_json::to_vec_pretty(&a).unwrap(),
+                        serde_json::to_vec_pretty(&wire).unwrap(),
                     )
                     .unwrap();
                 }
@@ -1940,7 +1935,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 0 => "injected fault: generations metadata",
                 1 => "injected fault: generations listing",
                 2 => "parse assignment",
-                3 => "unparseable created_at",
+                3 => "invalid RFC3339 timestamp",
                 _ => "assignment names generation"};
             assert!(
                 err_text.contains(expected_marker),
@@ -2433,14 +2428,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                         release: test_release_id("r"),
                         variant: VariantName::new("standard"),
                         tree: TreeDigest::parse(&g.tree).unwrap()},
-                    behavior_sha256: "b".into(),
+                    behavior_sha256: crate::identity::test_behavior_digest("b"),
                     prior_generation: g.prior.as_ref().map(|p| GenerationId::parse(p).unwrap()),
-                    created_at: g.created_at.to_string(),
+                    created_at: crate::identity::Timestamp::parse(&g.created_at.to_string()).unwrap(),
                     application: crate::identity::ApplicationStoreKey::parse("rot").unwrap(),
                     slot: crate::identity::SlotId::parse("p1").unwrap(),
-                    target: None,
+                    target: Some(crate::identity::TargetName::new("t1")),
                 };
-                crate::remote::helper::SlotRemote::new(&helper, owner()).acquire_lock_guard(&crate::identity::OperationId::new("op".to_string())).unwrap().create_generation(&asn.spec()).unwrap();
+                crate::remote::helper::SlotRemote::new(&helper, owner()).acquire_lock_guard(&crate::identity::OperationId::new("op".to_string())).unwrap().create_generation(&asn.spec().unwrap()).unwrap();
                 assignments.push(asn);
             }
             let current = history.last().unwrap().clone();
@@ -2494,15 +2489,17 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     std::fs::write(dir.path().join("remote").join(p), b"{ corrupt !").unwrap();
                 }
                 1 => {
-                    let mut a = assignments[corrupt_idx].clone();
-                    a.created_at = "not-a-timestamp".into();
+                    let a = assignments[corrupt_idx].clone();
+                    // (the typed record cannot hold a bad timestamp; the corrupt wire is written directly)
+                    let mut wire = serde_json::to_value(&a).unwrap();
+                    wire["created_at"] = serde_json::json!("not-a-timestamp");
                     let p = layout::generation(&GenerationId::parse(&history[corrupt_idx].id).expect("fixture generation id")).join("assignment.json").unwrap();
                     std::fs::write(
                         dir.path().join("remote").join(p),
-                        serde_json::to_vec_pretty(&a).unwrap(),
+                        serde_json::to_vec_pretty(&wire).unwrap(),
                     )
                     .unwrap();
-                    abort_marker = Some("unparseable created_at");
+                    abort_marker = Some("invalid RFC3339 timestamp");
                 }
                 2 => {
                     let mut a = assignments[corrupt_idx].clone();
@@ -2520,15 +2517,17 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     // parse `created_at`, so the chain validates while the
                     // inventory build aborts — the current dir was listed but
                     // its record failed the build.
-                    let mut a = assignments[n_gens - 1].clone();
-                    a.created_at = "not-a-timestamp".into();
+                    let a = assignments[n_gens - 1].clone();
+                    // (the typed record cannot hold a bad timestamp; the corrupt wire is written directly)
+                    let mut wire = serde_json::to_value(&a).unwrap();
+                    wire["created_at"] = serde_json::json!("not-a-timestamp");
                     let p = layout::generation(&GenerationId::parse(&current_id).expect("fixture generation id")).join("assignment.json").unwrap();
                     std::fs::write(
                         dir.path().join("remote").join(p),
-                        serde_json::to_vec_pretty(&a).unwrap(),
+                        serde_json::to_vec_pretty(&wire).unwrap(),
                     )
                     .unwrap();
-                    abort_marker = Some("unparseable created_at");
+                    abort_marker = Some("invalid RFC3339 timestamp");
                 }
                 4 => {
                     // A DANGLING prior: the current record names a prior with

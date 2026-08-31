@@ -59,6 +59,14 @@ pub(crate) fn test_tree_digest(tag: &str) -> TreeDigest {
     TreeDigest::parse(&test_sha256_hex(tag)).expect("canonical test digest")
 }
 
+/// A deterministic valid [`crate::identity::BehaviorDigest`] derived from a tag
+/// (test fixtures only: a behavior digest in a mutation input must be a valid
+/// 64-lowercase-hex digest).
+#[cfg(test)]
+pub(crate) fn test_behavior_digest(tag: &str) -> crate::identity::BehaviorDigest {
+    crate::identity::BehaviorDigest::parse(&test_sha256_hex(tag)).expect("canonical test digest")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

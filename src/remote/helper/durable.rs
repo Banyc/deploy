@@ -229,10 +229,10 @@ fn generation_spec(gen_id: &crate::identity::GenerationId) -> GenerationSpec {
             variant: VariantName::parse("standard").unwrap(),
             tree: test_tree_digest("tree-a"),
         },
-        behavior_sha256: "b".to_string(),
+        behavior_sha256: crate::identity::test_behavior_digest("b"),
         prior_generation: None,
-        created_at: "2020-01-01T00:00:00Z".to_string(),
-        target: Some(TargetName::new("t1")),
+        created_at: crate::identity::Timestamp::parse("2020-01-01T00:00:00Z").unwrap(),
+        target: TargetName::new("t1"),
     }
 }
 

@@ -256,10 +256,10 @@ pub(crate) fn commit(
             variant: mutation.artifact().variant.clone(),
             tree: mutation.tree().clone(),
         },
-        behavior_sha256: mutation.behavior_digest().as_str().to_string(),
+        behavior_sha256: mutation.behavior_digest().clone(),
         prior_generation: mutation.prior_generation().cloned(),
-        created_at: mutation.created_at().to_string(),
-        target: Some(mutation.target().clone()),
+        created_at: *mutation.created_at(),
+        target: mutation.target().clone(),
     })?;
     // 3. Record the transaction (`prepared` — the durable per-operation
     //    recovery record).

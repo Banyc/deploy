@@ -495,10 +495,10 @@ mod compensation_tests {
                 variant: crate::identity::VariantName::new("standard"),
                 tree: h.tree.clone(),
             },
-            behavior_sha256: "b".into(),
+            behavior_sha256: crate::identity::test_behavior_digest("b"),
             prior_generation: Some(first_gen.clone()),
-            created_at: crate::remote::helper::now_rfc3339(),
-            target: Some(crate::identity::TargetName::new("t1")),
+            created_at: crate::remote::helper::now_rfc3339_ts(),
+            target: crate::identity::TargetName::new("t1"),
         })
         .unwrap();
         crate::remote::helper::SlotRemote::new(
@@ -530,10 +530,10 @@ mod compensation_tests {
                 variant: crate::identity::VariantName::new("standard"),
                 tree: h.tree.clone(),
             },
-            behavior_sha256: "b".into(),
+            behavior_sha256: crate::identity::test_behavior_digest("b"),
             prior_generation: Some(g2.clone()),
-            created_at: crate::remote::helper::now_rfc3339(),
-            target: Some(crate::identity::TargetName::new("t1")),
+            created_at: crate::remote::helper::now_rfc3339_ts(),
+            target: crate::identity::TargetName::new("t1"),
         })
         .unwrap();
         crate::remote::helper::SlotRemote::new(

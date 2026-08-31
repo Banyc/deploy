@@ -3912,12 +3912,12 @@ exec /bin/mv "$@"
                 variant: VariantName::new("standard"),
                 tree: test_tree_digest(tree),
             },
-            behavior_sha256: "b".into(),
+            behavior_sha256: crate::identity::test_behavior_digest("b"),
             prior_generation: None,
-            created_at: created.to_string(),
+            created_at: crate::identity::Timestamp::parse(&created.to_string()).unwrap(),
             application: crate::identity::ApplicationStoreKey::parse("test-app").unwrap(),
             slot: crate::identity::SlotId::parse("s1").unwrap(),
-            target: None,
+            target: Some(crate::identity::TargetName::new("t1")),
         };
         crate::remote::helper::SlotRemote::new(
             &helper,
@@ -3925,7 +3925,7 @@ exec /bin/mv "$@"
         )
         .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
         .unwrap()
-        .create_generation(&mk(&g1, "t1").spec())
+        .create_generation(&mk(&g1, "t1").spec().unwrap())
         .unwrap();
         crate::remote::helper::SlotRemote::new(
             &helper,
@@ -3933,7 +3933,7 @@ exec /bin/mv "$@"
         )
         .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
         .unwrap()
-        .create_generation(&mk(&g2, "t2").spec())
+        .create_generation(&mk(&g2, "t2").spec().unwrap())
         .unwrap();
         for tree in ["t1", "t2"] {
             let d = test_tree_digest(tree);

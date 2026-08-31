@@ -1845,9 +1845,9 @@ mod cross_remote_guard_mutation {
                 variant: VariantName::parse("standard").unwrap(),
                 tree: tree.clone(),
             },
-            behavior_sha256: "b".to_string(),
+            behavior_sha256: crate::identity::test_behavior_digest("b"),
             prior_generation: None,
-            created_at: "2020-01-01T00:00:00Z".to_string(),
+            created_at: crate::identity::Timestamp::parse("2020-01-01T00:00:00Z").unwrap(),
             application: crate::identity::ApplicationStoreKey::parse("test-app").unwrap(),
             slot: crate::identity::SlotId::parse("s1").unwrap(),
             target: Some(TargetName::new("t1")),
@@ -2048,10 +2048,11 @@ mod cross_remote_guard_mutation {
                             variant: VariantName::parse("standard").unwrap(),
                             tree: crate::identity::test_tree_digest(tree_tag),
                         },
-                        behavior_sha256: "b".to_string(),
+                        behavior_sha256: crate::identity::test_behavior_digest("b"),
                         prior_generation: None,
-                        created_at: "2020-01-01T00:00:00Z".to_string(),
-                        target: Some(TargetName::new("t1")),
+                        created_at: crate::identity::Timestamp::parse("2020-01-01T00:00:00Z")
+                            .unwrap(),
+                        target: TargetName::new("t1"),
                     };
                     guard_a.create_generation(&spec).map(|_| ())
                 }
@@ -2129,10 +2130,11 @@ mod cross_remote_guard_mutation {
                             variant: VariantName::parse("standard").unwrap(),
                             tree: crate::identity::test_tree_digest(tree_tag),
                         },
-                        behavior_sha256: "b".to_string(),
+                        behavior_sha256: crate::identity::test_behavior_digest("b"),
                         prior_generation: None,
-                        created_at: "2020-01-01T00:00:00Z".to_string(),
-                        target: Some(TargetName::new("t1")),
+                        created_at: crate::identity::Timestamp::parse("2020-01-01T00:00:00Z")
+                            .unwrap(),
+                        target: TargetName::new("t1"),
                     };
                     guard_b.create_generation(&spec).map(|_| ())
                 }
@@ -2258,9 +2260,9 @@ mod owner_mismatch_proptest {
                 variant: VariantName::parse("standard").unwrap(),
                 tree: tree.clone(),
             },
-            behavior_sha256: "b".to_string(),
+            behavior_sha256: crate::identity::test_behavior_digest("b"),
             prior_generation: None,
-            created_at: "2020-01-01T00:00:00Z".to_string(),
+            created_at: crate::identity::Timestamp::parse("2020-01-01T00:00:00Z").unwrap(),
             application: crate::identity::ApplicationStoreKey::parse("app-b").unwrap(),
             slot: crate::identity::SlotId::parse("s-b").unwrap(),
             target: None,

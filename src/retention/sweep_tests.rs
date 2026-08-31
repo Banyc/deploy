@@ -178,10 +178,10 @@ fn make_gen(
                 variant: VariantName::parse("standard").unwrap(),
                 tree: canonical_tree,
             },
-            behavior_sha256: "b".into(),
+            behavior_sha256: crate::identity::test_behavior_digest("b"),
             prior_generation: prior_generation.map(test_generation_id),
-            created_at: created.into(),
-            target: None,
+            created_at: crate::identity::Timestamp::parse(created).unwrap(),
+            target: crate::identity::TargetName::new("t1"),
         })
         .unwrap();
 }

@@ -2050,11 +2050,13 @@ fn historical_rollback_uses_historical_behavior() -> Result<()> {
     )
     .unwrap();
     assert_eq!(
-        assignment.behavior_sha256, a_digest,
+        assignment.behavior_sha256.as_str(),
+        a_digest,
         "rollback must use the historical (A) behavior"
     );
     assert_ne!(
-        assignment.behavior_sha256, b_digest,
+        assignment.behavior_sha256.as_str(),
+        b_digest,
         "rollback must NOT use the current (B) behavior"
     );
 
@@ -3366,10 +3368,14 @@ fn pending_commit_diverged_generation_is_degraded_not_successful() -> Result<()>
             variant: deploy::identity::VariantName::parse("standard").expect("valid variant"),
             tree: foreign_tree,
         },
-        behavior_sha256: "b".to_string(),
+        behavior_sha256: deploy::identity::BehaviorDigest::parse(
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        )
+        .expect("valid behavior digest"),
         prior_generation: None,
-        created_at: "2020-01-01T00:00:00Z".to_string(),
-        target: None,
+        created_at: deploy::identity::Timestamp::parse("2020-01-01T00:00:00Z")
+            .expect("valid timestamp"),
+        target: deploy::identity::TargetName::parse("t1").expect("valid target"),
     })?;
     deploy::remote::helper::SlotRemote::new(
         &foreign_helper,

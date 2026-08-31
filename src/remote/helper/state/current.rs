@@ -485,9 +485,9 @@ mod tests_current {
                 variant: crate::identity::VariantName::parse("standard").unwrap(),
                 tree: crate::identity::test_tree_digest(tree),
             },
-            behavior_sha256: "b".to_string(),
+            behavior_sha256: crate::identity::test_behavior_digest("b"),
             prior_generation: None,
-            created_at: "2020-01-01T00:00:00Z".to_string(),
+            created_at: crate::identity::Timestamp::parse("2020-01-01T00:00:00Z").unwrap(),
             application: crate::identity::ApplicationStoreKey::parse("test-app").unwrap(),
             slot: crate::identity::SlotId::parse("s1").unwrap(),
             target: Some(TargetName::new("t1")),
@@ -516,7 +516,7 @@ mod tests_current {
         // (never re-derived from the id string, which would change it).
         let mut asn = assignment(gen_id.as_str(), tree);
         asn.generation_id = gen_id.clone();
-        guard.create_generation(&asn.spec()).unwrap();
+        guard.create_generation(&asn.spec().unwrap()).unwrap();
         guard
             .helper()
             .remote()

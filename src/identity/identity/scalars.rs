@@ -199,7 +199,8 @@ name_scalar!(
 /// A sha256 behavior digest: exactly 64 lowercase hex characters (the exact
 /// form [`crate::digest::sha256_bytes`] produces). Any other string — empty,
 /// short, long, uppercase, non-hex, or prefixed — is rejected.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
 pub struct BehaviorDigest(String);
 
 impl BehaviorDigest {
@@ -231,6 +232,19 @@ impl FromStr for BehaviorDigest {
     type Err = Error;
     fn from_str(s: &str) -> Result<BehaviorDigest> {
         BehaviorDigest::parse(s)
+    }
+}
+
+/// Wire strings go through the validated parse: a record carrying a
+/// non-digest `behavior_sha256` fails deserialization (fail closed — the
+/// known-state fact is typed, never a loose string).
+impl<'de> Deserialize<'de> for BehaviorDigest {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        BehaviorDigest::parse(&s).map_err(serde::de::Error::custom)
     }
 }
 

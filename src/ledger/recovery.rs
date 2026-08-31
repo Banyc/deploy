@@ -863,10 +863,10 @@ mod tests {
             deployment_id: deployment_id.clone(),
             generation_id: generation.clone(),
             artifact: artifact.clone(),
-            behavior_sha256: crate::identity::DIGEST_TEST_HEX_1.to_string(),
+            behavior_sha256: crate::identity::test_behavior_digest("hex1"),
             prior_generation: Some(prior.clone()),
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            target: Some(TargetName::parse("t1").unwrap()),
+            created_at: crate::identity::Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
+            target: TargetName::parse("t1").unwrap(),
         })
         .unwrap();
         crate::remote::helper::SlotRemote::new(

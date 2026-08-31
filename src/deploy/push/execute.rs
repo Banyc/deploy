@@ -561,9 +561,10 @@ pub(crate) mod execute_tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(assignment.behavior_sha256, a_digest);
+        assert_eq!(assignment.behavior_sha256.as_str(), a_digest);
         assert_ne!(
-            assignment.behavior_sha256, b_digest,
+            assignment.behavior_sha256.as_str(),
+            b_digest,
             "the restored generation must carry the PRIOR behavior, not the desired one"
         );
 

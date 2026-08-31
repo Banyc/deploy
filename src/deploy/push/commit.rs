@@ -2110,10 +2110,10 @@ pub(crate) mod commit_tests {
                 deployment_id: deployment_id.clone(),
                 generation_id: generation.clone(),
                 artifact: artifact.clone(),
-                behavior_sha256: crate::identity::DIGEST_TEST_HEX_1.to_string(),
+                behavior_sha256: crate::identity::test_behavior_digest("hex1"),
                 prior_generation: None,
-                created_at: "2026-01-01T00:00:00Z".to_string(),
-                target: Some(TargetName::parse("t1").unwrap()),
+                created_at: crate::identity::Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
+                target: TargetName::parse("t1").unwrap(),
             })
             .unwrap();
         slot_remote
@@ -2156,10 +2156,10 @@ pub(crate) mod commit_tests {
                 deployment_id: test_deployment_id("deploy-foreign"),
                 generation_id: foreign_gen.clone(),
                 artifact: foreign_artifact,
-                behavior_sha256: "b".to_string(),
+                behavior_sha256: crate::identity::test_behavior_digest("b"),
                 prior_generation: None,
-                created_at: "2026-01-01T00:00:00Z".to_string(),
-                target: Some(TargetName::parse("t1").unwrap()),
+                created_at: crate::identity::Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
+                target: TargetName::parse("t1").unwrap(),
             })
             .unwrap();
         foreign_gen

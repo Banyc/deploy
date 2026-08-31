@@ -4,7 +4,8 @@
 
 use crate::error::{Error, Result};
 use crate::identity::{
-    ApplicationStoreKey, ArtifactRef, DeploymentId, GenerationId, SlotId, TargetName,
+    ApplicationStoreKey, ArtifactRef, BehaviorDigest, DeploymentId, GenerationId, SlotId,
+    TargetName, Timestamp,
 };
 use crate::remote::layout;
 use crate::remote::transport::CreateNewVerdict;
@@ -36,10 +37,17 @@ pub struct GenerationAssignment {
     pub deployment_id: DeploymentId,
     pub generation_id: GenerationId,
     pub artifact: ArtifactRef,
-    pub behavior_sha256: String,
+    /// The typed behavior digest (exactly 64 lowercase hex — the wire string
+    /// routes through [`crate::identity::BehaviorDigest::parse`] on read, so
+    /// a record carrying a non-digest is refused fail-closed: the known
+    /// state fact is typed, never a loose string).
+    pub behavior_sha256: BehaviorDigest,
     #[serde(default)]
     pub prior_generation: Option<GenerationId>,
-    pub created_at: String,
+    /// The typed creation timestamp (canonical RFC 3339 on the wire, parsed
+    /// via [`crate::identity::Timestamp::parse`] on read — a malformed
+    /// timestamp is refused fail-closed).
+    pub created_at: Timestamp,
     /// THE OWNER MARKER, application half: the application whose store this
     /// generation belongs to. Required (no `#[serde(default)]`): a record
     /// without it is invalid and fails closed at every read.
@@ -113,14 +121,21 @@ impl<'a> RemoteHelper<'a> {
 /// identity the guard was acquired for; a caller cannot pass it as a free
 /// parameter.
 #[derive(Clone, Debug)]
+/// TYPED mutation input (the structural verdict's point 4): a generation
+/// install consumes validated values only — a typed [`BehaviorDigest`], a
+/// typed [`Timestamp`], and a MANDATORY [`TargetName`]. A caller cannot pass
+/// a loose behavior-digest or timestamp string (they are sealed validated
+/// types) or omit the owning target (no `Option`): the invalid mutation is
+/// unrepresentable. Use is capability-gated: the install methods are on the
+/// [`HeldSlotLock`] guard.
 pub struct GenerationSpec {
     pub deployment_id: DeploymentId,
     pub generation_id: GenerationId,
     pub artifact: ArtifactRef,
-    pub behavior_sha256: String,
+    pub behavior_sha256: BehaviorDigest,
     pub prior_generation: Option<GenerationId>,
-    pub created_at: String,
-    pub target: Option<TargetName>,
+    pub created_at: Timestamp,
+    pub target: TargetName,
 }
 
 impl GenerationSpec {
@@ -137,7 +152,7 @@ impl GenerationSpec {
             created_at: self.created_at,
             application: owner.application.clone(),
             slot: owner.slot.clone(),
-            target: self.target,
+            target: Some(self.target),
         }
     }
 }
@@ -150,16 +165,28 @@ impl GenerationAssignment {
     /// keep the full record for repair/read-back while creating it through
     /// the guard.
     #[cfg(test)]
-    pub(crate) fn spec(&self) -> GenerationSpec {
-        GenerationSpec {
+    pub(crate) fn spec(&self) -> Result<GenerationSpec> {
+        // The assignment's known-state facts are TYPED by construction
+        // (behavior_sha256/created_at cannot be loose). The target is the
+        // one legacy-optional wire field: a spec for a legacy record
+        // without a target is refused (the mutation input requires a
+        // mandatory owning target — a legacy record cannot drive a new
+        // generation-install mutation).
+        let target = self.target.as_ref().cloned().ok_or_else(|| {
+            Error::integrity(format!(
+                "generation {} carries no owning target (a legacy record cannot be re-committed as a generation-install mutation)",
+                self.generation_id
+            ))
+        })?;
+        Ok(GenerationSpec {
             deployment_id: self.deployment_id.clone(),
             generation_id: self.generation_id.clone(),
             artifact: self.artifact.clone(),
             behavior_sha256: self.behavior_sha256.clone(),
             prior_generation: self.prior_generation.clone(),
-            created_at: self.created_at.clone(),
-            target: self.target.clone(),
-        }
+            created_at: self.created_at,
+            target,
+        })
     }
 }
 
@@ -355,10 +382,10 @@ mod tests_assignment {
                 variant: crate::identity::VariantName::parse("standard").unwrap(),
                 tree: crate::identity::test_tree_digest(tree),
             },
-            behavior_sha256: "b".to_string(),
+            behavior_sha256: crate::identity::test_behavior_digest("b"),
             prior_generation: None,
-            created_at: "2020-01-01T00:00:00Z".to_string(),
-            target: Some(TargetName::new("t1")),
+            created_at: crate::identity::Timestamp::parse("2020-01-01T00:00:00Z").unwrap(),
+            target: TargetName::new("t1"),
         }
     }
 
