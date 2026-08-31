@@ -6,7 +6,6 @@
 
 use crate::error::{Error, Result};
 use crate::identity::{TreeDigest, TreeMetadata};
-use crate::remote::canonical::TREE_SCHEMA_VERSION;
 use crate::remote::layout;
 use crate::remote::transport::Remote;
 use crate::store::atomic::{
@@ -127,35 +126,26 @@ impl LocalStore {
     }
 
     /// Verify a WHOLE present object: the `root/` tree canonicalizes to
-    /// `digest` AND the `tree.json` metadata parses and carries the digest
-    /// and the canonical schema version. A partial/garbage object fails
-    /// (the caller repairs it); a verified object is reusable as-is.
+    /// `digest` AND the `tree.json` metadata is EXACTLY the canonical metadata
+    /// of the tree content (verified field-by-field by
+    /// [`crate::remote::canonical::verify_tree_metadata`] — a metadata record
+    /// whose fields were mutated while the tree root was left unchanged fails).
+    /// A partial/garbage object fails (the caller repairs it); a verified
+    /// object is reusable as-is.
     pub(crate) fn verify_object(&self, digest: &TreeDigest, obj_dir: &Path) -> Result<()> {
         let root = obj_dir.join("root");
-        let meta = crate::remote::canonical::canonicalize_tree(&root).map_err(|e| {
-            Error::integrity(format!(
-                "existing object {} cannot be canonicalized: {e}",
-                digest.as_str()
-            ))
-        })?;
-        if meta.tree_sha256 != digest.as_str() {
+        let stored: TreeMetadata = read_json(&obj_dir.join("tree.json"))?;
+        let canonical =
+            crate::remote::canonical::verify_tree_metadata(&root, &stored).map_err(|e| {
+                Error::integrity(format!(
+                    "existing object {} failed verification: {e}",
+                    digest.as_str()
+                ))
+            })?;
+        if canonical.tree_sha256 != digest.as_str() {
             return Err(Error::integrity(format!(
                 "existing object {} failed verification",
                 digest.as_str()
-            )));
-        }
-        let stored: TreeMetadata = read_json(&obj_dir.join("tree.json"))?;
-        if stored.tree_sha256 != digest.as_str() {
-            return Err(Error::integrity(format!(
-                "existing object {} metadata failed verification",
-                digest.as_str()
-            )));
-        }
-        if stored.tree_schema_version != TREE_SCHEMA_VERSION {
-            return Err(Error::integrity(format!(
-                "existing object {} carries unsupported tree_schema_version {} (expected {TREE_SCHEMA_VERSION})",
-                digest.as_str(),
-                stored.tree_schema_version
             )));
         }
         Ok(())
@@ -275,22 +265,22 @@ impl LocalStore {
         // — `objects/sha256/<digest>/tree.json`) — a metadata record swapped
         // into the wrong digest's directory is refused with an integrity
         // error naming both digests, never returned as if it were `digest`.
-        let meta: TreeMetadata = read_keyed_json(
+        let stored: TreeMetadata = read_keyed_json(
             &self.object_tree_json(digest),
             digest.as_str(),
             |m: &TreeMetadata| m.tree_sha256.as_str(),
         )?;
-        // Fail closed on the tree metadata format version: only
-        // `TREE_SCHEMA_VERSION` is accepted, any other version is refused
-        // (a tree.json written by a different schema is never interpreted).
-        if meta.tree_schema_version != TREE_SCHEMA_VERSION {
-            return Err(Error::integrity(format!(
-                "tree {} carries unsupported tree_schema_version {} (expected {TREE_SCHEMA_VERSION}): only TREE_SCHEMA_VERSION is accepted",
-                digest.as_str(),
-                meta.tree_schema_version
-            )));
-        }
-        Ok(meta)
+        // THE CONTENT BINDING: the stored metadata must be EXACTLY the
+        // canonical metadata of the ACTUAL tree content at
+        // `objects/sha256/<digest>/root/` — a `tree.json` whose fields were
+        // mutated (entries, hashes, modes, symlinks) while the tree root was
+        // left unchanged is REFUSED with an integrity error (fail closed),
+        // and the RECOMPUTED canonical value is returned — never the stored
+        // bytes. The verifier also fails closed on the tree metadata format
+        // version: only `TREE_SCHEMA_VERSION` is accepted, any other version
+        // is refused (a tree.json written by a different schema is never
+        // interpreted).
+        crate::remote::canonical::verify_tree_metadata(&self.object_root(digest), &stored)
     }
 }
 
@@ -426,5 +416,42 @@ mod tests {
                     .join(&tree),
             )
             .unwrap();
+    }
+
+    /// THE CONTENT BINDING (read side): `read_tree_meta` verifies the stored
+    /// metadata against the ACTUAL tree content — a `tree.json` whose fields
+    /// were mutated while the tree root was left unchanged is REFUSED with an
+    /// integrity error, and a valid object returns the RECOMPUTED canonical
+    /// metadata (never the stored bytes).
+    #[test]
+    fn read_tree_meta_binds_metadata_to_content() {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let tree_dir = dir.path().join("tree");
+        let tree = make_tree(&tree_dir, "content");
+        let digest = TreeDigest::new(tree.clone());
+        store.store_object(&digest, &tree_dir).unwrap();
+
+        // A valid object returns the RECOMPUTED canonical metadata.
+        let meta = store.read_tree_meta(&digest).unwrap();
+        let canonical = crate::remote::canonical::canonicalize_tree(&tree_dir).unwrap();
+        assert_eq!(
+            meta, canonical,
+            "read_tree_meta must return the recomputed canonical metadata"
+        );
+
+        // Mutate a metadata field (the tree_sha256) while leaving the tree
+        // root unchanged: the mutated tree.json must be refused.
+        let mut mutated = canonical.clone();
+        mutated.tree_sha256 = "0".repeat(64);
+        let bytes = serde_json::to_vec(&mutated).unwrap();
+        std::fs::write(store.object_tree_json(&digest), &bytes).unwrap();
+        let err = store.read_tree_meta(&digest).expect_err(
+            "a tree.json whose fields were mutated while the tree root is unchanged must be refused",
+        );
+        assert!(
+            err.to_string().contains("does not match"),
+            "the refusal must name the content binding, got: {err}"
+        );
     }
 }
