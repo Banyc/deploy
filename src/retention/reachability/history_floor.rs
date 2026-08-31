@@ -520,10 +520,10 @@ impl LocalStore {
         // file is an error, never "no pins" (a failed read must never shrink
         // the retained set).
         let pins = self.read_pins()?;
-        for rid in &pins.releases {
+        for rid in pins.releases() {
             self.honor_release_pin(&mut out, rid, true)?;
         }
-        for b in &pins.bindings {
+        for b in pins.bindings() {
             // An exact-binding pin names a release too: the pin cannot be
             // honored unless that release's record exists and reads clean
             // (the binding's own (release, tree) is kept regardless).

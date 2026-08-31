@@ -2351,15 +2351,15 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         seed_tree_dir(&store, &pinned_tree);
 
         store
-            .write_pins(&Pins {
-                schema_version: crate::ledger::PINS_SCHEMA_VERSION,
-                releases: vec![pinned.clone()],
-                bindings: vec![ArtifactRef {
-                    release: pinned.clone(),
-                    variant: VariantName::parse("standard").unwrap(),
-                    tree: test_tree_digest(&pinned_tree),
-                }],
-            })
+            .write_pins(
+                &Pins::empty()
+                    .with_release(pinned.clone())
+                    .with_binding(ArtifactRef {
+                        release: pinned.clone(),
+                        variant: VariantName::parse("standard").unwrap(),
+                        tree: test_tree_digest(&pinned_tree),
+                    }),
+            )
             .unwrap();
 
         let checkpoint_id = test_deployment_id(&format!("dep-t1-{at}"));

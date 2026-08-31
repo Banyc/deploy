@@ -560,18 +560,104 @@ pub type BehaviorIndex = BTreeMap<ReleaseId, BTreeMap<String, BehaviorContract>>
 ///
 /// `schema_version` is exactly `crate::ledger::PINS_SCHEMA_VERSION`;
 /// readers refuse any other version (fail closed).
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// NO `Default` and NO public fields: a `Default` pins value would be a
+/// wrong-schema record constructible by anyone, and public fields would let
+/// a caller hand-build a `Pins` with a `schema_version` the reader rejects.
+/// The ONLY constructors are [`Pins::empty`] (fixed to the current schema)
+/// and the wire `Deserialize` (which refuses any other version), so a
+/// wrong-schema `Pins` is UNCONSTRUCTIBLE — a pins file can never be
+/// written in a schema the reader rejects.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Pins {
-    pub schema_version: u32,
+    schema_version: u32,
     /// Whole-release pins: every variant/tree in each named release record
     /// is retained (release pins expand via the release record's `variants`
     /// map at GC time).
     #[serde(default)]
-    pub releases: Vec<ReleaseId>,
+    releases: Vec<ReleaseId>,
     /// Exact-binding pins: each `(release, variant, tree)` retains exactly
     /// that release record + tree object.
     #[serde(default)]
-    pub bindings: Vec<ArtifactRef>,
+    bindings: Vec<ArtifactRef>,
+}
+
+impl Pins {
+    /// The EMPTY pin set, fixed to the CURRENT schema
+    /// (`PINS_SCHEMA_VERSION`): the only way to build a pins value from
+    /// scratch. The fields are private and the wire `Deserialize` refuses
+    /// any other `schema_version`, so a wrong-schema `Pins` is
+    /// unconstructible.
+    pub fn empty() -> Self {
+        Self {
+            schema_version: PINS_SCHEMA_VERSION,
+            releases: Vec::new(),
+            bindings: Vec::new(),
+        }
+    }
+
+    /// Read-only accessor: the schema identity of a pins value is immutable
+    /// (`Pins::empty()` fixes it to `PINS_SCHEMA_VERSION`).
+    pub fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    /// Read-only accessor: the whole-release pins.
+    pub fn releases(&self) -> &[ReleaseId] {
+        &self.releases
+    }
+
+    /// Read-only accessor: the exact-binding pins.
+    pub fn bindings(&self) -> &[ArtifactRef] {
+        &self.bindings
+    }
+
+    /// Add a WHOLE-RELEASE pin (builder): every variant/tree in the named
+    /// release record is retained.
+    pub fn with_release(mut self, release: ReleaseId) -> Self {
+        self.releases.push(release);
+        self
+    }
+
+    /// Add an EXACT-BINDING pin (builder): the `(release, variant, tree)`
+    /// retains exactly that release record + tree object.
+    pub fn with_binding(mut self, binding: ArtifactRef) -> Self {
+        self.bindings.push(binding);
+        self
+    }
+}
+
+/// The wire `Deserialize` ROUTES THROUGH THE SCHEMA CHECK: a pins file
+/// carrying any `schema_version` other than `PINS_SCHEMA_VERSION` fails
+/// deserialization (fail closed), so a wrong-schema `Pins` is
+/// unconstructible even via the wire path. The reader's own check in
+/// [`crate::store::local::LocalStore::read_pins`] is defense in depth.
+impl<'de> Deserialize<'de> for Pins {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct PinsWire {
+            schema_version: u32,
+            #[serde(default)]
+            releases: Vec<ReleaseId>,
+            #[serde(default)]
+            bindings: Vec<ArtifactRef>,
+        }
+        let w = PinsWire::deserialize(deserializer)?;
+        if w.schema_version != PINS_SCHEMA_VERSION {
+            return Err(serde::de::Error::custom(format!(
+                "unsupported schema_version {} (expected {PINS_SCHEMA_VERSION}): only PINS_SCHEMA_VERSION is accepted",
+                w.schema_version
+            )));
+        }
+        Ok(Pins {
+            schema_version: w.schema_version,
+            releases: w.releases,
+            bindings: w.bindings,
+        })
+    }
 }
 
 /// Persisted per-server local record (`servers/<id>.json`). Keyed by the

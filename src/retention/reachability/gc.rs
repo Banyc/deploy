@@ -905,15 +905,13 @@ interval_seconds = 0
 
         // Store-level pins: a whole-release pin on `store_pin` AND an exact
         // binding pin on the same release's `tree-pinned-store` tree.
-        let pins = Pins {
-            schema_version: crate::ledger::PINS_SCHEMA_VERSION,
-            releases: vec![store_pin.clone()],
-            bindings: vec![ArtifactRef {
+        let pins = Pins::empty()
+            .with_release(store_pin.clone())
+            .with_binding(ArtifactRef {
                 release: store_pin.clone(),
                 variant: VariantName::parse("standard").unwrap(),
                 tree: test_tree_digest("tree-pinned-store"),
-            }],
-        };
+            });
         store.write_pins(&pins).unwrap();
         let pins_bytes = std::fs::read(store.pins_path()).unwrap();
         let pinned_bytes = std::fs::read(store.release_dir(&cfg_pin).join("release.json")).unwrap();
@@ -1451,11 +1449,7 @@ interval_seconds = 0
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let store_pin = seed_real_release(&store, "cfg");
         store
-            .write_pins(&Pins {
-                schema_version: crate::ledger::PINS_SCHEMA_VERSION,
-                releases: vec![store_pin.clone()],
-                bindings: Vec::new(),
-            })
+            .write_pins(&Pins::empty().with_release(store_pin.clone()))
             .unwrap();
         // Tamper the stored record's content (its slot declaration) while
         // leaving the digest fields: recompute-and-verify fails.
@@ -1501,15 +1495,11 @@ interval_seconds = 0
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let missing = crate::identity::test_release_id("rel-sha256-missing");
         store
-            .write_pins(&Pins {
-                schema_version: crate::ledger::PINS_SCHEMA_VERSION,
-                releases: Vec::new(),
-                bindings: vec![ArtifactRef {
-                    release: missing.clone(),
-                    variant: VariantName::parse("standard").unwrap(),
-                    tree: test_tree_digest("tree-x"),
-                }],
-            })
+            .write_pins(&Pins::empty().with_binding(ArtifactRef {
+                release: missing.clone(),
+                variant: VariantName::parse("standard").unwrap(),
+                tree: test_tree_digest("tree-x"),
+            }))
             .unwrap();
         seed_named_release(
             &store,
