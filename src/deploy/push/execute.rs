@@ -6,7 +6,7 @@
 //! consume.
 
 use crate::config::SlotConfig;
-use crate::deploy::push::PreflightOutcome;
+use crate::deploy::push::PreparedDeployment;
 use crate::deploy::push::PushContext;
 use crate::deploy::rollout::BatchRun;
 use crate::deploy::rollout::SlotExecution;
@@ -162,9 +162,15 @@ pub(crate) struct FailureEvidence {
 /// [`crate::deploy::rollout`]; the commit-marker / status decision in
 /// [`crate::deploy::rollout`]; the post-mutation observation in
 /// [`crate::deploy::rollout`].
+///
+/// THE EXECUTION CONSUMES ONLY THE PREPARED DEPLOYMENT'S PROJECTIONS: the
+/// assignments, generations, expected states, and execution requirements
+/// are all DERIVED from the persisted intent ([`PreparedDeployment`]) —
+/// never re-derived from the preflight outcome — so the executed plan can
+/// never drift from the durable intent.
 pub(crate) fn run_execution(
     ctx: &PushContext,
-    outcome: &PreflightOutcome,
+    prepared: &PreparedDeployment,
     members: &[(&SlotConfig, &crate::config::ServerDef)],
     remotes: &HashMap<SlotId, Box<dyn Remote>>,
     helpers: &HashMap<SlotId, RemoteHelper>,
@@ -188,20 +194,20 @@ pub(crate) fn run_execution(
     let failure_policy = target.rollout.failure_policy;
     let stop_on_failure = target.rollout.stop_on_failure;
 
-    let servers_order: Vec<SlotId> = outcome
-        .assignments
-        .iter()
-        .map(|a| a.placement_slot.clone())
-        .collect();
+    // The deployment-order slot list — the intent's slot-table insertion
+    // order (the deployment order), DERIVED from the prepared deployment's
+    // assignments projection.
+    let servers_order: Vec<SlotId> = prepared.servers_order();
 
     // The deployment-order batch loop (batch_size, stop_on_failure, the
     // `'batches` iteration) and the never-started `NotStarted` filler live
     // in [`crate::deploy::rollout`]; the outcome is the ONE per-slot
     // execution table the failure-policy pass and the terminal decision
-    // derive from.
+    // derive from. The batch loop consumes the prepared deployment's
+    // PROJECTIONS (assignments, behavior index, expected states,
+    // generations) — the intent is the single source of truth.
     let BatchRun { mut executions } = crate::deploy::rollout::run_batches(
-        &outcome.assignments,
-        &outcome.behavior_index,
+        prepared,
         members,
         config,
         target_name,
@@ -211,8 +217,6 @@ pub(crate) fn run_execution(
         statuses,
         op_id,
         deployment_id,
-        &outcome.plan_servers,
-        &outcome.new_gen,
         &servers_order,
         batch_size,
         stop_on_failure,
@@ -231,14 +235,13 @@ pub(crate) fn run_execution(
     // commit time.
     crate::deploy::rollout::apply_failure_policy(
         failure_policy,
+        prepared,
         members,
         config,
         target_name,
         helpers,
         op_id,
         deployment_id,
-        &outcome.plan_servers,
-        &outcome.new_gen,
         &mut executions,
     )?;
 
@@ -254,7 +257,7 @@ pub(crate) fn run_execution(
     // indeterminate) — the old `record_never_advanced_outcomes` wire-row
     // fix-up is GONE (its role moved into [`ExecutionOutcome::failure_outcomes`]).
     let (actual_servers, actual_observations) = crate::deploy::rollout::observe_actual_servers(
-        &outcome.assignments,
+        &prepared.assignments(),
         helpers,
         config.application(),
     );

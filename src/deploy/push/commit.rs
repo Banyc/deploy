@@ -7,6 +7,7 @@
 
 use crate::config::SlotConfig;
 use crate::deploy::push::ExecutionOutcome;
+use crate::deploy::push::PreparedDeployment;
 use crate::deploy::push::PushContext;
 use crate::deploy::push::PushReport;
 use crate::deploy::rollout::SlotExecution;
@@ -14,7 +15,6 @@ use crate::error::Result;
 use crate::identity::{SlotId, TargetName};
 use crate::kernel::terminal::NonSuccessfulDisposition;
 use crate::ledger;
-use crate::ledger::DeploymentIntent;
 use crate::ledger::DeploymentStatus;
 use crate::ledger::LedgerIntentReport;
 use crate::ledger::LedgerTerminal;
@@ -41,11 +41,13 @@ use crate::store::local::ledger::TargetLedgerTxn;
 ///
 /// `txn` is the push's target ledger transaction — the ONLY ledger write
 /// surface (every terminal append and the shared finalizer write through
-/// it, under the target lock).
+/// it, under the target lock). The commit phases consume the SEALED
+/// [`PreparedDeployment`] — the intent is the single source of truth for
+/// the report, the terminal decision, and the finalizer.
 pub(crate) fn run_commit(
     ctx: &PushContext,
     txn: &mut TargetLedgerTxn<'_>,
-    attempt_intent: &DeploymentIntent,
+    prepared: &PreparedDeployment,
     execution: &ExecutionOutcome,
     members: &[(&SlotConfig, &crate::config::ServerDef)],
     helpers: &std::collections::HashMap<SlotId, RemoteHelper>,
@@ -60,6 +62,9 @@ pub(crate) fn run_commit(
     let config = ctx.config;
     let deployment_id = ctx.deployment_id;
     let op_id = ctx.op_id;
+    // THE ONE DURABLE INTENT the prepared deployment owns — the report, the
+    // terminal decision, and the finalizer all consume it.
+    let attempt_intent = prepared.intent();
 
     // 16 & 17. Record outcomes, finalize, history, retention. The ledger's
     // intent line (persisted BEFORE the mutation loop) keeps only the

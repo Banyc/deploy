@@ -1,9 +1,13 @@
 //! Intent persistence: [`persist_intent`] builds the attempt INTENT through
 //! the KERNEL's validated constructor ([`crate::kernel::intent::plan`]) and
 //! writes it (the plan/record half of steps 5-9) — the intent FREEZES the
-//! COMPLETE RESULT in ONE full slot table at plan time.
+//! COMPLETE RESULT in ONE full slot table at plan time. The intent is then
+//! wrapped in the SEALED [`PreparedDeployment`] — the ONE value the mutation
+//! and commit phases consume: every execution input is a PROJECTION of the
+//! intent, never re-derived from the preflight outcome.
 
 use super::PreflightOutcome;
+use crate::deploy::push::PreparedDeployment;
 use crate::deploy::push::PushContext;
 use crate::error::Result;
 use crate::identity::{DeploymentId, RolloutGroupName, SlotId, TargetName};
@@ -13,19 +17,29 @@ use crate::kernel::snapshot::SnapshotSlot;
 use crate::ledger::TargetSnapshot;
 use crate::store::local::ledger::TargetLedgerTxn;
 
-/// The intent built by [`persist_intent`] before the append. The append
-/// happens through the push's [`TargetLedgerTxn`] — the ONLY ledger write
-/// surface (the txn owns the target lock + the folded state).
-pub(crate) fn persist_intent(
+/// Build the attempt INTENT from the preflight outcome — the PURE
+/// construction (no store write, no append): the intent FREEZES the
+/// complete result (deployment identity, target, parent, group, the ONE
+/// full slot table with each selected slot's plan-minted result + observed
+/// pre-push state, the behavior digest, attempted_at) through the kernel's
+/// validated constructor. Shared by the real push ([`persist_intent`]) and
+/// the dry run (which builds the intent read-only to render its plan from
+/// the intent's projections).
+///
+/// The binding recorded in the intent carries the deploy_dir's IMMUTABLE
+/// receiver UUID (read from the provisioned remote during preflight) — the
+/// PHYSICAL identity exact rollback compares. A real push's deploy_dir is
+/// always provisioned in phase B, so the UUID is present; a dry run never
+/// provisions, so the binding carries the config binding without a physical
+/// identity (the dry-run intent is never persisted).
+pub(crate) fn build_intent(
     ctx: &PushContext,
-    txn: &mut TargetLedgerTxn<'_>,
     outcome: &PreflightOutcome,
 ) -> Result<kernel::intent::DeploymentIntent> {
     let store = ctx.store;
     let target_name = ctx.target_name;
     let selection = ctx.selection;
     let deployment_id = ctx.deployment_id;
-    store.write_plan(deployment_id, &outcome.plan)?;
     let desired_behavior_sha =
         crate::verify::release::behavior_index_digest(&outcome.behavior_index);
     let slot_bindings = ctx.config.target_slot_bindings(target_name)?;
@@ -68,18 +82,19 @@ pub(crate) fn persist_intent(
                     deployment_id, a.placement_slot
                 ))
             })?;
-        let receiver_uuid = outcome
+        let binding = match outcome
             .receiver_uuids
             .get(&a.placement_slot)
             .cloned()
             .flatten()
-            .ok_or_else(|| {
-                crate::error::Error::integrity(format!(
-                    "intent {}: no receiver UUID for planned slot '{}' (the deploy_dir was not provisioned)",
-                    deployment_id, a.placement_slot
-                ))
-            })?;
-        let binding = config_binding.with_receiver_uuid(receiver_uuid);
+        {
+            Some(receiver_uuid) => config_binding.with_receiver_uuid(receiver_uuid),
+            // A dry run never provisions (its receiver UUIDs are all
+            // `None`), so the intent's binding carries the config binding
+            // without a physical identity; a real push's deploy_dir is
+            // always provisioned in phase B, so `None` is unreachable there.
+            None => config_binding,
+        };
         let generation = outcome.new_gen[&a.placement_slot].clone();
         let result = SnapshotSlot::new(generation, a.artifact.clone(), binding);
         // The intent's pre-push observation IS the map entry — the preflight
@@ -113,7 +128,7 @@ pub(crate) fn persist_intent(
         None => None,
     };
 
-    let attempt_intent = kernel::intent::plan(PlanInput {
+    kernel::intent::plan(PlanInput {
         deployment_id: deployment_id.clone(),
         target: TargetName::parse(target_name).expect("target name is a safe segment"),
         parent,
@@ -137,7 +152,23 @@ pub(crate) fn persist_intent(
                 ))
             })?,
     })
-    .map_err(|e| crate::error::Error::integrity(format!("intent {deployment_id}: {e}")))?;
+    .map_err(|e| crate::error::Error::integrity(format!("intent {deployment_id}: {e}")))
+}
+
+/// The intent built by [`persist_intent`] before the append, wrapped in the
+/// SEALED [`PreparedDeployment`] the mutation + commit phases consume. The
+/// append happens through the push's [`TargetLedgerTxn`] — the ONLY ledger
+/// write surface (the txn owns the target lock + the folded state).
+pub(crate) fn persist_intent(
+    ctx: &PushContext,
+    txn: &mut TargetLedgerTxn<'_>,
+    outcome: &PreflightOutcome,
+) -> Result<PreparedDeployment> {
+    let store = ctx.store;
+    let target_name = ctx.target_name;
+    let deployment_id = ctx.deployment_id;
+    let attempt_intent = build_intent(ctx, outcome)?;
+    store.write_plan(deployment_id, &outcome.plan)?;
 
     // THE ONE-PARENT RULE (before mutation): the intent's parent must be the
     // target's current successful head AT THE MOMENT OF MUTATION — a drifted
@@ -154,5 +185,7 @@ pub(crate) fn persist_intent(
         })?;
 
     txn.append_intent(&attempt_intent)?;
-    Ok(attempt_intent)
+    // RETAIN the sealed prepared deployment: the intent is persisted and the
+    // execution consumes ONLY its projections.
+    PreparedDeployment::new(attempt_intent, outcome.behavior_index.clone())
 }

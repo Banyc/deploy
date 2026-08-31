@@ -13,18 +13,17 @@ use crate::config::FailurePolicy;
 use crate::config::ProjectConfig;
 use crate::config::ServerDef;
 use crate::config::SlotConfig;
+use crate::deploy::push::PreparedDeployment;
 use crate::deploy::push::slot_vars;
 use crate::deploy::rollout::SlotExecution;
 use crate::deploy::rollout::compensate_server;
 use crate::deploy::rollout::server::CompensationOutcome;
 use crate::error::Result;
 use crate::identity::DeploymentId;
-use crate::identity::GenerationId;
 use crate::identity::OperationId;
 use crate::identity::SlotId;
 use crate::ledger::Observation;
 use crate::ledger::ObservedGeneration;
-use crate::ledger::SlotPlan;
 use crate::remote::helper::RemoteHelper;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -48,16 +47,21 @@ use std::collections::HashMap;
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_failure_policy(
     failure_policy: FailurePolicy,
+    prepared: &PreparedDeployment,
     members: &[(&SlotConfig, &ServerDef)],
     config: &ProjectConfig,
     target_name: &str,
     helpers: &HashMap<SlotId, RemoteHelper>,
     op_id: &OperationId,
     deployment_id: &DeploymentId,
-    plan_servers: &BTreeMap<SlotId, SlotPlan>,
-    new_gen: &HashMap<SlotId, GenerationId>,
     executions: &mut BTreeMap<SlotId, SlotExecution>,
 ) -> Result<()> {
+    // THE COMPENSATION INPUTS ARE THE PREPARED DEPLOYMENT'S PROJECTIONS —
+    // the expected states (each slot's artifact + expected pre-push
+    // generation) and the minted generations are DERIVED from the persisted
+    // intent, never re-derived from the preflight outcome.
+    let plan_servers = prepared.expected_states();
+    let new_gen = prepared.generations();
     // 13. Failure policy compensation of still-advanced servers. The policy
     // is matched EXHAUSTIVELY (no `_ =>` fallback, no string compare):
     //

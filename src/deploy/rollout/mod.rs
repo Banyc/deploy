@@ -13,13 +13,10 @@ use crate::deploy::plan::PlannedAssignment;
 use crate::deploy::push::slot_vars;
 use crate::error::Result;
 use crate::identity::DeploymentId;
-use crate::identity::GenerationId;
 use crate::identity::OperationId;
 use crate::identity::SlotId;
-use crate::ledger::BehaviorIndex;
 use crate::ledger::Observation;
 use crate::ledger::ObservedGeneration;
-use crate::ledger::SlotPlan;
 use crate::remote::helper::RemoteHelper;
 use crate::remote::helper::RemoteStatus;
 use crate::remote::transport::Remote;
@@ -185,7 +182,7 @@ impl SlotExecution {
     /// restored to / left on. TEST-ONLY: used by the compensation/rollback
     /// test assertions to compare the recorded generation.
     #[cfg(test)]
-    pub(crate) fn observed_generation(&self) -> Option<&GenerationId> {
+    pub(crate) fn observed_generation(&self) -> Option<&crate::identity::GenerationId> {
         match self {
             SlotExecution::Advanced { observation, .. }
             | SlotExecution::Restored {
@@ -229,17 +226,17 @@ pub(crate) struct BatchRun {
     pub(crate) executions: BTreeMap<SlotId, SlotExecution>,
 }
 
-// 16 parameters: one batch run is the full per-slot publication context
-// (data: assignments, behavior index, plan/statuses/generations, the
-// already-open remotes/helpers; policy: batch_size, stop_on_failure) plus
-// the deployment identity. Bundling the policy half into one settings struct
-// is a dedicated refactor (deferred: `run_batches` is a straight extraction
-// of the `push_inner` batch loop — the allow documents the deliberate
-// choice, mirroring `push_inner` itself).
+// 13 parameters: one batch run is the full per-slot publication context
+// (data: the prepared deployment — the ONE source of truth whose
+// projections drive the loop — the already-open remotes/helpers; policy:
+// batch_size, stop_on_failure) plus the deployment identity. Bundling the
+// policy half into one settings struct is a dedicated refactor (deferred:
+// `run_batches` is a straight extraction of the `push_inner` batch loop —
+// the allow documents the deliberate choice, mirroring `push_inner`
+// itself).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_batches(
-    assignments: &[PlannedAssignment],
-    behavior_index: &BehaviorIndex,
+    prepared: &crate::deploy::push::PreparedDeployment,
     members: &[(&SlotConfig, &ServerDef)],
     config: &ProjectConfig,
     target_name: &str,
@@ -249,56 +246,39 @@ pub(crate) fn run_batches(
     _statuses: &HashMap<SlotId, RemoteStatus>,
     op_id: &OperationId,
     deployment_id: &DeploymentId,
-    plan_servers: &BTreeMap<SlotId, SlotPlan>,
-    new_gen: &HashMap<SlotId, GenerationId>,
     servers_order: &[SlotId],
     batch_size: usize,
     stop_on_failure: bool,
 ) -> Result<BatchRun> {
+    // THE EXECUTION-REQUIREMENTS PROJECTION: every per-slot execution
+    // request (artifact, minted generation, expected pre-push generation,
+    // the frozen behavior contract + digest) is DERIVED from the persisted
+    // intent — the batch loop drives the per-server pipeline with exactly
+    // these requests, never re-derived from the preflight outcome, so the
+    // executed plan can never drift from the durable intent.
+    let requests = prepared.execution_requests()?;
+    let assignments: Vec<PlannedAssignment> = requests
+        .iter()
+        .map(|r| PlannedAssignment {
+            placement_slot: r.slot.clone(),
+            artifact: r.artifact.clone(),
+        })
+        .collect();
     let mut executions: BTreeMap<SlotId, SlotExecution> = BTreeMap::new();
 
     let mut idx = 0;
     'batches: while idx < servers_order.len() {
         let end = (idx + batch_size).min(servers_order.len());
         for sid in &servers_order[idx..end] {
-            let a = assignments
-                .iter()
-                .find(|x| &x.placement_slot == sid)
-                .unwrap();
-            // Select the assigned slot's OWN (release, variant) frozen
-            // behavior contract (never the caller's current variant file, and
-            // never another release's contract) before
-            // activation/verification. Coverage was validated before any
-            // remote mutation, so a miss here is an internal invariant
-            // violation: record a per-slot failure instead of panicking.
-            let Some(variant_behavior) = behavior_index
-                .get(&a.artifact.release)
-                .and_then(|m| m.get(a.artifact.variant.as_str()))
-            else {
-                executions.insert(
-                    sid.clone(),
-                    SlotExecution::FailedBeforeAdvance {
-                        error: Some(format!(
-                            "internal: no behavior contract for variant '{}' after coverage check",
-                            a.artifact.variant
-                        )),
-                    },
-                );
-                if stop_on_failure {
-                    break 'batches;
-                }
-                continue;
-            };
-            let variant_behavior_sha =
-                crate::verify::release::behavior_contract_digest(variant_behavior);
+            let req = requests.iter().find(|r| &r.slot == sid).unwrap();
             let vars = slot_vars(
                 members,
                 config,
                 target_name,
                 sid,
-                &a.artifact,
+                &req.artifact,
                 Some(deployment_id),
-                Some(&new_gen[sid]),
+                Some(&req.generation),
             )?;
             let outcome = process_server(
                 store,
@@ -308,11 +288,11 @@ pub(crate) fn run_batches(
                 deployment_id,
                 target_name,
                 sid,
-                &a.artifact,
-                &new_gen[sid],
-                plan_servers[sid].expected_generation.as_ref(),
-                variant_behavior,
-                &variant_behavior_sha,
+                &req.artifact,
+                &req.generation,
+                req.expected_generation.as_ref(),
+                &req.behavior,
+                &req.behavior_sha256,
                 &vars,
                 config,
             )?;
@@ -330,7 +310,7 @@ pub(crate) fn run_batches(
     // `NotStarted`; its post-mutation OBSERVATION (the reconciled current
     // state) is attached when the terminal inputs are derived. The filler
     // lives in [`fill_skipped_slots`] (the result-table shaping module).
-    fill_skipped_slots(&mut executions, assignments);
+    fill_skipped_slots(&mut executions, &assignments);
     Ok(BatchRun { executions })
 }
 

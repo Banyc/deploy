@@ -43,12 +43,14 @@ mod dryrun;
 mod execute;
 mod noop;
 mod preflight;
+mod prepared;
 
 pub(crate) use commit::*;
 pub(crate) use dryrun::*;
 pub(crate) use execute::*;
 pub(crate) use noop::*;
 pub(crate) use preflight::*;
+pub(crate) use prepared::*;
 
 // ---- push spine: orchestration and numbered steps ----
 // Push transaction ORCHESTRATION (A1 deployment semantics): the spine of
@@ -467,13 +469,18 @@ pub(crate) fn push_inner<'a>(
 
     // ---- Dry-run: read-only planning, no mutation of store/remote/locks -----
     if opts.dry_run {
-        // The dry-run PLAN RENDERING lives in [`crate::deploy::push`]: the
-        // per-slot current -> desired lines, the would-recover notes, and the
-        // first-deployment line, computed from the plan without touching the
-        // store beyond the local object-existence read. A dry run must never
-        // contact a remote, acquire a lock, or persist anything — the render
-        // is pure plan data.
-        let msg = render_dry_run_plan(store, &preflight.assignments, &statuses, &preflight.new_gen);
+        // The dry-run PLAN RENDERING is a PROJECTION of the prepared
+        // deployment: the intent is built (read-only — nothing is
+        // persisted) and the per-slot current -> desired lines, the
+        // would-recover notes, and the first-deployment line are rendered
+        // from the intent's assignments + generations projections. A dry
+        // run must never contact a remote, acquire a lock, or persist
+        // anything — the render is pure plan data.
+        let prepared = PreparedDeployment::new(
+            build_intent(&ctx, &preflight)?,
+            preflight.behavior_index.clone(),
+        )?;
+        let msg = prepared.plan_rendering(store, &statuses);
         // Explicit, FALLIBLE cleanup BEFORE returning: remove the disposable
         // staging tree, restoring owner-write permission on read-only entries
         // first so the removal can succeed (materialized trees can contain
@@ -552,7 +559,18 @@ pub(crate) fn push_inner<'a>(
     let txn = txn
         .as_mut()
         .expect("a real push opens the target ledger txn");
-    let attempt_intent = persist_intent(&ctx, txn, &preflight)?;
+    // PERSIST THE ATTEMPT INTENT BEFORE ANY REMOTE MUTATION and RETAIN the
+    // SEALED PREPARED DEPLOYMENT: the intent record is the IMMUTABLE INTENT
+    // of the deployment (deployment_id, target, membership, behavior
+    // digest, attempted_at, the planned (`desired`) generations, and the
+    // observed pre-push state). It must be durable BEFORE any server's
+    // `current`/generation changes, so a crash can never lose a deployment
+    // whose servers already advanced. The record carries NO outcomes — the
+    // actual per-slot outcomes and the status live in the deployment's
+    // TERMINAL EVENT. The mutation + commit phases consume ONLY the
+    // prepared deployment's PROJECTIONS (never the preflight outcome). See
+    // [`persist_intent`].
+    let prepared = persist_intent(&ctx, txn, &preflight)?;
 
     // 8 & 9. Capacity + staging preflight — capacity is the caller's CURRENT
     // per-server policy; every failure ends the attempt `FailedPreflight`
@@ -571,7 +589,7 @@ pub(crate) fn push_inner<'a>(
         // owns the truth table, so the preflight-failure path routes through
         // it with the intent, exactly like every other disposition.
         let disposition = crate::kernel::transition::decide_terminal(
-            &attempt_intent,
+            prepared.intent(),
             crate::kernel::transition::ExecutionReport::PreflightFailed,
         )
         .map_err(|e| {
@@ -598,7 +616,7 @@ pub(crate) fn push_inner<'a>(
             deployment_id,
             &LedgerTerminal::new(
                 crate::remote::helper::now_rfc3339_ts(),
-                crate::kernel::terminal::intent_digest(&attempt_intent),
+                crate::kernel::terminal::intent_digest(prepared.intent()),
                 NonSuccessfulDisposition::from_decision(disposition),
                 Some(failure.reason.to_string()),
             ),
@@ -609,14 +627,16 @@ pub(crate) fn push_inner<'a>(
     // MUTATION PHASES (steps 10-15) in [`crate::deploy::push`]: the
     // deployment-order batch loop, the failure-policy compensation + status
     // derivation, the commit-marker / status decision, and the post-mutation
-    // ACTUAL observation.
-    let execution = run_execution(&ctx, &preflight, &members, &remotes, &helpers, &statuses)?;
+    // ACTUAL observation. The execution consumes ONLY the prepared
+    // deployment's PROJECTIONS — the intent is the single source of truth;
+    // nothing is re-derived from the preflight outcome.
+    let execution = run_execution(&ctx, &prepared, &members, &remotes, &helpers, &statuses)?;
 
     // POST-MUTATION PHASES (steps 16-17) in [`crate::deploy::push`]: the
     // terminal event finalization (successful finalizer / plain terminal
     // append), the observed refresh + step-17 maintenance, and the report
     // assembly.
-    run_commit(&ctx, txn, &attempt_intent, &execution, &members, &helpers)
+    run_commit(&ctx, txn, &prepared, &execution, &members, &helpers)
 }
 
 #[cfg(test)]

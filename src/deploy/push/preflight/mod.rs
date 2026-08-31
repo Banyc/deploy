@@ -100,8 +100,6 @@ pub(crate) struct PreflightOutcome {
     pub behavior_index: BehaviorIndex,
     /// The planned per-slot assignments (exactly the SELECTED slots).
     pub assignments: Vec<PlannedAssignment>,
-    /// The per-slot plan with the expected (pre-push) generation.
-    pub plan_servers: BTreeMap<SlotId, SlotPlan>,
     /// The freshly minted desired generation per planned slot.
     pub new_gen: HashMap<SlotId, GenerationId>,
     /// The observed pre-push state per planned slot — the intent's OWN
@@ -690,7 +688,6 @@ pub(crate) fn run_preflight(
         pref,
         behavior_index,
         assignments,
-        plan_servers,
         new_gen,
         pre_push,
         receiver_uuids: provisioned_receiver_uuids,
