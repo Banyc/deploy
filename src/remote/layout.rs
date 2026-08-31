@@ -166,6 +166,22 @@ pub fn remote_release(release_id: &ReleaseId) -> RootedRelativePath {
         .expect("a validated release id is a safe path component")
 }
 
+/// A UNIQUE STAGING SIBLING of the release directory: every member of the
+/// release bundle is written here, verified, fsynced, and then the WHOLE
+/// directory is atomically renamed into the final release directory
+/// ([`remote_release`]) — the final release directory is either wholly
+/// absent or complete and readable, never partial. The `.partial` suffix
+/// marks the staging dir as not-yet-published; `nonce` makes it unique per
+/// publish attempt (a crashed earlier attempt's staging dir is removed
+/// before re-staging). `release_id` is the TYPED release identity and
+/// `nonce` a freshly minted unique value — a caller cannot stage an
+/// arbitrary name.
+pub fn staged_release(release_id: &ReleaseId, nonce: &str) -> RootedRelativePath {
+    remote_releases()
+        .join(format!("{}.partial-{}", release_id.as_str(), nonce))
+        .expect("a validated release id and a nonce are safe path components")
+}
+
 /// The server-side state directory.
 pub fn state_dir() -> RootedRelativePath {
     RootedRelativePath::from_validated(Path::new(STATE).to_path_buf())
@@ -294,6 +310,7 @@ mod tests {
                 staged_tree_global(&digest),
                 quarantined_tree(&digest),
                 remote_release(&rel),
+                staged_release(&rel, "nonce-1"),
                 state_dir(),
                 operation_lock(),
                 operation_lock_sidecar(),

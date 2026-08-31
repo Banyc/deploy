@@ -344,7 +344,7 @@ pub(crate) fn run_preflight(
         // An unsupported/unknown activation or verification adapter was
         // already refused when the contracts were parsed into the closed
         // enums above, so a silent no-op adapter can never reach a push.
-        crate::verify::release::ValidatedRelease::try_new(
+        let vr = crate::verify::release::ValidatedRelease::try_new(
             rec.clone(),
             variant_behaviors.clone(),
             &server_ids,
@@ -352,14 +352,16 @@ pub(crate) fn run_preflight(
         .map_err(|e| Error::preflight(format!("release {rid} fails semantic validation: {e}")))?;
         if !opts.dry_run {
             store.write_release(&rec)?;
-            let release_json = serde_json::to_string(&rec)
-                .map_err(|e| Error::store(format!("serialize release: {e}")))?;
             store.write_release_aux(&rid, &mapping_toml, &behavior_json)?;
-            // Persist release JSON string for remote publication.
-            REMOTE_RELEASE_JSON.with(|c| {
-                c.borrow_mut()
-                    .insert(rid.clone(), (release_json, behavior_json.to_string()))
-            });
+            // Build the COMPLETE publication bundle from the semantically
+            // validated release (the members are derived from the ONE
+            // validated value, so the bundle is complete by construction) and
+            // persist it for the ONE aggregate remote publish.
+            let bundle = crate::verify::release::ValidatedReleaseBundle::from_validated(vr)
+                .map_err(|e| {
+                    Error::preflight(format!("release {rid} bundle construction failed: {e}"))
+                })?;
+            REMOTE_RELEASE_JSON.with(|c| c.borrow_mut().insert(rid.clone(), bundle));
         }
         (rid.clone(), BTreeMap::from([(rid, variant_behaviors)]))
     } else {
@@ -420,19 +422,33 @@ pub(crate) fn run_preflight(
             // Publish EVERY referenced release's record + behavior snapshot:
             // each slot's server publishes ITS OWN slot's release, so a
             // multi-release rollback must carry every referenced release into
-            // the publication cache — never only the first.
+            // the publication cache — never only the first. Each bundle is
+            // built from the semantically validated release (the members are
+            // derived from the ONE validated value, so the bundle is complete
+            // by construction).
             for rid in &releases {
                 let rec = store.read_release(rid).map_err(|e| {
                     Error::preflight(format!("historical release {rid} not found: {e}"))
                 })?;
-                let release_json = serde_json::to_string(&rec)
-                    .map_err(|e| Error::store(format!("serialize release: {e}")))?;
-                let behaviors_json = serde_json::to_string(&index[rid])
-                    .map_err(|e| Error::store(format!("serialize behavior: {e}")))?;
-                REMOTE_RELEASE_JSON.with(|c| {
-                    c.borrow_mut()
-                        .insert(rid.clone(), (release_json, behaviors_json))
-                });
+                let behaviors = index.get(rid).cloned().ok_or_else(|| {
+                    Error::preflight(format!(
+                        "historical release {rid} has no behavior contracts (fail closed)"
+                    ))
+                })?;
+                let vr =
+                    crate::verify::release::ValidatedRelease::try_new(rec, behaviors, &server_ids)
+                        .map_err(|e| {
+                            Error::preflight(format!(
+                                "historical release {rid} fails semantic validation: {e}"
+                            ))
+                        })?;
+                let bundle = crate::verify::release::ValidatedReleaseBundle::from_validated(vr)
+                    .map_err(|e| {
+                        Error::preflight(format!(
+                            "historical release {rid} bundle construction failed: {e}"
+                        ))
+                    })?;
+                REMOTE_RELEASE_JSON.with(|c| c.borrow_mut().insert(rid.clone(), bundle));
             }
         }
         (

@@ -371,16 +371,9 @@ mod compensation_tests {
             let helper = h.helper();
             // The prior generation's behavior must be readable from the remote
             // (in a real push, push_inner publishes it; the harness bypasses
-            // push_inner, so publish it the same way).
-            let behaviors =
-                std::collections::BTreeMap::from([("standard".to_string(), h.behave())]);
-            helper
-                .publish_release(
-                    &h.harness_release_id(),
-                    &h.harness_release_json(),
-                    &serde_json::to_string(&behaviors).unwrap(),
-                )
-                .unwrap();
+            // push_inner, so publish it the same way — as ONE aggregate
+            // bundle).
+            h.publish_harness_release();
             let request = CompensationRequest {
                 op_id: op_id.clone(),
                 deployment_id: failed_deployment_id.clone(),
@@ -549,14 +542,7 @@ mod compensation_tests {
 
         // The prior generation's behavior must be readable for compensation to
         // attempt restoration (it still refuses on the CAS before using it).
-        let behaviors = std::collections::BTreeMap::from([("standard".to_string(), h.behave())]);
-        helper
-            .publish_release(
-                &h.harness_release_id(),
-                &h.harness_release_json(),
-                &serde_json::to_string(&behaviors).unwrap(),
-            )
-            .unwrap();
+        h.publish_harness_release();
 
         let members = h.config.target_slots("t1").unwrap();
         let (slot, server) = members[0];

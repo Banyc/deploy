@@ -1,6 +1,6 @@
 //! Object-store publication and staging: tree/release publication
 //! ([`HeldSlotLock::publish_tree`], [`HeldSlotLock::publish_from_incoming`],
-//! [`RemoteHelper::publish_release`]), incoming staging, and the two-phase
+//! [`HeldSlotLock::publish_release`]), incoming staging, and the two-phase
 //! host-tree upload ([`copy_host_tree_to_remote`]).
 //!
 //! # The staged-publish protocol (remote tree objects)
@@ -17,13 +17,25 @@
 //! QUARANTINED (moved aside, never deleted) and REPAIRED by re-publishing the
 //! verified staged tree — all while holding the slot lock (the publish
 //! operations are [`HeldSlotLock`] methods).
+//!
+//! # The aggregate release publish ([`HeldSlotLock::publish_release`])
+//!
+//! A release is published as ONE AGGREGATE BUNDLE
+//! ([`crate::verify::release::ValidatedReleaseBundle`]), never as
+//! independent files: every member of the release directory (`release.json`,
+//! `behavior.json`) is written into a UNIQUE SIBLING staging directory
+//! (`releases/<id>.partial-<nonce>`), the WHOLE bundle is verified there,
+//! fsynced, and then ATOMICALLY INSTALLED by renaming the staging directory
+//! into the final release directory — the final release directory is either
+//! wholly absent or complete and readable, never a partial directory (a
+//! crash or fault at any stage leaves at most a disposable staging
+//! sibling).
 
 use crate::error::{Error, Result};
-use crate::identity::{DeploymentId, ReleaseId, ReleaseRecord, TreeDigest};
+use crate::identity::{DeploymentId, ReleaseRecord, TreeDigest};
 use crate::remote::layout;
-use crate::remote::transport::{
-    ContentEquivalence, CreateNewVerdict, Remote, RootedRelativePath, VerifiedExisting,
-};
+use crate::remote::transport::{IMMUTABLE_RECORD_MODE, Remote, RootedRelativePath};
+use crate::verify::release::ValidatedReleaseBundle;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use walkdir::WalkDir;
@@ -103,148 +115,6 @@ impl<'a> RemoteHelper<'a> {
         self.remote.remove_dir_all(rel)
     }
 
-    pub fn publish_release(
-        &self,
-        release_id: &ReleaseId,
-        release_json: &str,
-        behavior_json: &str,
-    ) -> Result<()> {
-        // Recompute-and-verify before publishing: never install a release
-        // whose stored identity does not match its content. The digest is
-        // recomputed from the record's own payload (slot snapshot, bindings,
-        // provenance digests), never trusted from the `release_sha256` field;
-        // a malformed or tampered record fails closed with an integrity error.
-        let rec: ReleaseRecord = serde_json::from_str(release_json).map_err(|e| {
-            Error::integrity(format!("malformed release record for {release_id}: {e}"))
-        })?;
-        crate::verify::release::verify_release_identity(&rec)?;
-        if rec.release_id != release_id.as_str() {
-            return Err(Error::integrity(format!(
-                "release record identity {} does not match the publish path {release_id}",
-                rec.release_id
-            )));
-        }
-        // The behavior.json payload must digest to the release identity's
-        // provenance `behavior_sha256` BEFORE anything is written: an
-        // unparseable behavior document — or one whose canonical contract set
-        // digests to anything else — is never installed on the remote (fail
-        // closed), so a release never publishes a behavior snapshot that does
-        // not match the release it is stored under. A payload that parses to
-        // the SAME canonical contract set (e.g. key reordering) passes.
-        crate::verify::release::verify_behavior_json(
-            behavior_json.as_bytes(),
-            &rec.release_id,
-            &rec.provenance.behavior_sha256,
-        )?;
-        let dir = layout::remote_release(release_id);
-        // The release record is identified by its canonical digest
-        // (`release_sha256`), not by semantic equality of the full document:
-        // metadata fields such as `created_at`
-        // legitimately differ between runs of the same canonical release, so
-        // byte/semantic comparison of the whole record would falsely reject
-        // idempotent re-publication. Two records with the same recomputed
-        // digest are the same release.
-        let rel = dir.join("release.json")?;
-        if self.remote.metadata_opt(&rel)?.is_none() {
-            self.publish_release_file(&rel, release_json.as_bytes())?;
-        } else {
-            // The remote already carries a record under this release id.
-            // NEVER trust its stored `release_sha256`/`release_id` fields to
-            // declare it the same release: content-verify the EXISTING record
-            // by recomputing the canonical digest from its own content (slot
-            // snapshot, bindings, provenance digests) and checking both
-            // identity fields, exactly as incoming records are verified. A
-            // corrupted record whose identity-bearing content was mutated
-            // while the digest fields were retained at the original values
-            // FAILS here with an integrity error naming the remote release
-            // and the mismatch — republishing against a corrupted remote
-            // record always fails closed, never silently accepting it as
-            // identical. Malformed existing JSON is an integrity error, never
-            // a silent replace. Only a content-verified record whose
-            // recomputed identity equals the incoming record's identity is an
-            // idempotent no-op (metadata such as `created_at` and
-            // `created_at` is excluded from the digest, so it
-            // may differ between runs of the same canonical release).
-            let existing = self.remote.read(&rel)?;
-            let existing_rec: ReleaseRecord = serde_json::from_slice(&existing).map_err(|e| {
-                Error::integrity(format!(
-                    "malformed existing release record at {}: {e}",
-                    rel.display()
-                ))
-            })?;
-            crate::verify::release::verify_release_identity(&existing_rec)?;
-            if existing_rec.release_sha256 != rec.release_sha256 {
-                return Err(Error::integrity(format!(
-                    "refusing to replace existing {} with a different release",
-                    rel.display()
-                )));
-            }
-        }
-        self.publish_release_file(&dir.join("behavior.json")?, behavior_json.as_bytes())
-    }
-
-    /// Install one immutable release-side file with create-or-compare
-    /// semantics: the first writer wins via an exclusive create; a subsequent
-    /// writer must observe equivalent content or fail. Equivalence is
-    /// SEMANTIC for JSON (key order and whitespace may differ between
-    /// serializations of the same contract) and byte-exact otherwise — the
-    /// caller's requested [`ContentEquivalence::Semantic`] is passed INTO the
-    /// transport, so the centralized verification applies it directly.
-    fn publish_release_file(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<()> {
-        // The TYPED verdict: `Created`/`AlreadyPresent` (the existing entry
-        // verified as a regular file with the exact mode and SEMANTICALLY
-        // equivalent content — the idempotent re-publication) are success;
-        // a `Conflict` carries the TYPED reason: only a CONTENT mismatch
-        // keeps the caller-layer semantic read-back (for transports whose
-        // default `try_write_new_with` could not apply the equivalence
-        // directly), while a METADATA conflict — a directory/symlink where
-        // the immutable record should be, a mode mismatch, an unreadable
-        // entry — is a REAL conflict, never silently accepted as equivalent.
-        match self
-            .remote
-            .try_write_new_with(rel, data, ContentEquivalence::Semantic)?
-        {
-            CreateNewVerdict::Created | CreateNewVerdict::AlreadyPresent => Ok(()),
-            CreateNewVerdict::Conflict(reason) => match reason {
-                VerifiedExisting::ContentMismatch => {
-                    // Type and mode were verified; only the content differs.
-                    // The caller's semantic equivalence decides: JSON-equal is
-                    // the same contract re-serialized (accepted); anything
-                    // else is an integrity conflict.
-                    let existing = self.remote.read(rel)?;
-                    if json_semantically_equal(&existing, data) {
-                        return Ok(());
-                    }
-                    Err(Error::integrity(format!(
-                        "refusing to replace existing {} with different content",
-                        rel.display()
-                    )))
-                }
-                VerifiedExisting::ModeMismatch { actual, required } => {
-                    Err(Error::integrity(format!(
-                        "refusing to replace existing {} with a different mode ({actual:o} != {required:o})",
-                        rel.display()
-                    )))
-                }
-                VerifiedExisting::NotRegularFile { kind } => Err(Error::integrity(format!(
-                    "refusing to replace existing {} with a {kind:?} entry",
-                    rel.display()
-                ))),
-                VerifiedExisting::Unreadable(e) => Err(Error::integrity(format!(
-                    "existing {} is unreadable: {e}",
-                    rel.display()
-                ))),
-                VerifiedExisting::NotFound => Err(Error::integrity(format!(
-                    "existing {} vanished during verification",
-                    rel.display()
-                ))),
-                VerifiedExisting::Ok { .. } => {
-                    unreachable!("a verified-ok entry is AlreadyPresent, never Conflict")
-                }
-            },
-        }
-    }
-
     /// Stage a tree into a deployment-specific incoming directory (invisible to
     /// activation and retention until published). A stale staging dir from a
     /// crashed earlier attempt is removed first (restoring write perms), so a
@@ -264,6 +134,219 @@ impl<'a> RemoteHelper<'a> {
 }
 
 impl<'a> crate::remote::helper::HeldSlotLock<'a> {
+    /// Publish a release as ONE AGGREGATE BUNDLE
+    /// ([`crate::verify::release::ValidatedReleaseBundle`]) — never as
+    /// independent files. Requires the slot-mutation capability — the
+    /// receiver is the guard; the helper is the guard's own.
+    ///
+    /// The bundle is COMPLETE BY CONSTRUCTION
+    /// ([`crate::verify::release::ValidatedReleaseBundle::from_validated`]):
+    /// the members are derived from the ONE validated release, so the
+    /// publish never receives a `release.json` that disagrees with the
+    /// `behavior.json` (or with the release identity). The staged content is
+    /// STILL re-verified member-by-member before the install (defense in
+    /// depth: a fault between a write and its verify must never install
+    /// unverified content), and an EXISTING release directory is verified
+    /// as the WHOLE bundle before it is trusted (idempotent re-publication)
+    /// — a corrupted or partial existing directory fails closed, never
+    /// silently replaced.
+    ///
+    /// The publication protocol:
+    ///
+    /// 1. **Reuse verifies**: an existing release directory is verified as
+    ///    the WHOLE bundle (each member's content — the release record
+    ///    identity recomputed from its own content, the behavior digest
+    ///    against the record provenance — and each member's immutable mode)
+    ///    before it is trusted; a corrupted or partial existing directory
+    ///    fails closed with an integrity error, never silently replaced.
+    /// 2. **Stage**: ALL members are written into a UNIQUE SIBLING staging
+    ///    directory (`releases/<id>.partial-<nonce>`), so a crash or fault
+    ///    at any member write leaves at most a disposable staging sibling.
+    /// 3. **Staged verify**: the WHOLE bundle is verified in the staging
+    ///    directory BEFORE anything becomes visible — the release record
+    ///    identity and the behavior digest against the record provenance.
+    /// 4. **Fsync**: the whole staged bundle is made durable.
+    /// 5. **Atomic install**: the verified, fsynced staging directory is
+    ///    renamed into the final release directory — the final release
+    ///    directory is either wholly absent or complete and readable, never
+    ///    a partial directory.
+    pub fn publish_release(&self, bundle: &ValidatedReleaseBundle) -> Result<()> {
+        let release_id = bundle.release_id();
+        let dir = layout::remote_release(release_id);
+        // Reuse: an existing release directory is verified as the WHOLE
+        // bundle before it is trusted (idempotent re-publication). A
+        // corrupted or partial existing directory fails closed — never
+        // silently replaced.
+        if self.helper.remote.metadata_opt(&dir)?.is_some() {
+            return self.verify_installed_bundle(bundle, &dir);
+        }
+        // Stage: write ALL members into a unique sibling directory.
+        let nonce = uuid::Uuid::now_v7().to_string();
+        let staging = layout::staged_release(release_id, &nonce);
+        // A stale staging dir from a crashed earlier attempt is removed first
+        // (restoring write perms), so a retry re-stages cleanly instead of
+        // mixing stale and fresh content.
+        if self.helper.remote.metadata_opt(&staging)?.is_some() {
+            self.helper.remove_remote_tree_restoring_write(&staging)?;
+        }
+        self.helper.remote.create_dir_all(&staging)?;
+        self.helper.remote.write(
+            &staging.join("release.json")?,
+            bundle.release_json(),
+            IMMUTABLE_RECORD_MODE,
+        )?;
+        self.helper.remote.write(
+            &staging.join("behavior.json")?,
+            bundle.behavior_json(),
+            IMMUTABLE_RECORD_MODE,
+        )?;
+        // Verify the WHOLE bundle in the staging directory BEFORE anything
+        // becomes visible: the release record identity and the behavior
+        // digest against the record provenance.
+        self.verify_staged_bundle(bundle, &staging)?;
+        // Fsync the whole staged bundle, then atomically install the
+        // directory: the final release directory is either wholly absent or
+        // complete and readable, never partial.
+        self.helper.remote.fsync_tree(&staging)?;
+        self.helper.remote.rename(&staging, &dir)?;
+        Ok(())
+    }
+
+    /// Verify the WHOLE bundle in an EXISTING release directory (the
+    /// idempotent re-publication path): each member must be a REGULAR FILE
+    /// with the immutable record mode, the release record's identity must
+    /// recompute from its own content and equal the bundle's record
+    /// identity, and the behavior snapshot must digest to the record's
+    /// provenance `behavior_sha256`. A corrupted or partial existing
+    /// directory fails closed with an integrity error — never silently
+    /// replaced.
+    fn verify_installed_bundle(
+        &self,
+        bundle: &ValidatedReleaseBundle,
+        dir: &RootedRelativePath,
+    ) -> Result<()> {
+        // 1. The release record member: a regular file with the immutable
+        //    mode whose identity recomputes from its own content and equals
+        //    the bundle's record identity (metadata such as `created_at` is
+        //    excluded from the digest, so it may differ between runs of the
+        //    same canonical release).
+        let rel = dir.join("release.json")?;
+        self.verify_installed_member_shape(&rel)?;
+        let existing = self.helper.remote.read(&rel)?;
+        let existing_rec: ReleaseRecord = serde_json::from_slice(&existing).map_err(|e| {
+            Error::integrity(format!(
+                "malformed existing release record at {}: {e}",
+                rel.display()
+            ))
+        })?;
+        crate::verify::release::verify_release_identity(&existing_rec)?;
+        if existing_rec.release_id != bundle.release_id().as_str() {
+            return Err(Error::integrity(format!(
+                "release record identity {} does not match the publish path {}",
+                existing_rec.release_id,
+                bundle.release_id()
+            )));
+        }
+        if existing_rec.release_sha256 != bundle.release().record().release_sha256 {
+            return Err(Error::integrity(format!(
+                "refusing to replace existing {} with a different release",
+                rel.display()
+            )));
+        }
+        // 2. The behavior snapshot member: a regular file with the immutable
+        //    mode whose canonical contract set digests to the record's
+        //    provenance `behavior_sha256`.
+        let bpath = dir.join("behavior.json")?;
+        self.verify_installed_member_shape(&bpath)?;
+        let bdata = self.helper.remote.read(&bpath)?;
+        crate::verify::release::verify_behavior_json(
+            &bdata,
+            &existing_rec.release_id,
+            &existing_rec.provenance.behavior_sha256,
+        )?;
+        Ok(())
+    }
+
+    /// Verify the SHAPE of one installed member of the release directory: a
+    /// REGULAR FILE with the immutable record mode (the mode is part of the
+    /// immutable record). The member's CONTENT is verified by the caller
+    /// (the release record's identity recompute / the behavior digest against
+    /// the record provenance), so a metadata-only difference in the record
+    /// (`created_at` — excluded from the digest) stays an idempotent no-op.
+    fn verify_installed_member_shape(&self, rel: &RootedRelativePath) -> Result<()> {
+        let meta = self.helper.remote.metadata_opt(rel)?.ok_or_else(|| {
+            Error::integrity(format!(
+                "release member {} is missing; the release directory is incomplete",
+                rel.display()
+            ))
+        })?;
+        if !meta.is_file {
+            return Err(Error::integrity(format!(
+                "release member {} is a {} entry, not a regular file",
+                rel.display(),
+                if meta.is_dir {
+                    "directory"
+                } else if meta.is_symlink {
+                    "symlink"
+                } else {
+                    "non-file"
+                }
+            )));
+        }
+        if meta.mode & 0o7777 != IMMUTABLE_RECORD_MODE & 0o7777 {
+            return Err(Error::integrity(format!(
+                "release member {} carries mode {:o}, expected {:o}",
+                rel.display(),
+                meta.mode & 0o7777,
+                IMMUTABLE_RECORD_MODE & 0o7777
+            )));
+        }
+        Ok(())
+    }
+
+    /// Verify the WHOLE bundle in the STAGING directory BEFORE anything
+    /// becomes visible: the release record's identity must recompute from its
+    /// own content and equal the bundle's record identity, and the behavior
+    /// snapshot must digest to the record's provenance `behavior_sha256`.
+    /// A fault between a member write and its verify can never install
+    /// unverified content.
+    fn verify_staged_bundle(
+        &self,
+        bundle: &ValidatedReleaseBundle,
+        staging: &RootedRelativePath,
+    ) -> Result<()> {
+        let rel = staging.join("release.json")?;
+        let data = self.helper.remote.read(&rel)?;
+        let rec: ReleaseRecord = serde_json::from_slice(&data).map_err(|e| {
+            Error::integrity(format!(
+                "malformed staged release record at {}: {e}",
+                rel.display()
+            ))
+        })?;
+        crate::verify::release::verify_release_identity(&rec)?;
+        if rec.release_id != bundle.release_id().as_str() {
+            return Err(Error::integrity(format!(
+                "staged release record identity {} does not match the publish path {}",
+                rec.release_id,
+                bundle.release_id()
+            )));
+        }
+        if rec.release_sha256 != bundle.release().record().release_sha256 {
+            return Err(Error::integrity(format!(
+                "staged release record {} does not match the bundle",
+                rel.display()
+            )));
+        }
+        let bpath = staging.join("behavior.json")?;
+        let bdata = self.helper.remote.read(&bpath)?;
+        crate::verify::release::verify_behavior_json(
+            &bdata,
+            &rec.release_id,
+            &rec.provenance.behavior_sha256,
+        )?;
+        Ok(())
+    }
+
     /// Publish a previously staged incoming tree into the object store.
     /// Requires the slot-mutation capability — the receiver is the guard; the
     /// helper is the guard's own.
@@ -389,16 +472,6 @@ impl<'a> RemoteHelper<'a> {
     }
 }
 
-/// Compare two serialized JSON documents semantically: equal when they parse
-/// to equal `serde_json` values (object key order and whitespace are not part
-/// of the contract). Falls back to byte equality when either side is not JSON.
-/// Delegates to THE centralized comparison
-/// ([`crate::remote::transport::content_equivalent`]) so the transport's
-/// verification and the caller-layer fallback can never drift.
-fn json_semantically_equal(a: &[u8], b: &[u8]) -> bool {
-    crate::remote::transport::content_equivalent(a, b, ContentEquivalence::Semantic)
-}
-
 /// Copy a host-local tree into a remote-relative path, reconstructing symlinks
 /// and modes.
 ///
@@ -467,7 +540,9 @@ pub fn copy_host_tree_to_remote(
 #[cfg(test)]
 mod tests_publish {
     use super::*;
-    use crate::remote::transport::LocalTransport;
+    use crate::remote::transport::{
+        CreateNewVerdict, ExecOutcome, FsBytes, LocalTransport, RemoteEntry, RemoteMeta,
+    };
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
     use std::os::unix::fs::PermissionsExt;
@@ -539,13 +614,47 @@ mod tests_publish {
         (rec, behavior_json)
     }
 
-    /// `publish_release` recomputes the canonical digest from the serialized
-    /// record's content and verifies it against the stored identity before
-    /// installing anything: a pristine record publishes (and re-publishes
-    /// idempotently), while a record whose slot declaration was edited with the
-    /// old `release_sha256`/`release_id` retained fails closed with an
-    /// integrity error — a release whose identity does not match its content is
-    /// never published.
+    /// The server set the fixture's slots bind (the fixture declares one
+    /// slot on server "s1").
+    fn fixture_servers() -> std::collections::BTreeSet<String> {
+        std::collections::BTreeSet::from(["s1".to_string()])
+    }
+
+    /// Build the COMPLETE publication bundle from the fixture: the record +
+    /// behavior contracts validated into a [`ValidatedRelease`] (the
+    /// bundle's validated constructor), then the bundle itself.
+    fn publish_fixture_bundle() -> ValidatedReleaseBundle {
+        let (rec, behavior_json) = publish_fixture();
+        let behaviors: std::collections::BTreeMap<String, crate::identity::BehaviorContract> =
+            serde_json::from_str(&behavior_json).unwrap();
+        let vr =
+            crate::verify::release::ValidatedRelease::try_new(rec, behaviors, &fixture_servers())
+                .expect("the fixture release graph validates");
+        ValidatedReleaseBundle::from_validated(vr).expect("the fixture bundle builds")
+    }
+
+    /// Publish a bundle under the slot mutation lock (the guard is dropped
+    /// after the publish, releasing the lock).
+    fn publish_bundle(helper: &RemoteHelper, bundle: &ValidatedReleaseBundle) -> Result<()> {
+        let held = crate::remote::helper::SlotRemote::new(
+            helper,
+            crate::remote::helper::test_owner("test-app", "s1"),
+        )
+        .acquire_lock_guard(&crate::identity::test_operation_id("op-1"))
+        .expect("lock acquired");
+        let res = held.publish_release(bundle);
+        drop(held);
+        res
+    }
+
+    /// The aggregate publish installs the WHOLE bundle: a pristine bundle
+    /// publishes (and re-publishes idempotently), while a record whose
+    /// identity does not match its content can never become a bundle — the
+    /// validated constructor ([`ValidatedRelease::try_new`]) fails closed
+    /// with an integrity error naming the mismatch, so a release whose
+    /// identity does not match its content is never published. A malformed
+    /// payload is refused outright (it cannot even parse into a
+    /// [`ReleaseRecord`]).
     #[test]
     fn publish_release_recomputes_and_verifies_identity() {
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
@@ -553,28 +662,19 @@ mod tests_publish {
             LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
                 .unwrap();
         let helper = RemoteHelper::new(&remote);
-        let (rec, behavior_json) = publish_fixture();
-        let release_json = serde_json::to_string(&rec).unwrap();
+        let bundle = publish_fixture_bundle();
 
-        // Positive case: the pristine record publishes, and re-publishing the
-        // identical release is an idempotent no-op.
-        helper
-            .publish_release(
-                &ReleaseId::parse(&rec.release_id).expect("fixture release id"),
-                &release_json,
-                &behavior_json,
-            )
-            .expect("pristine record publishes");
-        helper
-            .publish_release(
-                &ReleaseId::parse(&rec.release_id).expect("fixture release id"),
-                &release_json,
-                &behavior_json,
-            )
-            .expect("identical re-publication is idempotent");
+        // Positive case: the pristine bundle publishes, and re-publishing the
+        // identical release is an idempotent no-op (the existing release
+        // directory verifies as the WHOLE bundle).
+        publish_bundle(&helper, &bundle).expect("pristine bundle publishes");
+        publish_bundle(&helper, &bundle).expect("identical re-publication is idempotent");
 
         // Tampered record: slot content changed, digest fields retained -> the
-        // publish must fail with an integrity error naming the mismatch.
+        // bundle's validated constructor fails with an integrity error naming
+        // the mismatch — a release whose identity does not match its content
+        // can never become a bundle, so it is never published.
+        let (rec, behavior_json) = publish_fixture();
         let mut tampered = rec.clone();
         tampered.slots.get_mut("standard").unwrap().slots[0].deploy_dir =
             "/srv/elsewhere".to_string();
@@ -582,13 +682,14 @@ mod tests_publish {
             tampered.release_sha256, rec.release_sha256,
             "digest retained"
         );
-        let err = helper
-            .publish_release(
-                &ReleaseId::parse(&rec.release_id).expect("fixture release id"),
-                &serde_json::to_string(&tampered).unwrap(),
-                &behavior_json,
-            )
-            .expect_err("tampered record must never be published");
+        let behaviors: std::collections::BTreeMap<String, crate::identity::BehaviorContract> =
+            serde_json::from_str(&behavior_json).unwrap();
+        let err = crate::verify::release::ValidatedRelease::try_new(
+            tampered,
+            behaviors,
+            &fixture_servers(),
+        )
+        .expect_err("a tampered record must never validate into a bundle");
         let msg = err.to_string();
         assert!(
             msg.contains("identity mismatch"),
@@ -599,54 +700,35 @@ mod tests_publish {
             "error must name the stored digest, got: {msg}"
         );
 
-        // A malformed payload is refused outright.
-        let err = helper
-            .publish_release(
-                &ReleaseId::parse(&rec.release_id).expect("fixture release id"),
-                "{}",
-                &behavior_json,
-            )
+        // A malformed payload is refused outright: it cannot even parse into
+        // a ReleaseRecord, so it can never reach the validated constructor.
+        let err = serde_json::from_str::<ReleaseRecord>("{}")
             .expect_err("a malformed release record must be refused");
-        assert!(err.to_string().contains("malformed release record"));
+        assert!(
+            err.to_string().contains("missing field"),
+            "error must name the missing field, got: {err}"
+        );
     }
 
-    /// A fresh remote already carrying the pristine record under
-    /// `releases/<id>/release.json` (+ `behavior.json`), plus the pristine
-    /// serialized record and behavior JSON for republishing. The behavior
-    /// payload is DIGEST-CONSISTENT: it is serialized from the same
-    /// per-variant contract set whose canonical digest is frozen into the
-    /// release's provenance `behavior_sha256` (see `publish_fixture`), so
-    /// `publish_release`'s behavior.json digest verification accepts the
-    /// pristine record. Each case builds its own fixture so the mutation
-    /// matrix stays deterministic.
-    fn published_release_fixture() -> (
-        tempfile::TempDir,
-        LocalTransport,
-        ReleaseRecord,
-        String,
-        String,
-    ) {
+    /// A fresh remote already carrying the pristine bundle under
+    /// `releases/<id>/` (release.json + behavior.json), plus the pristine
+    /// bundle for republishing. Each case builds its own fixture so the
+    /// mutation matrix stays deterministic.
+    fn published_release_fixture() -> (tempfile::TempDir, LocalTransport, ValidatedReleaseBundle) {
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let remote =
             LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
                 .unwrap();
         let helper = RemoteHelper::new(&remote);
-        let (rec, behavior_json) = publish_fixture();
-        let release_json = serde_json::to_string(&rec).unwrap();
-        helper
-            .publish_release(
-                &ReleaseId::parse(&rec.release_id).expect("fixture release id"),
-                &release_json,
-                &behavior_json,
-            )
-            .expect("pristine record publishes");
-        (dir, remote, rec, release_json, behavior_json)
+        let bundle = publish_fixture_bundle();
+        publish_bundle(&helper, &bundle).expect("pristine bundle publishes");
+        (dir, remote, bundle)
     }
 
-    /// Republishing against an EXISTING remote record that was CORRUPTED must
-    /// ALWAYS fail closed: mutate each identity-bearing field of the stored
-    /// remote `release.json` one at a time (written directly to the remote
-    /// path, bypassing the verified publish path) while retaining
+    /// Republishing against an EXISTING remote release directory that was
+    /// CORRUPTED must ALWAYS fail closed: mutate each identity-bearing field
+    /// of the stored remote `release.json` one at a time (written directly to
+    /// the remote path, bypassing the verified publish path) while retaining
     /// `release_sha256`/`release_id` at the ORIGINAL values, then republish
     /// the CORRECT original release. The mutation matrix covers the
     /// per-variant mappings digest, the behavior digest, the slot snapshot
@@ -690,85 +772,67 @@ mod tests_publish {
             }),
         ];
         for (name, mutate) in identity_mutations {
-            let (_dir, remote, rec, release_json, behavior_json) = published_release_fixture();
-            let mut stored = serde_json::to_value(&rec).unwrap();
+            let (_dir, remote, bundle) = published_release_fixture();
+            let mut stored = serde_json::to_value(bundle.release().record()).unwrap();
             mutate(&mut stored);
             // The identity-bearing content mutated, digest fields retained at
             // the original values.
             assert_eq!(
-                stored["release_sha256"], rec.release_sha256,
+                stored["release_sha256"],
+                bundle.release().record().release_sha256,
                 "{name}: digest must be retained"
             );
             assert_eq!(
-                stored["release_id"], rec.release_id,
+                stored["release_id"],
+                bundle.release().record().release_id,
                 "{name}: release id must be retained"
             );
-            let rel = layout::remote_release(
-                &ReleaseId::parse(&rec.release_id).expect("fixture release id"),
-            )
-            .join("release.json")
-            .unwrap();
+            let rel = layout::remote_release(bundle.release_id())
+                .join("release.json")
+                .unwrap();
             remote
                 .write(&rel, &serde_json::to_vec(&stored).unwrap(), 0o644)
                 .unwrap();
             let helper = RemoteHelper::new(&remote);
             let fail_msg =
                 format!("{name}: republishing against a corrupted remote record must fail closed");
-            let err = helper
-                .publish_release(
-                    &ReleaseId::parse(&rec.release_id).expect("fixture release id"),
-                    &release_json,
-                    &behavior_json,
-                )
-                .expect_err(&fail_msg);
+            let err = publish_bundle(&helper, &bundle).expect_err(&fail_msg);
             let msg = err.to_string();
             assert!(
                 msg.contains("identity mismatch"),
                 "{name}: error must name the content-vs-digest mismatch, got: {msg}"
             );
             assert!(
-                msg.contains(&rec.release_sha256),
+                msg.contains(&bundle.release().record().release_sha256),
                 "{name}: error must name the stored digest, got: {msg}"
             );
         }
 
         // A corrupted remote behavior.json fails the republish via the
-        // snapshot's own create-or-compare content check (release.json is
-        // untouched here, so the failure is pinned to behavior.json).
-        let (_dir, remote, rec, release_json, behavior_json) = published_release_fixture();
-        let bpath =
-            layout::remote_release(&ReleaseId::parse(&rec.release_id).expect("fixture release id"))
-                .join("behavior.json")
-                .unwrap();
+        // whole-bundle verify (release.json is untouched here, so the failure
+        // is pinned to behavior.json).
+        let (_dir, remote, bundle) = published_release_fixture();
+        let bpath = layout::remote_release(bundle.release_id())
+            .join("behavior.json")
+            .unwrap();
         remote.write(&bpath, b"{\"tampered\":", 0o644).unwrap();
         let helper = RemoteHelper::new(&remote);
-        let err = helper
-            .publish_release(
-                &ReleaseId::parse(&rec.release_id).expect("fixture release id"),
-                &release_json,
-                &behavior_json,
-            )
+        let err = publish_bundle(&helper, &bundle)
             .expect_err("a corrupted remote behavior.json must fail republish");
         assert!(
-            err.to_string().contains("different content"),
-            "error must name the create-or-compare refusal, got: {err}"
+            err.to_string().contains("malformed") || err.to_string().contains("digest mismatch"),
+            "error must name the behavior verification refusal, got: {err}"
         );
 
         // Malformed existing release.json is refused outright, never silently
         // replaced.
-        let (_dir, remote, rec, release_json, behavior_json) = published_release_fixture();
-        let rel =
-            layout::remote_release(&ReleaseId::parse(&rec.release_id).expect("fixture release id"))
-                .join("release.json")
-                .unwrap();
+        let (_dir, remote, bundle) = published_release_fixture();
+        let rel = layout::remote_release(bundle.release_id())
+            .join("release.json")
+            .unwrap();
         remote.write(&rel, b"{ not json", 0o644).unwrap();
         let helper = RemoteHelper::new(&remote);
-        let err = helper
-            .publish_release(
-                &ReleaseId::parse(&rec.release_id).expect("fixture release id"),
-                &release_json,
-                &behavior_json,
-            )
+        let err = publish_bundle(&helper, &bundle)
             .expect_err("malformed existing release.json must be refused, not silently replaced");
         assert!(
             err.to_string()
@@ -785,170 +849,74 @@ mod tests_publish {
                 v["created_at"] = serde_json::json!("2099-01-01T00:00:00Z");
             })];
         for (name, mutate) in metadata_mutations {
-            let (_dir, remote, rec, release_json, behavior_json) = published_release_fixture();
-            let mut stored = serde_json::to_value(&rec).unwrap();
+            let (_dir, remote, bundle) = published_release_fixture();
+            let mut stored = serde_json::to_value(bundle.release().record()).unwrap();
             mutate(&mut stored);
-            let rel = layout::remote_release(
-                &ReleaseId::parse(&rec.release_id).expect("fixture release id"),
-            )
-            .join("release.json")
-            .unwrap();
+            let rel = layout::remote_release(bundle.release_id())
+                .join("release.json")
+                .unwrap();
             remote
                 .write(&rel, &serde_json::to_vec(&stored).unwrap(), 0o644)
                 .unwrap();
             let helper = RemoteHelper::new(&remote);
             let ok_msg =
                 format!("{name}: a metadata-only difference keeps the republish idempotent");
-            helper
-                .publish_release(
-                    &ReleaseId::parse(&rec.release_id).expect("fixture release id"),
-                    &release_json,
-                    &behavior_json,
-                )
-                .expect(&ok_msg);
+            publish_bundle(&helper, &bundle).expect(&ok_msg);
         }
     }
 
-    /// Mutation matrix over the behavior JSON handed to `publish_release`:
-    /// deleting each required field, changing each identity-bearing field, or
-    /// corrupting the bytes must make the publication FAIL CLOSED with an
-    /// integrity error (the canonical digest no longer matches the release
-    /// identity's provenance `behavior_sha256`), while a mutation that keeps
-    /// the canonical contract set equal (JSON key reordering) MUST publish —
-    /// that is the "unless the canonical behavior digest remains equal"
-    /// clause.
+    /// The staged behavior.json is verified against the record's provenance
+    /// BEFORE the install: a CORRUPTED staged behavior member (a fault
+    /// between the write and the verify) fails the publish closed with an
+    /// integrity error and the final release directory stays wholly absent —
+    /// a release never publishes a behavior snapshot that does not match the
+    /// release it is stored under. The digest-changing behavior payloads
+    /// themselves are refused EARLIER, at the bundle's validated constructor
+    /// ([`ValidatedRelease::try_new`] — the behavior graph must agree with
+    /// the record provenance), which the release verification tests cover.
     #[test]
-    fn publish_release_verifies_behavior_json_digest() {
+    fn publish_release_verifies_staged_behavior_json_digest() {
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
-        let remote =
-            LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
-                .unwrap();
+        let remote = FaultOnceReleaseRemote::new(
+            &crate::testutil::fixture_env(),
+            dir.path().join("remote"),
+            ReleasePublishFault::CorruptBehaviorWrite,
+        )
+        .unwrap();
         let helper = RemoteHelper::new(&remote);
-        let (rec, behavior_json) = publish_fixture();
-        let release_json = serde_json::to_string(&rec).unwrap();
-        let rid = rec.release_id.as_str();
+        let bundle = publish_fixture_bundle();
 
-        // Baseline: the canonical behavior payload publishes.
-        helper
-            .publish_release(
-                &ReleaseId::parse(rid).expect("fixture release id"),
-                &release_json,
-                &behavior_json,
-            )
-            .expect("pristine behavior publishes");
-
-        let publish = |label: &str, payload: &str| {
-            let err = helper
-                .publish_release(
-                    &ReleaseId::parse(rid).expect("fixture release id"),
-                    &release_json,
-                    payload,
-                )
-                .expect_err("a digest-changing behavior payload must fail closed");
-            let msg = err.to_string();
-            assert!(
-                msg.contains("digest mismatch") || msg.contains("malformed"),
-                "mutation '{label}' must fail with an integrity error, got: {msg}"
-            );
-        };
-
-        let v: serde_json::Value = serde_json::from_str(&behavior_json).unwrap();
-        // Required-field deletions: activation.adapter, verification.argv, a
-        // whole variant's contract, the variant key itself.
-        let mut del = v.clone();
-        del["standard"]["activation"]
-            .as_object_mut()
-            .unwrap()
-            .remove("adapter");
-        publish(
-            "delete activation.adapter",
-            &serde_json::to_string(&del).unwrap(),
+        // The corrupted staged behavior member fails the staged verify.
+        let err = publish_bundle(&helper, &bundle)
+            .expect_err("a corrupted staged behavior.json must fail closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("malformed") || msg.contains("digest mismatch"),
+            "error must name the behavior verification refusal, got: {msg}"
         );
-        let mut del = v.clone();
-        del["standard"]["verification"]
-            .as_object_mut()
-            .unwrap()
-            .remove("argv");
-        publish(
-            "delete verification.argv",
-            &serde_json::to_string(&del).unwrap(),
+        // The final release directory is wholly absent — never a partial
+        // directory.
+        assert!(
+            remote
+                .metadata_opt(&layout::remote_release(bundle.release_id()))
+                .unwrap()
+                .is_none(),
+            "a failed publish must leave the final release directory wholly absent"
         );
-        let mut del = v.clone();
-        del.as_object_mut().unwrap().remove("standard");
-        publish(
-            "delete a whole variant's contract",
-            &serde_json::to_string(&del).unwrap(),
-        );
-        let mut del = v.clone();
-        del.as_object_mut().unwrap().remove("standard");
-        publish(
-            "delete the variant key itself",
-            &serde_json::to_string(&del).unwrap(),
-        );
-
-        // Identity-bearing field changes: adapter, argv element, timeout,
-        // scope, variant renamed.
-        let mut c = v.clone();
-        c["standard"]["activation"]["adapter"] = serde_json::json!("none");
-        publish(
-            "change activation.adapter",
-            &serde_json::to_string(&c).unwrap(),
-        );
-        let mut c = v.clone();
-        c["standard"]["verification"]["argv"][0] = serde_json::json!("false");
-        publish(
-            "change verification.argv element",
-            &serde_json::to_string(&c).unwrap(),
-        );
-        let mut c = v.clone();
-        c["standard"]["verification"]["timeout_seconds"] = serde_json::json!(31);
-        publish(
-            "change verification.timeout_seconds",
-            &serde_json::to_string(&c).unwrap(),
-        );
-        let mut c = v.clone();
-        c["standard"]["activation"]["scope"] = serde_json::json!("user");
-        publish(
-            "change activation.scope",
-            &serde_json::to_string(&c).unwrap(),
-        );
-        let mut c = v.clone();
-        let standard = v["standard"].clone();
-        c.as_object_mut().unwrap().remove("standard");
-        c["renamed"] = standard;
-        publish("rename the variant", &serde_json::to_string(&c).unwrap());
-
-        // Corrupt bytes: unparseable -> fail closed as malformed.
-        publish("corrupt bytes", "{ not json !");
-
-        // Digest-equal mutation: reorder JSON keys so the bytes differ but the
-        // parsed contract set is identical; the canonical digest stays equal,
-        // so the publication MUST succeed.
-        let reordered = r#"{"standard":{"verification":{"adapter":"command","argv":["true"],"timeout_seconds":30,"attempts":2,"interval_seconds":1},"activation":{"adapter":"systemd","scope":"system","reconcile_managed_units":true,"units":[{"name":"app.service","artifact_path":"integration/systemd/app.service","enable":true,"restart":true}]}}}"#;
-        helper
-            .publish_release(
-                &ReleaseId::parse(rid).expect("fixture release id"),
-                &release_json,
-                reordered,
-            )
-            .expect("a digest-equal key reorder must publish");
     }
 
     /// A MODE-MISMATCHED existing release file is a REAL conflict for the
-    /// SEMANTIC caller too — the old read-back comparison only checked
-    /// content, so a mode-mismatched-but-content-equivalent winner was
-    /// silently accepted as "already present, fine". The typed
-    /// `ModeMismatch` reason now fails the republish closed: the mode is
-    /// part of the immutable record.
+    /// whole-bundle verify too: the mode is part of the immutable record, so
+    /// a mode-mismatched-but-content-equivalent winner fails the republish
+    /// closed.
     #[test]
     fn publish_release_file_mode_mismatch_is_a_real_conflict() {
-        let (_dir, remote, rec, release_json, behavior_json) = published_release_fixture();
+        let (_dir, remote, bundle) = published_release_fixture();
         // Corrupt ONLY the mode of the existing behavior.json (content stays
-        // the semantically-equal pristine payload).
-        let bpath =
-            layout::remote_release(&ReleaseId::parse(&rec.release_id).expect("fixture release id"))
-                .join("behavior.json")
-                .unwrap();
+        // the pristine payload).
+        let bpath = layout::remote_release(bundle.release_id())
+            .join("behavior.json")
+            .unwrap();
         let other_mode = if crate::remote::transport::IMMUTABLE_RECORD_MODE & 0o7777 == 0o600 {
             0o640
         } else {
@@ -956,15 +924,9 @@ mod tests_publish {
         };
         remote.set_mode(&bpath, other_mode).unwrap();
         let helper = RemoteHelper::new(&remote);
-        let err = helper
-            .publish_release(
-                &ReleaseId::parse(&rec.release_id).expect("fixture release id"),
-                &release_json,
-                &behavior_json,
-            )
-            .expect_err(
-                "a mode-mismatched existing release file must fail the republish, never be silently accepted",
-            );
+        let err = publish_bundle(&helper, &bundle).expect_err(
+            "a mode-mismatched existing release file must fail the republish, never be silently accepted",
+        );
         let msg = err.to_string();
         assert!(
             msg.contains("mode"),
@@ -1104,6 +1066,265 @@ mod tests_publish {
             remote_meta.tree_sha256, host_meta.tree_sha256,
             "uploaded tree must match the host tree digest"
         );
+    }
+
+    // ---- THE AGGREGATE-RELEASE-PUBLISH ATOMICITY PROPERTY ----
+    //
+    // A release is published as ONE aggregate bundle: every member is
+    // written into a UNIQUE SIBLING staging directory, the whole bundle is
+    // verified there, fsynced, and then ATOMICALLY INSTALLED by renaming the
+    // staging directory into the final release directory. The property:
+    // after a publish under a fault at ANY publication stage (each member
+    // write, the staged verify, the staged fsync, the atomic install
+    // rename), the final release directory is either WHOLLY ABSENT or
+    // COMPLETE AND READABLE — never a partial directory.
+
+    /// The publication stage to fault: each member write, the staged verify
+    /// read, the staged fsync, or the atomic install rename. The fault is
+    /// armed for EXACTLY ONE matching operation and fires ONCE (then
+    /// disarms), per-fixture (owned by the wrapper, never a process-global
+    /// slot — two fixtures' faults can never interact).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ReleasePublishFault {
+        /// Fail the write of `release.json` into the staging directory.
+        WriteReleaseJson,
+        /// Fail the write of `behavior.json` into the staging directory.
+        WriteBehaviorJson,
+        /// CORRUPT the write of `behavior.json` into the staging directory
+        /// (write garbage instead of the intended bytes): the staged verify
+        /// must catch it — a release never publishes a behavior snapshot
+        /// that does not match the release it is stored under.
+        CorruptBehaviorWrite,
+        /// Fail the first read from the staging directory (the staged
+        /// verify).
+        VerifyRead,
+        /// Fail the fsync of the staged directory.
+        StagingFsync,
+        /// Fail the atomic install rename of the staging directory into the
+        /// final release directory.
+        InstallRename,
+    }
+
+    /// A transport wrapper that fails (or corrupts) EXACTLY ONE matching
+    /// publication operation once, letting the release-publish proptest fault
+    /// every publication stage deterministically. The fault is per-fixture
+    /// (owned by the wrapper, never a process-global slot); a non-matching
+    /// call passes through untouched.
+    struct FaultOnceReleaseRemote {
+        inner: LocalTransport,
+        fault: std::sync::Mutex<Option<ReleasePublishFault>>,
+    }
+
+    impl FaultOnceReleaseRemote {
+        fn new(
+            env: &crate::env::SysEnv,
+            base: std::path::PathBuf,
+            fault: ReleasePublishFault,
+        ) -> Result<Self> {
+            Ok(FaultOnceReleaseRemote {
+                inner: LocalTransport::new(env, base)?,
+                fault: std::sync::Mutex::new(Some(fault)),
+            })
+        }
+
+        /// Consume the fault if it matches `pred`; returns `true` when it
+        /// fired (and disarmed).
+        fn consume(&self, pred: impl Fn(ReleasePublishFault) -> bool) -> bool {
+            let mut f = self.fault.lock().unwrap();
+            match f.as_ref() {
+                Some(kind) if pred(*kind) => {
+                    *f = None;
+                    true
+                }
+                _ => false,
+            }
+        }
+
+        /// Whether `rel` is inside a release staging directory (a
+        /// `.partial-`-suffixed sibling of the final release directory).
+        fn is_staging(rel: &RootedRelativePath) -> bool {
+            rel.as_path().to_string_lossy().contains(".partial-")
+        }
+    }
+
+    impl Remote for FaultOnceReleaseRemote {
+        fn root(&self) -> &std::path::Path {
+            self.inner.root()
+        }
+        fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
+            if Self::is_staging(rel) && self.consume(|f| f == ReleasePublishFault::VerifyRead) {
+                return Err(Error::remote(
+                    "FaultOnceReleaseRemote: staged verify read forced to fail (once)",
+                ));
+            }
+            self.inner.read(rel)
+        }
+        fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
+            if Self::is_staging(rel) {
+                let name = rel.as_path().to_string_lossy();
+                if name.ends_with("release.json")
+                    && self.consume(|f| f == ReleasePublishFault::WriteReleaseJson)
+                {
+                    return Err(Error::remote(
+                        "FaultOnceReleaseRemote: staged release.json write forced to fail (once)",
+                    ));
+                }
+                if name.ends_with("behavior.json")
+                    && self.consume(|f| f == ReleasePublishFault::WriteBehaviorJson)
+                {
+                    return Err(Error::remote(
+                        "FaultOnceReleaseRemote: staged behavior.json write forced to fail (once)",
+                    ));
+                }
+                if name.ends_with("behavior.json")
+                    && self.consume(|f| f == ReleasePublishFault::CorruptBehaviorWrite)
+                {
+                    return self.inner.write(rel, b"{\"tampered\":", mode);
+                }
+            }
+            self.inner.write(rel, data, mode)
+        }
+        fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict> {
+            self.inner.try_write_new(rel, data)
+        }
+        fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
+            self.inner.create_dir(rel)
+        }
+        fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+            self.inner.create_dir_all(rel)
+        }
+        fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
+            self.inner.set_mode(rel, mode)
+        }
+        fn list(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>> {
+            self.inner.list(rel)
+        }
+        fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
+            if Self::is_staging(from) && self.consume(|f| f == ReleasePublishFault::InstallRename) {
+                return Err(Error::remote(
+                    "FaultOnceReleaseRemote: atomic install rename forced to fail (once)",
+                ));
+            }
+            self.inner.rename(from, to)
+        }
+        fn symlink(&self, target: &std::path::Path, link: &RootedRelativePath) -> Result<()> {
+            self.inner.symlink(target, link)
+        }
+        fn read_link(&self, rel: &RootedRelativePath) -> Result<std::path::PathBuf> {
+            self.inner.read_link(rel)
+        }
+        fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
+            self.inner.remove_file(rel)
+        }
+        fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+            self.inner.remove_dir_all(rel)
+        }
+        fn exists(&self, rel: &RootedRelativePath) -> bool {
+            self.inner.exists(rel)
+        }
+        fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta> {
+            self.inner.metadata(rel)
+        }
+        fn exec(&self, argv: &[String], timeout: std::time::Duration) -> Result<ExecOutcome> {
+            self.inner.exec(argv, timeout)
+        }
+        fn filesystem_bytes(&self) -> Result<FsBytes> {
+            self.inner.filesystem_bytes()
+        }
+        fn fsync_tree(&self, rel: &RootedRelativePath) -> Result<()> {
+            if Self::is_staging(rel) && self.consume(|f| f == ReleasePublishFault::StagingFsync) {
+                return Err(Error::remote(
+                    "FaultOnceReleaseRemote: staged fsync forced to fail (once)",
+                ));
+            }
+            self.inner.fsync_tree(rel)
+        }
+    }
+
+    /// The publication-stage fault strategy: every member write, the staged
+    /// verify read, the staged fsync, and the atomic install rename.
+    fn release_publish_fault() -> impl Strategy<Value = ReleasePublishFault> {
+        prop_oneof![
+            Just(ReleasePublishFault::WriteReleaseJson),
+            Just(ReleasePublishFault::WriteBehaviorJson),
+            Just(ReleasePublishFault::CorruptBehaviorWrite),
+            Just(ReleasePublishFault::VerifyRead),
+            Just(ReleasePublishFault::StagingFsync),
+            Just(ReleasePublishFault::InstallRename),
+        ]
+    }
+
+    proptest! {
+        // THE AGGREGATE-RELEASE-PUBLISH ATOMICITY PROPERTY: fault EVERY
+        // publication stage (each member write, the staged verify, the staged
+        // fsync, the atomic install rename); the final release directory must
+        // be WHOLLY ABSENT or COMPLETE AND READABLE — never a partial
+        // directory. Bounded 16 cases, fixed seed 0x5EED_5EED (house style),
+        // no failure persistence.
+        #![proptest_config(ProptestConfig {
+            cases: crate::testutil::proptest_cases(16),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn publish_never_leaves_a_partial_release_directory(
+            fault in release_publish_fault(),
+        ) {
+            let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+            let remote = FaultOnceReleaseRemote::new(
+                &crate::testutil::fixture_env(),
+                dir.path().join("remote"),
+                fault,
+            )
+            .unwrap();
+            let helper = RemoteHelper::new(&remote);
+            let bundle = publish_fixture_bundle();
+
+            // Publish under the fault: the operation may fail (the fault
+            // fired) or succeed (the fault never matched — e.g. the operation
+            // completed before the fault point).
+            let held = crate::remote::helper::SlotRemote::new(
+                &helper,
+                crate::remote::helper::test_owner("test-app", "s1"),
+            )
+            .acquire_lock_guard(&crate::identity::test_operation_id("op-1"))
+            .unwrap();
+            let _ = held.publish_release(&bundle);
+            drop(held);
+
+            // THE PROPERTY: the final release directory is either wholly
+            // absent or complete and readable — never a partial directory.
+            let final_path = remote.root().join(layout::remote_release(bundle.release_id()));
+            match std::fs::symlink_metadata(&final_path) {
+                Err(_) => {}
+                Ok(_) => {
+                    // Complete and readable: both members present, the record
+                    // identity verifies, the behavior digests to the
+                    // provenance.
+                    let release_json = std::fs::read(final_path.join("release.json"))
+                        .expect("a present release directory must carry a readable release.json");
+                    let rec: ReleaseRecord = serde_json::from_slice(&release_json).expect(
+                        "a present release directory must carry a parseable release.json",
+                    );
+                    crate::verify::release::verify_release_identity(&rec).expect(
+                        "a present release directory must carry an identity-verified record",
+                    );
+                    let behavior_json = std::fs::read(final_path.join("behavior.json")).expect(
+                        "a present release directory must carry a readable behavior.json",
+                    );
+                    crate::verify::release::verify_behavior_json(
+                        &behavior_json,
+                        &rec.release_id,
+                        &rec.provenance.behavior_sha256,
+                    )
+                    .expect(
+                        "a present release directory must carry a digest-consistent behavior.json",
+                    );
+                }
+            }
+        }
     }
 
     // ---- THE STAGED-PUBLISH ATOMICITY PROPERTY (remote tree objects) ----

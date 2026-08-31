@@ -41,6 +41,7 @@ use crate::error::{Error, Result};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use walkdir::WalkDir;
 
 /// The remote-state protocol version. Bumped 1 -> 2 when the remote
 /// generation record (`generations/<gen>/assignment.json`) gained the OWNER
@@ -236,6 +237,18 @@ pub trait Remote {
     fn read_link(&self, rel: &RootedRelativePath) -> Result<PathBuf>;
     fn remove_file(&self, rel: &RootedRelativePath) -> Result<()>;
     fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()>;
+    /// Recursively fsync every file and directory under `rel` (the staged
+    /// release bundle), making the WHOLE tree durable before the atomic
+    /// install rename — a crash after the fsync but before the rename loses
+    /// at most the disposable staging dir, never a partial final release
+    /// directory. The DEFAULT is a no-op (test wrappers that delegate to an
+    /// inner transport inherit the inner's implementation); the production
+    /// transports ([`LocalTransport`], [`SshTransport`]) realize it for
+    /// real.
+    fn fsync_tree(&self, rel: &RootedRelativePath) -> Result<()> {
+        let _ = rel;
+        Ok(())
+    }
     /// Atomically remove `rel` ONLY IF its content is byte-identical to
     /// `expected` — the compare-and-delete primitive that makes stale
     /// releases and expired-lease breaks safe. Returns the TYPED verdict
@@ -1572,6 +1585,36 @@ impl Remote for LocalTransport {
                 }
             })
             .map_err(|e| Error::transport(format!("rmdir {}: {e}", p.display())))
+    }
+
+    fn fsync_tree(&self, rel: &RootedRelativePath) -> Result<()> {
+        let root = join(&self.base, rel);
+        // Every file is fsynced; directories are collected and fsynced
+        // DEEPEST-FIRST (a parent's fsync runs only after every child's), so
+        // the whole tree is durable before the atomic install rename.
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        for entry in WalkDir::new(&root).into_iter() {
+            let entry = entry.map_err(|e| Error::transport(format!("walk: {e}")))?;
+            let p = entry.path();
+            let meta = std::fs::symlink_metadata(p)
+                .map_err(|e| Error::transport(format!("stat {}: {e}", p.display())))?;
+            if meta.is_dir() {
+                dirs.push(p.to_path_buf());
+            } else if meta.is_file() {
+                let f = std::fs::File::open(p)
+                    .map_err(|e| Error::transport(format!("open {}: {e}", p.display())))?;
+                f.sync_all()
+                    .map_err(|e| Error::transport(format!("fsync {}: {e}", p.display())))?;
+            }
+        }
+        dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
+        for d in dirs {
+            let f = std::fs::File::open(&d)
+                .map_err(|e| Error::transport(format!("open dir {}: {e}", d.display())))?;
+            f.sync_all()
+                .map_err(|e| Error::transport(format!("fsync dir {}: {e}", d.display())))?;
+        }
+        Ok(())
     }
 
     fn exists(&self, rel: &RootedRelativePath) -> bool {

@@ -1290,6 +1290,26 @@ impl Remote for SshTransport {
         ))
     }
 
+    fn fsync_tree(&self, rel: &RootedRelativePath) -> Result<()> {
+        let p = self.root.join(rel).to_string_lossy().into_owned();
+        // `find -depth` visits entries DEEPEST-FIRST (children before
+        // parents), so `-exec sync {} \;` fsyncs every file and directory
+        // in the right order — the whole staged bundle is durable before the
+        // atomic install rename. `sync FILE` fsyncs the path on Linux
+        // (coreutils >= 8.24) and macOS (forces pending writes), the same
+        // primitive `write_new_cmd` already relies on.
+        let cmd = Self::argv_cmd(&[
+            "find".into(),
+            p,
+            "-depth".into(),
+            "-exec".into(),
+            "sync".into(),
+            "{}".into(),
+            ";".into(),
+        ]);
+        self.run_remote_ok(&cmd)
+    }
+
     fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
         let t = target.to_string_lossy().into_owned();
         let l = self.root.join(link).to_string_lossy().into_owned();

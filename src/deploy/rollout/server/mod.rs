@@ -316,10 +316,13 @@ pub(crate) fn process_server(
         )));
     }
 
-    // 4. Publish the release record (idempotent) and create the generation.
-    if let Some((release_json, behavior_json)) =
-        REMOTE_RELEASE_JSON.with(|c| c.borrow().get(&artifact.release).cloned())
-        && let Err(e) = helper.publish_release(&artifact.release, &release_json, &behavior_json)
+    // 4. Publish the release as ONE aggregate bundle (idempotent) and create
+    //    the generation. The bundle is complete by construction (built in
+    //    preflight from the semantically validated release), so the publish
+    //    never receives a release.json that disagrees with the behavior.json
+    //    (or with the release identity).
+    if let Some(bundle) = REMOTE_RELEASE_JSON.with(|c| c.borrow().get(&artifact.release).cloned())
+        && let Err(e) = held.publish_release(&bundle)
     {
         return Ok(ServerProc::failed_before(format!(
             "publish release failed: {e}"
@@ -526,11 +529,16 @@ fn set_mode(path: &Path, mode: u32) -> Result<()> {
         .map_err(|e| Error::transport(format!("chmod {}: {e}", path.display())))
 }
 
-// Per-process cache of release JSON for remote publication (avoids re-reading
-// the local store inside the nested helper calls).
+// Per-process cache of the release publication bundle for remote
+// publication (avoids re-reading the local store inside the nested helper
+// calls). The bundle is COMPLETE BY CONSTRUCTION
+// ([`crate::verify::release::ValidatedReleaseBundle::from_validated`]): it
+// is built once in preflight from the semantically validated release and
+// consumed by the ONE aggregate publish
+// ([`crate::remote::helper::HeldSlotLock::publish_release`]).
 thread_local! {
     pub(crate) static REMOTE_RELEASE_JSON: std::cell::RefCell<
-        HashMap<ReleaseId, (String, String)>
+        HashMap<ReleaseId, crate::verify::release::ValidatedReleaseBundle>
     > = std::cell::RefCell::new(HashMap::new());
 }
 
@@ -680,7 +688,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             },
             variants: std::collections::BTreeMap::from([(
                 "standard".to_string(),
-                "tree".to_string(),
+                crate::identity::test_tree_digest("tree")
+                    .as_str()
+                    .to_string(),
             )]),
             slots: std::collections::BTreeMap::from([(
                 "standard".to_string(),
@@ -801,8 +811,36 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             crate::identity::ReleaseId::new(self.harness_release().release_id)
         }
 
-        pub(crate) fn harness_release_json(&self) -> String {
-            serde_json::to_string(&self.harness_release()).unwrap()
+        /// Publish the harness release as ONE aggregate bundle (the way a
+        /// real push publishes it), under the slot mutation lock. The
+        /// bundle is built from the semantically validated release (the
+        /// members are derived from the ONE validated value, so the bundle
+        /// is complete by construction).
+        pub(crate) fn publish_harness_release(&self) {
+            let helper = self.helper();
+            let behaviors =
+                std::collections::BTreeMap::from([("standard".to_string(), self.behave())]);
+            let servers: std::collections::BTreeSet<String> = self
+                .config
+                .servers()
+                .map(|s| s.id.as_str().to_string())
+                .collect();
+            let vr = crate::verify::release::ValidatedRelease::try_new(
+                self.harness_release(),
+                behaviors,
+                &servers,
+            )
+            .expect("the harness release graph validates");
+            let bundle = crate::verify::release::ValidatedReleaseBundle::from_validated(vr)
+                .expect("the harness bundle builds");
+            let held = crate::remote::helper::SlotRemote::new(
+                &helper,
+                crate::remote::helper::test_owner("eng", "p1"),
+            )
+            .acquire_lock_guard(&crate::identity::OperationId::generate())
+            .expect("lock acquired");
+            held.publish_release(&bundle)
+                .expect("the harness release publishes");
         }
 
         pub(crate) fn run(&self, expected_gen: Option<GenerationId>) -> ServerProc {

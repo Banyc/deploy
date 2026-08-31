@@ -594,6 +594,82 @@ impl ValidatedRelease {
     }
 }
 
+/// The COMPLETE release publication: the validated release (record +
+/// behaviors) plus the serialized wire bytes of every member the release
+/// directory carries. Built ONLY through
+/// [`ValidatedReleaseBundle::from_validated`] from a [`ValidatedRelease`] —
+/// a bundle is complete by construction: it always carries the release
+/// record, the behavior contracts, and the serialized `release.json` /
+/// `behavior.json` members, and the behavior digest is consistent with the
+/// record's provenance (enforced by [`ValidatedRelease::try_new`]). The
+/// publish operation ([`crate::remote::helper::HeldSlotLock::publish_release`])
+/// consumes exactly one bundle and installs it as ONE aggregate release
+/// directory — never as independent files that could half-publish.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidatedReleaseBundle {
+    /// The validated release (record + behaviors + typed graph).
+    release: ValidatedRelease,
+    /// The TYPED release identity, parsed once at construction from the
+    /// validated record's `release_id` (a validated release's identity is
+    /// verified, so the parse cannot fail).
+    release_id: ReleaseId,
+    /// The serialized `release.json` member (the record's wire bytes).
+    release_json: Vec<u8>,
+    /// The serialized `behavior.json` member (the contracts' wire bytes).
+    behavior_json: Vec<u8>,
+}
+
+impl ValidatedReleaseBundle {
+    /// Build the complete publication bundle from a validated release: the
+    /// serialized `release.json` and `behavior.json` members are DERIVED
+    /// from the validated record and behavior contracts, so a bundle is
+    /// complete by construction — the members always match the validated
+    /// release, and the behavior digest is consistent with the record's
+    /// provenance (enforced by [`ValidatedRelease::try_new`]). A caller can
+    /// never hand the publish a `release.json` that disagrees with the
+    /// `behavior.json` (or with the release identity): both are derived from
+    /// the ONE validated value.
+    pub fn from_validated(release: ValidatedRelease) -> Result<ValidatedReleaseBundle> {
+        let release_id = ReleaseId::parse(&release.record().release_id).map_err(|e| {
+            Error::integrity(format!(
+                "validated release {} carries an invalid release id: {e}",
+                release.record().release_id
+            ))
+        })?;
+        let release_json = serde_json::to_vec(release.record())
+            .map_err(|e| Error::integrity(format!("serialize release record: {e}")))?;
+        let behavior_json = serde_json::to_vec(release.behaviors())
+            .map_err(|e| Error::integrity(format!("serialize behavior contracts: {e}")))?;
+        Ok(ValidatedReleaseBundle {
+            release,
+            release_id,
+            release_json,
+            behavior_json,
+        })
+    }
+
+    /// The TYPED release identity this bundle publishes (the release
+    /// directory path is derived from it).
+    pub fn release_id(&self) -> &ReleaseId {
+        &self.release_id
+    }
+
+    /// The validated release (record + behaviors + typed graph).
+    pub fn release(&self) -> &ValidatedRelease {
+        &self.release
+    }
+
+    /// The serialized `release.json` member (the record's wire bytes).
+    pub fn release_json(&self) -> &[u8] {
+        &self.release_json
+    }
+
+    /// The serialized `behavior.json` member (the contracts' wire bytes).
+    pub fn behavior_json(&self) -> &[u8] {
+        &self.behavior_json
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1182,6 +1258,62 @@ mod tests {
         let err = verify_behavior_json(b"{ not json", "rel-x", &sha)
             .expect_err("malformed bytes must fail closed");
         assert!(err.to_string().contains("malformed"));
+    }
+
+    /// The publication bundle is COMPLETE BY CONSTRUCTION: built from a
+    /// [`ValidatedRelease`], it always carries the typed release identity and
+    /// the serialized `release.json` / `behavior.json` members, the members
+    /// re-parse to the validated record and behavior contracts, and the
+    /// behavior member digests to the record's provenance `behavior_sha256`
+    /// (the publish's staged-verify precondition holds by construction).
+    #[test]
+    fn validated_release_bundle_is_complete_by_construction() {
+        let variants: BTreeMap<VariantName, TreeDigest> = BTreeMap::from([(
+            VariantName::new("standard"),
+            crate::identity::test_tree_digest("t1"),
+        )]);
+        let slots: BTreeMap<String, Vec<SlotConfig>> = BTreeMap::from([(
+            "standard".to_string(),
+            vec![sdef("p1", "server-01", "/srv/deploy/example", "production")],
+        )]);
+        let behaviors: BTreeMap<String, BehaviorContract> = BTreeMap::from([(
+            "standard".to_string(),
+            BehaviorContract::new(
+                crate::config::Activation::None,
+                crate::config::Verification::Command(
+                    crate::config::ValidatedCommand::new(vec!["true".to_string()], 30, 2, 1)
+                        .expect("validated command"),
+                ),
+            ),
+        )]);
+        // The behavior digest must match the record provenance (the bundle
+        // constructor's precondition is the validated release, so build the
+        // record with the matching digest).
+        let sha = variant_behaviors_digest(&behaviors);
+        let rec = build_release("m", &sha, &variants, &slots, Path::new("."));
+        let servers: BTreeSet<String> = BTreeSet::from(["server-01".to_string()]);
+        let vr = ValidatedRelease::try_new(rec.clone(), behaviors, &servers)
+            .expect("a consistent release graph validates");
+        let bundle = ValidatedReleaseBundle::from_validated(vr).expect("bundle builds");
+
+        // The typed release identity matches the validated record's.
+        assert_eq!(bundle.release_id().as_str(), rec.release_id);
+        // The release.json member re-parses to the validated record.
+        let parsed_rec: ReleaseRecord =
+            serde_json::from_slice(bundle.release_json()).expect("release.json parses");
+        assert_eq!(parsed_rec, rec);
+        // The behavior.json member re-parses to the validated contracts and
+        // digests to the record's provenance (the publish's staged-verify
+        // precondition).
+        let parsed_behaviors: BTreeMap<String, BehaviorContract> =
+            serde_json::from_slice(bundle.behavior_json()).expect("behavior.json parses");
+        assert_eq!(
+            variant_behaviors_digest(&parsed_behaviors),
+            rec.provenance.behavior_sha256,
+            "the behavior member digests to the record provenance"
+        );
+        // The bundle's validated release is the same value it was built from.
+        assert_eq!(bundle.release().record(), &rec);
     }
     /// The schema-version property for the RELEASE RECORD: generate arbitrary
     /// `u32` `release_schema_version` values; ONLY
