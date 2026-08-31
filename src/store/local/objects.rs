@@ -12,7 +12,7 @@ use crate::remote::transport::Remote;
 use crate::store::atomic::{
     copy_dir_recursive, fsync_tree_recursive, path_state, read_json, sync_parent_dir, temp_name_for,
 };
-use crate::store::local::LocalStore;
+use crate::store::local::{LocalStore, read_keyed_json};
 use std::path::{Path, PathBuf};
 
 #[cfg(test)]
@@ -270,7 +270,16 @@ impl LocalStore {
     }
 
     pub fn read_tree_meta(&self, digest: &TreeDigest) -> Result<TreeMetadata> {
-        let meta: TreeMetadata = read_json(&self.object_tree_json(digest))?;
+        // THE EMBEDDED-IDENTITY BINDING (read side): the stored metadata's
+        // own `tree_sha256` must equal the requested `digest` (the path key
+        // — `objects/sha256/<digest>/tree.json`) — a metadata record swapped
+        // into the wrong digest's directory is refused with an integrity
+        // error naming both digests, never returned as if it were `digest`.
+        let meta: TreeMetadata = read_keyed_json(
+            &self.object_tree_json(digest),
+            digest.as_str(),
+            |m: &TreeMetadata| m.tree_sha256.as_str(),
+        )?;
         // Fail closed on the tree metadata format version: only
         // `TREE_SCHEMA_VERSION` is accepted, any other version is refused
         // (a tree.json written by a different schema is never interpreted).

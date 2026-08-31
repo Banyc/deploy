@@ -56,7 +56,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 pub(crate) fn run_step17_retention(
     store: &LocalStore,
     config: &ProjectConfig,
-    target_name: &str,
+    target_name: &TargetName,
     helpers: &HashMap<SlotId, RemoteHelper>,
     servers_order: &[SlotId],
     op_id: &OperationId,
@@ -108,7 +108,7 @@ pub(crate) fn run_step17_retention(
 pub(crate) fn retain_slot_post_commit(
     store: &LocalStore,
     config: &ProjectConfig,
-    target_name: &str,
+    target_name: &TargetName,
     helper: &RemoteHelper,
     sid: &SlotId,
     slot_retention: &RetentionConfig,
@@ -201,7 +201,7 @@ fn rotate_slot_locked(
 /// marker was not persisted.
 pub(crate) fn set_retention_deferred(
     store: &LocalStore,
-    target: &str,
+    target: &TargetName,
     slot: &SlotId,
     reason: &str,
 ) -> Vec<String> {
@@ -232,7 +232,7 @@ pub(crate) fn set_retention_deferred(
 /// failure keeps the stale marker — both become WARNING entries returned to
 /// the caller (merged into the report's `maintenance` channel), never an
 /// `Err`.
-fn clear_retention_deferred(store: &LocalStore, target: &str, slot: &SlotId) -> Vec<String> {
+fn clear_retention_deferred(store: &LocalStore, target: &TargetName, slot: &SlotId) -> Vec<String> {
     let mut warnings = Vec::new();
     let mut debt = match store.read_retention_debt(target) {
         Ok(debt) => debt,
@@ -306,6 +306,7 @@ pub(crate) fn refresh_observed_from_live(
                         // CHANGED identity stamps a FRESH version.
                         let version = match store.read_slot_observed(&slot_id) {
                             Ok(Some(ObservedSlot {
+                                slot: _,
                                 assignment:
                                     ObservedAssignment::Known {
                                         generation: prior_generation,
@@ -323,6 +324,7 @@ pub(crate) fn refresh_observed_from_live(
                         observed_servers.insert(
                             slot_id.clone(),
                             ObservedSlot {
+                                slot: slot_id.clone(),
                                 assignment: ObservedAssignment::Known {
                                     generation: asn.generation_id.clone(),
                                     artifact: asn.artifact.clone(),
@@ -346,6 +348,7 @@ pub(crate) fn refresh_observed_from_live(
                         observed_servers.insert(
                             slot_id.clone(),
                             ObservedSlot {
+                                slot: slot_id.clone(),
                                 assignment: ObservedAssignment::AssignmentUnknown {
                                     generation: g.clone(),
                                     error,
@@ -365,6 +368,7 @@ pub(crate) fn refresh_observed_from_live(
                     observed_servers.insert(
                         slot_id.clone(),
                         ObservedSlot {
+                            slot: slot_id.clone(),
                             assignment: ObservedAssignment::Absent,
                         },
                     );
@@ -379,6 +383,7 @@ pub(crate) fn refresh_observed_from_live(
                 observed_servers.insert(
                     slot_id.clone(),
                     ObservedSlot {
+                        slot: slot_id.clone(),
                         assignment: ObservedAssignment::Unknown {
                             error: ObservationError {
                                 message: format!("status read failed: {e}"),
@@ -477,7 +482,7 @@ pub(crate) fn refresh_observed(
 pub(crate) fn retry_deferred_retentions(
     store: &LocalStore,
     config: &ProjectConfig,
-    target_name: &str,
+    target_name: &TargetName,
     helpers: &HashMap<SlotId, RemoteHelper>,
     op_id: &OperationId,
     deployment_id: &DeploymentId,
@@ -812,7 +817,7 @@ pub(crate) fn maintenance_warning(deferred: &[String]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use crate::deploy::testsupport::{RecoveryHarness, engine_pin_release, push_clean};
-    use crate::identity::ReleaseId;
+    use crate::identity::{ReleaseId, TargetName};
     use crate::ledger::DeploymentStatus;
     use crate::remote::helper::RemoteHelper;
     use crate::remote::layout;
@@ -903,7 +908,10 @@ mod tests {
             warning.contains("retention deferred"),
             "the warning describes the deferred retention, got: {warning}"
         );
-        let debt = h.store.read_retention_debt("t1").unwrap();
+        let debt = h
+            .store
+            .read_retention_debt(&TargetName::parse("t1").unwrap())
+            .unwrap();
         let reason = debt
             .get("p1")
             .expect("a durable debt marker for slot p1 must be recorded");
@@ -939,7 +947,10 @@ mod tests {
             r3.warning
         );
         assert!(
-            h.store.read_retention_debt("t1").unwrap().is_empty(),
+            h.store
+                .read_retention_debt(&TargetName::parse("t1").unwrap())
+                .unwrap()
+                .is_empty(),
             "the debt marker is cleared once the retry succeeds"
         );
         let inventory = helper.status(&owner).unwrap().inventory;

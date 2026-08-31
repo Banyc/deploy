@@ -345,7 +345,7 @@ fn seed_object(store: &LocalStore, tree: &str) {
 /// Seed UNREACHABLE ghost content (a deployment dir + release record + tree
 /// object referenced by nothing): the sweep must delete it.
 fn seed_unreachable(store: &LocalStore, deployment: &str, release: &str, tree: &str) {
-    let dir = store.deployment_dir(deployment);
+    let dir = store.deployment_dir_named(deployment);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("plan.json"), "{}").unwrap();
     seed_named_release(store, release);
@@ -527,7 +527,7 @@ fn run_no_leak_case(
     // Ghost content is gone.
     assert!(
         !store
-            .deployment_dir(crate::identity::test_deployment_id("ghost-deploy").as_str())
+            .deployment_dir(&crate::identity::test_deployment_id("ghost-deploy"))
             .exists()
     );
     assert!(
@@ -681,7 +681,7 @@ fn run_fault_case(pusher_history: Vec<bool>, checkpoint_at: usize, fault: SweepF
     // The faulted stage's content remains (extra garbage, never less).
     match fault {
         SweepFault::SweepDeployments => {
-            assert!(store.deployment_dir("ghost-deploy").exists());
+            assert!(store.deployment_dir_named("ghost-deploy").exists());
         }
         SweepFault::SweepReleases
         | SweepFault::SweepObjects
@@ -711,7 +711,7 @@ fn run_fault_case(pusher_history: Vec<bool>, checkpoint_at: usize, fault: SweepF
     );
     assert!(
         !store
-            .deployment_dir(crate::identity::test_deployment_id("ghost-deploy").as_str())
+            .deployment_dir(&crate::identity::test_deployment_id("ghost-deploy"))
             .exists()
     );
     assert!(
@@ -803,8 +803,7 @@ fn run_markerless_fault_case(fault: SweepFault) {
     // The reachable deployment's dir + release + tree (mirroring
     // [`seed_unreachable`]'s dir creation) so the never-deleted reachable
     // assertions are meaningful.
-    let deploy0_dir =
-        store.deployment_dir(crate::identity::test_deployment_id("deploy-0").as_str());
+    let deploy0_dir = store.deployment_dir(&crate::identity::test_deployment_id("deploy-0"));
     std::fs::create_dir_all(&deploy0_dir).unwrap();
     std::fs::write(deploy0_dir.join("plan.json"), "{}").unwrap();
     seed_named_release(
@@ -830,7 +829,7 @@ fn run_markerless_fault_case(fault: SweepFault) {
     let warnings = retry_pending_sweep(&store, &cfg, "markerless-faulted");
     assert!(
         store
-            .deployment_dir(crate::identity::test_deployment_id("deploy-0").as_str())
+            .deployment_dir(&crate::identity::test_deployment_id("deploy-0"))
             .exists(),
         "reachable deployment survives the faulted pass: {warnings:?}"
     );
@@ -860,7 +859,7 @@ fn run_markerless_fault_case(fault: SweepFault) {
     assert!(warnings.is_empty(), "converges cleanly: {warnings:?}");
     assert!(
         !store
-            .deployment_dir(crate::identity::test_deployment_id("ghost-deploy").as_str())
+            .deployment_dir(&crate::identity::test_deployment_id("ghost-deploy"))
             .exists()
     );
     assert!(
@@ -875,7 +874,7 @@ fn run_markerless_fault_case(fault: SweepFault) {
     );
     assert!(
         store
-            .deployment_dir(crate::identity::test_deployment_id("deploy-0").as_str())
+            .deployment_dir(&crate::identity::test_deployment_id("deploy-0"))
             .exists()
     );
     assert!(store.release_dir(&pinned).exists());
@@ -1049,7 +1048,10 @@ fn receiver_retention_failure_is_maintenance_not_correction() {
         warning.contains("retention deferred"),
         "the warning names the deferred retention: {warning}"
     );
-    let debt = h.store.read_retention_debt("t1").unwrap();
+    let debt = h
+        .store
+        .read_retention_debt(&TargetName::parse("t1").unwrap())
+        .unwrap();
     assert!(
         debt.contains_key("p1"),
         "durable retention debt is recorded: {debt:?}"
@@ -1081,7 +1083,10 @@ fn receiver_retention_failure_is_maintenance_not_correction() {
     assert_eq!(r2.status, None, "the second push is a no-op");
     assert!(r2.message.contains("Everything up to date"));
     assert!(
-        h.store.read_retention_debt("t1").unwrap().is_empty(),
+        h.store
+            .read_retention_debt(&TargetName::parse("t1").unwrap())
+            .unwrap()
+            .is_empty(),
         "the next push clears the retention debt"
     );
 }

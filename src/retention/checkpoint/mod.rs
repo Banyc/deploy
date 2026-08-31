@@ -873,7 +873,7 @@ interval_seconds = 0
     fn seed_unreachable(store: &LocalStore, deployment: &str, release: &str, tree: &str) {
         // The deployment dir is keyed by the CANONICAL id (the ledger
         // references the validated form).
-        let dir = store.deployment_dir(test_deployment_id(deployment).as_str());
+        let dir = store.deployment_dir(&test_deployment_id(deployment));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("plan.json"), "{}").unwrap();
         let rel_dir = store.release_dir(&crate::identity::test_release_id(release));
@@ -959,7 +959,7 @@ interval_seconds = 0
     /// dir is keyed by the CANONICAL id (the ledger references the validated
     /// form).
     fn seed_deployment_dir(store: &LocalStore, id: &str) {
-        let dir = store.deployment_dir(test_deployment_id(id).as_str());
+        let dir = store.deployment_dir(&test_deployment_id(id));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("plan.json"), "{}").unwrap();
     }
@@ -1135,7 +1135,7 @@ interval_seconds = 0
         // The unreachable ghost content was swept.
         assert!(
             !store
-                .deployment_dir(test_deployment_id("ghost-deploy").as_str())
+                .deployment_dir(&test_deployment_id("ghost-deploy"))
                 .exists()
         );
         assert!(
@@ -1439,7 +1439,7 @@ interval_seconds = 0
                 );
                 assert!(
                     store
-                        .deployment_dir(test_deployment_id("ghost-deploy").as_str())
+                        .deployment_dir(&test_deployment_id("ghost-deploy"))
                         .exists(),
                     "fault {fault:?}: a pre-rename fault must delete nothing"
                 );
@@ -1487,7 +1487,7 @@ interval_seconds = 0
                 // ZERO ARTIFACTS DELETED: no reachability scan, no sweep ran.
                 assert!(
                     store
-                        .deployment_dir(test_deployment_id("ghost-deploy").as_str())
+                        .deployment_dir(&test_deployment_id("ghost-deploy"))
                         .exists(),
                     "fault {fault:?}: no sweep may run against an unconfirmed floor"
                 );
@@ -1659,7 +1659,7 @@ interval_seconds = 0
         );
         assert!(
             !store
-                .deployment_dir(test_deployment_id("ghost-deploy").as_str())
+                .deployment_dir(&test_deployment_id("ghost-deploy"))
                 .exists(),
             "fault {fault:?}: the converged sweep deleted the unreachable deployment dir"
         );
@@ -1816,7 +1816,7 @@ interval_seconds = 0
         );
         assert!(
             store
-                .deployment_dir(test_deployment_id("ghost-deploy").as_str())
+                .deployment_dir(&test_deployment_id("ghost-deploy"))
                 .exists(),
             "no sweep ran against the unconfirmed floor"
         );
@@ -1846,7 +1846,7 @@ interval_seconds = 0
         assert!(store.read_sweep_debt().unwrap().is_none());
         assert!(
             !store
-                .deployment_dir(test_deployment_id("ghost-deploy").as_str())
+                .deployment_dir(&test_deployment_id("ghost-deploy"))
                 .exists(),
             "the converged retry sweep deleted the unreachable content"
         );
@@ -1885,7 +1885,7 @@ interval_seconds = 0
         );
         assert!(
             store
-                .deployment_dir(test_deployment_id("ghost-deploy").as_str())
+                .deployment_dir(&test_deployment_id("ghost-deploy"))
                 .exists(),
             "no sweep ran against the unconfirmed floor"
         );
@@ -1954,7 +1954,7 @@ interval_seconds = 0
         // entries' deployment dirs, release records, and trees) exists.
         let below_floor_exists = |s: &LocalStore| -> bool {
             (0..at).all(|i| {
-                s.deployment_dir(test_deployment_id(&format!("dep-t1-{i}")).as_str())
+                s.deployment_dir(&test_deployment_id(&format!("dep-t1-{i}")))
                     .exists()
                     && s.release_dir(&crate::identity::test_release_id(&format!("rel-{i}")))
                         .exists()
@@ -1994,7 +1994,7 @@ interval_seconds = 0
         );
         assert!(
             store
-                .deployment_dir(test_deployment_id("ghost-deploy").as_str())
+                .deployment_dir(&test_deployment_id("ghost-deploy"))
                 .exists()
         );
 
@@ -2045,7 +2045,7 @@ interval_seconds = 0
         );
         assert!(
             store
-                .deployment_dir(test_deployment_id("ghost-deploy").as_str())
+                .deployment_dir(&test_deployment_id("ghost-deploy"))
                 .exists()
         );
 
@@ -2091,7 +2091,7 @@ interval_seconds = 0
         );
         assert!(
             store
-                .deployment_dir(test_deployment_id("ghost-deploy").as_str())
+                .deployment_dir(&test_deployment_id("ghost-deploy"))
                 .exists()
         );
 
@@ -2110,7 +2110,7 @@ interval_seconds = 0
         for i in 0..at {
             assert!(
                 !store
-                    .deployment_dir(test_deployment_id(&format!("dep-t1-{i}")).as_str())
+                    .deployment_dir(&test_deployment_id(&format!("dep-t1-{i}")))
                     .exists(),
                 "below-floor deployment {i} deleted only after the durable transition"
             );
@@ -2129,7 +2129,7 @@ interval_seconds = 0
         }
         assert!(
             !store
-                .deployment_dir(test_deployment_id("ghost-deploy").as_str())
+                .deployment_dir(&test_deployment_id("ghost-deploy"))
                 .exists(),
             "the ghost deployment is swept"
         );
@@ -2138,7 +2138,7 @@ interval_seconds = 0
         for i in at..t1_len {
             assert!(
                 store
-                    .deployment_dir(test_deployment_id(&format!("dep-t1-{i}")).as_str())
+                    .deployment_dir(&test_deployment_id(&format!("dep-t1-{i}")))
                     .exists()
                     && store
                         .release_dir(&crate::identity::test_release_id(&format!("rel-{i}")))
@@ -2151,7 +2151,7 @@ interval_seconds = 0
         }
         assert!(
             store
-                .deployment_dir(test_deployment_id("dep-t2-0").as_str())
+                .deployment_dir(&test_deployment_id("dep-t2-0"))
                 .exists()
         );
         assert!(
@@ -2323,6 +2323,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .write_slot_observed(
                 &SlotId::parse("s-obs").unwrap(),
                 &ObservedSlot {
+                    slot: SlotId::parse("s-obs").unwrap(),
                     assignment: ObservedAssignment::Known {
                         generation: test_generation_id("gen-obs"),
                         artifact: ArtifactRef {
@@ -2437,7 +2438,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // The real store removed exactly what it reported.
         for d in &executed.discards.sweep_deployments {
             assert!(
-                !clone.deployment_dir(d).exists(),
+                !clone.deployment_dir_named(d).exists(),
                 "deployment dir {d} must be deleted"
             );
         }
@@ -2479,13 +2480,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         );
         assert!(
             clone
-                .deployment_dir(test_deployment_id(&format!("dep-t1-{at}")).as_str())
+                .deployment_dir(&test_deployment_id(&format!("dep-t1-{at}")))
                 .exists()
         );
         for (i, &(r, t)) in t2_hist.iter().enumerate() {
             assert!(
                 clone
-                    .deployment_dir(test_deployment_id(&format!("dep-t2-{i}")).as_str())
+                    .deployment_dir(&test_deployment_id(&format!("dep-t2-{i}")))
                     .exists()
             );
             assert!(

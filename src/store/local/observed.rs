@@ -3,10 +3,10 @@
 //! global slot map, and the per-server records (`servers/<id>.json`).
 
 use crate::error::{Error, Result};
-use crate::identity::SlotId;
+use crate::identity::{ServerId, SlotId, TargetName};
 use crate::ledger::{ObservedSlot, ObservedTarget, ServerState};
-use crate::store::atomic::{ensure_private_dir, path_state, read_json};
-use crate::store::local::LocalStore;
+use crate::store::atomic::{ensure_private_dir, path_state};
+use crate::store::local::{LocalStore, read_keyed_json, write_keyed_json};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -14,10 +14,6 @@ use std::path::PathBuf;
 use crate::ledger::ObservedAssignment;
 #[cfg(test)]
 use crate::store::atomic::ReplaceStage;
-#[cfg(not(test))]
-use crate::store::local::write_json;
-#[cfg(test)]
-use crate::store::local::write_json_seam;
 #[cfg(test)]
 use crate::testutil::test_faults::FaultKind;
 
@@ -93,9 +89,16 @@ impl LocalStore {
             ));
         }
         let p = self.slot_observed_path(slot);
-        let dir = p
-            .parent()
-            .expect("a slot observed record always sits inside a slot directory");
+        // THE EMBEDDED-IDENTITY BINDING (write side): the record being
+        // persisted must carry the slot id of the key it is written under —
+        // a record whose embedded slot id differs from `slot` is refused
+        // with an integrity error naming both identities, never persisted.
+        let dir = p.parent().ok_or_else(|| {
+            Error::store(format!(
+                "slot observed record {} has no parent directory",
+                p.display()
+            ))
+        })?;
         ensure_private_dir(dir)?;
         // The mutable observed record is replaced ATOMICALLY (temp + fsync +
         // chmod + rename + parent-dir fsync — see [`write_json`]), so a
@@ -106,10 +109,10 @@ impl LocalStore {
         #[cfg(test)]
         {
             let mut hook = self.replace_stage_hook(slot.as_str(), observed_replace_kind);
-            write_json_seam(&p, observed, &mut hook)
+            write_keyed_json(&p, slot.as_str(), observed, |o| o.slot.as_str(), &mut hook)
         }
         #[cfg(not(test))]
-        write_json(&p, observed)
+        write_keyed_json(&p, slot.as_str(), observed, |o| o.slot.as_str())
     }
 
     /// Read one placement slot's physical observed record. `None` when the
@@ -117,10 +120,15 @@ impl LocalStore {
     /// only a genuine NotFound is "no observed record"; a stat failure
     /// propagates as a Store error (a permission error on the record must
     /// not read as "never observed").
+    ///
+    /// THE EMBEDDED-IDENTITY BINDING (read side): the stored record's own
+    /// slot id must equal the requested `slot` (the path key) — a record
+    /// swapped into the wrong slot directory is refused with an integrity
+    /// error naming both identities, never returned as if it were `slot`.
     pub fn read_slot_observed(&self, slot: &SlotId) -> Result<Option<ObservedSlot>> {
         let p = self.slot_observed_path(slot);
         if path_state(&p)? {
-            read_json(&p).map(Some)
+            read_keyed_json(&p, slot.as_str(), |o: &ObservedSlot| o.slot.as_str()).map(Some)
         } else {
             Ok(None)
         }
@@ -130,6 +138,11 @@ impl LocalStore {
     /// record (`slots/<slot-id>/observed.json`), keyed by [`SlotId`].
     /// This is the ONE physical state the per-target views are filtered
     /// from — a shared slot exists here exactly once.
+    ///
+    /// THE EMBEDDED-IDENTITY BINDING: each stored record's own slot id must
+    /// equal the directory it was read from — a record swapped into the
+    /// wrong slot directory is refused with an integrity error naming both
+    /// identities, never silently keyed under the wrong slot.
     pub fn read_global_observed(&self) -> Result<BTreeMap<SlotId, ObservedSlot>> {
         let root = self.base.join("slots");
         let mut out = BTreeMap::new();
@@ -144,12 +157,12 @@ impl LocalStore {
             if !path_state(&rec)? {
                 continue;
             }
-            let observed: ObservedSlot = read_json(&rec)?;
-            out.insert(
-                SlotId::parse(&entry.file_name().to_string_lossy())
-                    .expect("stored slot dir name is a safe segment"),
-                observed,
-            );
+            let observed: ObservedSlot = read_keyed_json(
+                &rec,
+                entry.file_name().to_string_lossy().as_ref(),
+                |o: &ObservedSlot| o.slot.as_str(),
+            )?;
+            out.insert(observed.slot.clone(), observed);
         }
         Ok(out)
     }
@@ -179,9 +192,13 @@ impl LocalStore {
             .into_iter()
             .filter(|(id, _)| members.contains(id.as_str()))
             .collect();
+        let target_name = TargetName::parse(target).map_err(|e| {
+            Error::integrity(format!(
+                "read_observed: target {target:?} is not a valid target name: {e}"
+            ))
+        })?;
         Ok(ObservedTarget {
-            target: crate::identity::TargetName::parse(target)
-                .expect("target name is a safe segment"),
+            target: target_name,
             slots,
         })
     }
@@ -210,6 +227,13 @@ impl LocalStore {
         ) {
             return Err(Error::store("test fault: write_server forced to fail once"));
         }
+        // THE EMBEDDED-IDENTITY BINDING (write side): the server record's
+        // path is derived from its OWN embedded `id` — the storage key IS the
+        // record's identity, so a mismatched write is structurally
+        // unrepresentable (there is no separate key argument to disagree
+        // with). The read side ([`LocalStore::read_server`]) verifies the
+        // binding the other way: a record swapped into the wrong server file
+        // is refused.
         let p = self
             .base
             .join("servers")
@@ -219,24 +243,32 @@ impl LocalStore {
         #[cfg(test)]
         {
             let mut hook = self.replace_stage_hook(state.id.as_str(), server_replace_kind);
-            write_json_seam(&p, state, &mut hook)
+            write_keyed_json(&p, state.id.as_str(), state, |s| s.id.as_str(), &mut hook)
         }
         #[cfg(not(test))]
-        write_json(&p, state)
+        write_keyed_json(&p, state.id.as_str(), state, |s| s.id.as_str())
     }
 
-    pub fn read_server(&self, id: &str) -> Result<ServerState> {
-        // The id is a validated server id ([`ServerId`] — the caller holds
-        // the typed value), stored VERBATIM: distinct server ids always map
-        // to distinct `servers/<id>.json` files.
-        let p = self.base.join("servers").join(format!("{id}.json"));
-        read_json(&p)
+    /// Read a server's local record by its typed [`ServerId`] (the storage
+    /// key — `servers/<id>.json`, stored VERBATIM: distinct server ids
+    /// always map to distinct files).
+    ///
+    /// THE EMBEDDED-IDENTITY BINDING (read side): the stored record's own
+    /// `id` must equal the requested `id` (the path key) — a record swapped
+    /// into the wrong server file is refused with an integrity error naming
+    /// both identities, never returned as if it were `id`.
+    pub fn read_server(&self, id: &ServerId) -> Result<ServerState> {
+        let p = self
+            .base
+            .join("servers")
+            .join(format!("{}.json", id.as_str()));
+        read_keyed_json(&p, id.as_str(), |s: &ServerState| s.id.as_str())
     }
 
-    pub fn server_exists(&self, id: &str) -> bool {
+    pub fn server_exists(&self, id: &ServerId) -> bool {
         self.base
             .join("servers")
-            .join(format!("{id}.json"))
+            .join(format!("{}.json", id.as_str()))
             .exists()
     }
 }

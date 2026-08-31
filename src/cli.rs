@@ -996,6 +996,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .write_slot_observed(
                 &SlotId::parse("p1").unwrap(),
                 &ObservedSlot {
+                    slot: SlotId::parse("p1").unwrap(),
                     assignment: crate::ledger::ObservedAssignment::Known {
                         generation: test_generation_id("gen-41da"),
                         artifact: crate::identity::ArtifactRef {
@@ -1014,6 +1015,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .write_slot_observed(
                 &SlotId::parse("p2").unwrap(),
                 &ObservedSlot {
+                    slot: SlotId::parse("p2").unwrap(),
                     assignment: crate::ledger::ObservedAssignment::Absent,
                 },
             )
@@ -1022,6 +1024,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .write_slot_observed(
                 &SlotId::parse("p3").unwrap(),
                 &ObservedSlot {
+                    slot: SlotId::parse("p3").unwrap(),
                     assignment: crate::ledger::ObservedAssignment::AssignmentUnknown {
                         generation: test_generation_id("gen-p3"),
                         error: crate::ledger::ObservationError {
@@ -1248,7 +1251,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // the deployment dirs are keyed by the same canonical ids.
         for id in ["deploy-0", "deploy-1", "deploy-2"] {
             seed_successful(&store, id, "2026-01-01T00:00:00Z");
-            std::fs::create_dir_all(store.deployment_dir(test_deployment_id(id).as_str())).unwrap();
+            std::fs::create_dir_all(store.deployment_dir(&test_deployment_id(id))).unwrap();
         }
         let c0 = test_deployment_id("deploy-0");
         let c1 = test_deployment_id("deploy-1");
@@ -1312,9 +1315,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let entries = store.read_ledger("production").unwrap();
         assert_eq!(entries.len(), 2, "deploy-1 and deploy-2 are retained");
         assert_eq!(entries[0].deployment_id, c1);
-        assert!(!store.deployment_dir(c0.as_str()).exists());
-        assert!(store.deployment_dir(c1.as_str()).exists());
-        assert!(store.deployment_dir(c2.as_str()).exists());
+        assert!(!store.deployment_dir(&c0).exists());
+        assert!(store.deployment_dir(&c1).exists());
+        assert!(store.deployment_dir(&c2).exists());
 
         // Repeating the same checkpoint: the suffix is identical (the ledger
         // already IS it) and the sweep finishes.
@@ -1755,6 +1758,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         );
         // A slot with no observed state is Absent, not Unknown.
         let slot_none = ObservedSlot {
+            slot: crate::identity::SlotId::parse("p1").unwrap(),
             assignment: crate::ledger::ObservedAssignment::Absent,
         };
         let json_none = serde_json::to_string(&slot_none).unwrap();
@@ -1763,6 +1767,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         assert_eq!(back.last_deployment(), None);
         // An unreadable observed state is Unknown, never a forged artifact.
         let slot_unknown = ObservedSlot {
+            slot: crate::identity::SlotId::parse("p1").unwrap(),
             assignment: crate::ledger::ObservedAssignment::Unknown {
                 error: crate::ledger::ObservationError {
                     message: "assignment read failed: boom".to_string(),
@@ -1786,6 +1791,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // likewise never renders a forged artifact — None on every column
         // with the preserved error.
         let slot_assign_unknown = ObservedSlot {
+            slot: crate::identity::SlotId::parse("p3").unwrap(),
             assignment: crate::ledger::ObservedAssignment::AssignmentUnknown {
                 generation: test_generation_id("gen-p3"),
                 error: crate::ledger::ObservationError {
@@ -1823,6 +1829,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .write_slot_observed(
                 &crate::identity::SlotId::parse("p1").unwrap(),
                 &ObservedSlot {
+                    slot: crate::identity::SlotId::parse("p1").unwrap(),
                     assignment: crate::ledger::ObservedAssignment::Unknown {
                         error: crate::ledger::ObservationError {
                             message: "assignment read failed: boom".to_string(),

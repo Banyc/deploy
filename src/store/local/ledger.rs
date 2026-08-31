@@ -290,12 +290,20 @@ impl LocalStore {
         // state); a stat failure propagates as a Store error (an unreadable
         // ledger must not read as "no history").
         if !path_state(&p)? {
-            let target_name = TargetName::parse(target).expect("ledger target is a safe segment");
+            let target_name = TargetName::parse(target).map_err(|e| {
+                Error::integrity(format!(
+                    "ledger target {target:?} is not a valid target name: {e}"
+                ))
+            })?;
             return Ok(DeploymentState::new(target_name));
         }
         let text =
             std::fs::read_to_string(&p).map_err(|e| Error::store(format!("read ledger: {e}")))?;
-        let target_name = TargetName::parse(target).expect("ledger target is a safe segment");
+        let target_name = TargetName::parse(target).map_err(|e| {
+            Error::integrity(format!(
+                "ledger target {target:?} is not a valid target name: {e}"
+            ))
+        })?;
         let mut state = DeploymentState::new(target_name);
         for line in text.lines() {
             if line.trim().is_empty() {
@@ -387,6 +395,15 @@ impl LocalStore {
     /// terminal) is corruption — the typed
     /// [`IntegrityError::CheckpointAnchorMismatch`], preserved through the
     /// facade.
+    ///
+    /// THE EMBEDDED-IDENTITY BINDING (read side): the ledger is keyed by
+    /// target (`targets/<target>/ledger.jsonl`), and every intent line
+    /// EMBEDS its own target ([`LedgerIntentWire::target`]). The kernel fold
+    /// ([`crate::kernel::transition::apply_event`]) refuses an intent whose
+    /// embedded target differs from the ledger's target — a ledger file
+    /// swapped into the wrong target's path fails closed with an integrity
+    /// error naming both targets, never folded as the wrong target's
+    /// history.
     pub fn read_ledger(&self, target: &str) -> Result<Vec<LedgerEntry>> {
         let state = self.read_ledger_state(target)?;
         state.finish().map_err(Error::Kernel)?;

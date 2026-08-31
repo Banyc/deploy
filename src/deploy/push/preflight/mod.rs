@@ -2579,7 +2579,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             // equals post-reconciliation position (latest + 1) - depth from
             // the newest — the deployment id at that chain position.
             let plan: DeploymentPlan = serde_json::from_str(
-                &std::fs::read_to_string(h.store.deployment_dir(ref_id.as_str()).join("plan.json"))
+                &std::fs::read_to_string(h.store.deployment_dir(&ref_id).join("plan.json"))
                     .unwrap(),
             )
             .unwrap();

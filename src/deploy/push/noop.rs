@@ -13,9 +13,7 @@ use crate::deploy::plan::PlannedAssignment;
 use crate::deploy::push::PushReport;
 use crate::deploy::push::slot_vars;
 use crate::error::Result;
-use crate::identity::DeploymentId;
-use crate::identity::OperationId;
-use crate::identity::SlotId;
+use crate::identity::{DeploymentId, OperationId, SlotId, TargetName};
 use crate::ledger::BehaviorIndex;
 use crate::ledger::PushRef;
 use crate::ledger::{ObservedAssignment, ObservedSlot};
@@ -83,6 +81,11 @@ pub(crate) fn check_up_to_date(
     if !matches!(pref, PushRef::Head) {
         return Ok(None);
     }
+    // The typed target for the target-keyed maintenance I/O (the debt
+    // marker functions take the validated [`TargetName`]); the target is
+    // validated at the config boundary upstream, so the parse cannot fail
+    // for a real push.
+    let target_name_typed = TargetName::parse(target_name)?;
     // Retain the CURRENT generation assignment for every matching slot: the
     // no-op verification below renders the EXISTING generation's identities
     // (deployment_id/generation_id/artifact) — the running service was
@@ -186,7 +189,7 @@ pub(crate) fn check_up_to_date(
             let deferred = retry_deferred_retentions(
                 store,
                 config,
-                target_name,
+                &target_name_typed,
                 helpers,
                 op_id,
                 deployment_id,
@@ -223,6 +226,7 @@ pub(crate) fn check_up_to_date(
                 );
                 let version = match store.read_slot_observed(slot_id) {
                     Ok(Some(ObservedSlot {
+                        slot: _,
                         assignment:
                             ObservedAssignment::Known {
                                 generation: prior_generation,
@@ -238,6 +242,7 @@ pub(crate) fn check_up_to_date(
                 observed_servers.insert(
                     slot_id.clone(),
                     ObservedSlot {
+                        slot: slot_id.clone(),
                         assignment: ObservedAssignment::Known {
                             generation: asn.generation_id.clone(),
                             artifact: asn.artifact.clone(),

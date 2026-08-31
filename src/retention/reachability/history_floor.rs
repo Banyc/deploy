@@ -778,7 +778,7 @@ impl LocalStore {
         let planned = names.len();
         let mut removed = 0usize;
         for name in names {
-            let dir = self.deployment_dir(name);
+            let dir = self.deployment_dir_named(name);
             // Test-only per-candidate fault hook: the K-TH deployment-dir
             // unlink fails — the stage aborts (fail closed), the count
             // stays at the successful unlinks so far, and the remaining

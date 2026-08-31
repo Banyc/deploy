@@ -36,7 +36,9 @@ use crate::identity::ApplicationStoreKey;
 use crate::remote::layout as remote_layout;
 #[cfg(not(test))]
 use crate::store::atomic::write_atomic_replace;
-use crate::store::atomic::{ReplaceOutcome, ensure_private_dir, set_private, sync_parent_dir};
+use crate::store::atomic::{
+    ReplaceOutcome, ensure_private_dir, read_json, set_private, sync_parent_dir,
+};
 use serde::Serialize;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -62,6 +64,64 @@ pub mod objects;
 pub mod observed;
 pub mod pins;
 pub mod releases;
+
+/// Read a KEYED JSON record and verify its embedded identity equals the
+/// storage key (path) it was read from — the binding between a durable
+/// record's EMBEDDED identity and its STORAGE KEY. A record swapped into the
+/// wrong storage location (its file relocated, or its embedded identity
+/// edited to a consistent-but-different value) is REFUSED with an
+/// [`Error::integrity`] failure naming BOTH identities — never returned as
+/// if it were the requested key. `extract` projects the record's embedded
+/// identity (the value that must equal the path key).
+pub(crate) fn read_keyed_json<T>(path: &Path, key: &str, extract: impl Fn(&T) -> &str) -> Result<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let rec: T = read_json(path)?;
+    let embedded = extract(&rec);
+    if embedded != key {
+        return Err(Error::integrity(format!(
+            "record read from {} declares identity {embedded:?}: the stored record's identity does not match the requested key {key:?} (a record swapped into the wrong storage location)",
+            path.display()
+        )));
+    }
+    Ok(rec)
+}
+
+/// Write a KEYED JSON record, refusing to persist a record whose embedded
+/// identity differs from the storage key it is being written under — the
+/// write-side half of the embedded-identity binding. The check is an
+/// [`Error::integrity`] failure naming BOTH identities, and it runs BEFORE
+/// any bytes are written (fail closed: a mismatched record is never
+/// persisted). The write itself goes through the same atomic-replace
+/// protocol as [`write_json`] (the test seam faults each replacement stage
+/// from the caller's per-fixture registry).
+pub(crate) fn write_keyed_json<T>(
+    path: &Path,
+    key: &str,
+    value: &T,
+    extract: impl Fn(&T) -> &str,
+    #[cfg(test)] fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
+) -> Result<()>
+where
+    T: Serialize,
+{
+    let embedded = extract(value);
+    if embedded != key {
+        return Err(Error::integrity(format!(
+            "refusing to write a record declaring identity {embedded:?} under key {key:?} at {}: the record's embedded identity does not match its storage key",
+            path.display()
+        )));
+    }
+    #[cfg(test)]
+    {
+        write_json_seam(path, value, fault)
+    }
+    #[cfg(not(test))]
+    {
+        write_json(path, value)
+    }
+}
 
 /// Durably write a MUTABLE JSON record via the atomic-replace protocol
 /// ([`crate::store::atomic::write_atomic_replace`]: unique temp in the
@@ -371,9 +431,11 @@ pub fn sanitize(name: &str) -> String {
 mod tests {
     use super::*;
     use crate::identity::{
-        ApplicationStoreKey, ArtifactRef, ServerId, SlotId, TargetName, TreeDigest, VariantName,
-        test_deployment_id, test_generation_id, test_release_id, test_tree_digest,
+        ApplicationStoreKey, ArtifactRef, DeploymentId, ReleaseId, ReleaseRecord, ServerId, SlotId,
+        TargetName, TreeDigest, VariantName, test_deployment_id, test_generation_id,
+        test_release_id, test_tree_digest,
     };
+    use crate::ledger::{BehaviorIndex, DeploymentPlan, PlanOrigin, SlotPlan};
     use crate::ledger::{ObservedAssignment, ObservedSlot, ServerState};
     use crate::store::local::debt::SweepDebt;
     use crate::testutil::test_faults::FaultKind;
@@ -457,6 +519,7 @@ mod tests {
             "a valid slot id is stored verbatim under its own slot dir"
         );
         let observed = ObservedSlot {
+            slot: ok_slot.clone(),
             assignment: ObservedAssignment::Known {
                 generation: test_generation_id("evil"),
                 artifact: ArtifactRef {
@@ -586,14 +649,14 @@ mod tests {
             let rel_b = crate::identity::test_release_id(&tag_b);
             if dep_a != dep_b {
                 assert_ne!(
-                    store.deployment_dir(dep_a.as_str()),
-                    store.deployment_dir(dep_b.as_str()),
+                    store.deployment_dir(&dep_a),
+                    store.deployment_dir(&dep_b),
                     "distinct deployment ids must map to distinct dirs"
                 );
             } else {
                 assert_eq!(
-                    store.deployment_dir(dep_a.as_str()),
-                    store.deployment_dir(dep_b.as_str()),
+                    store.deployment_dir(&dep_a),
+                    store.deployment_dir(&dep_b),
                     "the same deployment id must map to the same dir (determinism)"
                 );
             }
@@ -697,6 +760,7 @@ mod tests {
     /// A `Known` observed assignment whose artifact names `tree`.
     fn observed_record(tree: &str, gen_tag: &str, dep: &str) -> ObservedSlot {
         ObservedSlot {
+            slot: SlotId::new("p1".to_string()),
             assignment: ObservedAssignment::Known {
                 generation: test_generation_id(gen_tag),
                 artifact: ArtifactRef {
@@ -803,7 +867,9 @@ mod tests {
         if old_present {
             store.write_slot_observed(&slot, &obs_old).unwrap();
             store.write_server(&server_old).unwrap();
-            store.write_retention_debt(target, &debt_old).unwrap();
+            store
+                .write_retention_debt(&TargetName::parse(target).unwrap(), &debt_old)
+                .unwrap();
             store.write_sweep_debt(sweep_old.as_ref()).unwrap();
         }
 
@@ -858,7 +924,9 @@ mod tests {
         let res = match boundary {
             StoreBoundary::Observed(_) => store.write_slot_observed(&slot, &obs_new),
             StoreBoundary::Server(_) => store.write_server(&server_new),
-            StoreBoundary::Debt(_) => store.write_retention_debt(target, &debt_new),
+            StoreBoundary::Debt(_) => {
+                store.write_retention_debt(&TargetName::parse(target).unwrap(), &debt_new)
+            }
             StoreBoundary::Sweep(_) => store.write_sweep_debt(sweep_new.as_ref()),
             StoreBoundary::Object(_) => {
                 store.store_object(&TreeDigest::new(new_tree.clone()), &new_tree_dir)
@@ -911,9 +979,11 @@ mod tests {
                 }
             }
             StoreBoundary::Debt(_) => {
-                let read = reopened.read_retention_debt(target).expect(
-                    "the retention-debt marker must parse after a crash (never a torn record)",
-                );
+                let read = reopened
+                    .read_retention_debt(&TargetName::parse(target).unwrap())
+                    .expect(
+                        "the retention-debt marker must parse after a crash (never a torn record)",
+                    );
                 assert!(
                     read == debt_old || read == debt_new || (read.is_empty() && !old_present),
                     "{boundary:?}: the retention-debt marker must be wholly old/new/absent, got {read:?}"
@@ -976,7 +1046,9 @@ mod tests {
             }
         }
         if !matches!(boundary, StoreBoundary::Debt(_)) {
-            let read = reopened.read_retention_debt(target).unwrap();
+            let read = reopened
+                .read_retention_debt(&TargetName::parse(target).unwrap())
+                .unwrap();
             assert_eq!(
                 read,
                 if old_present {
@@ -1043,6 +1115,7 @@ mod tests {
             let read: ServerState = crate::store::atomic::read_json(&server_path)
                 .expect("the server record must parse");
             if let Some(ObservedSlot {
+                slot: _,
                 assignment: ObservedAssignment::Known { artifact, .. },
                 ..
             }) = read.last_observed
@@ -1094,6 +1167,290 @@ mod tests {
             old_present in prop::bool::ANY,
         ) {
             run_crash_consistency_case(ALL_BOUNDARIES[idx as usize], old_present);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // THE EMBEDDED-IDENTITY BINDING PROPERTY (the review's acceptance):
+    // write valid records for two DISTINCT keys of every keyed record
+    // family (releases, tree objects, servers, slot observed state,
+    // retention debt, deployment plans), PERMUTE each record file into the
+    // OTHER key's storage path, and require every non-identity permutation
+    // to FAIL — the read returns an integrity error naming both identities
+    // (a record swapped into the wrong storage location is never returned
+    // as if it were the requested key), and the write refuses to persist a
+    // record under a key its embedded identity does not match. The identity
+    // permutation (each record at its own key's path) succeeds. Bounded 16
+    // cases, fixed seed 0x5EED_5EED per house style.
+    // -------------------------------------------------------------------
+
+    /// A valid release record whose identity digest is derived from `tag`
+    /// (distinct tags => distinct release ids).
+    fn release_fixture(tag: &str) -> ReleaseRecord {
+        let variants: BTreeMap<VariantName, TreeDigest> =
+            BTreeMap::from([(VariantName::new("standard"), test_tree_digest(tag))]);
+        let slots: BTreeMap<String, Vec<crate::config::SlotConfig>> = BTreeMap::from([(
+            "standard".to_string(),
+            vec![crate::config::SlotConfig::new(
+                "p1".to_string(),
+                "s1".to_string(),
+                std::path::PathBuf::from("/srv/deploy/p1"),
+                "t1".to_string(),
+                Vec::new(),
+            )],
+        )]);
+        crate::verify::release::build_release(
+            "m",
+            crate::identity::DIGEST_TEST_HEX_1,
+            &variants,
+            &slots,
+            std::path::Path::new("."),
+        )
+    }
+
+    /// An `Absent` observed record carrying its own slot identity (the
+    /// storage key it is bound to).
+    fn observed_for_slot(slot: &SlotId) -> ObservedSlot {
+        ObservedSlot {
+            slot: slot.clone(),
+            assignment: ObservedAssignment::Absent,
+        }
+    }
+
+    /// A minimal valid plan for one slot carrying the given deployment id.
+    fn plan_fixture(id: &DeploymentId) -> DeploymentPlan {
+        let slot = SlotId::parse("p1").unwrap();
+        let mut slots = BTreeMap::new();
+        slots.insert(
+            slot.clone(),
+            SlotPlan {
+                slot_id: slot,
+                artifact: ArtifactRef {
+                    release: test_release_id("r"),
+                    variant: VariantName::parse("standard").unwrap(),
+                    tree: test_tree_digest("t"),
+                },
+                expected_generation: Some(test_generation_id("g")),
+            },
+        );
+        DeploymentPlan::new(
+            id.clone(),
+            TargetName::parse("t1").unwrap(),
+            BehaviorIndex::new(),
+            slots,
+            PlanOrigin::Head,
+        )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: crate::testutil::proptest_cases(16),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        /// THE EMBEDDED-IDENTITY BINDING PROPERTY (the review's acceptance):
+        /// write valid records for two DISTINCT keys of every keyed record
+        /// family, PERMUTE each record file into the OTHER key's storage
+        /// path, and require every non-identity permutation to FAIL — the
+        /// read returns an integrity error naming both identities, and the
+        /// write refuses to persist a record under a key its embedded
+        /// identity does not match. The identity permutation (each record at
+        /// its own key's path) succeeds.
+        #[test]
+        fn permuted_records_fail_the_embedded_identity_binding(
+            tag_a in "[a-z0-9]{1,8}",
+            tag_b in "[a-z0-9]{1,8}",
+        ) {
+            prop_assume!(tag_a != tag_b);
+            let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+            let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+
+            // ---- releases: `releases/<id>/release.json` embeds
+            // `release_id` (the read-side binding; the write derives its key
+            // from the record's own id, so a mismatched write is
+            // structurally unrepresentable)
+            {
+                let rec_a = release_fixture(&tag_a);
+                let rec_b = release_fixture(&tag_b);
+                let id_a = ReleaseId::new(rec_a.release_id.clone());
+                let id_b = ReleaseId::new(rec_b.release_id.clone());
+                prop_assume!(id_a != id_b);
+                store.write_release(&rec_a).unwrap();
+                store.write_release(&rec_b).unwrap();
+                // The identity permutation succeeds.
+                store.read_release(&id_a).unwrap();
+                // Permute: move A's record into B's path.
+                let path_a = store.release_dir(&id_a).join("release.json");
+                let path_b = store.release_dir(&id_b).join("release.json");
+                std::fs::rename(&path_a, &path_b).unwrap();
+                // The non-identity permutation FAILS (integrity, naming both
+                // identities).
+                let err = store.read_release(&id_b).expect_err(
+                    "a release record swapped into the wrong release directory must fail",
+                );
+                assert!(
+                    err.to_string()
+                        .contains("does not match the requested release id"),
+                    "the refusal must name the identity binding, got: {err}"
+                );
+            }
+
+            // ---- tree objects: `objects/sha256/<digest>/tree.json` embeds
+            // `tree_sha256` (the read-side binding; the write verifies the
+            // staged tree canonicalizes to the digest before publishing)
+            {
+                let tree_dir_a = dir.path().join("tree-a");
+                let tree_dir_b = dir.path().join("tree-b");
+                let tree_a = make_tree(&tree_dir_a, &tag_a);
+                let tree_b = make_tree(&tree_dir_b, &tag_b);
+                let digest_a = TreeDigest::new(tree_a.clone());
+                let digest_b = TreeDigest::new(tree_b.clone());
+                prop_assume!(digest_a != digest_b);
+                store.store_object(&digest_a, &tree_dir_a).unwrap();
+                store.store_object(&digest_b, &tree_dir_b).unwrap();
+                // The identity permutation succeeds.
+                store.read_tree_meta(&digest_a).unwrap();
+                // Permute: move A's tree.json into B's path.
+                let path_a = store.object_tree_json(&digest_a);
+                let path_b = store.object_tree_json(&digest_b);
+                std::fs::rename(&path_a, &path_b).unwrap();
+                // The non-identity permutation FAILS.
+                let err = store.read_tree_meta(&digest_b).expect_err(
+                    "a tree metadata record swapped into the wrong digest's directory must fail",
+                );
+                assert!(
+                    err.to_string().contains("does not match"),
+                    "the refusal must name the identity binding, got: {err}"
+                );
+            }
+
+            // ---- servers: `servers/<id>.json` embeds `id` (the read-side
+            // binding; the write derives its key from the record's own id)
+            {
+                let server_a = ServerId::parse(&tag_a).unwrap();
+                let server_b = ServerId::parse(&tag_b).unwrap();
+                let state_a = ServerState {
+                    id: server_a.clone(),
+                    last_seen_target: None,
+                    last_observed: None,
+                };
+                let state_b = ServerState {
+                    id: server_b.clone(),
+                    last_seen_target: None,
+                    last_observed: None,
+                };
+                store.write_server(&state_a).unwrap();
+                store.write_server(&state_b).unwrap();
+                // The identity permutation succeeds.
+                store.read_server(&server_a).unwrap();
+                // Permute: move A's record into B's path.
+                let path_a = store
+                    .base
+                    .join("servers")
+                    .join(format!("{}.json", server_a.as_str()));
+                let path_b = store
+                    .base
+                    .join("servers")
+                    .join(format!("{}.json", server_b.as_str()));
+                std::fs::rename(&path_a, &path_b).unwrap();
+                // The non-identity permutation FAILS.
+                let err = store
+                    .read_server(&server_b)
+                    .expect_err("a server record swapped into the wrong server file must fail");
+                assert!(
+                    err.to_string().contains("does not match"),
+                    "the refusal must name the identity binding, got: {err}"
+                );
+            }
+
+            // ---- slot observed state: `slots/<slot>/observed.json` embeds
+            // `slot` (BOTH directions: the read refuses a swapped record and
+            // the write refuses a record whose embedded identity differs
+            // from the key)
+            {
+                let slot_a = SlotId::parse(&tag_a).unwrap();
+                let slot_b = SlotId::parse(&tag_b).unwrap();
+                let obs_a = observed_for_slot(&slot_a);
+                let obs_b = observed_for_slot(&slot_b);
+                store.write_slot_observed(&slot_a, &obs_a).unwrap();
+                store.write_slot_observed(&slot_b, &obs_b).unwrap();
+                // The identity permutation succeeds.
+                store.read_slot_observed(&slot_a).unwrap();
+                // The write REFUSES a record whose embedded identity differs
+                // from the key it is written under.
+                let err = store.write_slot_observed(&slot_b, &obs_a).expect_err(
+                    "a write of a record under a key its embedded identity does not match must refuse",
+                );
+                assert!(
+                    err.to_string().contains("does not match its storage key"),
+                    "the refusal must name the identity binding, got: {err}"
+                );
+                // Permute: move A's record into B's path.
+                let path_a = store.slot_observed_path(&slot_a);
+                let path_b = store.slot_observed_path(&slot_b);
+                std::fs::rename(&path_a, &path_b).unwrap();
+                // The non-identity permutation FAILS.
+                let err = store.read_slot_observed(&slot_b).expect_err(
+                    "an observed record swapped into the wrong slot directory must fail",
+                );
+                assert!(
+                    err.to_string().contains("does not match"),
+                    "the refusal must name the identity binding, got: {err}"
+                );
+            }
+
+            // ---- retention debt: `targets/<target>/retention-debt.json`
+            // embeds `target` (the read-side binding; the write builds the
+            // record from the key, so a mismatched write is structurally
+            // unrepresentable)
+            {
+                let target_a = TargetName::parse(&tag_a).unwrap();
+                let target_b = TargetName::parse(&tag_b).unwrap();
+                let debt_a = BTreeMap::from([("p1".to_string(), format!("reason-{tag_a}"))]);
+                let debt_b = BTreeMap::from([("p1".to_string(), format!("reason-{tag_b}"))]);
+                store.write_retention_debt(&target_a, &debt_a).unwrap();
+                store.write_retention_debt(&target_b, &debt_b).unwrap();
+                // The identity permutation succeeds.
+                store.read_retention_debt(&target_a).unwrap();
+                // Permute: move A's marker into B's path.
+                let path_a = store.retention_debt_path(&target_a);
+                let path_b = store.retention_debt_path(&target_b);
+                std::fs::rename(&path_a, &path_b).unwrap();
+                // The non-identity permutation FAILS.
+                let err = store.read_retention_debt(&target_b).expect_err(
+                    "a retention-debt marker swapped into the wrong target's directory must fail",
+                );
+                assert!(
+                    err.to_string().contains("does not match"),
+                    "the refusal must name the identity binding, got: {err}"
+                );
+            }
+
+            // ---- deployment plans: `deployments/<id>/plan.json` embeds
+            // `deployment_id` (write-only — the write refuses a mismatched
+            // embedded identity)
+            {
+                let id_a = test_deployment_id(&format!("deploy-{tag_a}"));
+                let id_b = test_deployment_id(&format!("deploy-{tag_b}"));
+                prop_assume!(id_a != id_b);
+                let plan_a = plan_fixture(&id_a);
+                let plan_b = plan_fixture(&id_b);
+                store.write_plan(&id_a, &plan_a).unwrap();
+                store.write_plan(&id_b, &plan_b).unwrap();
+                // The identity permutation succeeds (idempotent rewrite).
+                store.write_plan(&id_a, &plan_a).unwrap();
+                // The write REFUSES a plan whose embedded deployment id
+                // differs from the key it is written under.
+                let err = store.write_plan(&id_b, &plan_a).expect_err(
+                    "a write of a plan under a key its embedded identity does not match must refuse",
+                );
+                assert!(
+                    err.to_string().contains("does not match its storage key"),
+                    "the refusal must name the identity binding, got: {err}"
+                );
+            }
         }
     }
 }

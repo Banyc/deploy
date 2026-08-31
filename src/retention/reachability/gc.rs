@@ -696,7 +696,7 @@ interval_seconds = 0
 
     /// Create a deployment record dir (`deployments/<id>/plan.json`).
     fn seed_deployment_dir(store: &LocalStore, id: &str) {
-        let dir = store.deployment_dir(id);
+        let dir = store.deployment_dir_named(id);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("plan.json"), "{}").unwrap();
     }
@@ -785,6 +785,7 @@ interval_seconds = 0
 
         // The observed slot state (the ONE physical observed record).
         let observed = ObservedSlot {
+            slot: SlotId::new(SLOT.to_string()),
             assignment: ObservedAssignment::Known {
                 generation: test_generation_id("gen-obs"),
                 artifact: ArtifactRef {
@@ -1045,18 +1046,18 @@ interval_seconds = 0
         );
         for id in &f.retained_deployments {
             assert!(
-                f.store.deployment_dir(id).exists(),
+                f.store.deployment_dir_named(id).exists(),
                 "retained deployment {id} must survive"
             );
         }
         assert!(
             f.store
-                .deployment_dir(test_deployment_id("deploy-obs").as_str())
+                .deployment_dir(&test_deployment_id("deploy-obs"))
                 .exists(),
             "the observed last deployment survives"
         );
         assert!(
-            !f.store.deployment_dir(&f.ghost_deployment).exists(),
+            !f.store.deployment_dir_named(&f.ghost_deployment).exists(),
             "the ghost deployment dir is gone"
         );
         for r in &f.garbage_releases {
@@ -1569,7 +1570,7 @@ interval_seconds = 0
             .skip(discards.removed_deployments)
         {
             assert!(
-                store.deployment_dir(d).exists(),
+                store.deployment_dir_named(d).exists(),
                 "pending deployment {d} stays on disk"
             );
         }

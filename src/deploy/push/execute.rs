@@ -280,7 +280,7 @@ pub(crate) mod execute_tests {
     //! [`crate::deploy::testsupport`].
 
     use crate::deploy::testsupport::*;
-    use crate::identity::test_deployment_id;
+    use crate::identity::{ServerId, test_deployment_id};
     use crate::ledger::SlotOutcomeBodyWire;
     use crate::remote::helper::RemoteHelper;
     use crate::remote::transport::LocalTransport;
@@ -592,7 +592,10 @@ pub(crate) mod execute_tests {
              (id1), not the failed attempt id2"
         );
         // The per-server record mirrors the observed slot state.
-        let server_state = h.store.read_server("s1").unwrap();
+        let server_state = h
+            .store
+            .read_server(&ServerId::parse("s1").unwrap())
+            .unwrap();
         assert_eq!(
             server_state
                 .last_observed

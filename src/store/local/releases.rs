@@ -51,10 +51,20 @@ impl LocalStore {
     pub fn write_release(&self, rec: &ReleaseRecord) -> Result<()> {
         // (a) Verify the incoming record from its content before any write.
         crate::verify::release::verify_release_identity(rec)?;
-        let dir = self.release_dir(
-            &ReleaseId::parse(&rec.release_id)
-                .expect("incoming release record carries a validated release id"),
-        );
+        // THE EMBEDDED-IDENTITY BINDING (write side): the release record's
+        // directory is derived from its OWN embedded `release_id` — the
+        // storage key IS the record's identity, so a mismatched write is
+        // structurally unrepresentable (there is no separate key argument
+        // to disagree with). The read side ([`LocalStore::read_release`])
+        // verifies the binding the other way: a record swapped into the
+        // wrong release directory is refused.
+        let id = ReleaseId::parse(&rec.release_id).map_err(|e| {
+            Error::integrity(format!(
+                "incoming release record carries an invalid release id {:?}: {e}",
+                rec.release_id
+            ))
+        })?;
+        let dir = self.release_dir(&id);
         if dir.exists() {
             // (b) Verify the EXISTING record from its content too, then
             // compare the recomputed identities (both records verified above,
@@ -98,8 +108,11 @@ impl LocalStore {
         // were left unchanged fails closed with an integrity error, and an
         // empty slot snapshot is rejected outright.
         crate::verify::release::verify_release_identity(&rec)?;
-        // Bind the record to the read path: the stored record must actually
-        // BE the release the caller asked for.
+        // THE EMBEDDED-IDENTITY BINDING (read side): the stored record's own
+        // `release_id` must equal the requested `id` (the path key —
+        // `releases/<release-id>/release.json`) — a record swapped into the
+        // wrong release directory is refused with an integrity error naming
+        // both ids, never returned as if it were `id`.
         if rec.release_id != id.as_str() {
             return Err(Error::integrity(format!(
                 "release record read from {id} declares release_id {}: the stored record's identity does not match the requested release id (a record swapped into the wrong release directory)",

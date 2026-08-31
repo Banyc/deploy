@@ -11,7 +11,7 @@ use crate::deploy::push::PushContext;
 use crate::deploy::push::PushReport;
 use crate::deploy::rollout::SlotExecution;
 use crate::error::Result;
-use crate::identity::SlotId;
+use crate::identity::{SlotId, TargetName};
 use crate::kernel::terminal::NonSuccessfulDisposition;
 use crate::ledger;
 use crate::ledger::DeploymentIntent;
@@ -52,6 +52,11 @@ pub(crate) fn run_commit(
 ) -> Result<PushReport> {
     let store = ctx.store;
     let target_name = ctx.target_name;
+    // The typed target for the target-keyed maintenance I/O (the debt
+    // marker functions take the validated [`TargetName`]); the target is
+    // validated at the config boundary upstream, so the parse cannot fail
+    // for a real push.
+    let target_name_typed = TargetName::parse(target_name)?;
     let config = ctx.config;
     let deployment_id = ctx.deployment_id;
     let op_id = ctx.op_id;
@@ -152,7 +157,7 @@ pub(crate) fn run_commit(
             maintenance.extend(crate::deploy::maintenance::retry_deferred_retentions(
                 store,
                 config,
-                target_name,
+                &target_name_typed,
                 helpers,
                 op_id,
                 deployment_id,
@@ -217,7 +222,7 @@ pub(crate) fn run_commit(
                 maintenance.extend(crate::deploy::maintenance::retry_deferred_retentions(
                     store,
                     config,
-                    target_name,
+                    &target_name_typed,
                     helpers,
                     op_id,
                     deployment_id,
@@ -296,7 +301,7 @@ pub(crate) fn run_commit(
     maintenance.extend(crate::deploy::maintenance::retry_deferred_retentions(
         store,
         config,
-        target_name,
+        &target_name_typed,
         helpers,
         op_id,
         deployment_id,
@@ -309,7 +314,7 @@ pub(crate) fn run_commit(
     crate::deploy::maintenance::run_step17_retention(
         store,
         config,
-        target_name,
+        &target_name_typed,
         helpers,
         &execution.servers_order,
         op_id,
@@ -1403,8 +1408,7 @@ pub(crate) mod commit_tests {
         // release) and the referenced-release set derived from the
         // snapshot's slots.
         let plan: DeploymentPlan = serde_json::from_str(
-            &std::fs::read_to_string(h.store.deployment_dir(id4.as_str()).join("plan.json"))
-                .unwrap(),
+            &std::fs::read_to_string(h.store.deployment_dir(&id4).join("plan.json")).unwrap(),
         )
         .unwrap();
         assert_eq!(

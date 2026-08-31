@@ -281,8 +281,9 @@ mod tests {
     use crate::deploy::set_retention_deferred;
     use crate::error::Error;
     use crate::identity::{
-        ArtifactRef, DeploymentId, GenerationId, ReleaseId, ReleaseRecord, SlotId, TreeDigest,
-        VariantName, test_deployment_id, test_generation_id, test_release_id, test_tree_digest,
+        ArtifactRef, DeploymentId, GenerationId, ReleaseId, ReleaseRecord, SlotId, TargetName,
+        TreeDigest, VariantName, test_deployment_id, test_generation_id, test_release_id,
+        test_tree_digest,
     };
     use crate::remote::helper::{CurrentAssignment, GenerationAssignment, RemoteHelper};
     use crate::remote::layout;
@@ -1524,9 +1525,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             // hard push failure); the retry services it once the record is
             // repaired.
             let slot = SlotId::parse("p1").unwrap();
-            let warnings = set_retention_deferred(&store, "t1", &slot, &err.to_string());
+            let warnings = set_retention_deferred(&store, &TargetName::parse("t1").unwrap(), &slot, &err.to_string());
             assert!(warnings.is_empty(), "the marker write must succeed: {warnings:?}");
-            let debt = store.read_retention_debt("t1").unwrap();
+            let debt = store.read_retention_debt(&TargetName::parse("t1").unwrap()).unwrap();
             assert_eq!(
                 debt.get("p1").map(|s| s.as_str()),
                 Some(err.to_string().as_str()),
@@ -1556,14 +1557,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     "garbage {t} is removed by the retry"
                 );
             }
-            let mut debt = store.read_retention_debt("t1").unwrap();
+            let mut debt = store.read_retention_debt(&TargetName::parse("t1").unwrap()).unwrap();
             assert!(
                 debt.remove("p1").is_some(),
                 "the retried retention services the marker"
             );
-            store.write_retention_debt("t1", &debt).unwrap();
+            store.write_retention_debt(&TargetName::parse("t1").unwrap(), &debt).unwrap();
             assert!(
-                store.read_retention_debt("t1").unwrap().is_empty(),
+                store.read_retention_debt(&TargetName::parse("t1").unwrap()).unwrap().is_empty(),
                 "the debt marker is cleared once the retry succeeds"
             );
         }
@@ -1970,9 +1971,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             // hard push failure); the retry services it once the fault is
             // repaired.
             let slot = SlotId::parse("p1").unwrap();
-            let warnings = set_retention_deferred(&store, "t1", &slot, &err_text);
+            let warnings = set_retention_deferred(&store, &TargetName::parse("t1").unwrap(), &slot, &err_text);
             assert!(warnings.is_empty(), "the marker write must succeed: {warnings:?}");
-            let debt = store.read_retention_debt("t1").unwrap();
+            let debt = store.read_retention_debt(&TargetName::parse("t1").unwrap()).unwrap();
             assert_eq!(
                 debt.get("p1").map(|s| s.as_str()),
                 Some(err_text.as_str()),
@@ -2019,14 +2020,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             );
 
             // The retried retention services the marker.
-            let mut debt = store.read_retention_debt("t1").unwrap();
+            let mut debt = store.read_retention_debt(&TargetName::parse("t1").unwrap()).unwrap();
             assert!(
                 debt.remove("p1").is_some(),
                 "the retried retention services the marker"
             );
-            store.write_retention_debt("t1", &debt).unwrap();
+            store.write_retention_debt(&TargetName::parse("t1").unwrap(), &debt).unwrap();
             assert!(
-                store.read_retention_debt("t1").unwrap().is_empty(),
+                store.read_retention_debt(&TargetName::parse("t1").unwrap()).unwrap().is_empty(),
                 "the debt marker is cleared once the retry succeeds"
             );
         }
@@ -2649,9 +2650,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 // repaired.
                 let slot = SlotId::parse("p1").unwrap();
                 let err_text = abort.as_ref().unwrap();
-                let warnings = set_retention_deferred(&store, "t1", &slot, err_text);
+                let warnings = set_retention_deferred(&store, &TargetName::parse("t1").unwrap(), &slot, err_text);
                 assert!(warnings.is_empty(), "the marker write must succeed: {warnings:?}");
-                let debt = store.read_retention_debt("t1").unwrap();
+                let debt = store.read_retention_debt(&TargetName::parse("t1").unwrap()).unwrap();
                 assert_eq!(
                     debt.get("p1").map(|s| s.as_str()),
                     Some(err_text.as_str()),
@@ -2707,14 +2708,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
             // The retried retention services the marker.
             if abort.is_some() {
-                let mut debt = store.read_retention_debt("t1").unwrap();
+                let mut debt = store.read_retention_debt(&TargetName::parse("t1").unwrap()).unwrap();
                 assert!(
                     debt.remove("p1").is_some(),
                     "the retried retention services the marker"
                 );
-                store.write_retention_debt("t1", &debt).unwrap();
+                store.write_retention_debt(&TargetName::parse("t1").unwrap(), &debt).unwrap();
                 assert!(
-                    store.read_retention_debt("t1").unwrap().is_empty(),
+                    store.read_retention_debt(&TargetName::parse("t1").unwrap()).unwrap().is_empty(),
                     "the debt marker is cleared once the retry succeeds"
                 );
             }

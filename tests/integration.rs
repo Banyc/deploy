@@ -4,7 +4,7 @@
 use deploy::config::ProjectConfig;
 use deploy::deploy::{PushOptions, push};
 use deploy::error::Result;
-use deploy::identity::{ServerId, SlotId, TreeDigest};
+use deploy::identity::{ServerId, SlotId, TargetName, TreeDigest};
 use deploy::ledger::{DeploymentStatus, LedgerEntry, PhysicalBinding, TargetSnapshot};
 
 use deploy::remote::transport::{CreateNewVerdict, FsBytes, LocalTransport, Remote};
@@ -2693,7 +2693,7 @@ fn step17_retention_failure_defers_maintenance_until_noop_retry() -> Result<()> 
 
     // The debt marker is PERSISTENT (a file under the store, keyed by
     // target+slot) and records the failure reason, so a later push can retry.
-    let debt = store.read_retention_debt("production")?;
+    let debt = store.read_retention_debt(&TargetName::parse("production").unwrap())?;
     assert!(
         !debt.is_empty(),
         "a debt marker must be recorded when step-17 retention fails"
@@ -2703,7 +2703,9 @@ fn step17_retention_failure_defers_maintenance_until_noop_retry() -> Result<()> 
         "the marker records the failure reason, got: {debt:?}"
     );
     assert!(
-        store.retention_debt_path("production").exists(),
+        store
+            .retention_debt_path(&TargetName::parse("production").unwrap())
+            .exists(),
         "the marker survives across pushes as a file under the store"
     );
 
@@ -2757,11 +2759,15 @@ fn step17_retention_failure_defers_maintenance_until_noop_retry() -> Result<()> 
         r2.warning
     );
     assert!(
-        store.read_retention_debt("production")?.is_empty(),
+        store
+            .read_retention_debt(&TargetName::parse("production").unwrap())?
+            .is_empty(),
         "the debt marker must be cleared once the retention succeeds"
     );
     assert!(
-        !store.retention_debt_path("production").exists(),
+        !store
+            .retention_debt_path(&TargetName::parse("production").unwrap())
+            .exists(),
         "a cleared debt marker leaves no file behind"
     );
     Ok(())
@@ -2819,7 +2825,9 @@ fn noop_retry_keeps_marker_until_retention_succeeds() -> Result<()> {
         "push 1 must warn about the deferred retention"
     );
     assert!(
-        !store.read_retention_debt("production")?.is_empty(),
+        !store
+            .read_retention_debt(&TargetName::parse("production").unwrap())?
+            .is_empty(),
         "push 1 must record the debt marker"
     );
 
@@ -2850,7 +2858,9 @@ fn noop_retry_keeps_marker_until_retention_succeeds() -> Result<()> {
         "the warning says the maintenance is still deferred, got: {warning2}"
     );
     assert!(
-        !store.read_retention_debt("production")?.is_empty(),
+        !store
+            .read_retention_debt(&TargetName::parse("production").unwrap())?
+            .is_empty(),
         "a failed retry must keep the debt marker"
     );
 
@@ -2876,7 +2886,9 @@ fn noop_retry_keeps_marker_until_retention_succeeds() -> Result<()> {
         r3.warning
     );
     assert!(
-        store.read_retention_debt("production")?.is_empty(),
+        store
+            .read_retention_debt(&TargetName::parse("production").unwrap())?
+            .is_empty(),
         "the marker must be cleared once the retention succeeds"
     );
     Ok(())

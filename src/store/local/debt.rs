@@ -5,7 +5,7 @@
 use crate::error::{Error, Result};
 use crate::identity::{DeploymentId, TargetName};
 use crate::store::atomic::{path_state, read_json, sync_parent_dir};
-use crate::store::local::LocalStore;
+use crate::store::local::{LocalStore, read_keyed_json, write_keyed_json};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -62,6 +62,24 @@ pub enum SweepDebt {
     },
 }
 
+/// THE DURABLE PER-TARGET RETENTION-DEBT MARKER (`targets/<target>/retention-debt.json`):
+/// the target it belongs to (the storage key) bound to the per-slot
+/// deferred-retention reasons. THE RECORD EMBEDS ITS OWN TARGET IDENTITY so
+/// the store can verify the binding between the record and its storage key
+/// on every read: a marker swapped into the wrong target's directory is
+/// refused with an integrity error naming both targets, never returned as
+/// the wrong target's debt.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetentionDebt {
+    /// THE RECORD'S OWN TARGET IDENTITY — the storage key the marker is
+    /// bound to (`targets/<target>/retention-debt.json`). The store verifies
+    /// it equals the path key on every read.
+    pub target: TargetName,
+    /// The per-slot deferred-retention reasons (placement slot id → reason).
+    pub debt: BTreeMap<String, String>,
+}
+
 /// TEST-ONLY: the per-stage fault kinds of a retention-debt marker's atomic
 /// replacement (keyed by the target), mirroring the checkpoint's
 /// [`FaultKind::LedgerReplace*`] stage pattern.
@@ -101,21 +119,27 @@ impl LocalStore {
     /// small record: it does not ride along in `observed.json` (which
     /// describes the deployed state, not pending controller work) and it
     /// survives across pushes.
-    pub fn retention_debt_path(&self, target: &str) -> PathBuf {
-        self.target_dir(target).join("retention-debt.json")
+    pub fn retention_debt_path(&self, target: &TargetName) -> PathBuf {
+        self.target_dir(target.as_str()).join("retention-debt.json")
     }
 
     /// Read the target's deferred-retention markers: a map of placement slot
     /// id to the reason the retention was deferred. Empty when no maintenance
     /// is pending.
-    pub fn read_retention_debt(&self, target: &str) -> Result<BTreeMap<String, String>> {
+    ///
+    /// THE EMBEDDED-IDENTITY BINDING (read side): the stored marker's own
+    /// target must equal the requested `target` (the path key —
+    /// `targets/<target>/retention-debt.json`) — a marker swapped into the
+    /// wrong target's directory is refused with an integrity error naming
+    /// both targets, never returned as the wrong target's debt.
+    pub fn read_retention_debt(&self, target: &TargetName) -> Result<BTreeMap<String, String>> {
         // Post-commit maintenance fault injection, keyed by target (the debt
         // file lives under `targets/<target>/`). Absorbs the debt-I/O
         // sibling agent's `arm_read_retention_debt`.
         #[cfg(test)]
         if self
             .fault_registry
-            .consume(FaultKind::ReadRetentionDebt, target)
+            .consume(FaultKind::ReadRetentionDebt, target.as_str())
         {
             return Err(Error::store(
                 "test fault: read_retention_debt forced to fail once",
@@ -126,7 +150,9 @@ impl LocalStore {
         // empty map); a stat failure propagates as a Store error (an
         // unreadable debt marker must not read as "no debt").
         if path_state(&p)? {
-            read_json(&p)
+            let rec: RetentionDebt =
+                read_keyed_json(&p, target.as_str(), |r: &RetentionDebt| r.target.as_str())?;
+            Ok(rec.debt)
         } else {
             Ok(BTreeMap::new())
         }
@@ -134,9 +160,15 @@ impl LocalStore {
 
     /// Persist the target's deferred-retention markers. An EMPTY map removes
     /// the marker file, so a fully-serviced target leaves no trace.
+    ///
+    /// THE EMBEDDED-IDENTITY BINDING (write side): the marker is persisted
+    /// WITH its own target identity (the storage key it is written under),
+    /// so a later read can verify the binding. The key IS the target
+    /// argument — a mismatched write is structurally unrepresentable (the
+    /// record is built from the key).
     pub fn write_retention_debt(
         &self,
-        target: &str,
+        target: &TargetName,
         debt: &BTreeMap<String, String>,
     ) -> Result<()> {
         // Post-commit maintenance write fault, keyed by target. Absorbs the
@@ -144,7 +176,7 @@ impl LocalStore {
         #[cfg(test)]
         if self
             .fault_registry
-            .consume(FaultKind::WriteRetentionDebt, target)
+            .consume(FaultKind::WriteRetentionDebt, target.as_str())
         {
             return Err(Error::store(
                 "test fault: write_retention_debt forced to fail once",
@@ -166,15 +198,20 @@ impl LocalStore {
             }
             return Ok(());
         }
-        // The mutable debt marker is replaced ATOMICALLY (see [`write_json`]);
-        // the test seam faults each replacement stage keyed by the target.
+        // The marker is persisted WITH its own target identity (the storage
+        // key), replaced ATOMICALLY (see [`write_json`]); the test seam
+        // faults each replacement stage keyed by the target.
+        let rec = RetentionDebt {
+            target: target.clone(),
+            debt: debt.clone(),
+        };
         #[cfg(test)]
         {
-            let mut hook = self.replace_stage_hook(target, retention_debt_replace_kind);
-            write_json_seam(&p, debt, &mut hook)
+            let mut hook = self.replace_stage_hook(target.as_str(), retention_debt_replace_kind);
+            write_keyed_json(&p, target.as_str(), &rec, |r| r.target.as_str(), &mut hook)
         }
         #[cfg(not(test))]
-        write_json(&p, debt)
+        write_keyed_json(&p, target.as_str(), &rec, |r| r.target.as_str())
     }
 
     // ---- the store-global sweep debt (checkpoint sweep maintenance) ------

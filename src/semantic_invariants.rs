@@ -79,8 +79,8 @@ use crate::deploy::plan::capacity_fits;
 use crate::deploy::{PushOptions, PushReport, push, push_with_id};
 use crate::error::Result;
 use crate::identity::{
-    ArtifactRef, DeploymentId, GenerationId, OperationId, ReleaseId, SlotId, TreeDigest,
-    VariantName, test_deployment_id, test_tree_digest,
+    ArtifactRef, DeploymentId, GenerationId, OperationId, ReleaseId, SlotId, TargetName,
+    TreeDigest, VariantName, test_deployment_id, test_tree_digest,
 };
 use crate::ledger;
 use crate::ledger::DeploymentStatus;
@@ -2358,7 +2358,10 @@ fn state_machine_lifecycle_cleanup_failure_after_commit() {
         "the warning describes the deferred retention, got: {warning}"
     );
     assert!(
-        !f.store.read_retention_debt("t1").unwrap().is_empty(),
+        !f.store
+            .read_retention_debt(&TargetName::parse("t1").unwrap())
+            .unwrap()
+            .is_empty(),
         "a persistent debt marker must be recorded"
     );
 
@@ -2372,7 +2375,10 @@ fn state_machine_lifecycle_cleanup_failure_after_commit() {
         "the maintenance succeeded on the no-op retry, so no warning remains"
     );
     assert!(
-        f.store.read_retention_debt("t1").unwrap().is_empty(),
+        f.store
+            .read_retention_debt(&TargetName::parse("t1").unwrap())
+            .unwrap()
+            .is_empty(),
         "the debt marker must be cleared once the retention succeeds"
     );
     f.check_invariants();
@@ -2453,7 +2459,10 @@ fn state_machine_lifecycle_retention_lock_contention_defers_not_silent() {
         "the contended push must warn naming the slot (never silent), got: {warning1}"
     );
     assert!(
-        !f.store.read_retention_debt("t1").unwrap().is_empty(),
+        !f.store
+            .read_retention_debt(&TargetName::parse("t1").unwrap())
+            .unwrap()
+            .is_empty(),
         "the contended push must record the debt marker"
     );
     // Step 1's guard drops here (lock released).
@@ -2498,7 +2507,10 @@ fn state_machine_lifecycle_retention_lock_contention_defers_not_silent() {
         "the held-lock no-op must keep warning that the retention is deferred, got: {warning2}"
     );
     assert!(
-        !f.store.read_retention_debt("t1").unwrap().is_empty(),
+        !f.store
+            .read_retention_debt(&TargetName::parse("t1").unwrap())
+            .unwrap()
+            .is_empty(),
         "the held-lock no-op must keep the debt marker"
     );
     // Step 2's guard drops here (lock released).
@@ -2516,7 +2528,10 @@ fn state_machine_lifecycle_retention_lock_contention_defers_not_silent() {
         "the maintenance succeeded on the unlocked no-op, so no warning remains"
     );
     assert!(
-        f.store.read_retention_debt("t1").unwrap().is_empty(),
+        f.store
+            .read_retention_debt(&TargetName::parse("t1").unwrap())
+            .unwrap()
+            .is_empty(),
         "the debt marker must be cleared once the retention succeeds"
     );
     f.check_invariants();
@@ -2755,7 +2770,7 @@ fn state_machine_checkpoint_floor_discards_below_pending_keeps_above() {
         "the below-floor attempt must be discarded"
     );
     assert!(
-        !f.store.deployment_dir(&pending_id).exists(),
+        !f.store.deployment_dir_named(&pending_id).exists(),
         "the below-floor deployment dir must be deleted"
     );
     assert_eq!(
@@ -4050,7 +4065,10 @@ fn lifecycle_observed_refresh_faults_never_fail_after_commit() {
             "{step:?}: refs/last-successful points at the committed attempt"
         );
         assert!(
-            f.store.read_retention_debt("t1").unwrap().is_empty(),
+            f.store
+                .read_retention_debt(&TargetName::parse("t1").unwrap())
+                .unwrap()
+                .is_empty(),
             "{step:?}: observed refresh needs no persistent debt marker — the next real push \
              re-projects from durable facts"
         );
@@ -4152,7 +4170,7 @@ fn lifecycle_debt_fault_matrix_never_fails_after_commit() {
                 if have_debt {
                     f.store
                         .write_retention_debt(
-                            "debtfx",
+                            &TargetName::parse("debtfx").unwrap(),
                             &BTreeMap::from([(SLOT.to_string(), "seeded".to_string())]),
                         )
                         .unwrap();
@@ -4203,7 +4221,10 @@ fn lifecycle_debt_fault_matrix_never_fails_after_commit() {
                 // a warning must name the debt maintenance; the real push's
                 // step-17 clear always converges the marker (the one-shot
                 // fault is spent by the retry's I/O).
-                let debt = f.store.read_retention_debt("debtfx").unwrap();
+                let debt = f
+                    .store
+                    .read_retention_debt(&TargetName::parse("debtfx").unwrap())
+                    .unwrap();
                 let expect_warning = !matches!(
                     (step, have_debt),
                     (FailureStep::DebtWrite | FailureStep::DebtRemove, false)
@@ -4248,7 +4269,7 @@ fn lifecycle_debt_fault_matrix_never_fails_after_commit() {
                 if have_debt {
                     f.store
                         .write_retention_debt(
-                            "debtfx",
+                            &TargetName::parse("debtfx").unwrap(),
                             &BTreeMap::from([(SLOT.to_string(), "seeded".to_string())]),
                         )
                         .unwrap();
@@ -4291,7 +4312,10 @@ fn lifecycle_debt_fault_matrix_never_fails_after_commit() {
                 // marker and a read fault the report warns about the failed
                 // read; with no marker and a write/remove fault nothing is
                 // written, the arm never fires, and nothing is warned.
-                let debt = f.store.read_retention_debt("debtfx").unwrap();
+                let debt = f
+                    .store
+                    .read_retention_debt(&TargetName::parse("debtfx").unwrap())
+                    .unwrap();
                 let expect_warning = !matches!(
                     (step, have_debt),
                     (FailureStep::DebtWrite | FailureStep::DebtRemove, false)
@@ -6306,7 +6330,7 @@ fn assert_semantic_invariants(model: &Model, system: &Fixture) {
     for t in ["t1", "t2"] {
         let sys_debt = !system
             .store
-            .read_retention_debt(t)
+            .read_retention_debt(&TargetName::parse(t).unwrap())
             .unwrap_or_default()
             .is_empty();
         assert_eq!(
@@ -6393,7 +6417,7 @@ fn assert_checkpoint_invariants(model: &Model, system: &Fixture) {
         let mut retained_ids: HashSet<&str> = HashSet::new();
         for (id, _) in &want_att {
             assert!(
-                system.store.deployment_dir(id).exists(),
+                system.store.deployment_dir_named(id).exists(),
                 "{ctx}: the deployment dir of retained entry {id} on {t} must exist"
             );
             assert!(
@@ -6798,11 +6822,13 @@ fn run_step17_contention_debt_case(preexisting_reason: Option<&str>, fault: Cont
     // Seed the preexisting debt marker with the ARBITRARY reason and
     // snapshot it BEFORE the push: a failed persistence must leave it
     // byte-identical.
-    let marker_path = f.store.retention_debt_path(TARGET);
+    let marker_path = f
+        .store
+        .retention_debt_path(&TargetName::parse(TARGET).unwrap());
     let before = if let Some(reason) = preexisting_reason {
         f.store
             .write_retention_debt(
-                TARGET,
+                &TargetName::parse(TARGET).unwrap(),
                 &BTreeMap::from([(SLOT.to_string(), reason.to_string())]),
             )
             .expect("seeding the preexisting debt marker");
@@ -6858,7 +6884,10 @@ fn run_step17_contention_debt_case(preexisting_reason: Option<&str>, fault: Cont
             after, before,
             "{ctx}: the preexisting debt marker must be preserved byte-identical"
         );
-        let debt = f.store.read_retention_debt(TARGET).unwrap();
+        let debt = f
+            .store
+            .read_retention_debt(&TargetName::parse(TARGET).unwrap())
+            .unwrap();
         assert_eq!(
             debt.get(SLOT).map(String::as_str),
             Some(reason),

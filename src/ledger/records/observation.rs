@@ -374,9 +374,21 @@ impl ObservedAssignment {
 /// parallel field, so a raw wire document can never pair a deployment with
 /// an `Absent`/`Unknown` assignment (a self-contradictory state) and never
 /// strip one from a `Known`. The wire rejects any key beyond `assignment`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+///
+/// THE RECORD EMBEDS ITS OWN SLOT IDENTITY (`slot`): the physical observed
+/// record is stored at `slots/<slot-id>/observed.json`, and the embedded
+/// slot id is the binding between the record and its storage key — a reader
+/// refuses a record whose embedded slot id differs from the directory it was
+/// read from (a record swapped into the wrong slot directory), and a writer
+/// refuses to persist a record under a slot key its embedded identity does
+/// not match.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObservedSlot {
+    /// THE RECORD'S OWN SLOT IDENTITY — the storage key the record is bound
+    /// to (`slots/<slot-id>/observed.json`). The store verifies it equals
+    /// the path key on every read and write.
+    pub slot: SlotId,
     /// The tagged observed assignment (Absent | Known | AssignmentUnknown |
     /// Unknown).
     pub assignment: ObservedAssignment,
@@ -579,8 +591,10 @@ mod tests {
             doc.insert("value".to_string(), serde_json::Value::Object(value));
         }
         // The full slot record wraps the assignment document under the
-        // slot's `assignment` key.
+        // slot's `assignment` key, next to the record's OWN slot identity
+        // (the storage key the record is bound to).
         let mut slot = serde_json::Map::new();
+        slot.insert("slot".to_string(), json!("p1"));
         slot.insert("assignment".to_string(), serde_json::Value::Object(doc));
         let doc = serde_json::Value::Object(slot);
 
@@ -647,6 +661,11 @@ mod tests {
                 },
             };
             assert_eq!(
+                slot.slot,
+                SlotId::parse("p1").unwrap(),
+                "the accepted record carries its own slot identity: {doc}"
+            );
+            assert_eq!(
                 slot.assignment, expected,
                 "the accepted representation is EXACTLY the tagged variant: {doc}"
             );
@@ -701,13 +720,23 @@ mod tests {
             serde_json::from_value::<ObservedAssignment>(value_extra).is_err(),
             "a key inside the variant value must be REJECTED"
         );
-        // A slot record with an extra key is rejected.
+        // A slot record with an extra key is rejected (the record's own
+        // `slot` identity is REQUIRED — a record without it is refused, and
+        // a stray key next to `slot`/`assignment` is refused).
         let slot_extra = json!({
+            "slot": "p1",
             "assignment": valid_known,
             "bogus": 1});
         assert!(
             serde_json::from_value::<ObservedSlot>(slot_extra).is_err(),
-            "a key next to assignment must be REJECTED"
+            "a key next to slot/assignment must be REJECTED"
+        );
+        // A slot record WITHOUT its own slot identity is refused (the
+        // embedded identity is the record's binding to its storage key).
+        let slot_missing_identity = json!({"assignment": valid_known});
+        assert!(
+            serde_json::from_value::<ObservedSlot>(slot_missing_identity).is_err(),
+            "a slot record without its own slot identity must be REJECTED"
         );
         // A target record with an extra key is rejected.
         let target_extra = json!({
@@ -732,11 +761,22 @@ mod tests {
     /// version), `Absent` (a live read showing no state), `AssignmentUnknown`
     /// (generation known, artifact NOT read), `Unknown` (status read failed).
     fn arbitrary_live_observation() -> impl Strategy<Value = ObservedSlot> {
+        // Every generated record carries its OWN slot identity (the storage
+        // key it is bound to) — the sequence property writes them through
+        // the store under the SAME slot, so the embedded identity always
+        // matches the path key.
+        let slot = SlotId::parse("p1").unwrap();
+        let slot_absent = slot.clone();
+        let slot_known = slot.clone();
+        let slot_assign_unknown = slot.clone();
+        let slot_unknown = slot.clone();
         prop_oneof![
             Just(ObservedSlot {
+                slot: slot_absent,
                 assignment: ObservedAssignment::Absent
             }),
-            (0..3usize, 0..3usize).prop_map(|(i, j)| ObservedSlot {
+            (0..3usize, 0..3usize).prop_map(move |(i, j)| ObservedSlot {
+                slot: slot_known.clone(),
                 assignment: ObservedAssignment::Known {
                     generation: test_generation_id(&format!("gen-seq-{i}")),
                     artifact: artifact_ref(&format!("art-seq-{i}-{j}")),
@@ -745,7 +785,8 @@ mod tests {
                     version: Some(format!("2026-01-0{}T00:00:00Z", (i + j) % 9 + 1))
                 }
             }),
-            (0..3usize, 0..3usize).prop_map(|(i, j)| ObservedSlot {
+            (0..3usize, 0..3usize).prop_map(move |(i, j)| ObservedSlot {
+                slot: slot_assign_unknown.clone(),
                 assignment: ObservedAssignment::AssignmentUnknown {
                     generation: test_generation_id(&format!("gen-seq-{i}")),
                     error: ObservationError {
@@ -753,7 +794,8 @@ mod tests {
                     }
                 }
             }),
-            (0..3usize).prop_map(|j| ObservedSlot {
+            (0..3usize).prop_map(move |j| ObservedSlot {
+                slot: slot_unknown.clone(),
                 assignment: ObservedAssignment::Unknown {
                     error: ObservationError {
                         message: format!("status read failed: case {j}")

@@ -25,7 +25,7 @@ pub(crate) fn persist_intent(
     let target_name = ctx.target_name;
     let selection = ctx.selection;
     let deployment_id = ctx.deployment_id;
-    store.write_plan(deployment_id.as_str(), &outcome.plan)?;
+    store.write_plan(deployment_id, &outcome.plan)?;
     let desired_behavior_sha =
         crate::verify::release::behavior_index_digest(&outcome.behavior_index);
     let slot_bindings = ctx.config.target_slot_bindings(target_name)?;
