@@ -30,29 +30,57 @@ use crate::error::{Error, Result};
 use crate::identity::{EndpointKey, LOCAL_ENDPOINT_MARKER};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// The process-global ownership registry: for each resolved endpoint, the
 /// set of canonical roots currently owned by a LIVE [`OwnedRoot`]. A root
-/// is registered at [`OwnedRoot::parse`] and released when the owning
-/// [`OwnedRoot`] is dropped — two SIMULTANEOUS owners over equal or
+/// is registered at [`OwnedRoot::parse`] and released when the LAST live
+/// [`OwnedRoot`] clone is dropped (the registration is REFCOUNTED — clones
+/// share one registration token, so the registration is released exactly
+/// once, when the last clone drops) — two SIMULTANEOUS owners over equal or
 /// ancestor/descendant roots on the same endpoint are refused, while a
 /// released root can be re-owned.
 static OWNED_ROOTS: Mutex<BTreeMap<EndpointKey, BTreeSet<PathBuf>>> = Mutex::new(BTreeMap::new());
 
-/// The SEALED filesystem-ownership root: a canonical, non-root, non-symlink
+/// THE SEALED filesystem-ownership root: a canonical, non-root, non-symlink
 /// directory, owned on one resolved endpoint. Private fields; the ONLY
 /// construction path is [`OwnedRoot::parse`], which canonicalizes the path,
 /// rejects the filesystem root and symlink roots, and refuses to register a
 /// root that equals — or is an ancestor or descendant of — an already-owned
-/// root on the same endpoint. The registration is released when the
-/// [`OwnedRoot`] is dropped.
-#[derive(Debug)]
+/// root on the same endpoint. The registration is REFCOUNTED: clones share
+/// one registration token, and the registration is released when the LAST
+/// clone is dropped (a root can be shared — e.g. every provisioned slot of
+/// a validated project is bound to the project's store root — without
+/// releasing the ownership while any clone is alive).
+#[derive(Clone, Debug)]
 pub struct OwnedRoot {
     /// The canonical, non-root, non-symlink directory.
     canonical: PathBuf,
     /// The resolved endpoint this root is owned on.
     endpoint: EndpointKey,
+    /// The REFCOUNTED registration token: the registration is released when
+    /// the LAST clone of this root drops (clones share the token).
+    registration: Arc<OwnedRootRegistration>,
+}
+
+/// The refcounted registration token: holds the (endpoint, canonical)
+/// pair whose registration it releases on the LAST drop.
+#[derive(Debug)]
+struct OwnedRootRegistration {
+    endpoint: EndpointKey,
+    canonical: PathBuf,
+}
+
+impl Drop for OwnedRootRegistration {
+    fn drop(&mut self) {
+        let mut registry = OWNED_ROOTS.lock().unwrap();
+        if let Some(owned) = registry.get_mut(&self.endpoint) {
+            owned.remove(&self.canonical);
+            if owned.is_empty() {
+                registry.remove(&self.endpoint);
+            }
+        }
+    }
 }
 
 impl OwnedRoot {
@@ -122,8 +150,12 @@ impl OwnedRoot {
             .or_default()
             .insert(canonical.clone());
         Ok(OwnedRoot {
-            canonical,
+            canonical: canonical.clone(),
             endpoint: endpoint.clone(),
+            registration: Arc::new(OwnedRootRegistration {
+                endpoint: endpoint.clone(),
+                canonical,
+            }),
         })
     }
 
@@ -135,18 +167,6 @@ impl OwnedRoot {
     /// The resolved endpoint this root is owned on.
     pub fn endpoint(&self) -> &EndpointKey {
         &self.endpoint
-    }
-}
-
-impl Drop for OwnedRoot {
-    fn drop(&mut self) {
-        let mut registry = OWNED_ROOTS.lock().unwrap();
-        if let Some(owned) = registry.get_mut(&self.endpoint) {
-            owned.remove(&self.canonical);
-            if owned.is_empty() {
-                registry.remove(&self.endpoint);
-            }
-        }
     }
 }
 

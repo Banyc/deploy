@@ -60,9 +60,12 @@ pub(crate) struct CompensationRequest {
 pub(crate) enum CompensationOutcome {
     /// The slot was fully restored; `adapter_restored` is the sealed proof
     /// (produced by a successful READ-BACK verification of the adapter's
-    /// restored side effects).
+    /// restored side effects) and `restoration` is the [`RestorationProof`]
+    /// evidence of the generation restoration (the restored generation, or
+    /// `None` for a first-deploy removal of `current`).
     Restored {
         adapter_restored: VerifiedAdapterRestoration,
+        restoration: crate::remote::helper::RestorationProof,
     },
     /// The compensation refused (CAS failure / unverified restoration): the
     /// slot stays on the advanced generation.
@@ -196,7 +199,12 @@ pub(crate) fn compensate_server_locked(
             })?;
             run_verification(remote, prior_behavior.verification(), &prior_vars)
                 .map_err(|e| Error::remote(format!("compensation verification failed: {e}")))?;
-            Ok(CompensationOutcome::Restored { adapter_restored })
+            Ok(CompensationOutcome::Restored {
+                adapter_restored,
+                restoration: crate::remote::helper::RestorationProof::restored(Some(
+                    prior.clone(),
+                )),
+            })
         }
         None => {
             // First deploy: remove `current` only if it still points at the
@@ -234,7 +242,10 @@ pub(crate) fn compensate_server_locked(
             .map_err(|e| {
                 Error::remote(format!("compensation adapter restore NOT verified: {e}"))
             })?;
-            Ok(CompensationOutcome::Restored { adapter_restored })
+            Ok(CompensationOutcome::Restored {
+                adapter_restored,
+                restoration: crate::remote::helper::RestorationProof::restored(None),
+            })
         }
     }
 }

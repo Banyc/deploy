@@ -4,8 +4,10 @@
 //! ([`compensation`]).
 
 mod compensation;
+mod mutation;
 
 pub(crate) use compensation::*;
+pub(crate) use mutation::*;
 
 // The per-server mutation pipeline: [`process_server`] (publish, integrity
 // re-verify, artifact-path validation, activation, commit marker), the
@@ -17,6 +19,7 @@ use crate::error::Error;
 use crate::error::Result;
 use crate::identity::ArtifactRef;
 use crate::identity::BehaviorContract;
+use crate::identity::BehaviorDigest;
 use crate::identity::DeploymentId;
 use crate::identity::GenerationId;
 use crate::identity::OperationId;
@@ -100,15 +103,18 @@ impl ServerProc {
     /// restored (the sealed proof — produced only by a successful
     /// [`verify_restored`](crate::verify::adapters::transaction::ActivationTransaction::verify_restored)
     /// read-back) — the `Restored` state with the restored generation as its
-    /// observation. A slot whose adapter restoration is NOT verified is
+    /// observation. The [`RestorationProof`] is the compensation's EVIDENCE
+    /// of the generation restoration (the restored generation, or `None`
+    /// for a first-deploy removal of `current`); the observation is DERIVED
+    /// from it. A slot whose adapter restoration is NOT verified is
     /// `FailedAfterAdvance`, never `Restored` (the review's P1 fix).
     fn restored(
-        expected_gen: Option<&GenerationId>,
+        restoration: crate::remote::helper::RestorationProof,
         adapter_restored: VerifiedAdapterRestoration,
     ) -> Self {
         ServerProc {
             state: SlotExecution::Restored {
-                observation: match expected_gen {
+                observation: match restoration.restored_generation() {
                     Some(g) => Observation::Known(ObservedGeneration {
                         generation: g.clone(),
                     }),
@@ -154,9 +160,10 @@ impl ServerProc {
         let comp = compensate_server_locked(held, request);
         let _ = held.transaction_record(&request.op_id, "compensated");
         match comp {
-            Ok(CompensationOutcome::Restored { adapter_restored }) => {
-                ServerProc::restored(request.prior_gen.as_ref(), adapter_restored)
-            }
+            Ok(CompensationOutcome::Restored {
+                adapter_restored,
+                restoration,
+            }) => ServerProc::restored(restoration, adapter_restored),
             _ => ServerProc::failed_after_advance(new_gen, error),
         }
     }
@@ -199,9 +206,10 @@ impl ServerProc {
         let comp = compensate_server_locked(held, request);
         let _ = held.transaction_record(&request.op_id, "compensated");
         match comp {
-            Ok(CompensationOutcome::Restored { .. }) => {
-                ServerProc::restored(request.prior_gen.as_ref(), proof)
-            }
+            Ok(CompensationOutcome::Restored {
+                adapter_restored: _,
+                restoration,
+            }) => ServerProc::restored(restoration, proof),
             _ => ServerProc::failed_after_advance(new_gen, error),
         }
     }
@@ -316,65 +324,98 @@ pub(crate) fn process_server(
         )));
     }
 
-    // 4. Publish the release as ONE aggregate bundle (idempotent) and create
-    //    the generation. The bundle is complete by construction (built in
-    //    preflight from the semantically validated release), so the publish
-    //    never receives a release.json that disagrees with the behavior.json
-    //    (or with the release identity).
-    if let Some(bundle) = REMOTE_RELEASE_JSON.with(|c| c.borrow().get(&artifact.release).cloned())
-        && let Err(e) = held.publish_release(&bundle)
-    {
+    // 4. THE ONE PROOF-BEARING SLOT MUTATION (the structural verdict's
+    //    point 4): build the [`PreparedSlotMutation`] — derived from the
+    //    validated release bundle, the verified tree, the verified current
+    //    state, and the persisted intent — and commit it through the ONE
+    //    mutation entry point ([`commit`]): publish the release bundle,
+    //    install the generation, record the transaction, and swap `current`,
+    //    returning the sealed [`SlotCommitProof`]. No loose generation IDs,
+    //    strings, targets, timestamps, or behavior digests cross the
+    //    mutation boundary: the mutation carries the typed [`BehaviorDigest`]
+    //    and [`Timestamp`].
+    let bundle = REMOTE_RELEASE_JSON.with(|c| c.borrow().get(&artifact.release).cloned());
+    let Some(bundle) = bundle else {
         return Ok(ServerProc::failed_before(format!(
-            "publish release failed: {e}"
+            "release bundle for {} unavailable",
+            artifact.release
         )));
-    }
-    // The generation SPEC carries the non-owner fields; the OWNER MARKER
-    // (application + slot) is bound by the guard itself — an assignment can
-    // never name a different slot than the guard authorizes.
-    let spec = crate::remote::helper::GenerationSpec {
-        deployment_id: deployment_id.clone(),
-        generation_id: new_gen.clone(),
-        artifact: artifact.clone(),
-        behavior_sha256: behavior_sha256.to_string(),
-        prior_generation: expected_gen.cloned(),
-        created_at: crate::remote::helper::now_rfc3339(),
-        target: Some(TargetName::parse(target_name).expect("target name is a safe segment")),
     };
-    if let Err(e) = held.create_generation(&spec) {
-        return Ok(ServerProc::failed_before(format!(
-            "create generation failed: {e}"
-        )));
-    }
-    if let Err(e) = held.transaction_record(op_id, "prepared") {
-        return Ok(ServerProc::failed_before(format!(
-            "transaction record failed: {e}"
-        )));
-    }
-
-    // Atomically move `current` (the per-slot commit point).
-    let swap = held.swap_current(
-        &match expected_gen {
+    let behavior_digest = match BehaviorDigest::parse(behavior_sha256) {
+        Ok(d) => d,
+        Err(e) => {
+            return Ok(ServerProc::failed_before(format!(
+                "behavior digest invalid: {e}"
+            )));
+        }
+    };
+    let mutation = match PreparedSlotMutation::new(
+        op_id.clone(),
+        deployment_id.clone(),
+        new_gen.clone(),
+        artifact.clone(),
+        behavior_digest,
+        expected_gen.cloned(),
+        crate::remote::helper::now_rfc3339_ts(),
+        TargetName::parse(target_name).expect("target name is a safe segment"),
+        match expected_gen {
             Some(g) => crate::remote::helper::ExpectedCurrent::Generation(g.clone()),
             None => crate::remote::helper::ExpectedCurrent::Absent,
         },
-        new_gen,
-        op_id.as_str(),
-    );
-    if let Err(e) = swap {
-        // A TRANSPORT/IO failure mid-swap is INDETERMINATE — the swap may or
-        // may not have moved `current`, so the outcome is unknown (never
-        // classified as a deterministic no-advance). A CAS-refusal or
-        // validation error is a DETERMINISTIC no-advance (the swap provably
-        // did not happen) — `FailedBeforeAdvance`.
-        if matches!(e, crate::error::Error::Transport(_)) {
-            return Ok(ServerProc::indeterminate(format!("swap failed: {e}")));
+        bundle,
+        artifact.tree.clone(),
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            return Ok(ServerProc::failed_before(format!(
+                "prepared mutation refused: {e}"
+            )));
         }
-        return Ok(ServerProc::failed_before(format!("swap failed: {e}")));
+    };
+    let proof = match commit(&held, mutation.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            // A TRANSPORT/IO failure is INDETERMINATE only if the swap (the
+            // commit point) may have moved `current`; otherwise the slot
+            // provably did not advance — `FailedBeforeAdvance`. The swap is
+            // the LAST step of the commit, so a transport failure before it
+            // (publish/install/transaction) is a deterministic no-advance;
+            // a transport failure at the swap itself is resolved by reading
+            // the actual `current` state.
+            if matches!(e, crate::error::Error::Transport(_)) {
+                match held.helper().resolve_current() {
+                    Ok(crate::remote::helper::CurrentState::Generation(g))
+                        if &g == mutation.generation_id() =>
+                    {
+                        return Ok(ServerProc::indeterminate(format!(
+                            "commit failed: {e}"
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+            return Ok(ServerProc::failed_before(format!("commit failed: {e}")));
+        }
+    };
+    // THE COMMIT PROOF IS THE EVIDENCE the slot was durably committed: the
+    // sealed witness carries the release, generation, and `current` evidence
+    // of the durable effects. The proof's generation must be the mutation's
+    // generation (the sealed evidence cannot disagree with the intent).
+    if proof.generation().generation_id() != mutation.generation_id()
+        || proof.current().generation_id() != mutation.generation_id()
+        || proof.release().release_id() != &mutation.artifact().release
+    {
+        return Ok(ServerProc::failed_before(
+            "commit proof generation disagrees with the mutation".to_string(),
+        ));
     }
     // The generation's tree content root: `generations/<gen>/root` is a
     // symlink to `objects/sha256/<tree>/root`, the same directory `current`
     // points at (it is the tree content root, not a nested `root/root`).
-    let generation_root = remote.root().join(layout::generation(new_gen)).join("root");
+    let generation_root = remote
+        .root()
+        .join(layout::generation(mutation.generation_id()))
+        .join("root");
 
     // 5. ACTIVATION via the ADAPTER TRANSACTION PROTOCOL (the review's P1
     //    fix: adapter side effects are inside the transaction): the mutating
@@ -402,15 +443,15 @@ pub(crate) fn process_server(
                 let request = CompensationRequest {
                     op_id: op_id.clone(),
                     deployment_id: deployment_id.clone(),
-                    prior_gen: expected_gen.cloned(),
-                    advanced_gen: new_gen.clone(),
+                    prior_gen: mutation.prior_generation().cloned(),
+                    advanced_gen: mutation.generation_id().clone(),
                     template_vars: template_vars.clone(),
                     owner: owner.clone(),
                 };
                 return Ok(ServerProc::compensate_after_activation_failure(
                     &held,
                     &request,
-                    new_gen,
+                    mutation.generation_id(),
                     format!("activation prepare failed: {e}"),
                 ));
             }
@@ -426,8 +467,8 @@ pub(crate) fn process_server(
                 let request = CompensationRequest {
                     op_id: op_id.clone(),
                     deployment_id: deployment_id.clone(),
-                    prior_gen: expected_gen.cloned(),
-                    advanced_gen: new_gen.clone(),
+                    prior_gen: mutation.prior_generation().cloned(),
+                    advanced_gen: mutation.generation_id().clone(),
                     template_vars: template_vars.clone(),
                     owner: owner.clone(),
                 };
@@ -436,7 +477,7 @@ pub(crate) fn process_server(
                     txn,
                     &SystemdApplied::from_prepared(&prepared),
                     &request,
-                    new_gen,
+                    mutation.generation_id(),
                     format!("activation failed: {e}"),
                 ));
             }
@@ -455,18 +496,18 @@ pub(crate) fn process_server(
         let request = CompensationRequest {
             op_id: op_id.clone(),
             deployment_id: deployment_id.clone(),
-            prior_gen: expected_gen.cloned(),
-            advanced_gen: new_gen.clone(),
+            prior_gen: mutation.prior_generation().cloned(),
+            advanced_gen: mutation.generation_id().clone(),
             template_vars: template_vars.clone(),
             owner: owner.clone(),
         };
         if let (Some(txn), Some(applied)) = (&mut activation_txn, &applied) {
             return Ok(ServerProc::restore_after_activation_failure(
-                &held, txn, applied, &request, new_gen, failure,
+                &held, txn, applied, &request, mutation.generation_id(), failure,
             ));
         }
         return Ok(ServerProc::compensate_after_activation_failure(
-            &held, &request, new_gen, failure,
+            &held, &request, mutation.generation_id(), failure,
         ));
     }
 
@@ -867,6 +908,26 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             let behavior = self.behave();
             let sha = crate::verify::release::behavior_contract_digest(&behavior);
             let helper = self.helper();
+            // Populate the per-process release-bundle cache the way preflight
+            // does, so the ONE mutation entry point ([`commit`]) can publish
+            // the validated release bundle (the harness drives `process_server`
+            // directly, bypassing preflight).
+            let servers: std::collections::BTreeSet<String> = self
+                .config
+                .servers()
+                .map(|s| s.id.as_str().to_string())
+                .collect();
+            let vr = crate::verify::release::ValidatedRelease::try_new(
+                self.harness_release(),
+                std::collections::BTreeMap::from([("standard".to_string(), self.behave())]),
+                &servers,
+            )
+            .expect("the harness release graph validates");
+            let bundle = crate::verify::release::ValidatedReleaseBundle::from_validated(vr)
+                .expect("the harness bundle builds");
+            REMOTE_RELEASE_JSON.with(|c| {
+                c.borrow_mut().insert(self.harness_release_id(), bundle);
+            });
             // Slot context from the harness config (one slot p1 on server s1,
             // target t1, deploy_dir /srv/eng), built from the artifact being
             // processed like the engine's `slot_vars`: release/variant/tree

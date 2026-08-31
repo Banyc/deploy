@@ -136,11 +136,15 @@
 
 #[cfg(test)]
 mod durable;
+mod evidence;
 mod mutation;
 mod observed;
 mod protocol;
 mod state;
 
+pub use evidence::{
+    DurableCurrent, DurableGeneration, DurableObject, DurableRelease, RestorationProof,
+};
 pub use mutation::copy_host_tree_to_remote;
 pub use observed::{
     Observation, ObservationError, ObservedAssignment, ObservedGeneration, ObservedSlot,
@@ -1990,22 +1994,28 @@ mod cross_remote_guard_mutation {
                     expected,
                     gen_id,
                     op_id,
-                } => guard_a.swap_current(
-                    expected,
-                    &crate::identity::GenerationId::parse(gen_id).expect("fixture generation id"),
-                    op_id,
-                ),
+                } => guard_a
+                    .swap_current(
+                        expected,
+                        &crate::identity::GenerationId::parse(gen_id)
+                            .expect("fixture generation id"),
+                        op_id,
+                    )
+                    .map(|_| ()),
                 GuardOp::RemoveCurrentIf { expected } => {
                     guard_a.remove_current_if(expected).map(|_| ())
                 }
                 GuardOp::PublishFromIncoming {
                     deployment_id,
                     digest,
-                } => guard_a.publish_from_incoming(
-                    &crate::identity::DeploymentId::parse(deployment_id)
-                        .expect("fixture deployment id"),
-                    &crate::identity::TreeDigest::parse(digest).expect("fixture tree digest"),
-                ),
+                } => guard_a
+                    .publish_from_incoming(
+                        &crate::identity::DeploymentId::parse(deployment_id)
+                            .expect("fixture deployment id"),
+                        &crate::identity::TreeDigest::parse(digest)
+                            .expect("fixture tree digest"),
+                    )
+                    .map(|_| ()),
                 GuardOp::TransactionRecord { op_id, state } => guard_a.transaction_record(
                     &crate::identity::OperationId::parse(op_id).expect("fixture operation id"),
                     state,
@@ -2040,7 +2050,7 @@ mod cross_remote_guard_mutation {
                         created_at: "2020-01-01T00:00:00Z".to_string(),
                         target: Some(TargetName::new("t1")),
                     };
-                    guard_a.create_generation(&spec)
+                    guard_a.create_generation(&spec).map(|_| ())
                 }
             };
         }
@@ -2070,22 +2080,28 @@ mod cross_remote_guard_mutation {
                     expected,
                     gen_id,
                     op_id,
-                } => guard_b.swap_current(
-                    expected,
-                    &crate::identity::GenerationId::parse(gen_id).expect("fixture generation id"),
-                    op_id,
-                ),
+                } => guard_b
+                    .swap_current(
+                        expected,
+                        &crate::identity::GenerationId::parse(gen_id)
+                            .expect("fixture generation id"),
+                        op_id,
+                    )
+                    .map(|_| ()),
                 GuardOp::RemoveCurrentIf { expected } => {
                     guard_b.remove_current_if(expected).map(|_| ())
                 }
                 GuardOp::PublishFromIncoming {
                     deployment_id,
                     digest,
-                } => guard_b.publish_from_incoming(
-                    &crate::identity::DeploymentId::parse(deployment_id)
-                        .expect("fixture deployment id"),
-                    &crate::identity::TreeDigest::parse(digest).expect("fixture tree digest"),
-                ),
+                } => guard_b
+                    .publish_from_incoming(
+                        &crate::identity::DeploymentId::parse(deployment_id)
+                            .expect("fixture deployment id"),
+                        &crate::identity::TreeDigest::parse(digest)
+                            .expect("fixture tree digest"),
+                    )
+                    .map(|_| ()),
                 GuardOp::TransactionRecord { op_id, state } => guard_b.transaction_record(
                     &crate::identity::OperationId::parse(op_id).expect("fixture operation id"),
                     state,
@@ -2116,7 +2132,7 @@ mod cross_remote_guard_mutation {
                         created_at: "2020-01-01T00:00:00Z".to_string(),
                         target: Some(TargetName::new("t1")),
                     };
-                    guard_b.create_generation(&spec)
+                    guard_b.create_generation(&spec).map(|_| ())
                 }
             };
         }
@@ -2343,11 +2359,14 @@ mod owner_mismatch_proptest {
                     expected,
                     gen_id,
                     op_id,
-                } => guard.swap_current(
-                    expected,
-                    &crate::identity::GenerationId::parse(gen_id).expect("fixture generation id"),
-                    op_id,
-                ),
+                } => guard
+                    .swap_current(
+                        expected,
+                        &crate::identity::GenerationId::parse(gen_id)
+                            .expect("fixture generation id"),
+                        op_id,
+                    )
+                    .map(|_| ()),
                 OwnerMismatchOp::RemoveCurrentIf { expected } => {
                     guard.remove_current_if(expected).map(|_| ())
                 }

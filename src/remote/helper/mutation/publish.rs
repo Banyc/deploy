@@ -178,7 +178,13 @@ impl<'a> crate::remote::helper::HeldSlotLock<'a> {
     ///    directory entry survives power loss — the durability commit point.
     ///    FAIL-CLOSED: a failed parent fsync is a propagated `Err`, never a
     ///    reported success.
-    pub fn durable_publish_release(&self, bundle: &ValidatedReleaseBundle) -> Result<()> {
+    ///
+    /// Returns the [`DurableRelease`] EVIDENCE of the durably published
+    /// release (the sealed witness — never a bare `()`).
+    pub fn durable_publish_release(
+        &self,
+        bundle: &ValidatedReleaseBundle,
+    ) -> Result<crate::remote::helper::DurableRelease> {
         let release_id = bundle.release_id();
         let dir = layout::remote_release(release_id);
         // Reuse: an existing release directory is verified as the WHOLE
@@ -186,7 +192,8 @@ impl<'a> crate::remote::helper::HeldSlotLock<'a> {
         // corrupted or partial existing directory fails closed — never
         // silently replaced.
         if self.helper.remote.metadata_opt(&dir)?.is_some() {
-            return self.verify_installed_bundle(bundle, &dir);
+            self.verify_installed_bundle(bundle, &dir)?;
+            return Ok(crate::remote::helper::DurableRelease::published(release_id.clone()));
         }
         // Stage: write ALL members into a unique sibling directory.
         let nonce = uuid::Uuid::now_v7().to_string();
@@ -221,15 +228,19 @@ impl<'a> crate::remote::helper::HeldSlotLock<'a> {
         // directory entry survives power loss. FAIL-CLOSED: a failed parent
         // fsync is a propagated error, never a reported success.
         self.helper.remote.fsync_parent(&dir)?;
-        Ok(())
+        Ok(crate::remote::helper::DurableRelease::published(release_id.clone()))
     }
 
     /// Publish a release as ONE AGGREGATE BUNDLE
     /// ([`crate::verify::release::ValidatedReleaseBundle`]) — the durable
     /// publication protocol ([`Self::durable_publish_release`]). Requires
     /// the slot-mutation capability — the receiver is the guard; the helper
-    /// is the guard's own.
-    pub fn publish_release(&self, bundle: &ValidatedReleaseBundle) -> Result<()> {
+    /// is the guard's own. Returns the [`DurableRelease`] EVIDENCE of the
+    /// durably published release.
+    pub fn publish_release(
+        &self,
+        bundle: &ValidatedReleaseBundle,
+    ) -> Result<crate::remote::helper::DurableRelease> {
         self.durable_publish_release(bundle)
     }
 
@@ -386,18 +397,21 @@ impl<'a> crate::remote::helper::HeldSlotLock<'a> {
     /// 3. **Atomic publish**: the verified staging directory is renamed into
     ///    the final digest path — the digest path is either absent or contains
     ///    exactly the verified canonical tree, never a partial/corrupt object.
+    ///
+    /// Returns the [`DurableObject`] EVIDENCE of the durably published
+    /// object (the sealed witness — never a bare `()`).
     pub fn publish_from_incoming(
         &self,
         deployment_id: &DeploymentId,
         digest: &TreeDigest,
-    ) -> Result<()> {
+    ) -> Result<crate::remote::helper::DurableObject> {
         let from = layout::staged_tree(deployment_id, digest);
         let to = layout::tree_root(digest);
         // Reuse: verify the existing object; quarantine + repair invalid
         // content (under the slot lock).
         if self.helper.tree_exists(digest)? {
             if self.helper.verify_remote_tree(&to, digest)? {
-                return Ok(());
+                return Ok(crate::remote::helper::DurableObject::published(digest.clone()));
             }
             self.quarantine_object(digest)?;
         }
@@ -420,14 +434,19 @@ impl<'a> crate::remote::helper::HeldSlotLock<'a> {
     /// an existing object is verified before reuse and invalid content is
     /// quarantined and repaired (under the slot lock). Success is reported
     /// only after the parent-directory fsync succeeds (fail closed: a failed
-    /// parent fsync is an `Err`, never a reported success).
-    pub fn durable_publish_tree(&self, digest: &TreeDigest, host_src: &Path) -> Result<()> {
+    /// parent fsync is an `Err`, never a reported success). Returns the
+    /// [`DurableObject`] EVIDENCE of the durably published object.
+    pub fn durable_publish_tree(
+        &self,
+        digest: &TreeDigest,
+        host_src: &Path,
+    ) -> Result<crate::remote::helper::DurableObject> {
         let to = layout::tree_root(digest);
         // Reuse: verify the existing object; quarantine + repair invalid
         // content (under the slot lock).
         if self.helper.tree_exists(digest)? {
             if self.helper.verify_remote_tree(&to, digest)? {
-                return Ok(());
+                return Ok(crate::remote::helper::DurableObject::published(digest.clone()));
             }
             self.quarantine_object(digest)?;
         }
@@ -449,14 +468,25 @@ impl<'a> crate::remote::helper::HeldSlotLock<'a> {
 
     /// Publish a host-local tree into the object store — the durable
     /// publication protocol ([`Self::durable_publish_tree`]). Requires the
-    /// slot-mutation capability.
-    pub fn publish_tree(&self, digest: &TreeDigest, host_src: &Path) -> Result<()> {
+    /// slot-mutation capability. Returns the [`DurableObject`] EVIDENCE of
+    /// the durably published object.
+    pub fn publish_tree(
+        &self,
+        digest: &TreeDigest,
+        host_src: &Path,
+    ) -> Result<crate::remote::helper::DurableObject> {
         self.durable_publish_tree(digest, host_src)
     }
 
     /// Publish a tree object from a host-local path (used when no prior
     /// incoming staging occurred). Requires the slot-mutation capability.
-    pub fn publish_tree_from_host(&self, digest: &TreeDigest, host_src: &Path) -> Result<()> {
+    /// Returns the [`DurableObject`] EVIDENCE of the durably published
+    /// object.
+    pub fn publish_tree_from_host(
+        &self,
+        digest: &TreeDigest,
+        host_src: &Path,
+    ) -> Result<crate::remote::helper::DurableObject> {
         self.publish_tree(digest, host_src)
     }
 
@@ -487,7 +517,11 @@ impl<'a> crate::remote::helper::HeldSlotLock<'a> {
     /// `create_dir_all` above may have just created), so the published
     /// directory entry survives power loss. FAIL-CLOSED: a failed parent
     /// fsync is a propagated `Err`, never a reported success.
-    fn publish_staged_tree(&self, digest: &TreeDigest, staging: &RootedRelativePath) -> Result<()> {
+    fn publish_staged_tree(
+        &self,
+        digest: &TreeDigest,
+        staging: &RootedRelativePath,
+    ) -> Result<crate::remote::helper::DurableObject> {
         let to = layout::tree_root(digest);
         if !self.helper.verify_remote_tree(staging, digest)? {
             return Err(Error::integrity(format!(
@@ -505,7 +539,7 @@ impl<'a> crate::remote::helper::HeldSlotLock<'a> {
         // may have been created by the `create_dir_all` above).
         self.helper.remote.fsync_parent(&to)?;
         self.helper.remote.fsync_parent(&to.parent().unwrap())?;
-        Ok(())
+        Ok(crate::remote::helper::DurableObject::published(digest.clone()))
     }
 }
 
@@ -688,7 +722,7 @@ pub(crate) mod tests_publish {
         )
         .acquire_lock_guard(&crate::identity::test_operation_id("op-1"))
         .expect("lock acquired");
-        let res = held.publish_release(bundle);
+        let res = held.publish_release(bundle).map(|_| ());
         drop(held);
         res
     }

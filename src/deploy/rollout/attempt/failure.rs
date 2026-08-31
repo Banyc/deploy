@@ -108,7 +108,11 @@ pub(crate) fn apply_failure_policy(
                     };
                     let comp = compensate_server(&helpers[sid], &request)
                         .unwrap_or(CompensationOutcome::Refused);
-                    if let CompensationOutcome::Restored { adapter_restored } = comp {
+                    if let CompensationOutcome::Restored {
+                        adapter_restored,
+                        restoration: _,
+                    } = comp
+                {
                         // Compensation is a TRANSITION between states: the
                         // compensated slot becomes `Restored` with the
                         // restored generation's observation (the observed

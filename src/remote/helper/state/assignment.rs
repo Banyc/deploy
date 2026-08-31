@@ -209,7 +209,14 @@ impl<'a> HeldSlotLock<'a> {
     ///    directory entry survives power loss — the durability commit point.
     ///    FAIL-CLOSED: a failed parent fsync is a propagated `Err`, never a
     ///    reported success.
-    pub fn durable_generation_install(&self, spec: &GenerationSpec) -> Result<()> {
+    ///
+    /// Returns the [`DurableGeneration`] EVIDENCE of the durably installed
+    /// generation (the sealed witness — the only way a caller can learn the
+    /// install succeeded; never a bare `()`).
+    pub fn durable_generation_install(
+        &self,
+        spec: &GenerationSpec,
+    ) -> Result<crate::remote::helper::DurableGeneration> {
         let assignment = spec.clone().into_assignment(&self.owner);
         let gen_dir = layout::generation(&assignment.generation_id);
         let json = serde_json::to_vec_pretty(&assignment)
@@ -244,7 +251,9 @@ impl<'a> HeldSlotLock<'a> {
                 // if it was just recreated).
                 self.helper.remote.fsync_parent(&gen_dir)?;
                 self.helper.remote.fsync_parent(&root_link_path)?;
-                return Ok(());
+                return Ok(crate::remote::helper::DurableGeneration::installed(
+                    assignment.generation_id,
+                ));
             }
             // The generation directory exists but the assignment is missing:
             // a stale empty dir from a crashed earlier attempt. Remove it
@@ -265,7 +274,7 @@ impl<'a> HeldSlotLock<'a> {
         if self.helper.remote.metadata_opt(&staging)?.is_some() {
             self.helper.remove_remote_tree_restoring_write(&staging)?;
         }
-        let res = (|| -> Result<()> {
+        let res = (|| -> Result<crate::remote::helper::DurableGeneration> {
             self.helper.remote.create_dir_all(&staging)?;
             match self
                 .helper
@@ -304,7 +313,7 @@ impl<'a> HeldSlotLock<'a> {
             //    failed parent fsync is a propagated error, never a reported
             //    success.
             self.helper.remote.fsync_parent(&gen_dir)?;
-            Ok(())
+            Ok(crate::remote::helper::DurableGeneration::installed(assignment.generation_id))
         })();
         if res.is_err() {
             // Best-effort cleanup of the disposable staging dir (a failed
@@ -317,8 +326,12 @@ impl<'a> HeldSlotLock<'a> {
     /// Create a generation record and its `root` symlink — the durable
     /// generation-install protocol ([`Self::durable_generation_install`]).
     /// Does not move `current`. Requires the slot-mutation capability — the
-    /// receiver is the guard; the helper is the guard's own.
-    pub fn create_generation(&self, spec: &GenerationSpec) -> Result<()> {
+    /// receiver is the guard; the helper is the guard's own. Returns the
+    /// [`DurableGeneration`] EVIDENCE of the durably installed generation.
+    pub fn create_generation(
+        &self,
+        spec: &GenerationSpec,
+    ) -> Result<crate::remote::helper::DurableGeneration> {
         self.durable_generation_install(spec)
     }
 }

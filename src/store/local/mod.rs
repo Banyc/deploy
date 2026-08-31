@@ -294,6 +294,28 @@ impl LocalStore {
         })
     }
 
+    /// The SEALED filesystem-ownership root this store owns — the canonical
+    /// root the store's mutations are confined to. `None` for test-only
+    /// [`LocalStore::with_base`] stores (which bypass ownership
+    /// registration). The validated project's provisioned topology binds
+    /// every slot to this root.
+    pub(crate) fn owned_root(&self) -> Option<&OwnedRoot> {
+        self.root.as_ref()
+    }
+
+    /// The SEALED filesystem-ownership root for the validated project's
+    /// provisioned topology: the store's OWNED root when this is a
+    /// production store, or a freshly-parsed root on the store's base for
+    /// test-only [`LocalStore::with_base`] stores (which bypass ownership
+    /// registration — the parsed root registers for the project's
+    /// lifetime and is released when the project drops).
+    pub(crate) fn owned_root_for_project(&self) -> Result<OwnedRoot> {
+        match self.owned_root() {
+            Some(root) => Ok(root.clone()),
+            None => OwnedRoot::parse(&OwnedRoot::local_endpoint()?, &self.base),
+        }
+    }
+
     /// TEST-ONLY: create a store rooted at an explicit base (used in
     /// tests). Bypasses the ownership registry (a test may create and
     /// reopen stores over the same base freely); the store still opens a

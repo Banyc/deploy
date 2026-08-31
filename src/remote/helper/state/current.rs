@@ -317,12 +317,16 @@ impl<'a> crate::remote::helper::HeldSlotLock<'a> {
     /// deploy_dir root (the parent of `current`) so the renamed directory
     /// entry survives power loss. FAIL-CLOSED: a failed parent fsync is a
     /// propagated `Err`, never a reported success.
+    ///
+    /// Returns the [`DurableCurrent`] EVIDENCE of the durably swapped
+    /// `current` (the sealed witness naming the generation `current` now
+    /// points at — never a bare `()`).
     pub fn durable_symlink_swap(
         &self,
         expected: &ExpectedCurrent,
         gen_id: &GenerationId,
         op_id: &str,
-    ) -> Result<()> {
+    ) -> Result<crate::remote::helper::DurableCurrent> {
         // Resolve the actual state ONCE (fallible: a malformed present link
         // or a transport error propagates and the link is never touched).
         // Then require EXACT equality with the typed expectation — there is
@@ -370,19 +374,20 @@ impl<'a> crate::remote::helper::HeldSlotLock<'a> {
         // never a reported success — `current` reports success only after
         // its parent fsync succeeds.
         self.helper.remote.fsync_parent(layout::current())?;
-        Ok(())
+        Ok(crate::remote::helper::DurableCurrent::swapped(gen_id.clone()))
     }
 
     /// Atomically move `current` to the given generation — the durable
     /// symlink-swap protocol ([`Self::durable_symlink_swap`]). Requires the
     /// slot-mutation capability — the receiver is the guard; the helper is
-    /// the guard's own.
+    /// the guard's own. Returns the [`DurableCurrent`] EVIDENCE of the
+    /// durably swapped `current`.
     pub fn swap_current(
         &self,
         expected: &ExpectedCurrent,
         gen_id: &GenerationId,
         op_id: &str,
-    ) -> Result<()> {
+    ) -> Result<crate::remote::helper::DurableCurrent> {
         self.durable_symlink_swap(expected, gen_id, op_id)
     }
 
@@ -1513,7 +1518,7 @@ mod tests_current {
             }))
             .expect("swap must never panic on arbitrary symlink layouts");
             match swap {
-                Ok(()) => {
+                Ok(_) => {
                     assert!(
                         layout.current.is_none(),
                         "swap must not succeed over a present current: a first deployment can never overwrite a concurrent link"
