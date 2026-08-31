@@ -40,7 +40,7 @@ use crate::config::activation::validate_unit_name;
 use crate::config::{Activation, ActivationScope, ValidatedSystemd, validate_relative_path};
 use crate::error::{Error, Result};
 use crate::remote::canonical::TemplateVars;
-use crate::remote::transport::Remote;
+use crate::remote::transport::{Remote, RootedRelativePath};
 use crate::verify::adapters::transaction::{ActivationTransaction, VerifiedAdapterRestoration};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -238,17 +238,20 @@ pub(crate) fn render_units(
 ) -> Result<Vec<RenderedUnit>> {
     // `generation_root` is an absolute host path (`remote.root()` joined with
     // the generation layout); the transport's read/write surface is anchored
-    // at the remote root, so strip the root prefix back off.
-    let gen_rel = generation_root.strip_prefix(remote.root()).map_err(|_| {
-        Error::remote(format!(
-            "generation root '{}' is not under remote root '{}'",
-            generation_root.display(),
-            remote.root().display()
-        ))
-    })?;
+    // at the remote root, so strip the root prefix back off and validate the
+    // result at the boundary (a generation root outside the remote root is
+    // refused).
+    let gen_rel =
+        RootedRelativePath::parse(generation_root.strip_prefix(remote.root()).map_err(|_| {
+            Error::remote(format!(
+                "generation root '{}' is not under remote root '{}'",
+                generation_root.display(),
+                remote.root().display()
+            ))
+        })?)?;
     let mut out = Vec::new();
     for u in sa.units() {
-        let src = gen_rel.join(u.artifact_path());
+        let src = gen_rel.join(u.artifact_path())?;
         let raw = remote.read(&src).map_err(|e| {
             Error::remote(format!(
                 "read unit artifact '{}' from generation tree: {e}",
@@ -285,7 +288,7 @@ pub fn stage_rendered_units(
     vars: &TemplateVars,
 ) -> Result<()> {
     for u in render_units(remote, generation_root, sa, vars)? {
-        let dest = Path::new(RENDERED_UNITS_DIR).join(&u.name);
+        let dest = RootedRelativePath::parse(&Path::new(RENDERED_UNITS_DIR).join(&u.name))?;
         remote
             .write(&dest, &u.content, 0o644)
             .map_err(|e| Error::remote(format!("stage rendered unit '{}': {e}", u.name)))?;
@@ -297,11 +300,11 @@ pub fn stage_rendered_units(
 /// tree with the correct type before changing `current`.
 pub fn validate_artifact_paths(
     remote: &dyn Remote,
-    generation_root_rel: &Path,
+    generation_root_rel: &RootedRelativePath,
     sa: &ValidatedSystemd,
 ) -> Result<()> {
     for u in sa.units() {
-        let p = generation_root_rel.join(u.artifact_path());
+        let p = generation_root_rel.join(u.artifact_path())?;
         if remote.metadata_opt(&p)?.is_none() {
             return Err(Error::remote(format!(
                 "declared artifact path '{}' missing in desired tree",
@@ -552,8 +555,12 @@ impl ActivationTransaction for SystemdActivation<'_> {
         let payload = serde_json::json!({ "managed_units": managed });
         let bytes = serde_json::to_vec_pretty(&payload)
             .map_err(|e| Error::remote(format!("serialize systemd state: {e}")))?;
-        self.remote
-            .write(Path::new("adapters/systemd.json"), &bytes, 0o644)?;
+        self.remote.write(
+            &RootedRelativePath::parse(Path::new("adapters/systemd.json"))
+                .expect("the adapters/systemd.json layout path is a safe relative path"),
+            &bytes,
+            0o644,
+        )?;
         Ok(SystemdApplied {
             prepared: prepared.clone(),
         })
@@ -576,7 +583,11 @@ impl ActivationTransaction for SystemdActivation<'_> {
                         // root and install it back over the unit link (the
                         // link lies outside the remote root, so the install
                         // goes through exec).
-                        let staged = Path::new(RESTORE_UNITS_DIR).join(&p.name);
+                        let staged =
+                            RootedRelativePath::parse(&Path::new(RESTORE_UNITS_DIR).join(&p.name))
+                                .expect(
+                                    "a restore-unit path built from a validated unit name is safe",
+                                );
                         self.remote.write(&staged, bytes, 0o644).map_err(|e| {
                             Error::remote(format!("stage prior unit '{}': {e}", p.name))
                         })?;
@@ -674,8 +685,12 @@ impl ActivationTransaction for SystemdActivation<'_> {
             let payload = serde_json::json!({ "managed_units": managed });
             let bytes = serde_json::to_vec_pretty(&payload)
                 .map_err(|e| Error::remote(format!("serialize systemd state: {e}")))?;
-            self.remote
-                .write(Path::new("adapters/systemd.json"), &bytes, 0o644)?;
+            self.remote.write(
+                &RootedRelativePath::parse(Path::new("adapters/systemd.json"))
+                    .expect("the adapters/systemd.json layout path is a safe relative path"),
+                &bytes,
+                0o644,
+            )?;
         } else {
             // System scope: no persistent state — reversing the restart is
             // re-applying it.
@@ -950,7 +965,7 @@ pub(crate) fn verify_adapter_restored(
 pub(crate) mod tests {
     use super::*;
     use crate::config::{ActivationScope, UnitDef, ValidatedSystemd};
-    use crate::identity::{TreeDigest, test_deployment_id, test_generation_id};
+    use crate::identity::{TreeDigest, test_deployment_id, test_generation_id, test_tree_digest};
     use crate::remote::transport::LocalTransport;
     use std::os::unix::fs::PermissionsExt;
 
@@ -1115,8 +1130,10 @@ pub(crate) mod tests {
         let env = crate::env::SysEnv::from_map(vars);
         let remote = LocalTransport::new(&env, base.clone()).unwrap();
         // Tree content under the object store, like `tree::canonicalize_tree`.
-        let tree_rel = crate::remote::layout::tree_root("abc123");
-        let unit_rel = tree_rel.join("integration/systemd/example.service");
+        let tree_rel = crate::remote::layout::tree_root(&test_tree_digest("abc123"));
+        let unit_rel = tree_rel
+            .join("integration/systemd/example.service")
+            .unwrap();
         std::fs::create_dir_all(base.join(unit_rel.parent().unwrap())).unwrap();
         std::fs::write(
             base.join(&unit_rel),
@@ -1125,11 +1142,11 @@ pub(crate) mod tests {
         .unwrap();
         // `generations/<gid>/root` -> the tree content root (symlink), as the
         // helper creates it.
-        let gen_rel = crate::remote::layout::generation("g1");
+        let gen_rel = crate::remote::layout::generation(&test_generation_id("g1"));
         let gen_dir = base.join(&gen_rel);
         std::fs::create_dir_all(&gen_dir).unwrap();
         std::os::unix::fs::symlink(
-            crate::remote::layout::generation_root_link("abc123"),
+            crate::remote::layout::generation_root_link(&test_tree_digest("abc123")),
             gen_dir.join("root"),
         )
         .unwrap();
@@ -1140,7 +1157,9 @@ pub(crate) mod tests {
 
         // The staged copy is a regular file with the rendered content.
         let staged = remote
-            .read(Path::new("adapters/systemd/example.service"))
+            .read(
+                &RootedRelativePath::parse(Path::new("adapters/systemd/example.service")).unwrap(),
+            )
             .unwrap();
         assert_eq!(
             String::from_utf8(staged).unwrap(),
@@ -1197,8 +1216,10 @@ pub(crate) mod tests {
         let env = crate::env::SysEnv::from_map(vars);
         let remote = LocalTransport::new(&env, base.clone()).unwrap();
         // Unit artifact under the tree content root.
-        let tree_rel = crate::remote::layout::tree_root("abc123");
-        let unit_rel = tree_rel.join("integration/systemd/example.service");
+        let tree_rel = crate::remote::layout::tree_root(&test_tree_digest("abc123"));
+        let unit_rel = tree_rel
+            .join("integration/systemd/example.service")
+            .unwrap();
         std::fs::create_dir_all(base.join(unit_rel.parent().unwrap())).unwrap();
         std::fs::write(
             base.join(&unit_rel),
@@ -1207,22 +1228,23 @@ pub(crate) mod tests {
         .unwrap();
         // `generations/<gid>/root` -> the tree content root (symlink), exactly
         // as `RemoteHelper::create_generation` installs it.
-        let gen_dir = base.join(crate::remote::layout::generation("g1"));
+        let gen_dir = base.join(crate::remote::layout::generation(&test_generation_id("g1")));
         std::fs::create_dir_all(&gen_dir).unwrap();
         std::os::unix::fs::symlink(
-            crate::remote::layout::generation_root_link("abc123"),
+            crate::remote::layout::generation_root_link(&test_tree_digest("abc123")),
             gen_dir.join("root"),
         )
         .unwrap();
 
         // Build the generation root exactly as the engine does at both
         // `run_activation` call sites: `<root>/generations/<gid>/root`.
+        let gid = test_generation_id("g1");
         let generation_root = remote
             .root()
-            .join(crate::remote::layout::generation("g1"))
+            .join(crate::remote::layout::generation(&gid))
             .join("root");
         assert!(
-            generation_root.ends_with(Path::new("generations/g1/root")),
+            generation_root.ends_with(Path::new(&format!("generations/{}/root", gid.as_str()))),
             "activation generation root must be <root>/generations/<gid>/root, got {}",
             generation_root.display()
         );
@@ -1239,7 +1261,10 @@ pub(crate) mod tests {
         let read_src = gen_rel.join("integration/systemd/example.service");
         assert_eq!(
             read_src,
-            Path::new("generations/g1/root/integration/systemd/example.service")
+            Path::new(&format!(
+                "generations/{}/root/integration/systemd/example.service",
+                gid.as_str()
+            ))
         );
         assert!(
             !read_src.to_string_lossy().contains("root/root"),
@@ -1249,7 +1274,9 @@ pub(crate) mod tests {
         // tree content root has no nested `root` directory), so a `root/root`
         // generation root would fail activation with a read error.
         assert!(
-            !base.join("generations/g1/root/root").exists(),
+            !base
+                .join(format!("generations/{}/root/root", gid.as_str()))
+                .exists(),
             "tree content root must have no nested root dir (a root/root double-join would ENOENT)"
         );
 
@@ -1258,7 +1285,9 @@ pub(crate) mod tests {
         let c = cfg(ActivationScope::User, vec!["example.service"]);
         stage_rendered_units(&remote, &generation_root, &c, &slot_vars()).unwrap();
         let staged = remote
-            .read(Path::new("adapters/systemd/example.service"))
+            .read(
+                &RootedRelativePath::parse(Path::new("adapters/systemd/example.service")).unwrap(),
+            )
             .unwrap();
         assert_eq!(
             String::from_utf8(staged).unwrap(),
@@ -1296,8 +1325,10 @@ pub(crate) mod tests {
         vars.insert("XDG_CONFIG_HOME".into(), config_home.as_os_str().to_owned());
         let env = crate::env::SysEnv::from_map(vars);
         let remote = LocalTransport::new(&env, base.clone()).unwrap();
-        let gen_rel = crate::remote::layout::generation("g1");
-        let unit_rel = gen_rel.join("root/integration/systemd/example.service");
+        let gen_rel = crate::remote::layout::generation(&test_generation_id("g1"));
+        let unit_rel = gen_rel
+            .join("root/integration/systemd/example.service")
+            .unwrap();
         std::fs::create_dir_all(base.join(unit_rel.parent().unwrap())).unwrap();
         std::fs::write(base.join(&unit_rel), "ExecStart={{ bogus }}\n").unwrap();
 
@@ -1352,18 +1383,20 @@ pub(crate) mod tests {
         let remote = LocalTransport::new(&env, base.clone()).unwrap();
         // Unit artifact with a slot-dependent ExecStart and the per-server
         // deployment account, under the tree.
-        let tree_rel = crate::remote::layout::tree_root("abc123");
-        let unit_rel = tree_rel.join("integration/systemd/example.service");
+        let tree_rel = crate::remote::layout::tree_root(&test_tree_digest("abc123"));
+        let unit_rel = tree_rel
+            .join("integration/systemd/example.service")
+            .unwrap();
         std::fs::create_dir_all(base.join(unit_rel.parent().unwrap())).unwrap();
         std::fs::write(
             base.join(&unit_rel),
             "[Unit]\nDescription=Example service (managed by deploy, run as {{ user }})\n\n[Service]\nExecStart={{ deploy_dir }}/current/app/server\n",
         )
         .unwrap();
-        let gen_dir = base.join(crate::remote::layout::generation("g1"));
+        let gen_dir = base.join(crate::remote::layout::generation(&test_generation_id("g1")));
         std::fs::create_dir_all(&gen_dir).unwrap();
         std::os::unix::fs::symlink(
-            crate::remote::layout::generation_root_link("abc123"),
+            crate::remote::layout::generation_root_link(&test_tree_digest("abc123")),
             gen_dir.join("root"),
         )
         .unwrap();
@@ -1373,11 +1406,12 @@ pub(crate) mod tests {
         // root), never a nested `root/root`. A double-join would make staging
         // read through a nonexistent `root` directory inside the tree content
         // root and fail below.
+        let gid = test_generation_id("g1");
         let generation_root = base
-            .join(crate::remote::layout::generation("g1"))
+            .join(crate::remote::layout::generation(&gid))
             .join("root");
         assert!(
-            generation_root.ends_with(Path::new("generations/g1/root")),
+            generation_root.ends_with(Path::new(&format!("generations/{}/root", gid.as_str()))),
             "activation root must be <root>/generations/<gid>/root, got {}",
             generation_root.display()
         );
@@ -1387,7 +1421,9 @@ pub(crate) mod tests {
             generation_root.display()
         );
         assert!(
-            !base.join("generations/g1/root/root").exists(),
+            !base
+                .join(format!("generations/{}/root/root", gid.as_str()))
+                .exists(),
             "tree content root has no nested root dir: a root/root double-join would ENOENT"
         );
 
@@ -1455,23 +1491,25 @@ pub(crate) mod tests {
         let remote = LocalTransport::new(&env, base.clone()).unwrap();
         // The unit artifact under the tree content root + the generation
         // symlink, exactly as the engine builds it.
-        let tree_rel = crate::remote::layout::tree_root("abc123");
-        let unit_rel = tree_rel.join("integration/systemd/example.service");
+        let tree_rel = crate::remote::layout::tree_root(&test_tree_digest("abc123"));
+        let unit_rel = tree_rel
+            .join("integration/systemd/example.service")
+            .unwrap();
         std::fs::create_dir_all(base.join(unit_rel.parent().unwrap())).unwrap();
         std::fs::write(
             base.join(&unit_rel),
             "[Service]\nExecStart={{ deploy_dir }}/current/app/server\n",
         )
         .unwrap();
-        let gen_dir = base.join(crate::remote::layout::generation("g1"));
+        let gen_dir = base.join(crate::remote::layout::generation(&test_generation_id("g1")));
         std::fs::create_dir_all(&gen_dir).unwrap();
         std::os::unix::fs::symlink(
-            crate::remote::layout::generation_root_link("abc123"),
+            crate::remote::layout::generation_root_link(&test_tree_digest("abc123")),
             gen_dir.join("root"),
         )
         .unwrap();
         let generation_root = base
-            .join(crate::remote::layout::generation("g1"))
+            .join(crate::remote::layout::generation(&test_generation_id("g1")))
             .join("root");
         (tmp, env, remote, config_home, generation_root)
     }

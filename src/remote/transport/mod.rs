@@ -24,11 +24,13 @@
 //!   host-key verification (`ssh::hostkey`) and the bounded subprocess
 //!   runner (`ssh::runner`).
 
+mod rooted;
 mod runner;
 #[cfg(test)]
 pub(crate) mod scripted;
 mod ssh;
 
+pub use rooted::RootedRelativePath;
 pub use runner::{
     ChildRunner, KillSeam, RealKill, RunError, RunOutcome, RunnerConfig, kill_process_group,
 };
@@ -134,10 +136,15 @@ pub struct FsBytes {
 }
 
 /// Filesystem + execution surface for one server's remote root.
+///
+/// Every path a transport operation receives is a validated
+/// [`RootedRelativePath`]: relative to the deployment root, never absolute,
+/// never traversal-bearing — so `root.join(rel)` inside a transport is safe
+/// by construction and a caller can never escape the deployment root.
 pub trait Remote {
     fn root(&self) -> &Path;
-    fn read(&self, rel: &Path) -> Result<Vec<u8>>;
-    fn write(&self, rel: &Path, data: &[u8], mode: u32) -> Result<()>;
+    fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>>;
+    fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()>;
     /// Atomically create `rel` with `data` only if it does not already exist,
     /// and make the install DURABLE before returning: the create-new
     /// primitive (`durable_create_new`) writes a unique temp inside the
@@ -164,7 +171,7 @@ pub trait Remote {
     /// the non-racy primitive used for lock acquisition:
     /// `exists`-then-`write` would let two controllers both observe "no lock"
     /// and both proceed.
-    fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<CreateNewVerdict>;
+    fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict>;
     /// [`Remote::try_write_new`] with a CALLER-CHOSEN content equivalence for
     /// the EEXIST verification: `Semantic` (JSON parse-equal, byte-exact
     /// fallback) is used by the release-file publisher whose idempotent
@@ -177,7 +184,7 @@ pub trait Remote {
     /// outcome a direct application would produce.
     fn try_write_new_with(
         &self,
-        rel: &Path,
+        rel: &RootedRelativePath,
         data: &[u8],
         equivalence: ContentEquivalence,
     ) -> Result<CreateNewVerdict> {
@@ -206,20 +213,29 @@ pub trait Remote {
             v => Ok(v),
         }
     }
-    fn create_dir(&self, rel: &Path) -> Result<()>;
-    fn create_dir_all(&self, rel: &Path) -> Result<()>;
+    fn create_dir(&self, rel: &RootedRelativePath) -> Result<()>;
+    fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()>;
     /// Apply a permission mode to an existing remote entry (file or directory).
     /// Uploads must preserve the canonical tree's modes exactly, or the
     /// post-upload integrity re-hash diverges on hosts with a permissive umask
     /// (a bare `mkdir`/`cat` inherits the remote umask, so modes must be
     /// applied explicitly).
-    fn set_mode(&self, rel: &Path, mode: u32) -> Result<()>;
-    fn list(&self, rel: &Path) -> Result<Vec<RemoteEntry>>;
-    fn rename(&self, from: &Path, to: &Path) -> Result<()>;
-    fn symlink(&self, target: &Path, link: &Path) -> Result<()>;
-    fn read_link(&self, rel: &Path) -> Result<PathBuf>;
-    fn remove_file(&self, rel: &Path) -> Result<()>;
-    fn remove_dir_all(&self, rel: &Path) -> Result<()>;
+    fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()>;
+    fn list(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>>;
+    fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()>;
+    /// Create a symlink at `link` (a rooted relative path) pointing at
+    /// `target`. `target` is a LINK TARGET, relative to the link's own
+    /// directory — it legitimately traverses up to the object store
+    /// (`../../objects/...`), so it is a plain `&Path`, never a
+    /// [`RootedRelativePath`].
+    fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()>;
+    /// Read the target of the symlink at `rel`. The returned target is a
+    /// LINK TARGET (relative to the link's directory, legitimately
+    /// `../../...`), so it is a plain `PathBuf`, never a
+    /// [`RootedRelativePath`].
+    fn read_link(&self, rel: &RootedRelativePath) -> Result<PathBuf>;
+    fn remove_file(&self, rel: &RootedRelativePath) -> Result<()>;
+    fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()>;
     /// Atomically remove `rel` ONLY IF its content is byte-identical to
     /// `expected` — the compare-and-delete primitive that makes stale
     /// releases and expired-lease breaks safe. Returns the TYPED verdict
@@ -233,7 +249,7 @@ pub trait Remote {
     /// The DEFAULT implementation is the NON-ATOMIC read-compare-remove
     /// fallback: adequate for single-process test wrappers that never race
     /// the lock, and only those; production must override it.
-    fn remove_file_if(&self, rel: &Path, expected: &[u8]) -> Result<RemoveIfVerdict> {
+    fn remove_file_if(&self, rel: &RootedRelativePath, expected: &[u8]) -> Result<RemoveIfVerdict> {
         // Typed absence probe first: a transport failure is an `Err`, never
         // a silent `Absent`.
         let Some(_) = self.metadata_opt(rel)? else {
@@ -247,14 +263,14 @@ pub trait Remote {
             Ok(RemoveIfVerdict::Mismatch)
         }
     }
-    fn exists(&self, rel: &Path) -> bool;
-    fn metadata(&self, rel: &Path) -> Result<RemoteMeta>;
+    fn exists(&self, rel: &RootedRelativePath) -> bool;
+    fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta>;
     /// The TYPED replacement for the `exists`/`metadata` pair: `Ok(Some(meta))`
     /// when the entry exists, `Ok(None)` ONLY for a CONFIRMED `NotFound`, and
     /// `Err` for every other failure (permission, transport fault, ...). A
     /// failed read is NEVER indistinguishable from absence — callers must
     /// never consult `exists` (a `bool` that swallows errors) to disambiguate.
-    fn metadata_opt(&self, rel: &Path) -> Result<Option<RemoteMeta>> {
+    fn metadata_opt(&self, rel: &RootedRelativePath) -> Result<Option<RemoteMeta>> {
         match self.metadata(rel) {
             Ok(m) => Ok(Some(m)),
             Err(crate::error::Error::NotFound(_)) => Ok(None),
@@ -277,7 +293,12 @@ pub trait Remote {
     /// mismatch/absent/contended/transport failure. Object-safe so
     /// `RemoteHelper` can call it via `&dyn Remote` without knowing the
     /// transport.
-    fn atomic_recover(&self, rel: &Path, observed: &[u8], new_data: &[u8]) -> Result<Option<()>> {
+    fn atomic_recover(
+        &self,
+        rel: &RootedRelativePath,
+        observed: &[u8],
+        new_data: &[u8],
+    ) -> Result<Option<()>> {
         let _ = (rel, observed, new_data);
         Ok(None)
     }
@@ -303,12 +324,8 @@ pub trait Remote {
     }
 }
 
-fn join(root: &Path, rel: &Path) -> PathBuf {
-    if rel.as_os_str().is_empty() {
-        root.to_path_buf()
-    } else {
-        root.join(rel)
-    }
+fn join(root: &Path, rel: &RootedRelativePath) -> PathBuf {
+    root.join(rel.as_path())
 }
 
 /// True when `p` has at least one NORMAL path component below the root —
@@ -718,7 +735,7 @@ pub(crate) struct CreateNewOptions<'a> {
 /// convergent path still returns with a durable entry.
 pub(crate) fn durable_create_new(
     base: &Path,
-    rel: &Path,
+    rel: &RootedRelativePath,
     data: &[u8],
     options: CreateNewOptions<'_>,
 ) -> Result<CreateNewVerdict> {
@@ -1316,12 +1333,12 @@ impl Remote for LocalTransport {
         Ok(())
     }
 
-    fn read(&self, rel: &Path) -> Result<Vec<u8>> {
+    fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
         std::fs::read(join(&self.base, rel))
             .map_err(|e| Error::transport(format!("read {}: {e}", rel.display())))
     }
 
-    fn write(&self, rel: &Path, data: &[u8], mode: u32) -> Result<()> {
+    fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
         let p = join(&self.base, rel);
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent)
@@ -1336,17 +1353,17 @@ impl Remote for LocalTransport {
         Ok(())
     }
 
-    fn create_dir(&self, rel: &Path) -> Result<()> {
+    fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
         std::fs::create_dir(join(&self.base, rel))
             .map_err(|e| Error::transport(format!("mkdir {}: {e}", rel.display())))
     }
 
-    fn create_dir_all(&self, rel: &Path) -> Result<()> {
+    fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
         std::fs::create_dir_all(join(&self.base, rel))
             .map_err(|e| Error::transport(format!("mkdir {}: {e}", rel.display())))
     }
 
-    fn set_mode(&self, rel: &Path, mode: u32) -> Result<()> {
+    fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
         std::fs::set_permissions(
             join(&self.base, rel),
             std::fs::Permissions::from_mode(mode & 0o7777),
@@ -1354,7 +1371,7 @@ impl Remote for LocalTransport {
         .map_err(|e| Error::transport(format!("chmod {}: {e}", rel.display())))
     }
 
-    fn list(&self, rel: &Path) -> Result<Vec<RemoteEntry>> {
+    fn list(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>> {
         let dir = join(&self.base, rel);
         // An unprovisioned remote root has no directories yet; report an empty
         // listing rather than erroring so read-only inspection stays valid.
@@ -1383,7 +1400,7 @@ impl Remote for LocalTransport {
         Ok(out)
     }
 
-    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+    fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
         let f = join(&self.base, from);
         let t = join(&self.base, to);
         if let Some(parent) = t.parent() {
@@ -1394,7 +1411,7 @@ impl Remote for LocalTransport {
         })
     }
 
-    fn symlink(&self, target: &Path, link: &Path) -> Result<()> {
+    fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
         let l = join(&self.base, link);
         if let Some(parent) = l.parent() {
             std::fs::create_dir_all(parent).ok();
@@ -1410,13 +1427,13 @@ impl Remote for LocalTransport {
         })
     }
 
-    fn read_link(&self, rel: &Path) -> Result<PathBuf> {
+    fn read_link(&self, rel: &RootedRelativePath) -> Result<PathBuf> {
         let p = join(&self.base, rel);
         std::fs::read_link(&p)
             .map_err(|e| Error::transport(format!("readlink {}: {e}", p.display())))
     }
 
-    fn remove_file(&self, rel: &Path) -> Result<()> {
+    fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
         let p = join(&self.base, rel);
         std::fs::remove_file(&p)
             .or_else(|e| {
@@ -1429,11 +1446,11 @@ impl Remote for LocalTransport {
             .map_err(|e| Error::transport(format!("remove {}: {e}", p.display())))
     }
 
-    fn remove_file_if(&self, rel: &Path, expected: &[u8]) -> Result<RemoveIfVerdict> {
+    fn remove_file_if(&self, rel: &RootedRelativePath, expected: &[u8]) -> Result<RemoveIfVerdict> {
         // If this is the lock path, serialize through the sidecar mutex so
         // the compare-then-delete becomes operation-atomic: a contender's
         // create-if-absent cannot win the freed path mid-operation.
-        if rel == crate::remote::layout::operation_lock() {
+        if rel.as_path() == crate::remote::layout::operation_lock().as_path() {
             return with_operation_lock_sidecar(&self.base, || {
                 self.remove_file_if_inner(rel, expected)
             });
@@ -1441,8 +1458,8 @@ impl Remote for LocalTransport {
         self.remove_file_if_inner(rel, expected)
     }
 
-    fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<CreateNewVerdict> {
-        if rel == crate::remote::layout::operation_lock() {
+    fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict> {
+        if rel.as_path() == crate::remote::layout::operation_lock().as_path() {
             return with_operation_lock_sidecar(&self.base, || self.try_write_new_inner(rel, data));
         }
         self.try_write_new_inner(rel, data)
@@ -1450,11 +1467,11 @@ impl Remote for LocalTransport {
 
     fn try_write_new_with(
         &self,
-        rel: &Path,
+        rel: &RootedRelativePath,
         data: &[u8],
         equivalence: ContentEquivalence,
     ) -> Result<CreateNewVerdict> {
-        if rel == crate::remote::layout::operation_lock() {
+        if rel.as_path() == crate::remote::layout::operation_lock().as_path() {
             return with_operation_lock_sidecar(&self.base, || {
                 self.try_write_new_with_inner(rel, data, equivalence)
             });
@@ -1462,7 +1479,7 @@ impl Remote for LocalTransport {
         self.try_write_new_with_inner(rel, data, equivalence)
     }
 
-    fn remove_dir_all(&self, rel: &Path) -> Result<()> {
+    fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
         let p = join(&self.base, rel);
         std::fs::remove_dir_all(&p)
             .or_else(|e| {
@@ -1475,11 +1492,11 @@ impl Remote for LocalTransport {
             .map_err(|e| Error::transport(format!("rmdir {}: {e}", p.display())))
     }
 
-    fn exists(&self, rel: &Path) -> bool {
+    fn exists(&self, rel: &RootedRelativePath) -> bool {
         join(&self.base, rel).exists()
     }
 
-    fn metadata(&self, rel: &Path) -> Result<RemoteMeta> {
+    fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta> {
         self.metadata_opt(rel)?.ok_or_else(|| {
             Error::NotFound(format!(
                 "stat {}: not found",
@@ -1488,7 +1505,7 @@ impl Remote for LocalTransport {
         })
     }
 
-    fn metadata_opt(&self, rel: &Path) -> Result<Option<RemoteMeta>> {
+    fn metadata_opt(&self, rel: &RootedRelativePath) -> Result<Option<RemoteMeta>> {
         let p = join(&self.base, rel);
         match std::fs::symlink_metadata(&p) {
             Ok(m) => Ok(Some(meta_to_remote(&m))),
@@ -1540,7 +1557,11 @@ impl Remote for LocalTransport {
 }
 
 impl LocalTransport {
-    fn remove_file_if_inner(&self, rel: &Path, expected: &[u8]) -> Result<RemoveIfVerdict> {
+    fn remove_file_if_inner(
+        &self,
+        rel: &RootedRelativePath,
+        expected: &[u8],
+    ) -> Result<RemoveIfVerdict> {
         let p = join(&self.base, rel);
         // When already holding the sidecar (we are inside with_operation_lock_sidecar),
         // the mutation is already serialized, so a simple read-compare-unlink
@@ -1637,13 +1658,17 @@ impl LocalTransport {
         }
     }
 
-    fn try_write_new_inner(&self, rel: &Path, data: &[u8]) -> Result<CreateNewVerdict> {
+    fn try_write_new_inner(
+        &self,
+        rel: &RootedRelativePath,
+        data: &[u8],
+    ) -> Result<CreateNewVerdict> {
         self.try_write_new_with_inner(rel, data, ContentEquivalence::Exact)
     }
 
     fn try_write_new_with_inner(
         &self,
-        rel: &Path,
+        rel: &RootedRelativePath,
         data: &[u8],
         equivalence: ContentEquivalence,
     ) -> Result<CreateNewVerdict> {
@@ -1698,7 +1723,10 @@ mod tests {
                 s.spawn(move || {
                     let _done = DoneGuard(done);
                     for i in 0..100 {
-                        let rel = Path::new("markers").join(format!("m{i}.json"));
+                        let rel = RootedRelativePath::parse(
+                            &Path::new("markers").join(format!("m{i}.json")),
+                        )
+                        .unwrap();
                         if let Err(e) = t.try_write_new(&rel, PAYLOAD.as_bytes()) {
                             *writer_error.lock().unwrap() = Some(e.to_string());
                             return;
@@ -1774,16 +1802,29 @@ mod tests {
     fn symlink_rename_exists() {
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let t = LocalTransport::new(&SysEnv::from_process(), dir.path().join("r")).unwrap();
-        t.create_dir_all(Path::new("generations/gen1")).unwrap();
-        t.symlink(Path::new("generations/gen1"), Path::new(".tmp.x"))
+        t.create_dir_all(&RootedRelativePath::parse(Path::new("generations/gen1")).unwrap())
             .unwrap();
-        assert!(t.exists(Path::new(".tmp.x")), "symlink should exist");
-        t.rename(Path::new(".tmp.x"), Path::new("current")).unwrap();
+        t.symlink(
+            Path::new("generations/gen1"),
+            &RootedRelativePath::parse(Path::new(".tmp.x")).unwrap(),
+        )
+        .unwrap();
         assert!(
-            t.exists(Path::new("current")),
+            t.exists(&RootedRelativePath::parse(Path::new(".tmp.x")).unwrap()),
+            "symlink should exist"
+        );
+        t.rename(
+            &RootedRelativePath::parse(Path::new(".tmp.x")).unwrap(),
+            &RootedRelativePath::parse(Path::new("current")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            t.exists(&RootedRelativePath::parse(Path::new("current")).unwrap()),
             "current should exist after rename"
         );
-        let target = t.read_link(Path::new("current")).unwrap();
+        let target = t
+            .read_link(&RootedRelativePath::parse(Path::new("current")).unwrap())
+            .unwrap();
         assert_eq!(target, Path::new("generations/gen1"));
     }
 
@@ -1802,15 +1843,15 @@ mod tests {
 
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let t = LocalTransport::new(&SysEnv::from_process(), dir.path().join("r")).unwrap();
-        let rel = Path::new("state/op.json");
+        let rel = RootedRelativePath::parse(Path::new("state/op.json")).unwrap();
         let data = b"{\"op\":\"1\"}";
 
         assert_eq!(
-            t.try_write_new(rel, data).unwrap(),
+            t.try_write_new(&rel, data).unwrap(),
             CreateNewVerdict::Created,
             "a fresh install wins"
         );
-        let p = t.root().join(rel);
+        let p = t.root().join(rel.as_path());
         assert_eq!(std::fs::read(&p).unwrap(), data, "exact bytes installed");
         assert_eq!(
             std::fs::metadata(&p).unwrap().mode() & 0o7777,
@@ -1819,7 +1860,7 @@ mod tests {
         );
         // Identical retry: convergent — AlreadyPresent, no error, no replace.
         assert_eq!(
-            t.try_write_new(rel, data).unwrap(),
+            t.try_write_new(&rel, data).unwrap(),
             CreateNewVerdict::AlreadyPresent,
             "an identical retry converges to already-present"
         );
@@ -1831,7 +1872,7 @@ mod tests {
         // Different content: the conflict verdict — never replaced.
         assert!(
             matches!(
-                t.try_write_new(rel, b"other").unwrap(),
+                t.try_write_new(&rel, b"other").unwrap(),
                 CreateNewVerdict::Conflict(VerifiedExisting::ContentMismatch)
             ),
             "a different-content conflict is the verdict"
@@ -1852,37 +1893,37 @@ mod tests {
     fn remove_file_if_compare_and_delete_verdicts() {
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let t = LocalTransport::new(&SysEnv::from_process(), dir.path().join("r")).unwrap();
-        let rel = Path::new("state/op.lock");
+        let rel = RootedRelativePath::parse(Path::new("state/op.lock")).unwrap();
         let data = b"{\"owner\":\"a\",\"token\":1}";
 
         // Absent: nothing to remove — the idempotent verdict.
         assert_eq!(
-            t.remove_file_if(rel, data).unwrap(),
+            t.remove_file_if(&rel, data).unwrap(),
             RemoveIfVerdict::Absent,
             "a genuinely absent entry is Absent, never an error"
         );
         // Match: the entry carried EXACTLY the expected bytes — removed.
-        t.try_write_new(rel, data).unwrap();
+        t.try_write_new(&rel, data).unwrap();
         assert_eq!(
-            t.remove_file_if(rel, data).unwrap(),
+            t.remove_file_if(&rel, data).unwrap(),
             RemoveIfVerdict::Removed,
             "a byte-identical match is removed"
         );
         assert!(
-            t.metadata_opt(rel).unwrap().is_none(),
+            t.metadata_opt(&rel).unwrap().is_none(),
             "the matched entry must be gone"
         );
         // Mismatch: different content — the winner is restored untouched,
         // NEVER removed, NEVER replaced.
-        t.try_write_new(rel, data).unwrap();
+        t.try_write_new(&rel, data).unwrap();
         assert_eq!(
-            t.remove_file_if(rel, b"{\"owner\":\"b\",\"token\":2}")
+            t.remove_file_if(&rel, b"{\"owner\":\"b\",\"token\":2}")
                 .unwrap(),
             RemoveIfVerdict::Mismatch,
             "different content is a Mismatch, never a delete"
         );
         assert_eq!(
-            t.read(rel).unwrap(),
+            t.read(&rel).unwrap(),
             data,
             "the mismatch must restore the winner byte-for-byte"
         );
@@ -1976,15 +2017,15 @@ mod tests {
         ) {
             let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
             let root = dir.path().to_path_buf();
-            let rel = Path::new("state/record.bin");
-            let dest = root.join(rel);
+            let rel = RootedRelativePath::parse(Path::new("state/record.bin")).unwrap();
+            let dest = root.join(rel.as_path());
             let dest_name = rel.file_name().unwrap().to_string_lossy().into_owned();
 
             match scenario {
                 CreateNewScenario::Healthy => {
                     let verdict = durable_create_new(
                         &root,
-                        rel,
+                        &rel,
                         &content,
                         CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None },
                     )
@@ -2022,7 +2063,7 @@ mod tests {
                     // naming the injected stage — never a swallowed Ok.
                     let err = durable_create_new(
                         &root,
-                        rel,
+                        &rel,
                         &content,
                         CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: Some(&fault) },
                     )
@@ -2037,7 +2078,7 @@ mod tests {
                     // OR absent — never a partial/torn file.
                     let retry = durable_create_new(
                         &root,
-                        rel,
+                        &rel,
                         &content,
                         CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None },
                     )
@@ -2067,10 +2108,10 @@ mod tests {
                     // A previous successful publish (identical bytes + mode):
                     // the identical retry converges — AlreadyPresent, no
                     // error, no replace.
-                    durable_create_new(&root, rel, &content, CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None })
+                    durable_create_new(&root, &rel, &content, CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None })
                         .expect("the first install must succeed");
                     let verdict =
-                        durable_create_new(&root, rel, &content, CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None })
+                        durable_create_new(&root, &rel, &content, CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None })
                             .expect("an identical retry must converge, not error");
                     prop_assert_eq!(verdict, CreateNewVerdict::AlreadyPresent);
                     prop_assert_eq!(
@@ -2105,7 +2146,7 @@ mod tests {
                     .unwrap();
                     let verdict = durable_create_new(
                         &root,
-                        rel,
+                        &rel,
                         &content,
                         CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None },
                     )
@@ -2124,7 +2165,7 @@ mod tests {
                     // Identical bytes but a DIFFERENT mode: still a genuine
                     // conflict (the mode is part of the record) — the verdict,
                     // never a replace.
-                    durable_create_new(&root, rel, &content, CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None })
+                    durable_create_new(&root, &rel, &content, CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None })
                         .expect("the first install must succeed");
                     let other_mode = if (mode & 0o7777) == 0o600 { 0o644 } else { 0o600 };
                     std::fs::set_permissions(
@@ -2133,7 +2174,7 @@ mod tests {
                     )
                     .unwrap();
                     let verdict =
-                        durable_create_new(&root, rel, &content, CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None })
+                        durable_create_new(&root, &rel, &content, CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None })
                             .expect("a mode mismatch is a verdict, not an I/O error");
                     let is_mode_mismatch = matches!(
                         verdict,
@@ -2165,7 +2206,7 @@ mod tests {
                     .unwrap();
                     let verdict = durable_create_new(
                         &root,
-                        rel,
+                        &rel,
                         &content,
                         CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None },
                     )
@@ -2198,12 +2239,12 @@ mod tests {
                     // identical existing entry — the retry must return Err
                     // (the faulted parent fsync), never a false
                     // Ok(AlreadyPresent) that claims durability.
-                    durable_create_new(&root, rel, &content, CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None })
+                    durable_create_new(&root, &rel, &content, CreateNewOptions { mode, content: ContentEquivalence::Exact, fault: None })
                         .expect("the first install must succeed");
                     let fault = CreateNewFault::new(CreateNewStep::ParentFsync);
                     let err = durable_create_new(
                         &root,
-                        rel,
+                        &rel,
                         &content,
                         CreateNewOptions {
                             mode,
@@ -2236,13 +2277,13 @@ mod tests {
         fn root(&self) -> &Path {
             self.inner.root()
         }
-        fn read(&self, rel: &Path) -> Result<Vec<u8>> {
+        fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
             self.inner.read(rel)
         }
-        fn write(&self, rel: &Path, data: &[u8], mode: u32) -> Result<()> {
+        fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
             self.inner.write(rel, data, mode)
         }
-        fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<CreateNewVerdict> {
+        fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict> {
             durable_create_new(
                 self.inner.root(),
                 rel,
@@ -2254,37 +2295,37 @@ mod tests {
                 },
             )
         }
-        fn create_dir(&self, rel: &Path) -> Result<()> {
+        fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
             self.inner.create_dir(rel)
         }
-        fn create_dir_all(&self, rel: &Path) -> Result<()> {
+        fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
             self.inner.create_dir_all(rel)
         }
-        fn set_mode(&self, rel: &Path, mode: u32) -> Result<()> {
+        fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
             self.inner.set_mode(rel, mode)
         }
-        fn list(&self, rel: &Path) -> Result<Vec<RemoteEntry>> {
+        fn list(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>> {
             self.inner.list(rel)
         }
-        fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
             self.inner.rename(from, to)
         }
-        fn symlink(&self, target: &Path, link: &Path) -> Result<()> {
+        fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
             self.inner.symlink(target, link)
         }
-        fn read_link(&self, rel: &Path) -> Result<PathBuf> {
+        fn read_link(&self, rel: &RootedRelativePath) -> Result<PathBuf> {
             self.inner.read_link(rel)
         }
-        fn remove_file(&self, rel: &Path) -> Result<()> {
+        fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
             self.inner.remove_file(rel)
         }
-        fn remove_dir_all(&self, rel: &Path) -> Result<()> {
+        fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
             self.inner.remove_dir_all(rel)
         }
-        fn exists(&self, rel: &Path) -> bool {
+        fn exists(&self, rel: &RootedRelativePath) -> bool {
             self.inner.exists(rel)
         }
-        fn metadata(&self, rel: &Path) -> Result<RemoteMeta> {
+        fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta> {
             self.inner.metadata(rel)
         }
         fn exec(&self, argv: &[String], timeout: Duration) -> Result<ExecOutcome> {
@@ -2358,15 +2399,15 @@ mod tests {
 
             let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
             let t = LocalTransport::new(&SysEnv::from_process(), dir.path().join("r")).unwrap();
-            let rel = Path::new("state/record.bin");
-            let dest = t.root().join(rel);
+            let rel = RootedRelativePath::parse(Path::new("state/record.bin")).unwrap();
+            let dest = t.root().join(rel.as_path());
             let dest_name = rel.file_name().unwrap().to_string_lossy().into_owned();
             let final_mode = IMMUTABLE_RECORD_MODE & 0o7777;
 
             match state {
                 TransportVerdictState::Fresh => {
                     let verdict = t
-                        .try_write_new(rel, &content)
+                        .try_write_new(&rel, &content)
                         .expect("the fresh install must succeed");
                     prop_assert_eq!(verdict, CreateNewVerdict::Created);
                     prop_assert_eq!(
@@ -2400,7 +2441,7 @@ mod tests {
                     std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(final_mode))
                         .unwrap();
                     let verdict = t
-                        .try_write_new(rel, &content)
+                        .try_write_new(&rel, &content)
                         .expect("an identical retry must converge, not error");
                     prop_assert!(matches!(verdict, CreateNewVerdict::AlreadyPresent));
                     prop_assert_eq!(
@@ -2431,7 +2472,7 @@ mod tests {
                     std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(final_mode))
                         .unwrap();
                     let verdict = t
-                        .try_write_new(rel, &content)
+                        .try_write_new(&rel, &content)
                         .expect("a different-content winner is a verdict, not an I/O error");
                     prop_assert!(matches!(
                         verdict,
@@ -2453,7 +2494,7 @@ mod tests {
                     std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(other_mode))
                         .unwrap();
                     let verdict = t
-                        .try_write_new(rel, &content)
+                        .try_write_new(&rel, &content)
                         .expect("a mode mismatch is a verdict, not an I/O error");
                     let is_mode_mismatch = matches!(
                         verdict,
@@ -2477,7 +2518,7 @@ mod tests {
                     std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(final_mode))
                         .unwrap();
                     let verdict = t
-                        .try_write_new(rel, &content)
+                        .try_write_new(&rel, &content)
                         .expect("the retry over a published-before-parent-sync entry must converge");
                     prop_assert_eq!(verdict, CreateNewVerdict::AlreadyPresent);
                     prop_assert_eq!(
@@ -2504,14 +2545,14 @@ mod tests {
                         inner: t,
                         fault: CreateNewFault::new(step)};
                     let err = w
-                        .try_write_new(rel, &content)
+                        .try_write_new(&rel, &content)
                         .expect_err("a failure at every stage must propagate as Err");
                     prop_assert!(
                         err.to_string().contains("forced to fail (once)"),
                         "the injected fault must be the propagated failure, got: {err}"
                     );
                     let retry = w
-                        .try_write_new(rel, &content)
+                        .try_write_new(&rel, &content)
                         .expect("the identical retry must converge");
                     prop_assert!(
                         matches!(
@@ -2594,8 +2635,8 @@ mod tests {
 
             let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
             let root = dir.path().to_path_buf();
-            let rel = Path::new("state/record.json");
-            let dest = root.join(rel);
+            let rel = RootedRelativePath::parse(Path::new("state/record.json")).unwrap();
+            let dest = root.join(rel.as_path());
             let required = IMMUTABLE_RECORD_MODE & 0o7777;
             let wrong_mode = if required == 0o600 { 0o640 } else { 0o600 };
             let intended: &[u8] = br#"{"a":1,"b":2}"#;

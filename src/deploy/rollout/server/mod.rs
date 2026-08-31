@@ -28,7 +28,7 @@ use crate::remote::canonical as tree;
 use crate::remote::helper::HeldSlotLock;
 use crate::remote::helper::RemoteHelper;
 use crate::remote::layout;
-use crate::remote::transport::Remote;
+use crate::remote::transport::{Remote, RootedRelativePath};
 use crate::store::local::LocalStore;
 use crate::verify::adapters::transaction::{ActivationTransaction, VerifiedAdapterRestoration};
 use crate::verify::command::run_verification;
@@ -152,7 +152,7 @@ impl ServerProc {
         error: String,
     ) -> Self {
         let comp = compensate_server_locked(held, request);
-        let _ = held.transaction_record(request.op_id.as_str(), "compensated");
+        let _ = held.transaction_record(&request.op_id, "compensated");
         match comp {
             Ok(CompensationOutcome::Restored { adapter_restored }) => {
                 ServerProc::restored(request.prior_gen.as_ref(), adapter_restored)
@@ -197,7 +197,7 @@ impl ServerProc {
             }
         };
         let comp = compensate_server_locked(held, request);
-        let _ = held.transaction_record(request.op_id.as_str(), "compensated");
+        let _ = held.transaction_record(&request.op_id, "compensated");
         match comp {
             Ok(CompensationOutcome::Restored { .. }) => {
                 ServerProc::restored(request.prior_gen.as_ref(), proof)
@@ -267,7 +267,7 @@ pub(crate) fn process_server(
     }
 
     // 1. Publish the staged tree (from incoming), reusing an existing object.
-    if let Err(e) = held.publish_from_incoming(deployment_id.as_str(), artifact.tree.as_str()) {
+    if let Err(e) = held.publish_from_incoming(deployment_id, &artifact.tree) {
         return Ok(ServerProc::failed_before(format!("publish failed: {e}")));
     }
 
@@ -279,7 +279,7 @@ pub(crate) fn process_server(
             return Ok(ServerProc::failed_before(format!("tempdir: {e}")));
         }
     };
-    let object_rel = layout::tree_root(artifact.tree.as_str());
+    let object_rel = layout::tree_root(&artifact.tree);
     if let Err(e) = download_tree_to_host(remote, &object_rel, verify_tmp.path()) {
         return Ok(ServerProc::failed_before(format!(
             "download for verify failed: {e}"
@@ -314,8 +314,7 @@ pub(crate) fn process_server(
     // 4. Publish the release record (idempotent) and create the generation.
     if let Some((release_json, behavior_json)) =
         REMOTE_RELEASE_JSON.with(|c| c.borrow().get(&artifact.release).cloned())
-        && let Err(e) =
-            helper.publish_release(artifact.release.as_str(), &release_json, &behavior_json)
+        && let Err(e) = helper.publish_release(&artifact.release, &release_json, &behavior_json)
     {
         return Ok(ServerProc::failed_before(format!(
             "publish release failed: {e}"
@@ -340,7 +339,7 @@ pub(crate) fn process_server(
             "create generation failed: {e}"
         )));
     }
-    if let Err(e) = held.transaction_record(op_id.as_str(), "prepared") {
+    if let Err(e) = held.transaction_record(op_id, "prepared") {
         return Ok(ServerProc::failed_before(format!(
             "transaction record failed: {e}"
         )));
@@ -352,7 +351,7 @@ pub(crate) fn process_server(
             Some(g) => crate::remote::helper::ExpectedCurrent::Generation(g.clone()),
             None => crate::remote::helper::ExpectedCurrent::Absent,
         },
-        new_gen.as_str(),
+        new_gen,
         op_id.as_str(),
     );
     if let Err(e) = swap {
@@ -369,10 +368,7 @@ pub(crate) fn process_server(
     // The generation's tree content root: `generations/<gen>/root` is a
     // symlink to `objects/sha256/<tree>/root`, the same directory `current`
     // points at (it is the tree content root, not a nested `root/root`).
-    let generation_root = remote
-        .root()
-        .join(layout::generation(new_gen.as_str()))
-        .join("root");
+    let generation_root = remote.root().join(layout::generation(new_gen)).join("root");
 
     // 5. ACTIVATION via the ADAPTER TRANSACTION PROTOCOL (the review's P1
     //    fix: adapter side effects are inside the transaction): the mutating
@@ -475,10 +471,7 @@ pub(crate) fn process_server(
     // still report the server as Advanced, but carry the bookkeeping error so
     // the attempt status is demoted (stays intent-only) rather than erroneously
     // `Successful`.
-    if held
-        .transaction_record(op_id.as_str(), "committed")
-        .is_err()
-    {
+    if held.transaction_record(op_id, "committed").is_err() {
         return Ok(ServerProc::advanced(
             new_gen,
             Some(
@@ -492,13 +485,13 @@ pub(crate) fn process_server(
 
 pub(crate) fn download_tree_to_host(
     remote: &dyn Remote,
-    rel: &Path,
+    rel: &RootedRelativePath,
     host_dest: &Path,
 ) -> Result<()> {
     std::fs::create_dir_all(host_dest)
         .map_err(|e| Error::transport(format!("mkdir {}: {e}", host_dest.display())))?;
     for entry in remote.list(rel)? {
-        let child_rel = rel.join(&entry.name);
+        let child_rel = rel.join(&entry.name)?;
         let dest = host_dest.join(&entry.name);
         if entry.is_symlink {
             // Reconstruct the exact symlink target; remove any stale entry first.
@@ -825,8 +818,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             let op_id = OperationId::generate();
             self.helper()
                 .stage_incoming(
-                    deployment_id.as_str(),
-                    self.tree.as_str(),
+                    &deployment_id,
+                    &self.tree,
                     &self.store.object_root(&self.tree),
                 )
                 .unwrap();
@@ -1104,7 +1097,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             let gen_root = h
                 .remote
                 .root()
-                .join(crate::remote::layout::generation(deployed_gen.as_str()))
+                .join(crate::remote::layout::generation(deployed_gen))
                 .join("root");
             assert!(
                 gen_root.ends_with(
@@ -1124,7 +1117,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             assert!(
                 !h.remote
                     .root()
-                    .join(crate::remote::layout::generation(deployed_gen.as_str()))
+                    .join(crate::remote::layout::generation(deployed_gen))
                     .join("root/root")
                     .exists(),
                 "published tree must have no nested root dir (root/root double-join would ENOENT)"

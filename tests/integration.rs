@@ -7,7 +7,9 @@ use deploy::error::Result;
 use deploy::identity::{ServerId, SlotId, TargetName, TreeDigest};
 use deploy::ledger::{DeploymentStatus, LedgerEntry, PhysicalBinding, TargetSnapshot};
 
-use deploy::remote::transport::{CreateNewVerdict, FsBytes, LocalTransport, Remote};
+use deploy::remote::transport::{
+    CreateNewVerdict, FsBytes, LocalTransport, Remote, RootedRelativePath,
+};
 use deploy::store::local::LocalStore;
 use std::path::Path;
 
@@ -1050,10 +1052,15 @@ impl Remote for SpyRemote {
     fn root(&self) -> &Path {
         self.inner.root()
     }
-    fn read(&self, rel: &Path) -> deploy::error::Result<Vec<u8>> {
+    fn read(&self, rel: &RootedRelativePath) -> deploy::error::Result<Vec<u8>> {
         self.inner.read(rel)
     }
-    fn write(&self, _rel: &Path, _data: &[u8], _mode: u32) -> deploy::error::Result<()> {
+    fn write(
+        &self,
+        _rel: &RootedRelativePath,
+        _data: &[u8],
+        _mode: u32,
+    ) -> deploy::error::Result<()> {
         self.mutations.fetch_add(1, Ordering::SeqCst);
         Err(deploy::error::Error::remote(
             "SpyRemote: write is forbidden",
@@ -1061,7 +1068,7 @@ impl Remote for SpyRemote {
     }
     fn try_write_new(
         &self,
-        _rel: &Path,
+        _rel: &RootedRelativePath,
         _data: &[u8],
     ) -> deploy::error::Result<deploy::remote::transport::CreateNewVerdict> {
         self.mutations.fetch_add(1, Ordering::SeqCst);
@@ -1069,58 +1076,62 @@ impl Remote for SpyRemote {
             "SpyRemote: write is forbidden",
         ))
     }
-    fn create_dir(&self, _rel: &Path) -> deploy::error::Result<()> {
+    fn create_dir(&self, _rel: &RootedRelativePath) -> deploy::error::Result<()> {
         self.mutations.fetch_add(1, Ordering::SeqCst);
         Err(deploy::error::Error::remote(
             "SpyRemote: create_dir is forbidden",
         ))
     }
-    fn create_dir_all(&self, _rel: &Path) -> deploy::error::Result<()> {
+    fn create_dir_all(&self, _rel: &RootedRelativePath) -> deploy::error::Result<()> {
         self.mutations.fetch_add(1, Ordering::SeqCst);
         Err(deploy::error::Error::remote(
             "SpyRemote: create_dir_all is forbidden",
         ))
     }
-    fn set_mode(&self, _rel: &Path, _mode: u32) -> deploy::error::Result<()> {
+    fn set_mode(&self, _rel: &RootedRelativePath, _mode: u32) -> deploy::error::Result<()> {
         self.mutations.fetch_add(1, Ordering::SeqCst);
         Err(deploy::error::Error::remote(
             "SpyRemote: set_mode is forbidden",
         ))
     }
-    fn list(&self, rel: &Path) -> deploy::error::Result<Vec<RemoteEntry>> {
+    fn list(&self, rel: &RootedRelativePath) -> deploy::error::Result<Vec<RemoteEntry>> {
         self.inner.list(rel)
     }
-    fn rename(&self, _from: &Path, _to: &Path) -> deploy::error::Result<()> {
+    fn rename(
+        &self,
+        _from: &RootedRelativePath,
+        _to: &RootedRelativePath,
+    ) -> deploy::error::Result<()> {
         self.mutations.fetch_add(1, Ordering::SeqCst);
         Err(deploy::error::Error::remote(
             "SpyRemote: rename is forbidden",
         ))
     }
-    fn symlink(&self, _target: &Path, _link: &Path) -> deploy::error::Result<()> {
+    fn symlink(&self, _target: &Path, _link: &RootedRelativePath) -> deploy::error::Result<()> {
         self.mutations.fetch_add(1, Ordering::SeqCst);
         Err(deploy::error::Error::remote(
             "SpyRemote: symlink is forbidden",
         ))
     }
-    fn read_link(&self, rel: &Path) -> deploy::error::Result<std::path::PathBuf> {
+    fn read_link(&self, rel: &RootedRelativePath) -> deploy::error::Result<std::path::PathBuf> {
         self.inner.read_link(rel)
     }
-    fn remove_file(&self, _rel: &Path) -> deploy::error::Result<()> {
+    fn remove_file(&self, _rel: &RootedRelativePath) -> deploy::error::Result<()> {
         self.mutations.fetch_add(1, Ordering::SeqCst);
         Err(deploy::error::Error::remote(
             "SpyRemote: remove_file is forbidden",
         ))
     }
-    fn remove_dir_all(&self, _rel: &Path) -> deploy::error::Result<()> {
+    fn remove_dir_all(&self, _rel: &RootedRelativePath) -> deploy::error::Result<()> {
         self.mutations.fetch_add(1, Ordering::SeqCst);
         Err(deploy::error::Error::remote(
             "SpyRemote: remove_dir_all is forbidden",
         ))
     }
-    fn exists(&self, rel: &Path) -> bool {
+    fn exists(&self, rel: &RootedRelativePath) -> bool {
         self.inner.exists(rel)
     }
-    fn metadata(&self, rel: &Path) -> deploy::error::Result<RemoteMeta> {
+    fn metadata(&self, rel: &RootedRelativePath) -> deploy::error::Result<RemoteMeta> {
         self.inner.metadata(rel)
     }
     fn exec(&self, _argv: &[String], _timeout: Duration) -> deploy::error::Result<ExecOutcome> {
@@ -1203,10 +1214,10 @@ impl Remote for FaultRemote {
     fn root(&self) -> &Path {
         self.inner.root()
     }
-    fn read(&self, rel: &Path) -> deploy::error::Result<Vec<u8>> {
+    fn read(&self, rel: &RootedRelativePath) -> deploy::error::Result<Vec<u8>> {
         self.inner.read(rel)
     }
-    fn write(&self, rel: &Path, data: &[u8], mode: u32) -> deploy::error::Result<()> {
+    fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> deploy::error::Result<()> {
         self.attempted.fetch_add(1, Ordering::SeqCst);
         if self.fail_write {
             return Err(deploy::error::Error::remote(
@@ -1219,7 +1230,12 @@ impl Remote for FaultRemote {
                 "FaultRemote: committed transaction record write forced to fail",
             ));
         }
-        if self.fail_commit_marker && rel.to_string_lossy().starts_with("state/commits/") {
+        if self.fail_commit_marker
+            && rel
+                .as_path()
+                .to_string_lossy()
+                .starts_with("state/commits/")
+        {
             return Err(deploy::error::Error::remote(
                 "FaultRemote: commit marker write forced to fail",
             ));
@@ -1228,7 +1244,7 @@ impl Remote for FaultRemote {
     }
     fn try_write_new(
         &self,
-        rel: &Path,
+        rel: &RootedRelativePath,
         data: &[u8],
     ) -> deploy::error::Result<deploy::remote::transport::CreateNewVerdict> {
         self.attempted.fetch_add(1, Ordering::SeqCst);
@@ -1239,26 +1255,35 @@ impl Remote for FaultRemote {
         }
         // Targeted fault injection mirrors `write`: markers are installed via
         // exclusive create, so the failure must be observable there too.
-        if self.fail_commit_marker && rel.to_string_lossy().starts_with("state/commits/") {
+        if self.fail_commit_marker
+            && rel
+                .as_path()
+                .to_string_lossy()
+                .starts_with("state/commits/")
+        {
             return Err(deploy::error::Error::remote(
                 "FaultRemote: commit marker create forced to fail",
             ));
         }
         self.inner.try_write_new(rel, data)
     }
-    fn create_dir(&self, rel: &Path) -> deploy::error::Result<()> {
+    fn create_dir(&self, rel: &RootedRelativePath) -> deploy::error::Result<()> {
         self.inner.create_dir(rel)
     }
-    fn create_dir_all(&self, rel: &Path) -> deploy::error::Result<()> {
+    fn create_dir_all(&self, rel: &RootedRelativePath) -> deploy::error::Result<()> {
         self.inner.create_dir_all(rel)
     }
-    fn set_mode(&self, rel: &Path, mode: u32) -> deploy::error::Result<()> {
+    fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> deploy::error::Result<()> {
         self.inner.set_mode(rel, mode)
     }
-    fn list(&self, rel: &Path) -> deploy::error::Result<Vec<RemoteEntry>> {
+    fn list(&self, rel: &RootedRelativePath) -> deploy::error::Result<Vec<RemoteEntry>> {
         self.inner.list(rel)
     }
-    fn rename(&self, from: &Path, to: &Path) -> deploy::error::Result<()> {
+    fn rename(
+        &self,
+        from: &RootedRelativePath,
+        to: &RootedRelativePath,
+    ) -> deploy::error::Result<()> {
         self.attempted.fetch_add(1, Ordering::SeqCst);
         if self.fail_rename {
             return Err(deploy::error::Error::remote(
@@ -1267,22 +1292,22 @@ impl Remote for FaultRemote {
         }
         self.inner.rename(from, to)
     }
-    fn symlink(&self, target: &Path, link: &Path) -> deploy::error::Result<()> {
+    fn symlink(&self, target: &Path, link: &RootedRelativePath) -> deploy::error::Result<()> {
         self.inner.symlink(target, link)
     }
-    fn read_link(&self, rel: &Path) -> deploy::error::Result<std::path::PathBuf> {
+    fn read_link(&self, rel: &RootedRelativePath) -> deploy::error::Result<std::path::PathBuf> {
         self.inner.read_link(rel)
     }
-    fn remove_file(&self, rel: &Path) -> deploy::error::Result<()> {
+    fn remove_file(&self, rel: &RootedRelativePath) -> deploy::error::Result<()> {
         self.inner.remove_file(rel)
     }
-    fn remove_dir_all(&self, rel: &Path) -> deploy::error::Result<()> {
+    fn remove_dir_all(&self, rel: &RootedRelativePath) -> deploy::error::Result<()> {
         self.inner.remove_dir_all(rel)
     }
-    fn exists(&self, rel: &Path) -> bool {
+    fn exists(&self, rel: &RootedRelativePath) -> bool {
         self.inner.exists(rel)
     }
-    fn metadata(&self, rel: &Path) -> deploy::error::Result<RemoteMeta> {
+    fn metadata(&self, rel: &RootedRelativePath) -> deploy::error::Result<RemoteMeta> {
         self.inner.metadata(rel)
     }
     fn exec(&self, argv: &[String], timeout: Duration) -> deploy::error::Result<ExecOutcome> {
@@ -1317,8 +1342,12 @@ impl FailOnceMarkerRemote {
             armed,
         }))
     }
-    fn fail_marker(&self, rel: &Path) -> bool {
-        self.armed.load(Ordering::SeqCst) && rel.to_string_lossy().starts_with("state/commits/")
+    fn fail_marker(&self, rel: &RootedRelativePath) -> bool {
+        self.armed.load(Ordering::SeqCst)
+            && rel
+                .as_path()
+                .to_string_lossy()
+                .starts_with("state/commits/")
     }
 }
 
@@ -1329,10 +1358,10 @@ impl Remote for FailOnceMarkerRemote {
     fn provision_layout(&self) -> Result<()> {
         self.inner.provision_layout()
     }
-    fn read(&self, rel: &Path) -> Result<Vec<u8>> {
+    fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
         self.inner.read(rel)
     }
-    fn write(&self, rel: &Path, data: &[u8], mode: u32) -> Result<()> {
+    fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
         if self.fail_marker(rel) {
             self.armed.store(false, Ordering::SeqCst);
             return Err(deploy::error::Error::remote(
@@ -1341,7 +1370,7 @@ impl Remote for FailOnceMarkerRemote {
         }
         self.inner.write(rel, data, mode)
     }
-    fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<CreateNewVerdict> {
+    fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict> {
         if self.fail_marker(rel) {
             self.armed.store(false, Ordering::SeqCst);
             return Err(deploy::error::Error::remote(
@@ -1350,37 +1379,37 @@ impl Remote for FailOnceMarkerRemote {
         }
         self.inner.try_write_new(rel, data)
     }
-    fn create_dir(&self, rel: &Path) -> Result<()> {
+    fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
         self.inner.create_dir(rel)
     }
-    fn create_dir_all(&self, rel: &Path) -> Result<()> {
+    fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
         self.inner.create_dir_all(rel)
     }
-    fn set_mode(&self, rel: &Path, mode: u32) -> Result<()> {
+    fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
         self.inner.set_mode(rel, mode)
     }
-    fn list(&self, rel: &Path) -> Result<Vec<RemoteEntry>> {
+    fn list(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>> {
         self.inner.list(rel)
     }
-    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+    fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
         self.inner.rename(from, to)
     }
-    fn symlink(&self, target: &Path, link: &Path) -> Result<()> {
+    fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
         self.inner.symlink(target, link)
     }
-    fn read_link(&self, rel: &Path) -> Result<std::path::PathBuf> {
+    fn read_link(&self, rel: &RootedRelativePath) -> Result<std::path::PathBuf> {
         self.inner.read_link(rel)
     }
-    fn remove_file(&self, rel: &Path) -> Result<()> {
+    fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
         self.inner.remove_file(rel)
     }
-    fn remove_dir_all(&self, rel: &Path) -> Result<()> {
+    fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
         self.inner.remove_dir_all(rel)
     }
-    fn exists(&self, rel: &Path) -> bool {
+    fn exists(&self, rel: &RootedRelativePath) -> bool {
         self.inner.exists(rel)
     }
-    fn metadata(&self, rel: &Path) -> Result<RemoteMeta> {
+    fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta> {
         self.inner.metadata(rel)
     }
     fn exec(&self, argv: &[String], timeout: Duration) -> Result<ExecOutcome> {
@@ -1427,8 +1456,9 @@ impl FailOnceRetentionRemote {
             avail,
         }))
     }
-    fn should_fail(&self, rel: &Path) -> bool {
-        self.armed.load(Ordering::SeqCst) && rel.to_string_lossy().starts_with(self.fail_path)
+    fn should_fail(&self, rel: &RootedRelativePath) -> bool {
+        self.armed.load(Ordering::SeqCst)
+            && rel.as_path().to_string_lossy().starts_with(self.fail_path)
     }
 }
 
@@ -1439,10 +1469,10 @@ impl Remote for FailOnceRetentionRemote {
     fn provision_layout(&self) -> Result<()> {
         self.inner.provision_layout()
     }
-    fn read(&self, rel: &Path) -> Result<Vec<u8>> {
+    fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
         self.inner.read(rel)
     }
-    fn write(&self, rel: &Path, data: &[u8], mode: u32) -> Result<()> {
+    fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
         if self.fail_write && self.should_fail(rel) {
             self.armed.store(false, Ordering::SeqCst);
             return Err(deploy::error::Error::remote(format!(
@@ -1452,22 +1482,22 @@ impl Remote for FailOnceRetentionRemote {
         }
         self.inner.write(rel, data, mode)
     }
-    fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<CreateNewVerdict> {
+    fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict> {
         self.inner.try_write_new(rel, data)
     }
-    fn remove_file(&self, rel: &Path) -> Result<()> {
+    fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
         self.inner.remove_file(rel)
     }
-    fn create_dir(&self, rel: &Path) -> Result<()> {
+    fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
         self.inner.create_dir(rel)
     }
-    fn create_dir_all(&self, rel: &Path) -> Result<()> {
+    fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
         self.inner.create_dir_all(rel)
     }
-    fn set_mode(&self, rel: &Path, mode: u32) -> Result<()> {
+    fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
         self.inner.set_mode(rel, mode)
     }
-    fn list(&self, rel: &Path) -> Result<Vec<RemoteEntry>> {
+    fn list(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>> {
         if self.fail_list && self.should_fail(rel) {
             self.armed.store(false, Ordering::SeqCst);
             return Err(deploy::error::Error::remote(format!(
@@ -1477,22 +1507,22 @@ impl Remote for FailOnceRetentionRemote {
         }
         self.inner.list(rel)
     }
-    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+    fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
         self.inner.rename(from, to)
     }
-    fn symlink(&self, target: &Path, link: &Path) -> Result<()> {
+    fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
         self.inner.symlink(target, link)
     }
-    fn read_link(&self, rel: &Path) -> Result<std::path::PathBuf> {
+    fn read_link(&self, rel: &RootedRelativePath) -> Result<std::path::PathBuf> {
         self.inner.read_link(rel)
     }
-    fn remove_dir_all(&self, rel: &Path) -> Result<()> {
+    fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
         self.inner.remove_dir_all(rel)
     }
-    fn exists(&self, rel: &Path) -> bool {
+    fn exists(&self, rel: &RootedRelativePath) -> bool {
         self.inner.exists(rel)
     }
-    fn metadata(&self, rel: &Path) -> Result<RemoteMeta> {
+    fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta> {
         self.inner.metadata(rel)
     }
     fn exec(&self, argv: &[String], timeout: Duration) -> Result<ExecOutcome> {
@@ -1535,9 +1565,11 @@ impl ConflictingMarkerRemote {
     }
     /// Arms only for the first marker-path call (once disarmed it behaves
     /// like the inner transport).
-    fn conflict_marker(&self, rel: &Path) -> bool {
+    fn conflict_marker(&self, rel: &RootedRelativePath) -> bool {
         // Prefix check FIRST so unrelated writes do not consume the one-shot.
-        rel.to_string_lossy().starts_with("state/commits/")
+        rel.as_path()
+            .to_string_lossy()
+            .starts_with("state/commits/")
             && self.armed.swap(false, Ordering::SeqCst)
     }
 }
@@ -1549,17 +1581,17 @@ impl Remote for ConflictingMarkerRemote {
     fn provision_layout(&self) -> Result<()> {
         self.inner.provision_layout()
     }
-    fn read(&self, rel: &Path) -> Result<Vec<u8>> {
+    fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
         self.inner.read(rel)
     }
-    fn write(&self, rel: &Path, data: &[u8], mode: u32) -> Result<()> {
+    fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
         if self.conflict_marker(rel) {
             let conflicting = Self::conflicting_payload();
             return self.inner.write(rel, &conflicting, mode);
         }
         self.inner.write(rel, data, mode)
     }
-    fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<CreateNewVerdict> {
+    fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict> {
         if self.conflict_marker(rel) {
             // Install the conflicting payload FIRST so the exclusive create
             // below reports "already exists" (`Ok(false)`), and
@@ -1570,37 +1602,37 @@ impl Remote for ConflictingMarkerRemote {
         }
         self.inner.try_write_new(rel, data)
     }
-    fn create_dir(&self, rel: &Path) -> Result<()> {
+    fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
         self.inner.create_dir(rel)
     }
-    fn create_dir_all(&self, rel: &Path) -> Result<()> {
+    fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
         self.inner.create_dir_all(rel)
     }
-    fn set_mode(&self, rel: &Path, mode: u32) -> Result<()> {
+    fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
         self.inner.set_mode(rel, mode)
     }
-    fn list(&self, rel: &Path) -> Result<Vec<RemoteEntry>> {
+    fn list(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>> {
         self.inner.list(rel)
     }
-    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+    fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
         self.inner.rename(from, to)
     }
-    fn symlink(&self, target: &Path, link: &Path) -> Result<()> {
+    fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
         self.inner.symlink(target, link)
     }
-    fn read_link(&self, rel: &Path) -> Result<std::path::PathBuf> {
+    fn read_link(&self, rel: &RootedRelativePath) -> Result<std::path::PathBuf> {
         self.inner.read_link(rel)
     }
-    fn remove_file(&self, rel: &Path) -> Result<()> {
+    fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
         self.inner.remove_file(rel)
     }
-    fn remove_dir_all(&self, rel: &Path) -> Result<()> {
+    fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
         self.inner.remove_dir_all(rel)
     }
-    fn exists(&self, rel: &Path) -> bool {
+    fn exists(&self, rel: &RootedRelativePath) -> bool {
         self.inner.exists(rel)
     }
-    fn metadata(&self, rel: &Path) -> Result<RemoteMeta> {
+    fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta> {
         self.inner.metadata(rel)
     }
     fn exec(&self, argv: &[String], timeout: Duration) -> Result<ExecOutcome> {
@@ -1964,9 +1996,12 @@ fn historical_rollback_uses_historical_behavior() -> Result<()> {
     let assignment: GenerationAssignment = serde_json::from_slice(
         &remote
             .read(
-                &Path::new("generations")
-                    .join(gen_id.as_str())
-                    .join("assignment.json"),
+                &RootedRelativePath::parse(
+                    &Path::new("generations")
+                        .join(gen_id.as_str())
+                        .join("assignment.json"),
+                )
+                .unwrap(),
             )
             .unwrap(),
     )
@@ -1994,9 +2029,12 @@ fn historical_rollback_uses_historical_behavior() -> Result<()> {
     .release
     .as_str()
     .to_string();
-    let behavior_path = Path::new("releases")
-        .join(&hist_release)
-        .join("behavior.json");
+    let behavior_path = RootedRelativePath::parse(
+        &Path::new("releases")
+            .join(&hist_release)
+            .join("behavior.json"),
+    )
+    .unwrap();
     let behavior: serde_json::Value =
         serde_json::from_slice(&remote.read(&behavior_path).unwrap()).unwrap();
     let verify_argv = behavior["standard"]["verification"]["argv"]
@@ -3251,7 +3289,7 @@ fn pending_commit_diverged_generation_is_degraded_not_successful() -> Result<()>
             .expect("valid tree digest");
     foreign_helper
         .remote()
-        .create_dir_all(&deploy::remote::layout::tree_root(foreign_tree.as_str()))?;
+        .create_dir_all(&deploy::remote::layout::tree_root(&foreign_tree))?;
     let foreign_gen = deploy::identity::GenerationId::generate();
     foreign_helper
         .acquire_lock_guard(&deploy::identity::OperationId::generate())
@@ -3279,7 +3317,7 @@ fn pending_commit_diverged_generation_is_degraded_not_successful() -> Result<()>
         .unwrap()
         .swap_current(
             &deploy::remote::helper::ExpectedCurrent::Absent,
-            foreign_gen.as_str(),
+            &foreign_gen,
             "op-foreign",
         )?;
     write_file(

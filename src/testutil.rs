@@ -983,7 +983,7 @@ pub(crate) mod test_remotes {
 
     use crate::error::{Error, Result};
     use crate::remote::transport::{
-        CreateNewVerdict, LocalTransport, Remote, scripted::ScriptedExec,
+        CreateNewVerdict, LocalTransport, Remote, RootedRelativePath, scripted::ScriptedExec,
     };
 
     /// A remote that fails commit marker writes exactly once: the first
@@ -1009,8 +1009,12 @@ pub(crate) mod test_remotes {
                 armed,
             }))
         }
-        fn fail_marker(&self, rel: &std::path::Path) -> bool {
-            self.armed.load(Ordering::SeqCst) && rel.to_string_lossy().starts_with("state/commits/")
+        fn fail_marker(&self, rel: &RootedRelativePath) -> bool {
+            self.armed.load(Ordering::SeqCst)
+                && rel
+                    .as_path()
+                    .to_string_lossy()
+                    .starts_with("state/commits/")
         }
     }
 
@@ -1018,10 +1022,10 @@ pub(crate) mod test_remotes {
         fn root(&self) -> &std::path::Path {
             self.inner.root()
         }
-        fn read(&self, rel: &std::path::Path) -> Result<Vec<u8>> {
+        fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
             self.inner.read(rel)
         }
-        fn write(&self, rel: &std::path::Path, data: &[u8], mode: u32) -> Result<()> {
+        fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
             if self.fail_marker(rel) {
                 self.armed.store(false, Ordering::SeqCst);
                 return Err(Error::remote(
@@ -1030,7 +1034,7 @@ pub(crate) mod test_remotes {
             }
             self.inner.write(rel, data, mode)
         }
-        fn try_write_new(&self, rel: &std::path::Path, data: &[u8]) -> Result<CreateNewVerdict> {
+        fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict> {
             if self.fail_marker(rel) {
                 self.armed.store(false, Ordering::SeqCst);
                 return Err(Error::remote(
@@ -1039,40 +1043,43 @@ pub(crate) mod test_remotes {
             }
             self.inner.try_write_new(rel, data)
         }
-        fn create_dir(&self, rel: &std::path::Path) -> Result<()> {
+        fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
             self.inner.create_dir(rel)
         }
-        fn create_dir_all(&self, rel: &std::path::Path) -> Result<()> {
+        fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
             self.inner.create_dir_all(rel)
         }
-        fn set_mode(&self, rel: &std::path::Path, mode: u32) -> Result<()> {
+        fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
             self.inner.set_mode(rel, mode)
         }
         fn list(
             &self,
-            rel: &std::path::Path,
+            rel: &RootedRelativePath,
         ) -> Result<Vec<crate::remote::transport::RemoteEntry>> {
             self.inner.list(rel)
         }
-        fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+        fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
             self.inner.rename(from, to)
         }
-        fn symlink(&self, target: &std::path::Path, link: &std::path::Path) -> Result<()> {
+        fn symlink(&self, target: &std::path::Path, link: &RootedRelativePath) -> Result<()> {
             self.inner.symlink(target, link)
         }
-        fn read_link(&self, rel: &std::path::Path) -> Result<std::path::PathBuf> {
+        fn read_link(&self, rel: &RootedRelativePath) -> Result<std::path::PathBuf> {
             self.inner.read_link(rel)
         }
-        fn remove_file(&self, rel: &std::path::Path) -> Result<()> {
+        fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
             self.inner.remove_file(rel)
         }
-        fn remove_dir_all(&self, rel: &std::path::Path) -> Result<()> {
+        fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
             self.inner.remove_dir_all(rel)
         }
-        fn exists(&self, rel: &std::path::Path) -> bool {
+        fn exists(&self, rel: &RootedRelativePath) -> bool {
             self.inner.exists(rel)
         }
-        fn metadata(&self, rel: &std::path::Path) -> Result<crate::remote::transport::RemoteMeta> {
+        fn metadata(
+            &self,
+            rel: &RootedRelativePath,
+        ) -> Result<crate::remote::transport::RemoteMeta> {
             self.inner.metadata(rel)
         }
         fn exec(
@@ -1106,10 +1113,10 @@ pub(crate) mod test_remotes {
                 armed,
             }))
         }
-        fn fail_generation(&self, rel: &std::path::Path) -> bool {
+        fn fail_generation(&self, rel: &RootedRelativePath) -> bool {
             self.armed.load(Ordering::SeqCst)
-                && rel.to_string_lossy().starts_with("generations/")
-                && rel.to_string_lossy().ends_with("assignment.json")
+                && rel.as_path().to_string_lossy().starts_with("generations/")
+                && rel.as_path().to_string_lossy().ends_with("assignment.json")
         }
     }
 
@@ -1117,13 +1124,13 @@ pub(crate) mod test_remotes {
         fn root(&self) -> &std::path::Path {
             self.inner.root()
         }
-        fn read(&self, rel: &std::path::Path) -> Result<Vec<u8>> {
+        fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
             self.inner.read(rel)
         }
-        fn write(&self, rel: &std::path::Path, data: &[u8], mode: u32) -> Result<()> {
+        fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
             self.inner.write(rel, data, mode)
         }
-        fn try_write_new(&self, rel: &std::path::Path, data: &[u8]) -> Result<CreateNewVerdict> {
+        fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict> {
             if self.fail_generation(rel) {
                 self.armed.store(false, Ordering::SeqCst);
                 return Err(Error::remote(
@@ -1132,40 +1139,43 @@ pub(crate) mod test_remotes {
             }
             self.inner.try_write_new(rel, data)
         }
-        fn create_dir(&self, rel: &std::path::Path) -> Result<()> {
+        fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
             self.inner.create_dir(rel)
         }
-        fn create_dir_all(&self, rel: &std::path::Path) -> Result<()> {
+        fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
             self.inner.create_dir_all(rel)
         }
-        fn set_mode(&self, rel: &std::path::Path, mode: u32) -> Result<()> {
+        fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
             self.inner.set_mode(rel, mode)
         }
         fn list(
             &self,
-            rel: &std::path::Path,
+            rel: &RootedRelativePath,
         ) -> Result<Vec<crate::remote::transport::RemoteEntry>> {
             self.inner.list(rel)
         }
-        fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+        fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
             self.inner.rename(from, to)
         }
-        fn symlink(&self, target: &std::path::Path, link: &std::path::Path) -> Result<()> {
+        fn symlink(&self, target: &std::path::Path, link: &RootedRelativePath) -> Result<()> {
             self.inner.symlink(target, link)
         }
-        fn read_link(&self, rel: &std::path::Path) -> Result<std::path::PathBuf> {
+        fn read_link(&self, rel: &RootedRelativePath) -> Result<std::path::PathBuf> {
             self.inner.read_link(rel)
         }
-        fn remove_file(&self, rel: &std::path::Path) -> Result<()> {
+        fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
             self.inner.remove_file(rel)
         }
-        fn remove_dir_all(&self, rel: &std::path::Path) -> Result<()> {
+        fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
             self.inner.remove_dir_all(rel)
         }
-        fn exists(&self, rel: &std::path::Path) -> bool {
+        fn exists(&self, rel: &RootedRelativePath) -> bool {
             self.inner.exists(rel)
         }
-        fn metadata(&self, rel: &std::path::Path) -> Result<crate::remote::transport::RemoteMeta> {
+        fn metadata(
+            &self,
+            rel: &RootedRelativePath,
+        ) -> Result<crate::remote::transport::RemoteMeta> {
             self.inner.metadata(rel)
         }
         fn exec(
@@ -1205,8 +1215,9 @@ pub(crate) mod test_remotes {
                 armed,
             }))
         }
-        fn fail_staging_write(&self, rel: &std::path::Path) -> bool {
-            self.armed.load(Ordering::SeqCst) && rel.to_string_lossy().starts_with("incoming/")
+        fn fail_staging_write(&self, rel: &RootedRelativePath) -> bool {
+            self.armed.load(Ordering::SeqCst)
+                && rel.as_path().to_string_lossy().starts_with("incoming/")
         }
     }
 
@@ -1217,10 +1228,10 @@ pub(crate) mod test_remotes {
         fn provision_layout(&self) -> Result<()> {
             self.inner.provision_layout()
         }
-        fn read(&self, rel: &std::path::Path) -> Result<Vec<u8>> {
+        fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
             self.inner.read(rel)
         }
-        fn write(&self, rel: &std::path::Path, data: &[u8], mode: u32) -> Result<()> {
+        fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
             if self.fail_staging_write(rel) {
                 self.armed.store(false, Ordering::SeqCst);
                 return Err(Error::remote(
@@ -1229,43 +1240,46 @@ pub(crate) mod test_remotes {
             }
             self.inner.write(rel, data, mode)
         }
-        fn try_write_new(&self, rel: &std::path::Path, data: &[u8]) -> Result<CreateNewVerdict> {
+        fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict> {
             self.inner.try_write_new(rel, data)
         }
-        fn create_dir(&self, rel: &std::path::Path) -> Result<()> {
+        fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
             self.inner.create_dir(rel)
         }
-        fn create_dir_all(&self, rel: &std::path::Path) -> Result<()> {
+        fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
             self.inner.create_dir_all(rel)
         }
-        fn set_mode(&self, rel: &std::path::Path, mode: u32) -> Result<()> {
+        fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
             self.inner.set_mode(rel, mode)
         }
         fn list(
             &self,
-            rel: &std::path::Path,
+            rel: &RootedRelativePath,
         ) -> Result<Vec<crate::remote::transport::RemoteEntry>> {
             self.inner.list(rel)
         }
-        fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+        fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
             self.inner.rename(from, to)
         }
-        fn symlink(&self, target: &std::path::Path, link: &std::path::Path) -> Result<()> {
+        fn symlink(&self, target: &std::path::Path, link: &RootedRelativePath) -> Result<()> {
             self.inner.symlink(target, link)
         }
-        fn read_link(&self, rel: &std::path::Path) -> Result<std::path::PathBuf> {
+        fn read_link(&self, rel: &RootedRelativePath) -> Result<std::path::PathBuf> {
             self.inner.read_link(rel)
         }
-        fn remove_file(&self, rel: &std::path::Path) -> Result<()> {
+        fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
             self.inner.remove_file(rel)
         }
-        fn remove_dir_all(&self, rel: &std::path::Path) -> Result<()> {
+        fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
             self.inner.remove_dir_all(rel)
         }
-        fn exists(&self, rel: &std::path::Path) -> bool {
+        fn exists(&self, rel: &RootedRelativePath) -> bool {
             self.inner.exists(rel)
         }
-        fn metadata(&self, rel: &std::path::Path) -> Result<crate::remote::transport::RemoteMeta> {
+        fn metadata(
+            &self,
+            rel: &RootedRelativePath,
+        ) -> Result<crate::remote::transport::RemoteMeta> {
             self.inner.metadata(rel)
         }
         fn exec(
@@ -1304,8 +1318,9 @@ pub(crate) mod test_remotes {
                 armed,
             }))
         }
-        fn fail_inventory(&self, rel: &std::path::Path) -> bool {
-            self.armed.load(Ordering::SeqCst) && rel.to_string_lossy() == "state/inventory.json"
+        fn fail_inventory(&self, rel: &RootedRelativePath) -> bool {
+            self.armed.load(Ordering::SeqCst)
+                && rel.as_path().to_string_lossy() == "state/inventory.json"
         }
     }
 
@@ -1316,10 +1331,10 @@ pub(crate) mod test_remotes {
         fn provision_layout(&self) -> Result<()> {
             self.inner.provision_layout()
         }
-        fn read(&self, rel: &std::path::Path) -> Result<Vec<u8>> {
+        fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
             self.inner.read(rel)
         }
-        fn write(&self, rel: &std::path::Path, data: &[u8], mode: u32) -> Result<()> {
+        fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
             if self.fail_inventory(rel) {
                 self.armed.store(false, Ordering::SeqCst);
                 return Err(Error::remote(
@@ -1328,43 +1343,46 @@ pub(crate) mod test_remotes {
             }
             self.inner.write(rel, data, mode)
         }
-        fn try_write_new(&self, rel: &std::path::Path, data: &[u8]) -> Result<CreateNewVerdict> {
+        fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict> {
             self.inner.try_write_new(rel, data)
         }
-        fn create_dir(&self, rel: &std::path::Path) -> Result<()> {
+        fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
             self.inner.create_dir(rel)
         }
-        fn create_dir_all(&self, rel: &std::path::Path) -> Result<()> {
+        fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
             self.inner.create_dir_all(rel)
         }
-        fn set_mode(&self, rel: &std::path::Path, mode: u32) -> Result<()> {
+        fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
             self.inner.set_mode(rel, mode)
         }
         fn list(
             &self,
-            rel: &std::path::Path,
+            rel: &RootedRelativePath,
         ) -> Result<Vec<crate::remote::transport::RemoteEntry>> {
             self.inner.list(rel)
         }
-        fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+        fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
             self.inner.rename(from, to)
         }
-        fn symlink(&self, target: &std::path::Path, link: &std::path::Path) -> Result<()> {
+        fn symlink(&self, target: &std::path::Path, link: &RootedRelativePath) -> Result<()> {
             self.inner.symlink(target, link)
         }
-        fn read_link(&self, rel: &std::path::Path) -> Result<std::path::PathBuf> {
+        fn read_link(&self, rel: &RootedRelativePath) -> Result<std::path::PathBuf> {
             self.inner.read_link(rel)
         }
-        fn remove_file(&self, rel: &std::path::Path) -> Result<()> {
+        fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
             self.inner.remove_file(rel)
         }
-        fn remove_dir_all(&self, rel: &std::path::Path) -> Result<()> {
+        fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
             self.inner.remove_dir_all(rel)
         }
-        fn exists(&self, rel: &std::path::Path) -> bool {
+        fn exists(&self, rel: &RootedRelativePath) -> bool {
             self.inner.exists(rel)
         }
-        fn metadata(&self, rel: &std::path::Path) -> Result<crate::remote::transport::RemoteMeta> {
+        fn metadata(
+            &self,
+            rel: &RootedRelativePath,
+        ) -> Result<crate::remote::transport::RemoteMeta> {
             self.inner.metadata(rel)
         }
         fn exec(
@@ -1407,62 +1425,65 @@ pub(crate) mod test_remotes {
         fn root(&self) -> &std::path::Path {
             self.inner.root()
         }
-        fn read(&self, rel: &std::path::Path) -> Result<Vec<u8>> {
+        fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
             self.tick();
             self.inner.read(rel)
         }
-        fn write(&self, rel: &std::path::Path, data: &[u8], mode: u32) -> Result<()> {
+        fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
             self.tick();
             self.inner.write(rel, data, mode)
         }
-        fn try_write_new(&self, rel: &std::path::Path, data: &[u8]) -> Result<CreateNewVerdict> {
+        fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict> {
             self.tick();
             self.inner.try_write_new(rel, data)
         }
-        fn create_dir(&self, rel: &std::path::Path) -> Result<()> {
+        fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
             self.tick();
             self.inner.create_dir(rel)
         }
-        fn create_dir_all(&self, rel: &std::path::Path) -> Result<()> {
+        fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
             self.tick();
             self.inner.create_dir_all(rel)
         }
-        fn set_mode(&self, rel: &std::path::Path, mode: u32) -> Result<()> {
+        fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
             self.tick();
             self.inner.set_mode(rel, mode)
         }
         fn list(
             &self,
-            rel: &std::path::Path,
+            rel: &RootedRelativePath,
         ) -> Result<Vec<crate::remote::transport::RemoteEntry>> {
             self.tick();
             self.inner.list(rel)
         }
-        fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+        fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
             self.tick();
             self.inner.rename(from, to)
         }
-        fn symlink(&self, target: &std::path::Path, link: &std::path::Path) -> Result<()> {
+        fn symlink(&self, target: &std::path::Path, link: &RootedRelativePath) -> Result<()> {
             self.tick();
             self.inner.symlink(target, link)
         }
-        fn read_link(&self, rel: &std::path::Path) -> Result<std::path::PathBuf> {
+        fn read_link(&self, rel: &RootedRelativePath) -> Result<std::path::PathBuf> {
             self.tick();
             self.inner.read_link(rel)
         }
-        fn remove_file(&self, rel: &std::path::Path) -> Result<()> {
+        fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
             self.tick();
             self.inner.remove_file(rel)
         }
-        fn remove_dir_all(&self, rel: &std::path::Path) -> Result<()> {
+        fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
             self.tick();
             self.inner.remove_dir_all(rel)
         }
-        fn exists(&self, rel: &std::path::Path) -> bool {
+        fn exists(&self, rel: &RootedRelativePath) -> bool {
             self.tick();
             self.inner.exists(rel)
         }
-        fn metadata(&self, rel: &std::path::Path) -> Result<crate::remote::transport::RemoteMeta> {
+        fn metadata(
+            &self,
+            rel: &RootedRelativePath,
+        ) -> Result<crate::remote::transport::RemoteMeta> {
             self.tick();
             self.inner.metadata(rel)
         }

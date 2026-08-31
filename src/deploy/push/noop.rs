@@ -106,7 +106,7 @@ pub(crate) fn check_up_to_date(
                     a.placement_slot.clone(),
                 );
                 helpers[&a.placement_slot]
-                    .read_assignment(g.as_str(), &owner)
+                    .read_assignment(g, &owner)
                     .map(|asn| {
                         // COMPLETE ArtifactRef equality (release + variant
                         // + tree). Two variants can share a release AND the
@@ -455,7 +455,9 @@ interval_seconds = 0
                 .read(
                     &layout::generations()
                         .join(cur.as_str())
-                        .join("assignment.json"),
+                        .unwrap()
+                        .join("assignment.json")
+                        .unwrap(),
                 )
                 .unwrap(),
         )
@@ -818,7 +820,9 @@ interval_seconds = 0
                 .read(
                     &layout::generations()
                         .join(cur.as_str())
-                        .join("assignment.json"),
+                        .unwrap()
+                        .join("assignment.json")
+                        .unwrap(),
                 )
                 .unwrap(),
         )

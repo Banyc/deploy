@@ -99,8 +99,7 @@ use super::history_floor::ReachabilitySnapshot;
 #[cfg(test)]
 use crate::config::ProjectConfig;
 use crate::error::{Error, Result};
-#[cfg(test)]
-use crate::identity::ReleaseId;
+use crate::identity::{ReleaseId, TreeDigest};
 use crate::remote::layout;
 use crate::store::atomic::{path_state, sync_parent_dir};
 use crate::store::local::LocalStore;
@@ -148,12 +147,66 @@ pub(crate) struct SweepStageStats {
     pub completed: bool,
 }
 
+/// The semantic kind of the entries under an enumerated GC root: a release
+/// record directory (`releases/<id>/`) or a tree object directory
+/// (`objects/sha256/<digest>/`). The kind determines which VALIDATED identity
+/// an entry name is parsed into — a raw filesystem string is never consumed
+/// as a semantic identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EntryKind {
+    /// `releases/` — every directory names a release record.
+    Release,
+    /// `objects/sha256/` — every directory names a tree object.
+    Tree,
+}
+
+/// ONE enumerated directory entry, as an OPAQUE handle: the raw filesystem
+/// name is never exposed as a semantic string. An entry is either a
+/// RECOGNIZED semantic kind carrying its VALIDATED identity (a release
+/// record or a tree object) or an UNRECOGNIZED entry (a stray file, a
+/// dotfile, a malformed name) that is never compared against the retained
+/// sets as a semantic identity — but is still an unreachable filesystem
+/// entry GC may reclaim (the retained sets only ever contain VALIDATED
+/// identities, so an unrecognized name can never be retained).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum EnumeratedEntry {
+    /// A release record directory (`releases/<id>/`): the validated
+    /// [`ReleaseId`] the directory names.
+    Release(ReleaseId),
+    /// A tree object directory (`objects/sha256/<digest>/`): the validated
+    /// [`TreeDigest`] the directory names.
+    Tree(TreeDigest),
+    /// An entry that is not a recognized semantic kind: never treated as a
+    /// semantic identity (never compared against the retained sets), but
+    /// still an unreachable filesystem entry GC may reclaim. The raw name
+    /// is carried ONLY for deletion-path construction.
+    Other(String),
+}
+
+impl EnumeratedEntry {
+    /// The VALIDATED identity string of a recognized entry (for retained-set
+    /// membership checks); `None` for an unrecognized entry. The raw
+    /// filesystem name is never exposed — only the parsed identity.
+    pub(crate) fn identity(&self) -> Option<&str> {
+        match self {
+            EnumeratedEntry::Release(id) => Some(id.as_str()),
+            EnumeratedEntry::Tree(digest) => Some(digest.as_str()),
+            EnumeratedEntry::Other(_) => None,
+        }
+    }
+}
+
 /// Enumerate the store's targets (every directory under `targets/`), sorted
 /// for determinism. An empty store (no `targets/` dir yet) is the empty
 /// list; ANY other enumeration failure propagates (an unreadable targets
 /// directory must never read as "no targets" — the retained set would then
 /// be computed without the targets' history).
-fn enumerate_dirs(root: &Path) -> Result<Vec<String>> {
+///
+/// Every directory entry is returned as an OPAQUE [`EnumeratedEntry`]
+/// handle: the raw name is parsed into the VALIDATED identity of the
+/// requested [`EntryKind`] (a malformed name is an [`EnumeratedEntry::Other`]
+/// — never a semantic identity, never a deletion candidate).
+fn enumerate_dirs(root: &Path, kind: EntryKind) -> Result<Vec<EnumeratedEntry>> {
     let mut out = Vec::new();
     match std::fs::read_dir(root) {
         Ok(rd) => {
@@ -167,14 +220,21 @@ fn enumerate_dirs(root: &Path) -> Result<Vec<String>> {
                     })?
                     .is_dir()
                 {
-                    out.push(entry.file_name().to_string_lossy().into_owned());
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    let parsed = match kind {
+                        EntryKind::Release => ReleaseId::parse(&name).map(EnumeratedEntry::Release),
+                        EntryKind::Tree => TreeDigest::parse(&name).map(EnumeratedEntry::Tree),
+                    };
+                    out.push(parsed.unwrap_or(EnumeratedEntry::Other(name)));
                 }
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(Error::store(format!("read_dir {}: {e}", root.display()))),
     }
-    out.sort();
+    // Sort by the raw name for determinism (the deletion order is the sorted
+    // enumeration).
+    out.sort_by(|a, b| a.identity().cmp(&b.identity()));
     Ok(out)
 }
 
@@ -216,13 +276,20 @@ impl LocalStore {
             let trees = self.delete_unretained_trees(snapshot)?;
             trees
         } else {
-            let planned = match enumerate_dirs(&self.base().join(layout::objects())) {
-                Ok(names) => names
-                    .iter()
-                    .filter(|n| !snapshot.trees.contains(*n))
-                    .count(),
-                Err(_) => 0,
-            };
+            let planned =
+                match enumerate_dirs(&self.base().join(layout::objects()), EntryKind::Tree) {
+                    Ok(entries) => entries
+                        .iter()
+                        .filter(|e| match e.identity() {
+                            Some(id) => !snapshot.trees.contains(id),
+                            // An unrecognized entry is never in the retained set
+                            // (which only contains validated identities) — it is
+                            // unreachable garbage.
+                            None => true,
+                        })
+                        .count(),
+                    Err(_) => 0,
+                };
             SweepStageStats {
                 planned,
                 removed: 0,
@@ -269,12 +336,26 @@ impl LocalStore {
             ));
         }
         let root = self.base().join(layout::RELEASES);
-        let mut candidates = enumerate_dirs(&root)?;
-        candidates.retain(|n| !snapshot.releases.contains(n));
+        let mut candidates = enumerate_dirs(&root, EntryKind::Release)?;
+        // Keep the deletion candidates: a RECOGNIZED release record NOT in
+        // the retained set, or an UNRECOGNIZED entry (a stray file, a
+        // malformed name) — never compared against the retained sets as a
+        // semantic identity, but still unreachable garbage (the retained
+        // sets only contain validated identities).
+        candidates.retain(|e| match e.identity() {
+            Some(id) => !snapshot.releases.contains(id),
+            None => true,
+        });
         let planned = candidates.len();
         let mut removed = 0usize;
-        for name in &candidates {
-            let dir = self.release_dir_named(name);
+        for entry in &candidates {
+            let dir = match entry {
+                EnumeratedEntry::Release(id) => self.release_dir(id),
+                EnumeratedEntry::Other(name) => self.base().join(layout::RELEASES).join(name),
+                EnumeratedEntry::Tree(_) => {
+                    unreachable!("a tree entry is never a release candidate")
+                }
+            };
             // TRI-STATE: an already-removed dir (a previous interrupted
             // pass) is a skip — it is neither removed now nor pending. ANY
             // other stat failure stops the stage (fail closed) with the
@@ -361,14 +442,29 @@ impl LocalStore {
             ));
         }
         let root = self.base().join(layout::objects());
-        let mut candidates = enumerate_dirs(&root)?;
-        candidates.retain(|n| !snapshot.trees.contains(n));
+        let mut candidates = enumerate_dirs(&root, EntryKind::Tree)?;
+        // Keep the deletion candidates: a RECOGNIZED tree object NOT in the
+        // retained set, or an UNRECOGNIZED entry (never compared against the
+        // retained sets as a semantic identity, but still unreachable
+        // garbage).
+        candidates.retain(|e| match e.identity() {
+            Some(id) => !snapshot.trees.contains(id),
+            None => true,
+        });
         let planned = candidates.len();
         let mut removed = 0usize;
-        for name in &candidates {
-            // The digest directory itself (`objects/sha256/<digest>/`),
-            // holding `root/` and `tree.json`.
-            let dir = self.base().join(layout::objects()).join(name);
+        for entry in &candidates {
+            let dir = match entry {
+                EnumeratedEntry::Tree(digest) => {
+                    // The digest directory itself (`objects/sha256/<digest>/`),
+                    // holding `root/` and `tree.json`.
+                    self.base().join(layout::objects()).join(digest.as_str())
+                }
+                EnumeratedEntry::Other(name) => self.base().join(layout::objects()).join(name),
+                EnumeratedEntry::Release(_) => {
+                    unreachable!("a release entry is never a tree candidate")
+                }
+            };
             let present = match path_state(&dir) {
                 Ok(p) => p,
                 Err(_) => {

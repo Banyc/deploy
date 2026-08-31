@@ -686,7 +686,7 @@ pub(crate) mod commit_tests {
         let marker_path = h
             .remotes_base
             .join("s1")
-            .join(crate::remote::layout::commit_marker(dep2.as_str()));
+            .join(crate::remote::layout::commit_marker(&dep2));
         assert!(
             !marker_path.exists(),
             "marker absent after the faulted push"
@@ -1105,7 +1105,7 @@ pub(crate) mod commit_tests {
         let marker = h
             .remotes_base
             .join("s1")
-            .join(crate::remote::layout::commit_marker(id_a.as_str()));
+            .join(crate::remote::layout::commit_marker(&id_a));
         assert!(marker.exists(), "marker written for the original id");
     }
 
@@ -1451,7 +1451,9 @@ pub(crate) mod commit_tests {
                     .read(
                         &crate::remote::layout::generations()
                             .join(cur.as_str())
-                            .join("assignment.json"),
+                            .unwrap()
+                            .join("assignment.json")
+                            .unwrap(),
                     )
                     .unwrap(),
             )
@@ -1464,15 +1466,17 @@ pub(crate) mod commit_tests {
             assert_eq!(assignment.artifact.release.as_str(), want_release.as_str());
             assert!(
                 remote.exists(
-                    &crate::remote::layout::remote_release(want_release.as_str())
+                    &crate::remote::layout::remote_release(want_release)
                         .join("release.json")
+                        .unwrap()
                 ),
                 "slot {slot}'s release record must be published on its server's remote"
             );
             assert!(
                 remote.exists(
-                    &crate::remote::layout::remote_release(want_release.as_str())
+                    &crate::remote::layout::remote_release(want_release)
                         .join("behavior.json")
+                        .unwrap()
                 ),
                 "slot {slot}'s release behavior.json must be published on its server's remote"
             );
@@ -2065,7 +2069,7 @@ pub(crate) mod commit_tests {
         let base = h.remotes_base.join(server);
         let remote = LocalTransport::new(&crate::testutil::fixture_env(), base).unwrap();
         remote
-            .create_dir_all(&layout::tree_root(artifact.tree.as_str()))
+            .create_dir_all(&layout::tree_root(&artifact.tree))
             .unwrap();
         let helper = RemoteHelper::new(&remote);
         helper
@@ -2087,7 +2091,7 @@ pub(crate) mod commit_tests {
         helper
             .acquire_lock_guard(&crate::identity::OperationId::new("op-mint".to_string()))
             .unwrap()
-            .swap_current(&ExpectedCurrent::Absent, generation.as_str(), "op-mint")
+            .swap_current(&ExpectedCurrent::Absent, generation, "op-mint")
             .unwrap();
     }
 
@@ -2105,7 +2109,7 @@ pub(crate) mod commit_tests {
             tree: test_tree_digest("tree-foreign"),
         };
         remote
-            .create_dir_all(&layout::tree_root(foreign_artifact.tree.as_str()))
+            .create_dir_all(&layout::tree_root(&foreign_artifact.tree))
             .unwrap();
         let helper = RemoteHelper::new(&remote);
         helper

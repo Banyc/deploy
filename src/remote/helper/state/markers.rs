@@ -2,6 +2,7 @@
 //! immutable per-deployment commit record under `state/commits/`.
 
 use crate::error::{Error, Result};
+use crate::identity::DeploymentId;
 use crate::remote::layout;
 use crate::remote::transport::{CreateNewVerdict, VerifiedExisting};
 
@@ -25,7 +26,7 @@ impl<'a> HeldSlotLock<'a> {
     /// retried commit therefore never corrupts a recorded fact.
     pub fn write_commit_marker(
         &self,
-        deployment_id: &str,
+        deployment_id: &DeploymentId,
         generation: &str,
         slot_ids: &[String],
         target: Option<&str>,
@@ -80,6 +81,7 @@ impl<'a> HeldSlotLock<'a> {
 #[cfg(test)]
 mod tests_markers {
     use super::*;
+    use crate::identity::test_deployment_id;
     use crate::remote::transport::LocalTransport;
     use crate::remote::transport::Remote;
     use std::path::PathBuf;
@@ -100,11 +102,13 @@ mod tests_markers {
         let (_dir, remote, root) = setup();
 
         std::fs::create_dir_all(root.join(layout::commits_dir())).unwrap();
-        let marker = layout::commit_marker("deploy-0");
-        let tmp = marker.with_file_name(format!(
-            ".{}.tmp.99999.7",
-            marker.file_name().unwrap().to_string_lossy()
-        ));
+        let marker = layout::commit_marker(&test_deployment_id("deploy-0"));
+        let tmp = marker
+            .with_file_name(format!(
+                ".{}.tmp.99999.7",
+                marker.file_name().unwrap().to_string_lossy()
+            ))
+            .unwrap();
         std::fs::write(
             root.join(&tmp),
             b"{ \"deployment_id\": \"deploy-0\", \"commi",
@@ -116,11 +120,17 @@ mod tests_markers {
             .acquire_lock_guard(&crate::identity::OperationId::new("op-marker".to_string()))
             .unwrap();
         _guard
-            .write_commit_marker("deploy-0", "gen-0", &["p1".to_string()], Some("t1"))
+            .write_commit_marker(
+                &test_deployment_id("deploy-0"),
+                "gen-0",
+                &["p1".to_string()],
+                Some("t1"),
+            )
             .expect("commit marker install must succeed past stale temp");
 
         let marker: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(root.join(layout::commit_marker("deploy-0"))).unwrap(),
+            &std::fs::read(root.join(layout::commit_marker(&test_deployment_id("deploy-0"))))
+                .unwrap(),
         )
         .expect("installed commit marker must be valid JSON");
         assert_eq!(marker["committed"], serde_json::json!(true));
@@ -136,7 +146,7 @@ mod tests_markers {
     #[test]
     fn commit_marker_symlink_is_a_conflict_never_followed() {
         let (_dir, remote, root) = setup();
-        let marker = layout::commit_marker("deploy-0");
+        let marker = layout::commit_marker(&test_deployment_id("deploy-0"));
         std::fs::create_dir_all(root.join(marker.parent().unwrap())).unwrap();
 
         // The marker the writer would install: deterministic bytes for this
@@ -166,7 +176,12 @@ mod tests_markers {
             .acquire_lock_guard(&crate::identity::OperationId::new("op-symlink".to_string()))
             .unwrap();
         let err = _guard
-            .write_commit_marker("deploy-0", "gen-0", &["p1".to_string()], Some("t1"))
+            .write_commit_marker(
+                &test_deployment_id("deploy-0"),
+                "gen-0",
+                &["p1".to_string()],
+                Some("t1"),
+            )
             .expect_err("a symlink where the marker should be is a real conflict");
         let msg = err.to_string();
         assert!(
@@ -225,7 +240,7 @@ mod tests_markers {
                     .unwrap();
                 for i in 0..80 {
                     if let Err(e) = _guard.write_commit_marker(
-                        &format!("deploy-{i}"),
+                        &test_deployment_id(&format!("deploy-{i}")),
                         &format!("gen-{i}"),
                         &["p1".to_string()],
                         Some("t1"),
@@ -272,7 +287,17 @@ mod tests_markers {
         });
 
         for i in 0..80 {
-            let p = commits_dir.join(format!("deploy-{i}.json"));
+            // The marker is written under the CANONICAL deployment id (the
+            // typed identity the layout builder names), so the read-back uses
+            // the same canonical id — never a raw fixture string.
+            // The marker is written under the CANONICAL deployment id (the
+            // typed identity the layout builder names), so the read-back uses
+            // the same canonical id — never a raw fixture string. The marker
+            // path is relative to the REMOTE ROOT, so it is joined onto the
+            // root (not onto the commits dir, which would double the prefix).
+            let p = root.join(layout::commit_marker(&test_deployment_id(&format!(
+                "deploy-{i}"
+            ))));
             let v: serde_json::Value = serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap();
             assert_eq!(v["committed"], serde_json::json!(true));
         }

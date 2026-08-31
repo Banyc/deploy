@@ -89,6 +89,7 @@ use crate::remote::helper::{GenerationAssignment, LockRecord, RemoteHelper};
 use crate::remote::layout;
 use crate::remote::transport::{
     CreateNewVerdict, ExecOutcome, FsBytes, LocalTransport, Remote, RemoteEntry, RemoteMeta,
+    RootedRelativePath,
 };
 use crate::retention::checkpoint::{CheckpointReport, run_checkpoint_unlocked};
 use crate::retention::compute_retained;
@@ -353,10 +354,10 @@ impl FailOnceRemote {
             fault,
         }))
     }
-    fn should_fail(&self, rel: &Path) -> bool {
+    fn should_fail(&self, rel: &RootedRelativePath) -> bool {
         let mut f = self.fault.lock().unwrap();
         if let Some(marker) = &f.fail_write_once {
-            let rel = rel.to_string_lossy().to_string();
+            let rel = rel.as_path().to_string_lossy().to_string();
             // Commit-marker faults name the `state/commits/` DIRECTORY
             // (prefix match); the retention-inventory fault names the exact
             // file. The fault is consumed ONLY by a matching write — a write
@@ -372,7 +373,7 @@ impl FailOnceRemote {
     /// the `current` link AFTER the push's mutation-lock write was seen. The
     /// planning status reads (before any lock write) and the reconcile reads
     /// (which verify generations BEFORE acquiring any lock) pass.
-    fn should_fail_status_read(&self, rel: &Path) -> bool {
+    fn should_fail_status_read(&self, rel: &RootedRelativePath) -> bool {
         let mut f = self.fault.lock().unwrap();
         // The per-server arm fires only on the transport of the NAMED server
         // (the batch-position failures): that server's first post-lock
@@ -380,12 +381,15 @@ impl FailOnceRemote {
         // pass and leave the arm armed.
         if f.fail_current_read_on_server.as_deref() == Some(self.server_name().as_str())
             && f.lock_written
-            && rel == layout::current()
+            && rel.as_path() == layout::current().as_path()
         {
             f.fail_current_read_on_server = None;
             return true;
         }
-        if f.fail_current_read_after_lock && f.lock_written && rel == layout::current() {
+        if f.fail_current_read_after_lock
+            && f.lock_written
+            && rel.as_path() == layout::current().as_path()
+        {
             f.fail_current_read_after_lock = false;
             return true;
         }
@@ -408,10 +412,10 @@ impl Remote for FailOnceRemote {
     fn root(&self) -> &Path {
         self.inner.root()
     }
-    fn read(&self, rel: &Path) -> Result<Vec<u8>> {
+    fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
         self.inner.read(rel)
     }
-    fn write(&self, rel: &Path, data: &[u8], mode: u32) -> Result<()> {
+    fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
         if self.should_fail(rel) {
             return Err(crate::error::Error::transport(format!(
                 "injected write failure at {}",
@@ -420,7 +424,7 @@ impl Remote for FailOnceRemote {
         }
         self.inner.write(rel, data, mode)
     }
-    fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<CreateNewVerdict> {
+    fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict> {
         if self.should_fail(rel) {
             return Err(crate::error::Error::transport(format!(
                 "injected write failure at {}",
@@ -431,30 +435,30 @@ impl Remote for FailOnceRemote {
         // e.g. the reconcile marker write of this push) marks the mutating
         // phase: the pre-swap status-read arm may now fire on the next
         // `current`-link read.
-        if rel == layout::operation_lock() {
+        if rel.as_path() == layout::operation_lock().as_path() {
             self.fault.lock().unwrap().lock_written = true;
         }
         self.inner.try_write_new(rel, data)
     }
-    fn create_dir(&self, rel: &Path) -> Result<()> {
+    fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
         self.inner.create_dir(rel)
     }
-    fn create_dir_all(&self, rel: &Path) -> Result<()> {
+    fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
         self.inner.create_dir_all(rel)
     }
-    fn set_mode(&self, rel: &Path, mode: u32) -> Result<()> {
+    fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
         self.inner.set_mode(rel, mode)
     }
-    fn list(&self, rel: &Path) -> Result<Vec<RemoteEntry>> {
+    fn list(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>> {
         self.inner.list(rel)
     }
-    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+    fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
         self.inner.rename(from, to)
     }
-    fn symlink(&self, target: &Path, link: &Path) -> Result<()> {
+    fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
         self.inner.symlink(target, link)
     }
-    fn read_link(&self, rel: &Path) -> Result<PathBuf> {
+    fn read_link(&self, rel: &RootedRelativePath) -> Result<PathBuf> {
         if self.should_fail_status_read(rel) {
             return Err(crate::error::Error::transport(format!(
                 "injected pre-swap status read failure at {}",
@@ -463,16 +467,16 @@ impl Remote for FailOnceRemote {
         }
         self.inner.read_link(rel)
     }
-    fn remove_file(&self, rel: &Path) -> Result<()> {
+    fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
         self.inner.remove_file(rel)
     }
-    fn remove_dir_all(&self, rel: &Path) -> Result<()> {
+    fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
         self.inner.remove_dir_all(rel)
     }
-    fn exists(&self, rel: &Path) -> bool {
+    fn exists(&self, rel: &RootedRelativePath) -> bool {
         self.inner.exists(rel)
     }
-    fn metadata(&self, rel: &Path) -> Result<RemoteMeta> {
+    fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta> {
         self.inner.metadata(rel)
     }
     fn exec(&self, argv: &[String], timeout: std::time::Duration) -> Result<ExecOutcome> {
@@ -1069,7 +1073,7 @@ impl Fixture {
         self.with_helper(|helper| {
             let status = helper.status(&owner).ok()?;
             let g = status.current_generation()?;
-            helper.read_assignment(g.as_str(), &owner).ok()
+            helper.read_assignment(g, &owner).ok()
         })
     }
 
@@ -1086,7 +1090,7 @@ impl Fixture {
             let asn = self.with_slot_helper(slot, |helper| {
                 let status = helper.status(&owner).ok()?;
                 let g = status.current_generation()?;
-                helper.read_assignment(g.as_str(), &owner).ok()
+                helper.read_assignment(g, &owner).ok()
             });
             if let Some(a) = asn {
                 out.insert(SlotId::new(slot.to_string()), a);
@@ -1817,7 +1821,7 @@ impl Fixture {
         let path = self
             .remotes_base
             .join("s1")
-            .join(layout::generation(gen_id.as_str()))
+            .join(layout::generation(&gen_id))
             .join("assignment.json");
         let mut stored: GenerationAssignment =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -1860,7 +1864,7 @@ impl Fixture {
         let path = self
             .remotes_base
             .join("s1")
-            .join(layout::generation(gen_id.as_str()))
+            .join(layout::generation(&gen_id))
             .join("assignment.json");
         let mut stored: GenerationAssignment =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -2034,7 +2038,9 @@ impl Fixture {
             let remote = self.remote_for(server);
             for tree in &retained {
                 assert!(
-                    remote.exists(&layout::tree_root(tree)),
+                    remote.exists(&layout::tree_root(
+                        &TreeDigest::parse(tree).expect("fixture tree digest")
+                    )),
                     "policy-retained tree {tree} on {server} must survive retention"
                 );
             }
@@ -2089,7 +2095,9 @@ impl Fixture {
                         for server in &target_servers {
                             let remote = self.remote_for(server);
                             assert!(
-                                remote.exists(&layout::commit_marker(id)),
+                                remote.exists(&layout::commit_marker(
+                                    &DeploymentId::parse(id).expect("fixture deployment id")
+                                )),
                                 "Successful attempt {id} must have a durable commit marker on \
                                  {server}"
                             );
@@ -2175,12 +2183,12 @@ impl Fixture {
                     && let Some(g) = status.current_generation()
                 {
                     let asn = helper
-                        .read_assignment(g.as_str(), &owner)
+                        .read_assignment(g, &owner)
                         .expect("current generation assignment must parse");
                     assert!(
                         helper
                             .remote()
-                            .exists(&layout::tree_root(asn.artifact.tree.as_str())),
+                            .exists(&layout::tree_root(&asn.artifact.tree)),
                         "current generation's tree object must exist on the remote"
                     );
                 }
@@ -7382,8 +7390,9 @@ struct CtrlFaultState {
 /// Mutate step writes UNDER the capability, tagged with the holder's record. The
 /// probe is a real remote write (faultable at the `Mutate` seam) and the
 /// test asserts it always carries the holder's record's operation_id + acquisition_id.
-fn mutation_probe() -> PathBuf {
-    Path::new("state").join("mutation.probe")
+fn mutation_probe() -> RootedRelativePath {
+    RootedRelativePath::parse(&Path::new("state").join("mutation.probe"))
+        .expect("the mutation probe path is a safe relative path")
 }
 
 /// A transport that injects ONE-SHOT faults at the mutation lock's
@@ -7397,8 +7406,8 @@ struct CtrlFaultRemote {
 }
 
 impl CtrlFaultRemote {
-    fn hits_lock(rel: &Path) -> bool {
-        rel == layout::operation_lock()
+    fn hits_lock(rel: &RootedRelativePath) -> bool {
+        rel.as_path() == layout::operation_lock().as_path()
     }
 }
 
@@ -7406,7 +7415,7 @@ impl Remote for CtrlFaultRemote {
     fn root(&self) -> &Path {
         self.inner.root()
     }
-    fn read(&self, rel: &Path) -> crate::error::Result<Vec<u8>> {
+    fn read(&self, rel: &RootedRelativePath) -> crate::error::Result<Vec<u8>> {
         if Self::hits_lock(rel) && self.faults.lock().unwrap().fail_read {
             self.faults.lock().unwrap().fail_read = false;
             return Err(crate::error::Error::transport(
@@ -7415,8 +7424,8 @@ impl Remote for CtrlFaultRemote {
         }
         self.inner.read(rel)
     }
-    fn write(&self, rel: &Path, data: &[u8], mode: u32) -> crate::error::Result<()> {
-        if rel == mutation_probe() && self.faults.lock().unwrap().fail_mutate {
+    fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> crate::error::Result<()> {
+        if rel.as_path() == mutation_probe().as_path() && self.faults.lock().unwrap().fail_mutate {
             self.faults.lock().unwrap().fail_mutate = false;
             return Err(crate::error::Error::transport(
                 "injected mutation write failure".to_string(),
@@ -7424,7 +7433,11 @@ impl Remote for CtrlFaultRemote {
         }
         self.inner.write(rel, data, mode)
     }
-    fn try_write_new(&self, rel: &Path, data: &[u8]) -> crate::error::Result<CreateNewVerdict> {
+    fn try_write_new(
+        &self,
+        rel: &RootedRelativePath,
+        data: &[u8],
+    ) -> crate::error::Result<CreateNewVerdict> {
         if Self::hits_lock(rel) && self.faults.lock().unwrap().fail_claim {
             self.faults.lock().unwrap().fail_claim = false;
             return Err(crate::error::Error::transport(
@@ -7433,33 +7446,37 @@ impl Remote for CtrlFaultRemote {
         }
         self.inner.try_write_new(rel, data)
     }
-    fn create_dir(&self, rel: &Path) -> crate::error::Result<()> {
+    fn create_dir(&self, rel: &RootedRelativePath) -> crate::error::Result<()> {
         self.inner.create_dir(rel)
     }
-    fn create_dir_all(&self, rel: &Path) -> crate::error::Result<()> {
+    fn create_dir_all(&self, rel: &RootedRelativePath) -> crate::error::Result<()> {
         self.inner.create_dir_all(rel)
     }
-    fn set_mode(&self, rel: &Path, mode: u32) -> crate::error::Result<()> {
+    fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> crate::error::Result<()> {
         self.inner.set_mode(rel, mode)
     }
-    fn list(&self, rel: &Path) -> crate::error::Result<Vec<RemoteEntry>> {
+    fn list(&self, rel: &RootedRelativePath) -> crate::error::Result<Vec<RemoteEntry>> {
         self.inner.list(rel)
     }
-    fn rename(&self, from: &Path, to: &Path) -> crate::error::Result<()> {
+    fn rename(
+        &self,
+        from: &RootedRelativePath,
+        to: &RootedRelativePath,
+    ) -> crate::error::Result<()> {
         self.inner.rename(from, to)
     }
-    fn symlink(&self, target: &Path, link: &Path) -> crate::error::Result<()> {
+    fn symlink(&self, target: &Path, link: &RootedRelativePath) -> crate::error::Result<()> {
         self.inner.symlink(target, link)
     }
-    fn read_link(&self, rel: &Path) -> crate::error::Result<PathBuf> {
+    fn read_link(&self, rel: &RootedRelativePath) -> crate::error::Result<PathBuf> {
         self.inner.read_link(rel)
     }
-    fn remove_file(&self, rel: &Path) -> crate::error::Result<()> {
+    fn remove_file(&self, rel: &RootedRelativePath) -> crate::error::Result<()> {
         self.inner.remove_file(rel)
     }
     fn remove_file_if(
         &self,
-        rel: &Path,
+        rel: &RootedRelativePath,
         expected: &[u8],
     ) -> crate::error::Result<crate::remote::transport::RemoveIfVerdict> {
         if Self::hits_lock(rel) && self.faults.lock().unwrap().fail_remove {
@@ -7470,16 +7487,16 @@ impl Remote for CtrlFaultRemote {
         }
         self.inner.remove_file_if(rel, expected)
     }
-    fn remove_dir_all(&self, rel: &Path) -> crate::error::Result<()> {
+    fn remove_dir_all(&self, rel: &RootedRelativePath) -> crate::error::Result<()> {
         self.inner.remove_dir_all(rel)
     }
-    fn exists(&self, rel: &Path) -> bool {
+    fn exists(&self, rel: &RootedRelativePath) -> bool {
         self.inner.exists(rel)
     }
-    fn metadata(&self, rel: &Path) -> crate::error::Result<RemoteMeta> {
+    fn metadata(&self, rel: &RootedRelativePath) -> crate::error::Result<RemoteMeta> {
         self.inner.metadata(rel)
     }
-    fn metadata_opt(&self, rel: &Path) -> crate::error::Result<Option<RemoteMeta>> {
+    fn metadata_opt(&self, rel: &RootedRelativePath) -> crate::error::Result<Option<RemoteMeta>> {
         self.inner.metadata_opt(rel)
     }
     fn exec(

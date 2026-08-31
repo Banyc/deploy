@@ -2,6 +2,7 @@
 //! the durable `transactions/<op-id>.json` recovery record.
 
 use crate::error::{Error, Result};
+use crate::identity::OperationId;
 use crate::remote::layout;
 
 use super::super::{HeldSlotLock, now_rfc3339};
@@ -12,7 +13,7 @@ impl<'a> HeldSlotLock<'a> {
     /// per-operation recovery record (`transactions/<op-id>.json`, advanced
     /// `prepared` → `committed` → `compensated`): a disconnected client learns an
     /// operation's outcome by reading it, not from any per-server history log.
-    pub fn transaction_record(&self, op_id: &str, state: &str) -> Result<()> {
+    pub fn transaction_record(&self, op_id: &OperationId, state: &str) -> Result<()> {
         let p = layout::transaction_record(op_id);
         let payload = serde_json::json!({
             "operation_id": op_id,

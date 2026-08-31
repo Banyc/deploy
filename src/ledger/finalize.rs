@@ -137,7 +137,7 @@ pub(crate) fn finalize_successful_locked(
         let guard = &guards[idx];
         let entry = snapshot.get(sid).expect("selected in snapshot");
         match guard.write_commit_marker(
-            attempt.deployment_id().as_str(),
+            attempt.deployment_id(),
             entry.generation().as_str(),
             &slot_ids,
             Some(attempt.target().as_str()),
@@ -257,7 +257,7 @@ fn verify_selected_locked(
         let Some(live_gen) = st1.current_generation() else {
             return Ok(LockedObservation::Diverged(sid.clone()));
         };
-        let asn = helper.read_assignment(live_gen.as_str(), &owner)?;
+        let asn = helper.read_assignment(live_gen, &owner)?;
         let st2 = helper.status(&owner)?;
         if st2.current_generation() != Some(live_gen)
             || live_gen != entry.generation()

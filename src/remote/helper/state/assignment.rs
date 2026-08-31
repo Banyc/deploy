@@ -68,10 +68,10 @@ impl<'a> RemoteHelper<'a> {
     /// closed the same way.
     pub fn read_assignment(
         &self,
-        gen_id: &str,
+        gen_id: &GenerationId,
         owner: &GenerationOwner,
     ) -> Result<GenerationAssignment> {
-        let p = layout::generation(gen_id).join("assignment.json");
+        let p = layout::generation(gen_id).join("assignment.json")?;
         let data = self.remote.read(&p)?;
         let assignment: GenerationAssignment = serde_json::from_slice(&data).map_err(|e| {
             Error::integrity(format!(
@@ -116,11 +116,11 @@ impl<'a> HeldSlotLock<'a> {
     /// fresh UUIDv7 values minted while holding the slot lock, so this can
     /// only fire on corruption or retry-after-crash with divergent state.
     pub fn create_generation(&self, assignment: &GenerationAssignment) -> Result<()> {
-        let gen_dir = layout::generation(assignment.generation_id.as_str());
+        let gen_dir = layout::generation(&assignment.generation_id);
         self.helper.remote.create_dir_all(&gen_dir)?;
         let json = serde_json::to_vec_pretty(assignment)
             .map_err(|e| Error::remote(format!("serialize assignment: {e}")))?;
-        let assignment_path = gen_dir.join("assignment.json");
+        let assignment_path = gen_dir.join("assignment.json")?;
         // The TYPED verdict: `Created`/`AlreadyPresent` (the identical retry)
         // skip the read-back; a `Conflict` carries the TYPED reason — the
         // winner is never replaced, and a metadata conflict (a
@@ -169,9 +169,9 @@ impl<'a> HeldSlotLock<'a> {
         // relative to that directory (../../objects/...). Its target is derived
         // deterministically from the (now-verified) assignment, so recreating
         // it after a crash is safe.
-        let root_link_path = gen_dir.join("root");
+        let root_link_path = gen_dir.join("root")?;
         if self.helper.remote.metadata_opt(&root_link_path)?.is_none() {
-            let root_link = layout::generation_root_link(assignment.artifact.tree.as_str());
+            let root_link = layout::generation_root_link(&assignment.artifact.tree);
             self.helper.remote.symlink(&root_link, &root_link_path)?;
         }
         Ok(())
@@ -246,7 +246,7 @@ mod tests_assignment {
         // itself rather than its resolved target.)
         let owner = crate::remote::helper::test_owner("test-app", "s1");
         let a = helper
-            .read_assignment(test_generation_id("gen-1").as_str(), &owner)
+            .read_assignment(&test_generation_id("gen-1"), &owner)
             .unwrap();
         assert_eq!(
             a.artifact.tree.as_str(),
@@ -319,12 +319,12 @@ mod tests_assignment {
             };
             let bytes = serde_json::to_vec_pretty(&value).unwrap();
             let gen_id = test_generation_id(&tag);
-            let p = crate::remote::layout::generation(gen_id.as_str()).join("assignment.json");
-            remote.create_dir_all(p.parent().unwrap()).unwrap();
+            let p = crate::remote::layout::generation(&gen_id).join("assignment.json").unwrap();
+            remote.create_dir_all(&p.parent().unwrap()).unwrap();
             remote.write(&p, &bytes, 0o600).unwrap();
 
             // read_assignment: ACCEPT the exact match, REFUSE every tamper.
-            let read = helper.read_assignment(gen_id.as_str(), &owner());
+            let read = helper.read_assignment(&gen_id, &owner());
             match tampered {
                 None => assert!(
                     read.is_ok(),
@@ -345,19 +345,17 @@ mod tests_assignment {
             // chain and assert status reports the generation; for the REFUSE
             // cases the owner failure fires at the assignment read, before
             // the tree check.
-            let gen_dir = crate::remote::layout::generation(gen_id.as_str());
+            let gen_dir = crate::remote::layout::generation(&gen_id);
             if tamper == 0 {
                 remote
-                    .create_dir_all(&crate::remote::layout::tree_root(
-                        asn.artifact.tree.as_str(),
-                    ))
+                    .create_dir_all(&crate::remote::layout::tree_root(&asn.artifact.tree))
                     .unwrap();
                 let root_link =
-                    crate::remote::layout::generation_root_link(asn.artifact.tree.as_str());
-                remote.symlink(&root_link, &gen_dir.join("root")).unwrap();
+                    crate::remote::layout::generation_root_link(&asn.artifact.tree);
+                remote.symlink(&root_link, &gen_dir.join("root").unwrap()).unwrap();
                 remote
                     .symlink(
-                        &gen_dir.join("root"),
+                        gen_dir.join("root").unwrap().as_path(),
                         crate::remote::layout::current(),
                     )
                     .unwrap();
@@ -367,16 +365,14 @@ mod tests_assignment {
                 assert_eq!(st.current_generation(), Some(&gen_id));
             } else {
                 remote
-                    .create_dir_all(&crate::remote::layout::tree_root(
-                        asn.artifact.tree.as_str(),
-                    ))
+                    .create_dir_all(&crate::remote::layout::tree_root(&asn.artifact.tree))
                     .unwrap();
                 let root_link =
-                    crate::remote::layout::generation_root_link(asn.artifact.tree.as_str());
-                remote.symlink(&root_link, &gen_dir.join("root")).unwrap();
+                    crate::remote::layout::generation_root_link(&asn.artifact.tree);
+                remote.symlink(&root_link, &gen_dir.join("root").unwrap()).unwrap();
                 remote
                     .symlink(
-                        &gen_dir.join("root"),
+                        gen_dir.join("root").unwrap().as_path(),
                         crate::remote::layout::current(),
                     )
                     .unwrap();

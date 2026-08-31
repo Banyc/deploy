@@ -50,7 +50,7 @@ impl LocalStore {
         if self.object_exists(digest) {
             return Ok(());
         }
-        let root_rel = layout::tree_root(digest.as_str());
+        let root_rel = layout::tree_root(digest);
         if !remote.exists(&root_rel) {
             return Ok(());
         }

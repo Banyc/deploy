@@ -7,6 +7,7 @@
 use crate::error::{Error, Result};
 use crate::identity::GenerationId;
 use crate::remote::layout;
+use crate::remote::transport::RootedRelativePath;
 use std::path::Path;
 
 use super::super::{CurrentAssignment, GenerationOwner, LockRecord, RemoteHelper, RemoteStatus};
@@ -80,14 +81,14 @@ impl<'a> RemoteHelper<'a> {
             // missing tree object is a MALFORMED remote state — fail closed
             // with an integrity error rather than reporting a current
             // generation that cannot be verified.
-            let gen_dir = layout::generation(gid.as_str());
+            let gen_dir = layout::generation(&gid);
             if self.remote.metadata_opt(&gen_dir)?.is_none() {
                 return Err(Error::integrity(format!(
                     "current symlink points at missing generation directory {}",
                     gen_dir.display()
                 )));
             }
-            let a = self.read_assignment(gid.as_str(), owner).map_err(|e| {
+            let a = self.read_assignment(&gid, owner).map_err(|e| {
                 Error::integrity(format!(
                     "current generation {gid} has a malformed, ownerless, or owner-mismatched assignment: {e}"
                 ))
@@ -106,7 +107,7 @@ impl<'a> RemoteHelper<'a> {
             // still PRESENT — the link itself is seen — so a reported
             // absence is GENUINE, never a failed follow; a transport
             // failure is an `Err`, never a silent absence.
-            let root_link = gen_dir.join("root");
+            let root_link = gen_dir.join("root")?;
             let Some(root_meta) = self.remote.metadata_opt(&root_link)? else {
                 return Err(Error::integrity(format!(
                     "current generation {gid} has no root symlink at {}",
@@ -120,7 +121,7 @@ impl<'a> RemoteHelper<'a> {
                 )));
             }
             let root_target = self.remote.read_link(&root_link)?;
-            let canonical_root = layout::generation_root_link(a.artifact.tree.as_str());
+            let canonical_root = layout::generation_root_link(&a.artifact.tree);
             if root_target != canonical_root {
                 return Err(Error::integrity(format!(
                     "generation {gid} root symlink target {root_target:?} is not the canonical {} for tree {}",
@@ -130,7 +131,7 @@ impl<'a> RemoteHelper<'a> {
             }
             // Object tree: the tree object directory the `root` link names
             // must exist on the remote.
-            let tree_root = layout::tree_root(a.artifact.tree.as_str());
+            let tree_root = layout::tree_root(&a.artifact.tree);
             if self.remote.metadata_opt(&tree_root)?.is_none() {
                 return Err(Error::integrity(format!(
                     "current generation {gid} tree object {} is missing",
@@ -243,7 +244,7 @@ impl<'a> crate::remote::helper::HeldSlotLock<'a> {
     pub fn swap_current(
         &self,
         expected: &ExpectedCurrent,
-        gen_id: &str,
+        gen_id: &GenerationId,
         op_id: &str,
     ) -> Result<()> {
         // Resolve the actual state ONCE (fallible: a malformed present link
@@ -271,14 +272,15 @@ impl<'a> crate::remote::helper::HeldSlotLock<'a> {
                 )));
             }
         }
-        let new_target = layout::generation(gen_id).join("root");
+        let new_target = layout::generation(gen_id).join("root")?;
         let tmp_name = format!(".current.tmp.{op_id}");
-        let tmp = Path::new(&tmp_name);
+        let tmp = RootedRelativePath::parse(Path::new(&tmp_name))
+            .expect("a temp name built from an operation id is a single safe segment");
         // Remove any stale temp link.
-        self.helper.remote.remove_file(tmp)?;
-        self.helper.remote.symlink(new_target.as_path(), tmp)?;
-        self.helper.remote.rename(tmp, layout::current())?;
-        self.helper.remote.remove_file(tmp).ok();
+        self.helper.remote.remove_file(&tmp)?;
+        self.helper.remote.symlink(new_target.as_path(), &tmp)?;
+        self.helper.remote.rename(&tmp, layout::current())?;
+        self.helper.remote.remove_file(&tmp).ok();
         Ok(())
     }
 
@@ -340,7 +342,7 @@ fn parse_canonical_current_target(target: &Path) -> Option<GenerationId> {
 #[cfg(test)]
 mod tests_current {
     use super::*;
-    use crate::identity::{ArtifactRef, TargetName};
+    use crate::identity::{ArtifactRef, TargetName, TreeDigest};
     use crate::identity::{test_deployment_id, test_generation_id, test_tree_digest};
     use crate::remote::helper::{GenerationAssignment, GenerationOwner};
     use crate::remote::transport::LocalTransport;
@@ -425,7 +427,7 @@ mod tests_current {
                 gen_id: Some(gid.as_str().to_string()),
                 assignment: Some(assignment_json(tag, tree)),
                 root: Some(RootLink::Symlink(
-                    layout::generation_root_link(test_tree_digest(tree).as_str())
+                    layout::generation_root_link(&test_tree_digest(tree))
                         .to_string_lossy()
                         .into_owned(),
                 )),
@@ -445,7 +447,9 @@ mod tests_current {
                 None => {}
             }
             if let Some(gid) = &self.gen_id {
-                let gen_dir = base.join(layout::generation(gid));
+                let gen_dir = base.join(layout::generation(
+                    &GenerationId::parse(gid).expect("fixture generation id"),
+                ));
                 std::fs::create_dir_all(&gen_dir).unwrap();
                 if let Some(bytes) = &self.assignment {
                     std::fs::write(gen_dir.join("assignment.json"), bytes).unwrap();
@@ -461,7 +465,10 @@ mod tests_current {
                 }
             }
             if let Some(tree) = &self.tree {
-                std::fs::create_dir_all(base.join(layout::tree_root(tree))).unwrap();
+                std::fs::create_dir_all(base.join(layout::tree_root(
+                    &TreeDigest::parse(tree).expect("fixture tree digest"),
+                )))
+                .unwrap();
             }
         }
     }
@@ -694,7 +701,7 @@ mod tests_current {
                 test_tree_digest("tree-a").as_str()
             ),
             // The canonical target for a DIFFERENT tree.
-            layout::generation_root_link(test_tree_digest("tree-b").as_str())
+            layout::generation_root_link(&test_tree_digest("tree-b"))
                 .to_string_lossy()
                 .into_owned(),
             // Garbage.
@@ -794,7 +801,7 @@ mod tests_current {
                 helper
                     .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
                     .unwrap()
-                    .swap_current(&ExpectedCurrent::Absent, new_gen.as_str(), "op")
+                    .swap_current(&ExpectedCurrent::Absent, &new_gen, "op")
             }))
             .expect("swap must never panic on a malformed current link")
             .expect_err("a malformed present current must never be swapped over");
@@ -815,7 +822,7 @@ mod tests_current {
                     .unwrap()
                     .swap_current(
                         &ExpectedCurrent::Generation(new_gen.clone()),
-                        new_gen.as_str(),
+                        &new_gen,
                         "op",
                     )
             }))
@@ -853,7 +860,7 @@ mod tests_current {
             helper
                 .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
                 .unwrap()
-                .swap_current(&ExpectedCurrent::Absent, new_gen.as_str(), "op")
+                .swap_current(&ExpectedCurrent::Absent, &new_gen, "op")
         }))
         .expect("swap must never panic on a plain-file current")
         .expect_err("a plain-file current must never be swapped over");
@@ -885,14 +892,14 @@ mod tests_current {
             helper
                 .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
                 .unwrap()
-                .swap_current(&ExpectedCurrent::Absent, new_gen.as_str(), "op")
+                .swap_current(&ExpectedCurrent::Absent, &new_gen, "op")
         }))
         .expect("swap must never panic on genuine absence")
         .expect("first deployment over genuine absence must succeed");
         let target = std::fs::read_link(base.join("current")).unwrap();
         assert_eq!(
             target,
-            layout::generation(new_gen.as_str()).join("root"),
+            layout::generation(&new_gen).join("root").unwrap().as_path(),
             "the swap must install the canonical current target"
         );
     }
@@ -923,7 +930,7 @@ mod tests_current {
             .unwrap()
             .swap_current(
                 &ExpectedCurrent::Generation(next_gen.clone()),
-                next_gen.as_str(),
+                &next_gen,
                 "op",
             )
             .expect_err("a mismatched CAS precondition must refuse");
@@ -943,13 +950,16 @@ mod tests_current {
             .unwrap()
             .swap_current(
                 &ExpectedCurrent::Generation(cas_gid.clone()),
-                next_gen.as_str(),
+                &next_gen,
                 "op",
             )
             .expect("a matching CAS precondition must swap");
         assert_eq!(
             std::fs::read_link(base.join("current")).unwrap(),
-            layout::generation(next_gen.as_str()).join("root")
+            layout::generation(&next_gen)
+                .join("root")
+                .unwrap()
+                .as_path()
         );
     }
 
@@ -1093,9 +1103,11 @@ mod tests_current {
                 gen_dir: true,
                 assignment: Some(assignment_json(&g_tag, &t_tag)),
                 root: Some(RootKind::Symlink(
-                    layout::generation_root_link(&tree)
-                        .to_string_lossy()
-                        .into_owned(),
+                    layout::generation_root_link(
+                        &TreeDigest::parse(&tree).expect("fixture tree digest"),
+                    )
+                    .to_string_lossy()
+                    .into_owned(),
                 )),
                 tree_dir: true,
             }
@@ -1115,8 +1127,10 @@ mod tests_current {
     /// garbage target, or a plain file.
     fn arbitrary_root_kind() -> impl Strategy<Value = RootKind> {
         prop_oneof![
-            arbitrary_tree().prop_map(|t| RootKind::Symlink(
-                layout::generation_root_link(&t)
+            // The CANONICAL root link names a VALID tree digest (a raw
+            // filesystem string is never consumed as a semantic identity).
+            "[a-z0-9]{1,32}".prop_map(|tag| RootKind::Symlink(
+                layout::generation_root_link(&crate::identity::test_tree_digest(&tag))
                     .to_string_lossy()
                     .into_owned()
             )),
@@ -1175,7 +1189,9 @@ mod tests_current {
         if layout.gen_dir
             && let Some(gid) = &current_gid
         {
-            let gen_dir = base.join(layout::generation(gid));
+            let gen_dir = base.join(layout::generation(
+                &GenerationId::parse(gid).expect("fixture generation id"),
+            ));
             std::fs::create_dir_all(&gen_dir).unwrap();
             if let Some(bytes) = &layout.assignment {
                 std::fs::write(gen_dir.join("assignment.json"), bytes).unwrap();
@@ -1204,7 +1220,10 @@ mod tests_current {
                     })
             })
         {
-            std::fs::create_dir_all(base.join(layout::tree_root(&tree))).unwrap();
+            std::fs::create_dir_all(base.join(layout::tree_root(
+                &TreeDigest::parse(&tree).expect("fixture tree digest"),
+            )))
+            .unwrap();
         }
     }
 
@@ -1285,7 +1304,7 @@ mod tests_current {
                     layout.gen_dir
                         && a_gid == g
                         && matches!(&layout.root, Some(RootKind::Symlink(t))
-                            if t.as_str() == layout::generation_root_link(tree).to_string_lossy().as_ref())
+                            if t.as_str() == layout::generation_root_link(&TreeDigest::parse(tree).expect("fixture tree digest")).to_string_lossy().as_ref())
                         && layout.tree_dir
                 }
                 _ => false};
@@ -1338,7 +1357,7 @@ mod tests_current {
             // malformed-present current is an integrity error — both leave
             // the entry byte-identical. ----
             let swap = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                helper.acquire_lock_guard(&crate::identity::OperationId::new("op".to_string())).unwrap().swap_current( &ExpectedCurrent::Absent, new_gen.as_str(), "op")
+                helper.acquire_lock_guard(&crate::identity::OperationId::new("op".to_string())).unwrap().swap_current( &ExpectedCurrent::Absent, &GenerationId::parse(&new_gen).expect("fixture generation id"), "op")
             }))
             .expect("swap must never panic on arbitrary symlink layouts");
             match swap {
@@ -1350,7 +1369,7 @@ mod tests_current {
                     // The swap installed the canonical target for the new gen.
                     assert_eq!(
                         std::fs::read_link(base.join("current")).unwrap(),
-                        layout::generation(new_gen.as_str()).join("root")
+                        layout::generation(&GenerationId::parse(&new_gen).expect("fixture generation id")).join("root").unwrap().as_path()
                     );
                 }
                 Err(e) => {
@@ -1397,7 +1416,7 @@ mod tests_current {
         fn root(&self) -> &std::path::Path {
             self.inner.root()
         }
-        fn exists(&self, rel: &std::path::Path) -> bool {
+        fn exists(&self, rel: &RootedRelativePath) -> bool {
             if rel == crate::remote::layout::current() {
                 return true;
             }
@@ -1405,7 +1424,7 @@ mod tests_current {
         }
         fn metadata(
             &self,
-            rel: &std::path::Path,
+            rel: &RootedRelativePath,
         ) -> crate::error::Result<crate::remote::transport::RemoteMeta> {
             if rel == crate::remote::layout::current() {
                 return Err(crate::error::Error::transport(
@@ -1414,7 +1433,7 @@ mod tests_current {
             }
             self.inner.metadata(rel)
         }
-        fn read_link(&self, rel: &std::path::Path) -> crate::error::Result<std::path::PathBuf> {
+        fn read_link(&self, rel: &RootedRelativePath) -> crate::error::Result<std::path::PathBuf> {
             if rel == crate::remote::layout::current() {
                 return Err(crate::error::Error::transport(
                     "current read failed: injected transport fault",
@@ -1422,48 +1441,57 @@ mod tests_current {
             }
             self.inner.read_link(rel)
         }
-        fn read(&self, rel: &std::path::Path) -> crate::error::Result<Vec<u8>> {
+        fn read(&self, rel: &RootedRelativePath) -> crate::error::Result<Vec<u8>> {
             self.inner.read(rel)
         }
-        fn write(&self, rel: &std::path::Path, data: &[u8], mode: u32) -> crate::error::Result<()> {
+        fn write(
+            &self,
+            rel: &RootedRelativePath,
+            data: &[u8],
+            mode: u32,
+        ) -> crate::error::Result<()> {
             self.inner.write(rel, data, mode)
         }
         fn try_write_new(
             &self,
-            rel: &std::path::Path,
+            rel: &RootedRelativePath,
             data: &[u8],
         ) -> crate::error::Result<crate::remote::transport::CreateNewVerdict> {
             self.inner.try_write_new(rel, data)
         }
-        fn create_dir(&self, rel: &std::path::Path) -> crate::error::Result<()> {
+        fn create_dir(&self, rel: &RootedRelativePath) -> crate::error::Result<()> {
             self.inner.create_dir(rel)
         }
-        fn create_dir_all(&self, rel: &std::path::Path) -> crate::error::Result<()> {
+        fn create_dir_all(&self, rel: &RootedRelativePath) -> crate::error::Result<()> {
             self.inner.create_dir_all(rel)
         }
-        fn set_mode(&self, rel: &std::path::Path, mode: u32) -> crate::error::Result<()> {
+        fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> crate::error::Result<()> {
             self.inner.set_mode(rel, mode)
         }
         fn list(
             &self,
-            rel: &std::path::Path,
+            rel: &RootedRelativePath,
         ) -> crate::error::Result<Vec<crate::remote::transport::RemoteEntry>> {
             self.inner.list(rel)
         }
-        fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> crate::error::Result<()> {
+        fn rename(
+            &self,
+            from: &RootedRelativePath,
+            to: &RootedRelativePath,
+        ) -> crate::error::Result<()> {
             self.inner.rename(from, to)
         }
         fn symlink(
             &self,
             target: &std::path::Path,
-            link: &std::path::Path,
+            link: &RootedRelativePath,
         ) -> crate::error::Result<()> {
             self.inner.symlink(target, link)
         }
-        fn remove_file(&self, rel: &std::path::Path) -> crate::error::Result<()> {
+        fn remove_file(&self, rel: &RootedRelativePath) -> crate::error::Result<()> {
             self.inner.remove_file(rel)
         }
-        fn remove_dir_all(&self, rel: &std::path::Path) -> crate::error::Result<()> {
+        fn remove_dir_all(&self, rel: &RootedRelativePath) -> crate::error::Result<()> {
             self.inner.remove_dir_all(rel)
         }
         fn exec(
@@ -1535,7 +1563,7 @@ mod tests_current {
                     0 => {}
                     1 => {
                         std::os::unix::fs::symlink(
-                            layout::generation(actual_g.as_str()).join("root"),
+                            layout::generation(&actual_g).join("root").unwrap(),
                             base.join("current"),
                         )
                         .unwrap();
@@ -1556,7 +1584,7 @@ mod tests_current {
                 };
                 let helper = RemoteHelper::new(remote.as_ref());
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match name {
-                    "swap" => helper.acquire_lock_guard(&crate::identity::OperationId::new("op".to_string())).unwrap().swap_current( &expected, new_gen.as_str(), "op")
+                    "swap" => helper.acquire_lock_guard(&crate::identity::OperationId::new("op".to_string())).unwrap().swap_current( &expected, &new_gen, "op")
                         .map(|_| true),
                     _ => helper.acquire_lock_guard(&crate::identity::OperationId::new("op".to_string())).unwrap().remove_current_if( &expected),
                 }));
@@ -1603,7 +1631,7 @@ mod tests_current {
         fn root(&self) -> &std::path::Path {
             self.inner.root()
         }
-        fn exists(&self, rel: &std::path::Path) -> bool {
+        fn exists(&self, rel: &RootedRelativePath) -> bool {
             if rel == crate::remote::layout::current() {
                 return self.exists_hint;
             }
@@ -1611,7 +1639,7 @@ mod tests_current {
         }
         fn metadata_opt(
             &self,
-            rel: &std::path::Path,
+            rel: &RootedRelativePath,
         ) -> crate::error::Result<Option<crate::remote::transport::RemoteMeta>> {
             if rel == crate::remote::layout::current() {
                 return match self.meta {
@@ -1626,7 +1654,7 @@ mod tests_current {
         }
         fn metadata(
             &self,
-            rel: &std::path::Path,
+            rel: &RootedRelativePath,
         ) -> crate::error::Result<crate::remote::transport::RemoteMeta> {
             if rel == crate::remote::layout::current() {
                 return match self.meta {
@@ -1641,51 +1669,60 @@ mod tests_current {
             }
             self.inner.metadata(rel)
         }
-        fn read_link(&self, rel: &std::path::Path) -> crate::error::Result<std::path::PathBuf> {
+        fn read_link(&self, rel: &RootedRelativePath) -> crate::error::Result<std::path::PathBuf> {
             self.inner.read_link(rel)
         }
-        fn read(&self, rel: &std::path::Path) -> crate::error::Result<Vec<u8>> {
+        fn read(&self, rel: &RootedRelativePath) -> crate::error::Result<Vec<u8>> {
             self.inner.read(rel)
         }
-        fn write(&self, rel: &std::path::Path, data: &[u8], mode: u32) -> crate::error::Result<()> {
+        fn write(
+            &self,
+            rel: &RootedRelativePath,
+            data: &[u8],
+            mode: u32,
+        ) -> crate::error::Result<()> {
             self.inner.write(rel, data, mode)
         }
         fn try_write_new(
             &self,
-            rel: &std::path::Path,
+            rel: &RootedRelativePath,
             data: &[u8],
         ) -> crate::error::Result<crate::remote::transport::CreateNewVerdict> {
             self.inner.try_write_new(rel, data)
         }
-        fn create_dir(&self, rel: &std::path::Path) -> crate::error::Result<()> {
+        fn create_dir(&self, rel: &RootedRelativePath) -> crate::error::Result<()> {
             self.inner.create_dir(rel)
         }
-        fn create_dir_all(&self, rel: &std::path::Path) -> crate::error::Result<()> {
+        fn create_dir_all(&self, rel: &RootedRelativePath) -> crate::error::Result<()> {
             self.inner.create_dir_all(rel)
         }
-        fn set_mode(&self, rel: &std::path::Path, mode: u32) -> crate::error::Result<()> {
+        fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> crate::error::Result<()> {
             self.inner.set_mode(rel, mode)
         }
         fn list(
             &self,
-            rel: &std::path::Path,
+            rel: &RootedRelativePath,
         ) -> crate::error::Result<Vec<crate::remote::transport::RemoteEntry>> {
             self.inner.list(rel)
         }
-        fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> crate::error::Result<()> {
+        fn rename(
+            &self,
+            from: &RootedRelativePath,
+            to: &RootedRelativePath,
+        ) -> crate::error::Result<()> {
             self.inner.rename(from, to)
         }
         fn symlink(
             &self,
             target: &std::path::Path,
-            link: &std::path::Path,
+            link: &RootedRelativePath,
         ) -> crate::error::Result<()> {
             self.inner.symlink(target, link)
         }
-        fn remove_file(&self, rel: &std::path::Path) -> crate::error::Result<()> {
+        fn remove_file(&self, rel: &RootedRelativePath) -> crate::error::Result<()> {
             self.inner.remove_file(rel)
         }
-        fn remove_dir_all(&self, rel: &std::path::Path) -> crate::error::Result<()> {
+        fn remove_dir_all(&self, rel: &RootedRelativePath) -> crate::error::Result<()> {
             self.inner.remove_dir_all(rel)
         }
         fn exec(
@@ -1735,7 +1772,7 @@ mod tests_current {
                 std::fs::create_dir_all(&base).unwrap();
                 if meta_outcome == 0 {
                     std::os::unix::fs::symlink(
-                        layout::generation(actual_g.as_str()).join("root"),
+                        layout::generation(&actual_g).join("root").unwrap(),
                         base.join("current"),
                     )
                     .unwrap();
@@ -1756,7 +1793,7 @@ mod tests_current {
                 let remote = HintedCurrentRemote { inner, exists_hint, meta };
                 let helper = RemoteHelper::new(&remote);
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match name {
-                    "swap" => helper.acquire_lock_guard(&crate::identity::OperationId::new("op".to_string())).unwrap().swap_current( &expected, new_gen.as_str(), "op").map(|_| true),
+                    "swap" => helper.acquire_lock_guard(&crate::identity::OperationId::new("op".to_string())).unwrap().swap_current( &expected, &new_gen, "op").map(|_| true),
                     _ => helper.acquire_lock_guard(&crate::identity::OperationId::new("op".to_string())).unwrap().remove_current_if( &expected),
                 }));
                 match result {

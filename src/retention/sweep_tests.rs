@@ -165,7 +165,7 @@ fn make_gen(
     let canonical_tree = TreeDigest::parse(tree).expect("canonical tree");
     helper
         .remote()
-        .create_dir_all(&layout::tree_root(canonical_tree.as_str()))
+        .create_dir_all(&layout::tree_root(&canonical_tree))
         .unwrap();
     helper
         .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
@@ -390,7 +390,7 @@ fn run_no_leak_case(
         .unwrap()
         .swap_current(
             &crate::remote::helper::ExpectedCurrent::Absent,
-            test_generation_id(&format!("g{}", n - 1)).as_str(),
+            &test_generation_id(&format!("g{}", n - 1)),
             "op",
         )
         .unwrap();
@@ -398,7 +398,7 @@ fn run_no_leak_case(
     // receiver's tree dirs are keyed by the canonical digest.
     helper
         .remote()
-        .create_dir_all(&layout::tree_root(test_tree_digest("tree-pinned").as_str()))
+        .create_dir_all(&layout::tree_root(&test_tree_digest("tree-pinned")))
         .unwrap();
 
     // ---- the pusher: a store with a ledger + ghost content ----------------
@@ -460,7 +460,9 @@ fn run_no_leak_case(
     // The receiver retains EXACTLY the policy-retained trees: stale ones are
     // gone, retained + pinned content survives.
     for t in &receiver_trees {
-        let exists = helper.remote().exists(&layout::tree_root(t));
+        let exists = helper.remote().exists(&layout::tree_root(
+            &TreeDigest::parse(t).expect("fixture tree digest"),
+        ));
         assert_eq!(
             exists,
             retained.contains(t),
@@ -470,7 +472,7 @@ fn run_no_leak_case(
     assert!(
         helper
             .remote()
-            .exists(&layout::tree_root(test_tree_digest("tree-pinned").as_str())),
+            .exists(&layout::tree_root(&test_tree_digest("tree-pinned"))),
         "pinned content survives on the receiver"
     );
     // Independence: retention never touches the pusher's ledger.

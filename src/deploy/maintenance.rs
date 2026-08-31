@@ -88,7 +88,7 @@ pub(crate) fn run_step17_retention(
         // RAII guard (released on every return path), and a stale lock file
         // is a LEASE that expires and is broken harmlessly next time — it can
         // never block the slot.
-        helpers[sid].remove_incoming(deployment_id.as_str()).ok();
+        helpers[sid].remove_incoming(deployment_id).ok();
     }
 }
 
@@ -285,7 +285,7 @@ pub(crate) fn refresh_observed_from_live(
         let status = helpers[&slot_id].status(&owner);
         match status {
             Ok(s) => match s.current_generation() {
-                Some(g) => match helpers[&slot_id].read_assignment(g.as_str(), &owner) {
+                Some(g) => match helpers[&slot_id].read_assignment(g, &owner) {
                     Ok(asn) => {
                         // The projection RECORDS THE ASSIGNMENT IDENTITY
                         // that produced it: the VERIFIED owner at
@@ -848,7 +848,13 @@ mod tests {
         // The pinned release protects two pin-only trees (referenced ONLY by
         // the pin — outside every count/age window), and a garbage object is
         // referenced by nothing.
-        let rec = engine_pin_release(&h.store, &["tree-pin-a", "tree-pin-b"]);
+        let rec = engine_pin_release(
+            &h.store,
+            &[
+                crate::identity::test_tree_digest("tree-pin-a").as_str(),
+                crate::identity::test_tree_digest("tree-pin-b").as_str(),
+            ],
+        );
         h.config = h
             .config
             .with_pin(crate::config::Pin {
@@ -863,7 +869,7 @@ mod tests {
         for t in ["tree-pin-a", "tree-pin-b", "tree-garbage"] {
             helper
                 .remote()
-                .create_dir_all(&layout::tree_root(t))
+                .create_dir_all(&layout::tree_root(&crate::identity::test_tree_digest(t)))
                 .unwrap();
         }
 
@@ -925,8 +931,9 @@ mod tests {
         let owner = crate::remote::helper::test_owner("eng", "p1");
         let inventory_after = helper.status(&owner).unwrap().inventory;
         for t in ["tree-pin-a", "tree-pin-b", "tree-garbage"] {
+            let digest = crate::identity::test_tree_digest(t);
             assert!(
-                inventory_after.contains(&t.to_string()),
+                inventory_after.iter().any(|s| s == digest.as_str()),
                 "tree {t} must survive the failed retention"
             );
         }
@@ -955,13 +962,16 @@ mod tests {
         );
         let inventory = helper.status(&owner).unwrap().inventory;
         for t in ["tree-pin-a", "tree-pin-b"] {
+            let digest = crate::identity::test_tree_digest(t);
             assert!(
-                inventory.contains(&t.to_string()),
+                inventory.iter().any(|s| s == digest.as_str()),
                 "pin-only tree {t} survives the retry"
             );
         }
         assert!(
-            !inventory.contains(&"tree-garbage".to_string()),
+            !inventory
+                .iter()
+                .any(|s| s == crate::identity::test_tree_digest("tree-garbage").as_str()),
             "the true garbage is removed by the retry"
         );
         let st = helper.status(&owner).unwrap();
@@ -969,7 +979,7 @@ mod tests {
             .current_generation()
             .expect("a current generation exists");
         let live = helper
-            .read_assignment(cur.as_str(), &owner)
+            .read_assignment(cur, &owner)
             .unwrap()
             .artifact
             .tree

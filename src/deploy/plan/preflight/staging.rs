@@ -98,7 +98,16 @@ pub(crate) fn cleanup_abandoned_incoming(
 ) -> Result<()> {
     for pend in pending_incoming {
         if pend != deployment_id.as_str() {
-            helper.remove_incoming(pend)?;
+            // A pending incoming directory name is a raw filesystem string;
+            // it is parsed into the TYPED deployment identity before it can
+            // name a staging area (a malformed name is refused, never
+            // consumed as a semantic identity).
+            let pend_id = DeploymentId::parse(pend).map_err(|err| {
+                Error::integrity(format!(
+                    "pending incoming directory {pend:?} names an invalid deployment id: {err}"
+                ))
+            })?;
+            helper.remove_incoming(&pend_id)?;
         }
     }
     Ok(())

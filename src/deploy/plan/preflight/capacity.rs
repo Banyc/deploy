@@ -62,7 +62,7 @@ pub(crate) fn capacity_preflight(
         let reserve_bytes = capacity.reserve_bytes;
         let reserve_percent = capacity.reserve_percent.get() as u64;
         let helper = helpers.get(&a.placement_slot).expect("helper present");
-        if helper.tree_exists(a.artifact.tree.as_str())? {
+        if helper.tree_exists(&a.artifact.tree)? {
             continue;
         }
         let need = tree_size_on_host(&store.object_root(&a.artifact.tree));
@@ -163,6 +163,7 @@ mod capacity_tests {
     use crate::remote::helper::RemoteHelper;
     use crate::remote::transport::{
         CreateNewVerdict, ExecOutcome, FsBytes, LocalTransport, Remote, RemoteEntry, RemoteMeta,
+        RootedRelativePath,
     };
     use crate::store::local::LocalStore;
     use std::path::{Path, PathBuf};
@@ -190,46 +191,46 @@ mod capacity_tests {
         fn root(&self) -> &Path {
             self.inner.root()
         }
-        fn read(&self, rel: &Path) -> Result<Vec<u8>> {
+        fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
             self.inner.read(rel)
         }
-        fn write(&self, rel: &Path, data: &[u8], mode: u32) -> Result<()> {
+        fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
             self.inner.write(rel, data, mode)
         }
-        fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<CreateNewVerdict> {
+        fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict> {
             self.inner.try_write_new(rel, data)
         }
-        fn create_dir(&self, rel: &Path) -> Result<()> {
+        fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
             self.inner.create_dir(rel)
         }
-        fn create_dir_all(&self, rel: &Path) -> Result<()> {
+        fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
             self.inner.create_dir_all(rel)
         }
-        fn set_mode(&self, rel: &Path, mode: u32) -> Result<()> {
+        fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
             self.inner.set_mode(rel, mode)
         }
-        fn list(&self, rel: &Path) -> Result<Vec<RemoteEntry>> {
+        fn list(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>> {
             self.inner.list(rel)
         }
-        fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
             self.inner.rename(from, to)
         }
-        fn symlink(&self, target: &Path, link: &Path) -> Result<()> {
+        fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
             self.inner.symlink(target, link)
         }
-        fn read_link(&self, rel: &Path) -> Result<PathBuf> {
+        fn read_link(&self, rel: &RootedRelativePath) -> Result<PathBuf> {
             self.inner.read_link(rel)
         }
-        fn remove_file(&self, rel: &Path) -> Result<()> {
+        fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
             self.inner.remove_file(rel)
         }
-        fn remove_dir_all(&self, rel: &Path) -> Result<()> {
+        fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
             self.inner.remove_dir_all(rel)
         }
-        fn exists(&self, rel: &Path) -> bool {
+        fn exists(&self, rel: &RootedRelativePath) -> bool {
             self.inner.exists(rel)
         }
-        fn metadata(&self, rel: &Path) -> Result<RemoteMeta> {
+        fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta> {
             self.inner.metadata(rel)
         }
         fn exec(&self, argv: &[String], timeout: std::time::Duration) -> Result<ExecOutcome> {
@@ -417,7 +418,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
         // A tree ALREADY on the server skips the headroom check entirely.
         remote
-            .create_dir_all(&crate::remote::layout::tree_root(tree.as_str()))
+            .create_dir_all(&crate::remote::layout::tree_root(&tree))
             .unwrap();
         config = config
             .with_server_capacity(

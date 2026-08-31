@@ -135,7 +135,9 @@ use crate::identity::{
     ReleaseId, ReleaseRecord, SlotId, TreeDigest,
 };
 use crate::remote::layout;
-use crate::remote::transport::{CreateNewVerdict, Remote, RemoveIfVerdict, VerifiedExisting};
+use crate::remote::transport::{
+    CreateNewVerdict, Remote, RemoveIfVerdict, RootedRelativePath, VerifiedExisting,
+};
 use serde::{Deserialize, Serialize};
 
 /// The EXPECTED OWNER of a remote generation: the application + placement
@@ -304,7 +306,7 @@ impl<'a> RemoteHelper<'a> {
     /// match. A tampered behavior document fails closed with an integrity
     /// error — the historical contract is never returned unverified.
     pub fn read_behavior(&self, release_id: &ReleaseId, variant: &str) -> Result<BehaviorContract> {
-        let p = layout::remote_release(release_id.as_str()).join("behavior.json");
+        let p = layout::remote_release(release_id).join("behavior.json")?;
         let data = self.remote.read(&p)?;
         // Verify the published release record (its own identity is recomputed
         // from its content) and bind it to the requested release path; its
@@ -313,7 +315,7 @@ impl<'a> RemoteHelper<'a> {
         let rec: ReleaseRecord = serde_json::from_slice(
             &self
                 .remote
-                .read(&layout::remote_release(release_id.as_str()).join("release.json"))?,
+                .read(&layout::remote_release(release_id).join("release.json")?)?,
         )
         .map_err(|e| Error::integrity(format!("malformed release record for {release_id}: {e}")))?;
         crate::verify::release::verify_release_identity(&rec)?;
@@ -776,7 +778,7 @@ pub struct LockRecord {
 /// means a failed read is NEVER indistinguishable from absence.
 pub(crate) fn read_lock_record(
     remote: &dyn Remote,
-    p: &std::path::Path,
+    p: &RootedRelativePath,
 ) -> Result<Option<LockRecord>> {
     let Some(_) = remote.metadata_opt(p)? else {
         return Ok(None);
@@ -1301,64 +1303,68 @@ mod nested_guard_proptest {
         fn root(&self) -> &Path {
             &self.fake_root
         }
-        fn read(&self, rel: &Path) -> RemoteResult<Vec<u8>> {
+        fn read(&self, rel: &RootedRelativePath) -> RemoteResult<Vec<u8>> {
             self.inner.read(rel)
         }
-        fn write(&self, rel: &Path, data: &[u8], mode: u32) -> RemoteResult<()> {
+        fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> RemoteResult<()> {
             self.inner.write(rel, data, mode)
         }
-        fn try_write_new(&self, rel: &Path, data: &[u8]) -> RemoteResult<CreateNewVerdict> {
+        fn try_write_new(
+            &self,
+            rel: &RootedRelativePath,
+            data: &[u8],
+        ) -> RemoteResult<CreateNewVerdict> {
             self.inner.try_write_new(rel, data)
         }
         fn try_write_new_with(
             &self,
-            rel: &Path,
+            rel: &RootedRelativePath,
             data: &[u8],
             equivalence: crate::remote::transport::ContentEquivalence,
         ) -> RemoteResult<CreateNewVerdict> {
             self.inner.try_write_new_with(rel, data, equivalence)
         }
-        fn create_dir(&self, rel: &Path) -> RemoteResult<()> {
+        fn create_dir(&self, rel: &RootedRelativePath) -> RemoteResult<()> {
             self.inner.create_dir(rel)
         }
-        fn create_dir_all(&self, rel: &Path) -> RemoteResult<()> {
+        fn create_dir_all(&self, rel: &RootedRelativePath) -> RemoteResult<()> {
             self.inner.create_dir_all(rel)
         }
-        fn set_mode(&self, rel: &Path, mode: u32) -> RemoteResult<()> {
+        fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> RemoteResult<()> {
             self.inner.set_mode(rel, mode)
         }
-        fn list(&self, rel: &Path) -> RemoteResult<Vec<RemoteEntry>> {
+        fn list(&self, rel: &RootedRelativePath) -> RemoteResult<Vec<RemoteEntry>> {
             self.inner.list(rel)
         }
-        fn rename(&self, from: &Path, to: &Path) -> RemoteResult<()> {
+        fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> RemoteResult<()> {
             self.inner.rename(from, to)
         }
-        fn symlink(&self, target: &Path, link: &Path) -> RemoteResult<()> {
+        fn symlink(&self, target: &Path, link: &RootedRelativePath) -> RemoteResult<()> {
             self.inner.symlink(target, link)
         }
-        fn read_link(&self, rel: &Path) -> RemoteResult<PathBuf> {
+        fn read_link(&self, rel: &RootedRelativePath) -> RemoteResult<PathBuf> {
             self.inner.read_link(rel)
         }
-        fn remove_file(&self, rel: &Path) -> RemoteResult<()> {
+        fn remove_file(&self, rel: &RootedRelativePath) -> RemoteResult<()> {
             self.inner.remove_file(rel)
         }
-        fn remove_dir_all(&self, rel: &Path) -> RemoteResult<()> {
+        fn remove_dir_all(&self, rel: &RootedRelativePath) -> RemoteResult<()> {
             self.inner.remove_dir_all(rel)
         }
         fn remove_file_if(
             &self,
-            rel: &Path,
+            rel: &RootedRelativePath,
             expected: &[u8],
         ) -> RemoteResult<crate::remote::transport::RemoveIfVerdict> {
             self.inner.remove_file_if(rel, expected)
         }
-        fn exists(&self, rel: &Path) -> bool {
+        fn exists(&self, rel: &RootedRelativePath) -> bool {
             self.inner.exists(rel)
         }
-        fn metadata(&self, rel: &Path) -> RemoteResult<RemoteMeta> {
+        fn metadata(&self, rel: &RootedRelativePath) -> RemoteResult<RemoteMeta> {
             self.inner.metadata(rel)
         }
-        fn metadata_opt(&self, rel: &Path) -> RemoteResult<Option<RemoteMeta>> {
+        fn metadata_opt(&self, rel: &RootedRelativePath) -> RemoteResult<Option<RemoteMeta>> {
             self.inner.metadata_opt(rel)
         }
         fn exec(&self, argv: &[String], timeout: Duration) -> RemoteResult<ExecOutcome> {
@@ -1693,9 +1699,7 @@ mod cross_remote_guard_mutation {
         let tree = crate::identity::test_tree_digest("tree-seed");
         let deployment_id = "deploy-seed";
         // Tree object
-        let tree_root = remote
-            .root()
-            .join(crate::remote::layout::tree_root(tree.as_str()));
+        let tree_root = remote.root().join(crate::remote::layout::tree_root(&tree));
         std::fs::create_dir_all(&tree_root).unwrap();
         std::fs::write(tree_root.join("file"), b"seed").unwrap();
         // Generation assignment
@@ -1716,14 +1720,14 @@ mod cross_remote_guard_mutation {
         };
         let gen_dir = remote
             .root()
-            .join(crate::remote::layout::generation(gen_id.as_str()));
+            .join(crate::remote::layout::generation(&gen_id));
         std::fs::create_dir_all(&gen_dir).unwrap();
         std::fs::write(
             gen_dir.join("assignment.json"),
             serde_json::to_vec(&asn).unwrap(),
         )
         .unwrap();
-        let root_link = crate::remote::layout::generation_root_link(tree.as_str());
+        let root_link = crate::remote::layout::generation_root_link(&tree);
         std::os::unix::fs::symlink(&root_link, gen_dir.join("root")).unwrap();
         // current -> generations/<gen>/root
         let cur_target = PathBuf::from(format!(
@@ -1736,8 +1740,8 @@ mod cross_remote_guard_mutation {
         std::os::unix::fs::symlink(&cur_target, &cur_path).unwrap();
         // Staged incoming tree
         let staged = remote.root().join(crate::remote::layout::staged_tree(
-            deployment_id,
-            tree.as_str(),
+            &crate::identity::test_deployment_id(deployment_id),
+            &tree,
         ));
         std::fs::create_dir_all(&staged).unwrap();
         std::fs::write(staged.join("staged_file"), b"staged").unwrap();
@@ -1855,24 +1859,34 @@ mod cross_remote_guard_mutation {
                     expected,
                     gen_id,
                     op_id,
-                } => guard_a.swap_current(expected, gen_id, op_id),
+                } => guard_a.swap_current(
+                    expected,
+                    &crate::identity::GenerationId::parse(gen_id).expect("fixture generation id"),
+                    op_id,
+                ),
                 GuardOp::RemoveCurrentIf { expected } => {
                     guard_a.remove_current_if(expected).map(|_| ())
                 }
                 GuardOp::PublishFromIncoming {
                     deployment_id,
                     digest,
-                } => guard_a.publish_from_incoming(deployment_id, digest),
-                GuardOp::TransactionRecord { op_id, state } => {
-                    guard_a.transaction_record(op_id, state)
-                }
+                } => guard_a.publish_from_incoming(
+                    &crate::identity::DeploymentId::parse(deployment_id)
+                        .expect("fixture deployment id"),
+                    &crate::identity::TreeDigest::parse(digest).expect("fixture tree digest"),
+                ),
+                GuardOp::TransactionRecord { op_id, state } => guard_a.transaction_record(
+                    &crate::identity::OperationId::parse(op_id).expect("fixture operation id"),
+                    state,
+                ),
                 GuardOp::WriteCommitMarker {
                     deployment_id,
                     generation,
                     slot_ids,
                     target,
                 } => guard_a.write_commit_marker(
-                    deployment_id,
+                    &crate::identity::DeploymentId::parse(deployment_id)
+                        .expect("fixture deployment id"),
                     generation,
                     slot_ids,
                     target.as_deref(),
@@ -1924,24 +1938,34 @@ mod cross_remote_guard_mutation {
                     expected,
                     gen_id,
                     op_id,
-                } => guard_b.swap_current(expected, gen_id, op_id),
+                } => guard_b.swap_current(
+                    expected,
+                    &crate::identity::GenerationId::parse(gen_id).expect("fixture generation id"),
+                    op_id,
+                ),
                 GuardOp::RemoveCurrentIf { expected } => {
                     guard_b.remove_current_if(expected).map(|_| ())
                 }
                 GuardOp::PublishFromIncoming {
                     deployment_id,
                     digest,
-                } => guard_b.publish_from_incoming(deployment_id, digest),
-                GuardOp::TransactionRecord { op_id, state } => {
-                    guard_b.transaction_record(op_id, state)
-                }
+                } => guard_b.publish_from_incoming(
+                    &crate::identity::DeploymentId::parse(deployment_id)
+                        .expect("fixture deployment id"),
+                    &crate::identity::TreeDigest::parse(digest).expect("fixture tree digest"),
+                ),
+                GuardOp::TransactionRecord { op_id, state } => guard_b.transaction_record(
+                    &crate::identity::OperationId::parse(op_id).expect("fixture operation id"),
+                    state,
+                ),
                 GuardOp::WriteCommitMarker {
                     deployment_id,
                     generation,
                     slot_ids,
                     target,
                 } => guard_b.write_commit_marker(
-                    deployment_id,
+                    &crate::identity::DeploymentId::parse(deployment_id)
+                        .expect("fixture deployment id"),
                     generation,
                     slot_ids,
                     target.as_deref(),
@@ -2028,14 +2052,18 @@ mod barrier_proptest {
         fn root(&self) -> &Path {
             self.inner.root()
         }
-        fn read(&self, rel: &Path) -> RemoteResult<Vec<u8>> {
+        fn read(&self, rel: &RootedRelativePath) -> RemoteResult<Vec<u8>> {
             self.inner.read(rel)
         }
-        fn write(&self, rel: &Path, data: &[u8], mode: u32) -> RemoteResult<()> {
+        fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> RemoteResult<()> {
             self.inner.write(rel, data, mode)
         }
-        fn try_write_new(&self, rel: &Path, data: &[u8]) -> RemoteResult<CreateNewVerdict> {
-            if rel == layout::operation_lock()
+        fn try_write_new(
+            &self,
+            rel: &RootedRelativePath,
+            data: &[u8],
+        ) -> RemoteResult<CreateNewVerdict> {
+            if rel.as_path() == layout::operation_lock().as_path()
                 && self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2
             {
                 self.barrier.wait();
@@ -2060,11 +2088,11 @@ mod barrier_proptest {
         }
         fn try_write_new_with(
             &self,
-            rel: &Path,
+            rel: &RootedRelativePath,
             data: &[u8],
             equivalence: crate::remote::transport::ContentEquivalence,
         ) -> RemoteResult<CreateNewVerdict> {
-            if rel == layout::operation_lock()
+            if rel.as_path() == layout::operation_lock().as_path()
                 && self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2
             {
                 self.barrier.wait();
@@ -2081,47 +2109,47 @@ mod barrier_proptest {
                 }
             }
         }
-        fn create_dir(&self, rel: &Path) -> RemoteResult<()> {
+        fn create_dir(&self, rel: &RootedRelativePath) -> RemoteResult<()> {
             self.inner.create_dir(rel)
         }
-        fn create_dir_all(&self, rel: &Path) -> RemoteResult<()> {
+        fn create_dir_all(&self, rel: &RootedRelativePath) -> RemoteResult<()> {
             self.inner.create_dir_all(rel)
         }
-        fn set_mode(&self, rel: &Path, mode: u32) -> RemoteResult<()> {
+        fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> RemoteResult<()> {
             self.inner.set_mode(rel, mode)
         }
-        fn list(&self, rel: &Path) -> RemoteResult<Vec<RemoteEntry>> {
+        fn list(&self, rel: &RootedRelativePath) -> RemoteResult<Vec<RemoteEntry>> {
             self.inner.list(rel)
         }
-        fn rename(&self, from: &Path, to: &Path) -> RemoteResult<()> {
+        fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> RemoteResult<()> {
             self.inner.rename(from, to)
         }
-        fn symlink(&self, target: &Path, link: &Path) -> RemoteResult<()> {
+        fn symlink(&self, target: &Path, link: &RootedRelativePath) -> RemoteResult<()> {
             self.inner.symlink(target, link)
         }
-        fn read_link(&self, rel: &Path) -> RemoteResult<PathBuf> {
+        fn read_link(&self, rel: &RootedRelativePath) -> RemoteResult<PathBuf> {
             self.inner.read_link(rel)
         }
-        fn remove_file(&self, rel: &Path) -> RemoteResult<()> {
+        fn remove_file(&self, rel: &RootedRelativePath) -> RemoteResult<()> {
             self.inner.remove_file(rel)
         }
-        fn remove_dir_all(&self, rel: &Path) -> RemoteResult<()> {
+        fn remove_dir_all(&self, rel: &RootedRelativePath) -> RemoteResult<()> {
             self.inner.remove_dir_all(rel)
         }
         fn remove_file_if(
             &self,
-            rel: &Path,
+            rel: &RootedRelativePath,
             expected: &[u8],
         ) -> RemoteResult<crate::remote::transport::RemoveIfVerdict> {
             self.inner.remove_file_if(rel, expected)
         }
-        fn exists(&self, rel: &Path) -> bool {
+        fn exists(&self, rel: &RootedRelativePath) -> bool {
             self.inner.exists(rel)
         }
-        fn metadata(&self, rel: &Path) -> RemoteResult<RemoteMeta> {
+        fn metadata(&self, rel: &RootedRelativePath) -> RemoteResult<RemoteMeta> {
             self.inner.metadata(rel)
         }
-        fn metadata_opt(&self, rel: &Path) -> RemoteResult<Option<RemoteMeta>> {
+        fn metadata_opt(&self, rel: &RootedRelativePath) -> RemoteResult<Option<RemoteMeta>> {
             self.inner.metadata_opt(rel)
         }
         fn exec(&self, argv: &[String], timeout: Duration) -> RemoteResult<ExecOutcome> {
@@ -2311,49 +2339,57 @@ mod guard_release_retry {
         fn root(&self) -> &Path {
             self.inner.root()
         }
-        fn read(&self, rel: &Path) -> RemoteResult<Vec<u8>> {
+        fn read(&self, rel: &RootedRelativePath) -> RemoteResult<Vec<u8>> {
             self.inner.read(rel)
         }
-        fn write(&self, rel: &Path, data: &[u8], mode: u32) -> RemoteResult<()> {
+        fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> RemoteResult<()> {
             self.inner.write(rel, data, mode)
         }
-        fn try_write_new(&self, rel: &Path, data: &[u8]) -> RemoteResult<CreateNewVerdict> {
+        fn try_write_new(
+            &self,
+            rel: &RootedRelativePath,
+            data: &[u8],
+        ) -> RemoteResult<CreateNewVerdict> {
             self.inner.try_write_new(rel, data)
         }
         fn try_write_new_with(
             &self,
-            rel: &Path,
+            rel: &RootedRelativePath,
             data: &[u8],
             equivalence: crate::remote::transport::ContentEquivalence,
         ) -> RemoteResult<CreateNewVerdict> {
             self.inner.try_write_new_with(rel, data, equivalence)
         }
-        fn create_dir(&self, rel: &Path) -> RemoteResult<()> {
+        fn create_dir(&self, rel: &RootedRelativePath) -> RemoteResult<()> {
             self.inner.create_dir(rel)
         }
-        fn create_dir_all(&self, rel: &Path) -> RemoteResult<()> {
+        fn create_dir_all(&self, rel: &RootedRelativePath) -> RemoteResult<()> {
             self.inner.create_dir_all(rel)
         }
-        fn set_mode(&self, rel: &Path, mode: u32) -> RemoteResult<()> {
+        fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> RemoteResult<()> {
             self.inner.set_mode(rel, mode)
         }
-        fn list(&self, rel: &Path) -> RemoteResult<Vec<RemoteEntry>> {
+        fn list(&self, rel: &RootedRelativePath) -> RemoteResult<Vec<RemoteEntry>> {
             self.inner.list(rel)
         }
-        fn rename(&self, from: &Path, to: &Path) -> RemoteResult<()> {
+        fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> RemoteResult<()> {
             self.inner.rename(from, to)
         }
-        fn symlink(&self, target: &Path, link: &Path) -> RemoteResult<()> {
+        fn symlink(&self, target: &Path, link: &RootedRelativePath) -> RemoteResult<()> {
             self.inner.symlink(target, link)
         }
-        fn read_link(&self, rel: &Path) -> RemoteResult<PathBuf> {
+        fn read_link(&self, rel: &RootedRelativePath) -> RemoteResult<PathBuf> {
             self.inner.read_link(rel)
         }
-        fn remove_file(&self, rel: &Path) -> RemoteResult<()> {
+        fn remove_file(&self, rel: &RootedRelativePath) -> RemoteResult<()> {
             self.inner.remove_file(rel)
         }
-        fn remove_file_if(&self, rel: &Path, expected: &[u8]) -> RemoteResult<RemoveIfVerdict> {
-            if rel == layout::operation_lock() {
+        fn remove_file_if(
+            &self,
+            rel: &RootedRelativePath,
+            expected: &[u8],
+        ) -> RemoteResult<RemoveIfVerdict> {
+            if rel.as_path() == layout::operation_lock().as_path() {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 let mut guard = self.fault.lock().unwrap();
                 if let Some(outcome) = guard.take() {
@@ -2377,16 +2413,16 @@ mod guard_release_retry {
             }
             self.inner.remove_file_if(rel, expected)
         }
-        fn remove_dir_all(&self, rel: &Path) -> RemoteResult<()> {
+        fn remove_dir_all(&self, rel: &RootedRelativePath) -> RemoteResult<()> {
             self.inner.remove_dir_all(rel)
         }
-        fn exists(&self, rel: &Path) -> bool {
+        fn exists(&self, rel: &RootedRelativePath) -> bool {
             self.inner.exists(rel)
         }
-        fn metadata(&self, rel: &Path) -> RemoteResult<RemoteMeta> {
+        fn metadata(&self, rel: &RootedRelativePath) -> RemoteResult<RemoteMeta> {
             self.inner.metadata(rel)
         }
-        fn metadata_opt(&self, rel: &Path) -> RemoteResult<Option<RemoteMeta>> {
+        fn metadata_opt(&self, rel: &RootedRelativePath) -> RemoteResult<Option<RemoteMeta>> {
             self.inner.metadata_opt(rel)
         }
         fn exec(&self, argv: &[String], timeout: Duration) -> RemoteResult<ExecOutcome> {

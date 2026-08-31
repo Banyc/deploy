@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use super::{
     ContentEquivalence, CreateNewVerdict, FsBytes, IMMUTABLE_RECORD_MODE, OpenedEntry,
-    OpenedExisting, Remote, RemoteEntry, RemoteMeta, RemoveIfVerdict,
+    OpenedExisting, Remote, RemoteEntry, RemoteMeta, RemoveIfVerdict, RootedRelativePath,
     has_normal_component_below_root, verified_to_verdict, verify_existing,
 };
 use hostkey::pin_known_hosts;
@@ -1237,25 +1237,25 @@ impl Remote for SshTransport {
         self.run_remote_ok(&Self::argv_cmd(&argv))
     }
 
-    fn read(&self, rel: &Path) -> Result<Vec<u8>> {
-        self.download_bytes(rel)
+    fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
+        self.download_bytes(rel.as_path())
     }
 
-    fn write(&self, rel: &Path, data: &[u8], mode: u32) -> Result<()> {
-        self.upload_bytes(rel, data, mode)
+    fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
+        self.upload_bytes(rel.as_path(), data, mode)
     }
 
-    fn create_dir(&self, rel: &Path) -> Result<()> {
+    fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
         let p = self.root.join(rel).to_string_lossy().into_owned();
         self.run_remote_ok(&Self::argv_cmd(&["mkdir".into(), p]))
     }
 
-    fn create_dir_all(&self, rel: &Path) -> Result<()> {
+    fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
         let p = self.root.join(rel).to_string_lossy().into_owned();
         self.run_remote_ok(&Self::argv_cmd(&["mkdir".into(), "-p".into(), p]))
     }
 
-    fn set_mode(&self, rel: &Path, mode: u32) -> Result<()> {
+    fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
         let p = self.root.join(rel).to_string_lossy().into_owned();
         self.run_remote_ok(&Self::argv_cmd(&[
             "chmod".into(),
@@ -1264,8 +1264,8 @@ impl Remote for SshTransport {
         ]))
     }
 
-    fn list(&self, rel: &Path) -> Result<Vec<RemoteEntry>> {
-        let out = self.run_remote(&self.list_script(rel))?;
+    fn list(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>> {
+        let out = self.run_remote(&self.list_script(rel.as_path()))?;
         if !out.status.success() {
             return Err(Error::transport(format!(
                 "ssh list failed: {}",
@@ -1277,11 +1277,15 @@ impl Remote for SshTransport {
         )))
     }
 
-    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
-        self.run_remote_ok(&SshTransport::rename_cmd(&self.root, from, to))
+    fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
+        self.run_remote_ok(&SshTransport::rename_cmd(
+            &self.root,
+            from.as_path(),
+            to.as_path(),
+        ))
     }
 
-    fn symlink(&self, target: &Path, link: &Path) -> Result<()> {
+    fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
         let t = target.to_string_lossy().into_owned();
         let l = self.root.join(link).to_string_lossy().into_owned();
         let parent = Path::new(&l)
@@ -1297,7 +1301,7 @@ impl Remote for SshTransport {
         self.run_remote_ok(&cmd)
     }
 
-    fn read_link(&self, rel: &Path) -> Result<PathBuf> {
+    fn read_link(&self, rel: &RootedRelativePath) -> Result<PathBuf> {
         let p = self.root.join(rel).to_string_lossy().into_owned();
         let out = self.run_remote(&Self::argv_cmd(&["readlink".into(), p]))?;
         if !out.status.success() {
@@ -1310,7 +1314,7 @@ impl Remote for SshTransport {
         Ok(PathBuf::from(target))
     }
 
-    fn remove_file(&self, rel: &Path) -> Result<()> {
+    fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
         let p = self.root.join(rel).to_string_lossy().into_owned();
         // Ignore "not found".
         let out = self.run_remote(&Self::argv_cmd(&["rm".into(), "-f".into(), p]))?;
@@ -1323,11 +1327,11 @@ impl Remote for SshTransport {
         Ok(())
     }
 
-    fn remove_file_if(&self, rel: &Path, expected: &[u8]) -> Result<RemoveIfVerdict> {
-        let cmd = if rel == crate::remote::layout::operation_lock() {
+    fn remove_file_if(&self, rel: &RootedRelativePath, expected: &[u8]) -> Result<RemoveIfVerdict> {
+        let cmd = if rel.as_path() == crate::remote::layout::operation_lock().as_path() {
             remove_file_if_sidecar_cmd(&self.root, expected)
         } else {
-            Self::remove_file_if_cmd(&self.root, rel, expected)
+            Self::remove_file_if_cmd(&self.root, rel.as_path(), expected)
         };
         let out = self.run_remote(&cmd)?;
         if !out.status.success() {
@@ -1346,18 +1350,18 @@ impl Remote for SshTransport {
         }
     }
 
-    fn remove_dir_all(&self, rel: &Path) -> Result<()> {
+    fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
         let p = self.root.join(rel).to_string_lossy().into_owned();
         self.run_remote_ok(&Self::argv_cmd(&["rm".into(), "-rf".into(), p]))
     }
 
-    fn exists(&self, rel: &Path) -> bool {
+    fn exists(&self, rel: &RootedRelativePath) -> bool {
         let p = self.root.join(rel).to_string_lossy().into_owned();
         let out = self.run_remote(&Self::argv_cmd(&["test".into(), "-e".into(), p]));
         matches!(out, Ok(o) if o.status.success())
     }
 
-    fn metadata(&self, rel: &Path) -> Result<RemoteMeta> {
+    fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta> {
         self.metadata_opt(rel)?.ok_or_else(|| {
             Error::NotFound(format!(
                 "ssh stat {}: no such entry",
@@ -1366,7 +1370,7 @@ impl Remote for SshTransport {
         })
     }
 
-    fn metadata_opt(&self, rel: &Path) -> Result<Option<RemoteMeta>> {
+    fn metadata_opt(&self, rel: &RootedRelativePath) -> Result<Option<RemoteMeta>> {
         // ONE remote exec: the framed perl `lstat` helper reports the OUTCOME
         // WITH THE ERRNO (a `P`/`A`/`E` frame on stdout, exit 0 for every
         // outcome). The frame is the signal — no shell booleans, no reserved
@@ -1374,7 +1378,7 @@ impl Remote for SshTransport {
         // for absence. A transport failure, a signal-killed command, or any
         // nonzero exit is an error; the single stdout frame is parsed
         // strictly (malformed output is never a silent default).
-        let out = self.run_remote(&self.lstat_script(rel))?;
+        let out = self.run_remote(&self.lstat_script(rel.as_path()))?;
         if !out.status.success() {
             return Err(Error::transport(format!(
                 "ssh lstat failed: {}",
@@ -1451,20 +1455,20 @@ impl Remote for SshTransport {
         })
     }
 
-    fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<CreateNewVerdict> {
+    fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict> {
         self.try_write_new_with(rel, data, ContentEquivalence::Exact)
     }
 
     fn try_write_new_with(
         &self,
-        rel: &Path,
+        rel: &RootedRelativePath,
         data: &[u8],
         equivalence: ContentEquivalence,
     ) -> Result<CreateNewVerdict> {
-        let cmd = if rel == crate::remote::layout::operation_lock() {
-            self.try_write_new_sidecar_cmd(rel, IMMUTABLE_RECORD_MODE)
+        let cmd = if rel.as_path() == crate::remote::layout::operation_lock().as_path() {
+            self.try_write_new_sidecar_cmd(rel.as_path(), IMMUTABLE_RECORD_MODE)
         } else {
-            Self::write_new_cmd(&self.root, rel, IMMUTABLE_RECORD_MODE)
+            Self::write_new_cmd(&self.root, rel.as_path(), IMMUTABLE_RECORD_MODE)
         };
         let mut argv = vec!["ssh".to_string()];
         argv.extend(self.ssh_args()?);
@@ -1532,7 +1536,7 @@ impl Remote for SshTransport {
         // unreadable entry — never an undifferentiated conflict).
         let verified = verify_existing(
             || {
-                let out = self.run_remote(&self.verify_open_script(rel))?;
+                let out = self.run_remote(&self.verify_open_script(rel.as_path()))?;
                 if !out.status.success() {
                     return Err(Error::transport(format!(
                         "ssh verify-open failed: {}",
@@ -1558,9 +1562,14 @@ impl Remote for SshTransport {
         Ok(verdict)
     }
 
-    fn atomic_recover(&self, rel: &Path, observed: &[u8], new_data: &[u8]) -> Result<Option<()>> {
+    fn atomic_recover(
+        &self,
+        rel: &RootedRelativePath,
+        observed: &[u8],
+        new_data: &[u8],
+    ) -> Result<Option<()>> {
         // Only the operation lock's recover is sidecar-serialized; other paths are not supported.
-        if rel != crate::remote::layout::operation_lock() {
+        if rel.as_path() != crate::remote::layout::operation_lock().as_path() {
             return Ok(None);
         }
         let cmd = recover_sidecar_cmd(&self.root, observed, new_data);
@@ -1758,7 +1767,7 @@ mod tests_ssh {
         let t = transport();
         let cmd = SshTransport::write_new_cmd(
             t.root(),
-            &crate::remote::layout::operation_lock(),
+            crate::remote::layout::operation_lock().as_path(),
             IMMUTABLE_RECORD_MODE,
         );
         assert!(
@@ -1783,7 +1792,7 @@ mod tests_ssh {
         let cmd = SshTransport::rename_cmd(
             t.root(),
             Path::new(".current.tmp.op-x"),
-            crate::remote::layout::current(),
+            crate::remote::layout::current().as_path(),
         );
         assert!(
             cmd.contains("mv -T"),
@@ -1857,7 +1866,7 @@ mod tests_ssh {
         let t = transport();
         let cmd = SshTransport::write_new_cmd(
             t.root(),
-            &crate::remote::layout::operation_lock(),
+            crate::remote::layout::operation_lock().as_path(),
             IMMUTABLE_RECORD_MODE,
         );
         assert!(
@@ -1899,7 +1908,7 @@ mod tests_ssh {
     fn try_write_new_sidecar_is_perl_native_and_holds_flock() {
         let tr = transport();
         let cmd = tr.try_write_new_sidecar_cmd(
-            &crate::remote::layout::operation_lock(),
+            crate::remote::layout::operation_lock().as_path(),
             IMMUTABLE_RECORD_MODE,
         );
         assert!(
@@ -2041,7 +2050,7 @@ mod tests_ssh {
         let recover = recover_sidecar_cmd(Path::new("/srv/app"), b"obs", b"new");
         let tr = transport();
         let create = tr.try_write_new_sidecar_cmd(
-            &crate::remote::layout::operation_lock(),
+            crate::remote::layout::operation_lock().as_path(),
             IMMUTABLE_RECORD_MODE,
         );
         for (name, cmd) in [
@@ -2078,7 +2087,7 @@ mod tests_ssh {
         // The tmp-name O_EXCL allocation loop in create-new is still present.
         let tr2 = transport();
         let create2 = tr2.try_write_new_sidecar_cmd(
-            &crate::remote::layout::operation_lock(),
+            crate::remote::layout::operation_lock().as_path(),
             IMMUTABLE_RECORD_MODE,
         );
         assert!(
@@ -2665,8 +2674,11 @@ mod tests_ssh {
     #[test]
     fn try_write_new_cmd_final_chmod_and_real_parent_sync() {
         let t = transport();
-        let cmd =
-            SshTransport::write_new_cmd(t.root(), &crate::remote::layout::operation_lock(), 0o640);
+        let cmd = SshTransport::write_new_cmd(
+            t.root(),
+            crate::remote::layout::operation_lock().as_path(),
+            0o640,
+        );
         // Step 3 (final chmod) BEFORE step 4 (file fsync) BEFORE step 5
         // (no-replace install): the published inode carries the caller's
         // mode, never the remote umask.
@@ -3372,7 +3384,7 @@ exec /bin/mv "$@"
 
         // Present regular file: strictly parsed `size` + `rawmode`.
         let meta = t
-            .metadata_opt(Path::new("app.txt"))
+            .metadata_opt(&RootedRelativePath::parse(Path::new("app.txt")).unwrap())
             .unwrap()
             .expect("present file must be Some");
         assert!(meta.is_file && !meta.is_dir && !meta.is_symlink);
@@ -3384,7 +3396,7 @@ exec /bin/mv "$@"
         // link is still PRESENT).
         for rel in ["link", "dangling"] {
             let m = t
-                .metadata_opt(Path::new(rel))
+                .metadata_opt(&RootedRelativePath::parse(Path::new(rel)).unwrap())
                 .unwrap()
                 .expect("present symlink must be Some");
             assert!(m.is_symlink && !m.is_file && !m.is_dir, "{rel}");
@@ -3393,16 +3405,22 @@ exec /bin/mv "$@"
         // Confirmed absence: the helper's real lstat fails with ENOENT (2)
         // for a missing final component and for a missing ancestor -> `A`
         // frames -> None.
-        assert!(t.metadata_opt(Path::new("absent.txt")).unwrap().is_none());
         assert!(
-            t.metadata_opt(Path::new("missing/dir/entry"))
+            t.metadata_opt(&RootedRelativePath::parse(Path::new("absent.txt")).unwrap())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            t.metadata_opt(&RootedRelativePath::parse(Path::new("missing/dir/entry")).unwrap())
                 .unwrap()
                 .is_none(),
             "a missing parent is also a confirmed absence"
         );
 
         // `metadata()` keeps delegating: confirmed absence -> NotFound.
-        let err = t.metadata(Path::new("absent.txt")).unwrap_err();
+        let err = t
+            .metadata(&RootedRelativePath::parse(Path::new("absent.txt")).unwrap())
+            .unwrap_err();
         assert!(
             matches!(err, Error::NotFound(_)),
             "metadata() must map confirmed absence to NotFound, got: {err}"
@@ -3440,7 +3458,9 @@ exec /bin/mv "$@"
         // A fake `perl` whose lstat fails with EACCES: `E\t13` on stdout,
         // exit 0 (the FRAME is the signal).
         write_fake_lstat(&fake.bin, "E\t13");
-        let err = t.metadata_opt(Path::new("app.txt")).unwrap_err();
+        let err = t
+            .metadata_opt(&RootedRelativePath::parse(Path::new("app.txt")).unwrap())
+            .unwrap_err();
         assert!(
             err.to_string().contains("errno 13"),
             "EACCES must be an error naming the errno, got: {err}"
@@ -3449,7 +3469,11 @@ exec /bin/mv "$@"
         // Restore the real helper (drop the fake `perl`): confirmed absence
         // still resolves to None through the REAL errno.
         std::fs::remove_file(fake.bin.join("perl")).unwrap();
-        assert!(t.metadata_opt(Path::new("absent.txt")).unwrap().is_none());
+        assert!(
+            t.metadata_opt(&RootedRelativePath::parse(Path::new("absent.txt")).unwrap())
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// Malformed frames (exit 0 with garbage) are errors — every frame is
@@ -3475,7 +3499,9 @@ exec /bin/mv "$@"
 
         // Garbage (no prefix at all).
         write_fake_lstat(&fake.bin, "garbage");
-        let err = t.metadata_opt(Path::new("app.txt")).unwrap_err();
+        let err = t
+            .metadata_opt(&RootedRelativePath::parse(Path::new("app.txt")).unwrap())
+            .unwrap_err();
         assert!(
             err.to_string().contains("malformed"),
             "garbage stdout must be malformed, got: {err}"
@@ -3483,7 +3509,9 @@ exec /bin/mv "$@"
 
         // Wrong prefix.
         write_fake_lstat(&fake.bin, "X\t2");
-        let err = t.metadata_opt(Path::new("app.txt")).unwrap_err();
+        let err = t
+            .metadata_opt(&RootedRelativePath::parse(Path::new("app.txt")).unwrap())
+            .unwrap_err();
         assert!(
             err.to_string().contains("malformed"),
             "wrong prefix must be malformed, got: {err}"
@@ -3491,7 +3519,9 @@ exec /bin/mv "$@"
 
         // Present frame with the mode field missing.
         write_fake_lstat(&fake.bin, "P\t5");
-        let err = t.metadata_opt(Path::new("app.txt")).unwrap_err();
+        let err = t
+            .metadata_opt(&RootedRelativePath::parse(Path::new("app.txt")).unwrap())
+            .unwrap_err();
         assert!(
             err.to_string().contains("malformed"),
             "missing mode field must be malformed, got: {err}"
@@ -3499,7 +3529,9 @@ exec /bin/mv "$@"
 
         // Absent frame with the errno field missing.
         write_fake_lstat(&fake.bin, "A");
-        let err = t.metadata_opt(Path::new("app.txt")).unwrap_err();
+        let err = t
+            .metadata_opt(&RootedRelativePath::parse(Path::new("app.txt")).unwrap())
+            .unwrap_err();
         assert!(
             err.to_string().contains("malformed"),
             "missing errno field must be malformed, got: {err}"
@@ -3507,7 +3539,9 @@ exec /bin/mv "$@"
 
         // Present frame plus a stray extra field.
         write_fake_lstat(&fake.bin, "P\t5\t81a4\textra");
-        let err = t.metadata_opt(Path::new("app.txt")).unwrap_err();
+        let err = t
+            .metadata_opt(&RootedRelativePath::parse(Path::new("app.txt")).unwrap())
+            .unwrap_err();
         assert!(
             err.to_string().contains("malformed"),
             "extra field must be malformed, got: {err}"
@@ -3515,7 +3549,9 @@ exec /bin/mv "$@"
 
         // More than one frame line.
         write_fake_lstat(&fake.bin, "P\t5\t81a4\nE\t13");
-        let err = t.metadata_opt(Path::new("app.txt")).unwrap_err();
+        let err = t
+            .metadata_opt(&RootedRelativePath::parse(Path::new("app.txt")).unwrap())
+            .unwrap_err();
         assert!(
             err.to_string().contains("malformed"),
             "extra lines must be malformed, got: {err}"
@@ -3702,7 +3738,7 @@ exec /bin/mv "$@"
             }
 
             // FRAME-LEVEL: the real transport parses the injected outcome.
-            let result = t.metadata_opt(Path::new("probe"));
+            let result = t.metadata_opt(&RootedRelativePath::parse(Path::new("probe")).unwrap());
             match result {
                 Ok(Some(meta)) => {
                     // ONLY the Present outcome may be `Some`.
@@ -3767,7 +3803,7 @@ exec /bin/mv "$@"
                 let helper = RemoteHelper::new(&t);
                 let guard = helper.acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()));
                 let err = match guard {
-                    Ok(g) => g.swap_current( &ExpectedCurrent::Absent, "gen-gate", "op")
+                    Ok(g) => g.swap_current( &ExpectedCurrent::Absent, &crate::identity::test_generation_id("gen-gate"), "op")
                         .unwrap_err(),
                     Err(e) => e};
                 assert!(
@@ -3857,18 +3893,18 @@ exec /bin/mv "$@"
             let d = test_tree_digest(tree);
             helper
                 .remote()
-                .create_dir_all(&crate::remote::layout::tree_root(d.as_str()))
+                .create_dir_all(&crate::remote::layout::tree_root(&d))
                 .unwrap();
         }
         helper
             .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
             .unwrap()
-            .swap_current(&ExpectedCurrent::Absent, g2.as_str(), "op")
+            .swap_current(&ExpectedCurrent::Absent, &g2, "op")
             .unwrap();
         let garbage = test_tree_digest("garbage");
         helper
             .remote()
-            .create_dir_all(&crate::remote::layout::tree_root(garbage.as_str()))
+            .create_dir_all(&crate::remote::layout::tree_root(&garbage))
             .unwrap();
 
         // Inject EACCES ONLY on the generations-root lstat; every other
@@ -3918,14 +3954,14 @@ exec /bin/mv "$@"
             assert!(
                 helper
                     .remote()
-                    .exists(&crate::remote::layout::tree_root(d.as_str())),
+                    .exists(&crate::remote::layout::tree_root(&d)),
                 "history tree {d} must survive the failed retention"
             );
         }
         assert!(
             helper
                 .remote()
-                .exists(&crate::remote::layout::tree_root(garbage.as_str())),
+                .exists(&crate::remote::layout::tree_root(&garbage)),
             "the garbage tree must survive the failed retention"
         );
     }
@@ -3962,7 +3998,10 @@ exec /bin/mv "$@"
         // propagates the error.
         write_fake_bin(&fake.bin, "mktemp", "#!/bin/sh\nexit 1\n");
         let err = t
-            .try_write_new(Path::new("state/op.json"), b"payload")
+            .try_write_new(
+                &RootedRelativePath::parse(Path::new("state/op.json")).unwrap(),
+                b"payload",
+            )
             .unwrap_err();
         assert!(
             err.to_string().contains("ssh try_write_new failed"),
@@ -4052,8 +4091,8 @@ exec /bin/mv "$@"
                 ),
             );
 
-            let rel = Path::new("state/record.json");
-            let dest = remote_deploy.join(rel);
+            let rel = RootedRelativePath::parse(Path::new("state/record.json")).unwrap();
+            let dest = remote_deploy.join(rel.as_path());
             let parent = dest.parent().unwrap().to_path_buf();
             let data = payload.as_bytes();
             let final_mode = IMMUTABLE_RECORD_MODE & 0o7777;
@@ -4061,7 +4100,7 @@ exec /bin/mv "$@"
             match state {
                 SshVerdictState::Fresh => {
                     let verdict = t
-                        .try_write_new(rel, data)
+                        .try_write_new(&rel, data)
                         .expect("the fresh ssh install must succeed");
                     prop_assert_eq!(verdict, CreateNewVerdict::Created);
                     prop_assert_eq!(
@@ -4091,7 +4130,7 @@ exec /bin/mv "$@"
                     std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(final_mode))
                         .unwrap();
                     let verdict = t
-                        .try_write_new(rel, data)
+                        .try_write_new(&rel, data)
                         .expect("an identical retry must converge, not error");
                     prop_assert_eq!(verdict, CreateNewVerdict::AlreadyPresent);
                     prop_assert_eq!(
@@ -4113,7 +4152,7 @@ exec /bin/mv "$@"
                     std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(final_mode))
                         .unwrap();
                     let verdict = t
-                        .try_write_new(rel, data)
+                        .try_write_new(&rel, data)
                         .expect("a different-content winner is a verdict, not an I/O error");
                     let is_content_mismatch = matches!(
                         verdict,
@@ -4141,7 +4180,7 @@ exec /bin/mv "$@"
                     std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(other_mode))
                         .unwrap();
                     let verdict = t
-                        .try_write_new(rel, data)
+                        .try_write_new(&rel, data)
                         .expect("a mode mismatch is a verdict, not an I/O error");
                     let is_mode_mismatch = matches!(
                         verdict,
@@ -4170,7 +4209,7 @@ exec /bin/mv "$@"
                     std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(final_mode))
                         .unwrap();
                     let verdict = t
-                        .try_write_new(rel, data)
+                        .try_write_new(&rel, data)
                         .expect("the retry over a published-before-parent-sync entry must converge");
                     prop_assert_eq!(verdict, CreateNewVerdict::AlreadyPresent);
                     prop_assert_eq!(
@@ -4243,12 +4282,12 @@ exec /bin/mv "$@"
             let t = fake.transport(&cache, &env);
             t.prepare_identity().unwrap();
 
-            let rel = Path::new("state/record.bin");
+            let rel = RootedRelativePath::parse(Path::new("state/record.bin")).unwrap();
             let verdict = t
-                .try_write_new(rel, &data)
+                .try_write_new(&rel, &data)
                 .expect("the fresh byte install must succeed");
             prop_assert_eq!(verdict, CreateNewVerdict::Created);
-            let read_back = t.read(rel).expect("read back over ssh");
+            let read_back = t.read(&rel).expect("read back over ssh");
             prop_assert_eq!(
                 read_back.as_slice(),
                 data.as_slice(),
@@ -4264,7 +4303,7 @@ exec /bin/mv "$@"
             expected.push("--".into());
             expected.push(SshTransport::write_new_cmd(
                 t.root(),
-                rel,
+                rel.as_path(),
                 IMMUTABLE_RECORD_MODE,
             ));
             let invocations = read_ssh_argv_log(&fake.argv_log);
@@ -4291,12 +4330,12 @@ exec /bin/mv "$@"
                 tmp.path().join("local"),
             )
             .expect("local transport");
-            let local_rel = Path::new("state/record.bin");
+            let local_rel = RootedRelativePath::parse(Path::new("state/record.bin")).unwrap();
             let local_verdict = local
-                .try_write_new(local_rel, &data)
+                .try_write_new(&local_rel, &data)
                 .expect("the fresh local byte install must succeed");
             prop_assert_eq!(local_verdict, CreateNewVerdict::Created);
-            let local_read_back = local.read(local_rel).expect("local read back");
+            let local_read_back = local.read(&local_rel).expect("local read back");
             prop_assert_eq!(
                 local_read_back.as_slice(),
                 data.as_slice(),
@@ -4539,7 +4578,7 @@ exec /bin/mv "$@"
             let intent: &[u8] = br#"{"a":1,"b":2}"#;
             let required_mode = IMMUTABLE_RECORD_MODE & 0o7777;
             let wrong_mode = if required_mode == 0o600 { 0o640 } else { 0o600 };
-            let rel = Path::new("state/record.json");
+            let rel = RootedRelativePath::parse(Path::new("state/record.json")).unwrap();
             let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
 
             // Each case drives its OWN transport fixture: LocalTransport
@@ -4554,7 +4593,7 @@ exec /bin/mv "$@"
                         tmp.path().join("r"),
                     )
                     .unwrap();
-                    let dest = t.root().join(rel);
+                    let dest = t.root().join(rel.as_path());
                     (Box::new(t), dest)
                 }
                 XTransport::Ssh => {
@@ -4574,7 +4613,7 @@ exec /bin/mv "$@"
                     let t = fake.transport(&cache, &env);
                     t.prepare_identity().unwrap();
                     write_fake_bin(&fake.bin, "sync", "#!/bin/sh\nexit 0\n");
-                    let dest = fake.remote_root.join("srv/deploy/xprod-ssh").join(rel);
+                    let dest = fake.remote_root.join("srv/deploy/xprod-ssh").join(rel.as_path());
                     (Box::new(t), dest)
                 }
             };
@@ -4640,7 +4679,7 @@ exec /bin/mv "$@"
             }
 
             let verdict = handle
-                .try_write_new_with(rel, intent, equivalence)
+                .try_write_new_with(&rel, intent, equivalence)
                 .expect("a create-new attempt must return a verdict, never hang");
 
             // THE ORACLE comparison: the implementation's verdict must equal
@@ -4763,9 +4802,9 @@ exec /bin/mv "$@"
             let wrong_mode = if required == 0o600 { 0o640 } else { 0o600 };
             let intended: &[u8] = br#"{"a":1,"b":2}"#;
             let swapped_content: &[u8] = br#"{"a":9,"b":9}"#;
-            let rel = Path::new("state/record.json");
+            let rel = RootedRelativePath::parse(Path::new("state/record.json")).unwrap();
             let remote_deploy = fake.remote_root.join("srv/deploy/swap-ssh");
-            let dest = remote_deploy.join(rel);
+            let dest = remote_deploy.join(rel.as_path());
             std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
             // The ORIGINAL entry: a regular file matching the intent.
             std::fs::write(&dest, intended).unwrap();
@@ -4785,7 +4824,7 @@ exec /bin/mv "$@"
             )));
 
             let verdict = t
-                .try_write_new(rel, intended)
+                .try_write_new(&rel, intended)
                 .expect("a create-new attempt must return a verdict, never hang");
 
             match boundary {
@@ -4943,9 +4982,9 @@ exec /bin/mv "$@"
             // test: a regular file matching the intent with IMMUTABLE_RECORD_MODE.
             let required = IMMUTABLE_RECORD_MODE & 0o7777;
             let intended: &[u8] = br#"{"a":1,"b":2}"#;
-            let rel = Path::new("state/record.json");
+            let rel = RootedRelativePath::parse(Path::new("state/record.json")).unwrap();
             let remote_deploy = fake.remote_root.join("srv/deploy/ambient-ssh");
-            let dest = remote_deploy.join(rel);
+            let dest = remote_deploy.join(rel.as_path());
             std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
             std::fs::write(&dest, intended).unwrap();
             std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(required)).unwrap();
@@ -4983,7 +5022,7 @@ exec /bin/mv "$@"
             // AlreadyPresent (regular file with exact mode + exact bytes).
             // We assert the production op returns that baseline and leaves the
             // filesystem unchanged.
-            let verdict = t.try_write_new(rel, intended).expect("production verification must return a verdict");
+            let verdict = t.try_write_new(&rel, intended).expect("production verification must return a verdict");
             let after = snapshot_remote_recursive(&fake.remote_root);
 
             prop_assert_eq!(

@@ -225,12 +225,14 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
     );
     let tree_path = layout::objects()
         .join(known_artifact(srv).tree.as_str())
-        .join("root");
+        .unwrap()
+        .join("root")
+        .unwrap();
     assert!(
-        endpoint.exists(&tree_path.join("app/hello")),
+        endpoint.exists(&tree_path.join("app/hello").unwrap()),
         "artifact mapped to app/hello"
     );
-    let hello = String::from_utf8(endpoint.read(&tree_path.join("app/hello"))?).unwrap();
+    let hello = String::from_utf8(endpoint.read(&tree_path.join("app/hello").unwrap())?).unwrap();
     assert_eq!(hello, PLACEHOLDER, "placeholder content round-trips");
 
     // 7. History, snapshot log, and observed state back `deploy log` /

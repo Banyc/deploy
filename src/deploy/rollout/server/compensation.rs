@@ -75,7 +75,7 @@ pub(crate) enum CompensationOutcome {
 /// verify absent).
 fn load_generation_behavior(
     helper: &crate::remote::helper::RemoteHelper,
-    gid: &str,
+    gid: &crate::identity::GenerationId,
     owner: &crate::remote::helper::GenerationOwner,
 ) -> Result<crate::identity::BehaviorContract> {
     let assignment = helper.read_assignment(gid, owner).map_err(|e| {
@@ -117,7 +117,7 @@ pub(crate) fn compensate_server_locked(
             // The read VERIFIES the generation's OWNER MARKER against the
             // expected owner: a prior generation transplanted from another
             // application/slot is refused (never compensated onto).
-            let prior_assignment = match helper.read_assignment(prior.as_str(), &request.owner) {
+            let prior_assignment = match helper.read_assignment(prior, &request.owner) {
                 Ok(a) => a,
                 Err(_) => return Ok(CompensationOutcome::Refused),
             };
@@ -141,17 +141,14 @@ pub(crate) fn compensate_server_locked(
                     &crate::remote::helper::ExpectedCurrent::Generation(
                         request.advanced_gen.clone(),
                     ),
-                    prior.as_str(),
+                    prior,
                     request.op_id.as_str(),
                 )
                 .is_err()
             {
                 return Ok(CompensationOutcome::Refused);
             }
-            let root = remote
-                .root()
-                .join(layout::generation(prior.as_str()))
-                .join("root");
+            let root = remote.root().join(layout::generation(prior)).join("root");
             // Re-run prior activation contract + verification. A failure means the
             // service was not actually restored to prior behavior, so propagate
             // it as a compensation failure (the attempt is marked Degraded).
@@ -169,7 +166,7 @@ pub(crate) fn compensate_server_locked(
             // sealed proof a `Restored` execution must carry. The unit-file
             // restore runs BEFORE the prior verification health check.
             let advanced_behavior =
-                load_generation_behavior(helper, request.advanced_gen.as_str(), &request.owner)?;
+                load_generation_behavior(helper, &request.advanced_gen, &request.owner)?;
             let advanced_units =
                 crate::verify::systemd::declared_user_units(advanced_behavior.activation());
             let prior_units =
@@ -216,7 +213,7 @@ pub(crate) fn compensate_server_locked(
             // first deploy is ABSENT — the advanced contract's installed units
             // are removed and their absence VERIFIED by reading the remote.
             let advanced_behavior =
-                load_generation_behavior(helper, request.advanced_gen.as_str(), &request.owner)?;
+                load_generation_behavior(helper, &request.advanced_gen, &request.owner)?;
             let advanced_units =
                 crate::verify::systemd::declared_user_units(advanced_behavior.activation());
             crate::verify::systemd::restore_adapter_to(
@@ -334,10 +331,7 @@ mod compensation_tests {
             // remote record (generations/<gen>/assignment.json).
             let prior_assignment = h
                 .helper()
-                .read_assignment(
-                    first_gen.as_str(),
-                    &crate::remote::helper::test_owner("eng", "p1"),
-                )
+                .read_assignment(&first_gen, &crate::remote::helper::test_owner("eng", "p1"))
                 .unwrap();
 
             // A subsequent (desired) push fails activation and the engine
@@ -378,7 +372,7 @@ mod compensation_tests {
                 std::collections::BTreeMap::from([("standard".to_string(), h.behave())]);
             helper
                 .publish_release(
-                    h.harness_release_id().as_str(),
+                    &h.harness_release_id(),
                     &h.harness_release_json(),
                     &serde_json::to_string(&behaviors).unwrap(),
                 )
@@ -505,7 +499,7 @@ mod compensation_tests {
             .unwrap()
             .swap_current(
                 &crate::remote::helper::ExpectedCurrent::Generation(first_gen.clone()),
-                g2.as_str(),
+                &g2,
                 "op2",
             )
             .unwrap();
@@ -536,7 +530,7 @@ mod compensation_tests {
             .unwrap()
             .swap_current(
                 &crate::remote::helper::ExpectedCurrent::Generation(g2.clone()),
-                g3.as_str(),
+                &g3,
                 "op3",
             )
             .unwrap();
@@ -546,7 +540,7 @@ mod compensation_tests {
         let behaviors = std::collections::BTreeMap::from([("standard".to_string(), h.behave())]);
         helper
             .publish_release(
-                h.harness_release_id().as_str(),
+                &h.harness_release_id(),
                 &h.harness_release_json(),
                 &serde_json::to_string(&behaviors).unwrap(),
             )

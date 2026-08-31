@@ -59,7 +59,7 @@ pub fn run_verification(
 mod tests {
     use super::*;
     use crate::config::{ValidatedCommand, Verification};
-    use crate::remote::transport::CreateNewVerdict;
+    use crate::remote::transport::{CreateNewVerdict, RootedRelativePath};
     use std::cell::RefCell;
     use std::path::{Path, PathBuf};
 
@@ -84,46 +84,56 @@ mod tests {
         fn root(&self) -> &Path {
             &self.base
         }
-        fn read(&self, _rel: &Path) -> Result<Vec<u8>> {
+        fn read(&self, _rel: &RootedRelativePath) -> Result<Vec<u8>> {
             unreachable!("not used by run_verification")
         }
-        fn write(&self, _rel: &Path, _data: &[u8], _mode: u32) -> Result<()> {
+        fn write(&self, _rel: &RootedRelativePath, _data: &[u8], _mode: u32) -> Result<()> {
             unreachable!("not used by run_verification")
         }
-        fn try_write_new(&self, _rel: &Path, _data: &[u8]) -> Result<CreateNewVerdict> {
+        fn try_write_new(
+            &self,
+            _rel: &RootedRelativePath,
+            _data: &[u8],
+        ) -> Result<CreateNewVerdict> {
             unreachable!("not used by run_verification")
         }
-        fn create_dir(&self, _rel: &Path) -> Result<()> {
+        fn create_dir(&self, _rel: &RootedRelativePath) -> Result<()> {
             unreachable!("not used by run_verification")
         }
-        fn create_dir_all(&self, _rel: &Path) -> Result<()> {
+        fn create_dir_all(&self, _rel: &RootedRelativePath) -> Result<()> {
             unreachable!("not used by run_verification")
         }
-        fn set_mode(&self, _rel: &Path, _mode: u32) -> Result<()> {
+        fn set_mode(&self, _rel: &RootedRelativePath, _mode: u32) -> Result<()> {
             unreachable!("not used by run_verification")
         }
-        fn list(&self, _rel: &Path) -> Result<Vec<crate::remote::transport::RemoteEntry>> {
+        fn list(
+            &self,
+            _rel: &RootedRelativePath,
+        ) -> Result<Vec<crate::remote::transport::RemoteEntry>> {
             unreachable!("not used by run_verification")
         }
-        fn rename(&self, _from: &Path, _to: &Path) -> Result<()> {
+        fn rename(&self, _from: &RootedRelativePath, _to: &RootedRelativePath) -> Result<()> {
             unreachable!("not used by run_verification")
         }
-        fn symlink(&self, _target: &Path, _link: &Path) -> Result<()> {
+        fn symlink(&self, _target: &Path, _link: &RootedRelativePath) -> Result<()> {
             unreachable!("not used by run_verification")
         }
-        fn read_link(&self, _rel: &Path) -> Result<PathBuf> {
+        fn read_link(&self, _rel: &RootedRelativePath) -> Result<PathBuf> {
             unreachable!("not used by run_verification")
         }
-        fn remove_file(&self, _rel: &Path) -> Result<()> {
+        fn remove_file(&self, _rel: &RootedRelativePath) -> Result<()> {
             unreachable!("not used by run_verification")
         }
-        fn remove_dir_all(&self, _rel: &Path) -> Result<()> {
+        fn remove_dir_all(&self, _rel: &RootedRelativePath) -> Result<()> {
             unreachable!("not used by run_verification")
         }
-        fn exists(&self, _rel: &Path) -> bool {
+        fn exists(&self, _rel: &RootedRelativePath) -> bool {
             unreachable!("not used by run_verification")
         }
-        fn metadata(&self, _rel: &Path) -> Result<crate::remote::transport::RemoteMeta> {
+        fn metadata(
+            &self,
+            _rel: &RootedRelativePath,
+        ) -> Result<crate::remote::transport::RemoteMeta> {
             unreachable!("not used by run_verification")
         }
         fn exec(

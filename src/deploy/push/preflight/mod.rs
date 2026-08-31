@@ -591,7 +591,7 @@ pub(crate) fn run_preflight(
                         config.application().clone(),
                         slot_id.clone(),
                     );
-                    match helpers[slot_id].read_assignment(g.as_str(), &owner) {
+                    match helpers[slot_id].read_assignment(&g, &owner) {
                         Ok(asn) => Observation::Known(PreviousGeneration {
                             generation: g,
                             artifact: asn.artifact,
@@ -824,7 +824,7 @@ pub(crate) mod preflight_tests {
         let remote_handle =
             LocalTransport::new(&crate::testutil::fixture_env(), remote_path).unwrap();
         assert!(
-            remote_handle.exists(&crate::remote::layout::tree_root(tree.as_str())),
+            remote_handle.exists(&crate::remote::layout::tree_root(&tree)),
             "remote still retains the tree"
         );
 
@@ -1678,7 +1678,7 @@ pub(crate) mod preflight_tests {
         // its `app/` subdir were created, so a real partial upload existed and
         // must be gone.
         assert!(
-            !remote.exists(&crate::remote::layout::incoming_dir(id.as_str())),
+            !remote.exists(&crate::remote::layout::incoming_dir(&id)),
             "the partial incoming upload must be cleaned best-effort"
         );
     }
@@ -1836,7 +1836,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 LocalTransport::new(&crate::testutil::fixture_env(), remotes_base.join(sname))
                     .unwrap();
             assert!(
-                !remote.exists(&crate::remote::layout::incoming_dir(id.as_str())),
+                !remote.exists(&crate::remote::layout::incoming_dir(&id)),
                 "slot {sname}'s incoming dir must be cleaned best-effort"
             );
             assert!(

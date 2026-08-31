@@ -591,7 +591,7 @@ pub(crate) fn push_inner<'a>(
         // must see the persistence boundary failed.
         for a in &preflight.assignments {
             helpers[&a.placement_slot]
-                .remove_incoming(deployment_id.as_str())
+                .remove_incoming(deployment_id)
                 .ok();
         }
         txn.append_terminal(

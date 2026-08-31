@@ -99,17 +99,19 @@ pub fn compute_retained(
             // Assignment read/parse failure aborts the whole rotation (no
             // more `continue`): a generation that cannot be read must not
             // silently disappear from the inventory — its tree would look
-            // unprotected and be deleted.
-            let a = helper.read_assignment(&e.name, owner)?;
-            // Identity: the record must agree with the directory it lives
-            // under. A tampered/mismatched record fails closed — it is never
-            // trusted as evidence about the generation's tree.
+            // unprotected and be deleted. The directory name is parsed into
+            // the TYPED generation identity FIRST — a raw filesystem string
+            // is never consumed as a semantic identity.
             let dir_gen = GenerationId::parse(&e.name).map_err(|err| {
                 Error::integrity(format!(
                     "generation directory {} names an invalid generation id: {err}",
                     e.name
                 ))
             })?;
+            let a = helper.read_assignment(&dir_gen, owner)?;
+            // Identity: the record must agree with the directory it lives
+            // under. A tampered/mismatched record fails closed — it is never
+            // trusted as evidence about the generation's tree.
             if a.generation_id != dir_gen {
                 return Err(Error::integrity(format!(
                     "generation {} assignment names generation {}, not its directory",
@@ -288,7 +290,7 @@ mod tests {
     use crate::remote::helper::{CurrentAssignment, GenerationAssignment, RemoteHelper};
     use crate::remote::layout;
     use crate::remote::transport::{
-        CreateNewVerdict, LocalTransport, Remote, RemoteEntry, RemoteMeta,
+        CreateNewVerdict, LocalTransport, Remote, RemoteEntry, RemoteMeta, RootedRelativePath,
     };
     use crate::store::local::LocalStore;
     use crate::verify::release::RELEASE_RECORD_SCHEMA_VERSION;
@@ -377,11 +379,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let helper = RemoteHelper::new(&remote);
         helper
             .remote()
-            .create_dir_all(&layout::tree_root(test_tree_digest("t1").as_str()))
+            .create_dir_all(&layout::tree_root(&test_tree_digest("t1")))
             .unwrap();
         helper
             .remote()
-            .create_dir_all(&layout::tree_root(test_tree_digest("t2").as_str()))
+            .create_dir_all(&layout::tree_root(&test_tree_digest("t2")))
             .unwrap();
         helper
             .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
@@ -426,7 +428,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .unwrap()
             .swap_current(
                 &crate::remote::helper::ExpectedCurrent::Absent,
-                test_generation_id("g2").as_str(),
+                &test_generation_id("g2"),
                 "op",
             )
             .unwrap();
@@ -540,7 +542,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let canonical_tree = test_tree_digest(tree);
         helper
             .remote()
-            .create_dir_all(&layout::tree_root(canonical_tree.as_str()))
+            .create_dir_all(&layout::tree_root(&canonical_tree))
             .unwrap();
         helper
             .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
@@ -606,7 +608,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .unwrap()
             .swap_current(
                 &crate::remote::helper::ExpectedCurrent::Absent,
-                test_generation_id("g3").as_str(),
+                &test_generation_id("g3"),
                 "op",
             )
             .unwrap();
@@ -668,7 +670,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .unwrap()
             .swap_current(
                 &crate::remote::helper::ExpectedCurrent::Absent,
-                test_generation_id("g2").as_str(),
+                &test_generation_id("g2"),
                 "op",
             )
             .unwrap();
@@ -758,7 +760,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .unwrap()
             .swap_current(
                 &crate::remote::helper::ExpectedCurrent::Absent,
-                test_generation_id("g3").as_str(),
+                &test_generation_id("g3"),
                 "op",
             )
             .unwrap();
@@ -834,7 +836,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .unwrap()
             .swap_current(
                 &crate::remote::helper::ExpectedCurrent::Absent,
-                test_generation_id("g2").as_str(),
+                &test_generation_id("g2"),
                 "op",
             )
             .unwrap();
@@ -901,7 +903,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .unwrap()
             .swap_current(
                 &crate::remote::helper::ExpectedCurrent::Absent,
-                test_generation_id("g1").as_str(),
+                &test_generation_id("g1"),
                 "op",
             )
             .unwrap();
@@ -909,16 +911,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         std::fs::write(
             dir.path()
                 .join("remote")
-                .join(crate::remote::layout::generation(
-                    test_generation_id("g1").as_str(),
-                ))
+                .join(crate::remote::layout::generation(&test_generation_id("g1")))
                 .join("assignment.json"),
             b"{ corrupt !",
         )
         .unwrap();
         assert!(
             helper
-                .read_assignment(test_generation_id("g1").as_str(), &owner())
+                .read_assignment(&test_generation_id("g1"), &owner())
                 .is_err(),
             "the live assignment must be unreadable after corruption"
         );
@@ -957,9 +957,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "the retention failure must be an integrity error, got: {err}"
         );
         assert!(
-            helper.remote().exists(&crate::remote::layout::tree_root(
-                test_tree_digest("t1").as_str()
-            )),
+            helper
+                .remote()
+                .exists(&crate::remote::layout::tree_root(&test_tree_digest("t1"))),
             "retention must not sweep the tree behind a corrupt current"
         );
     }
@@ -1010,7 +1010,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .unwrap()
             .swap_current(
                 &crate::remote::helper::ExpectedCurrent::Absent,
-                test_generation_id("g3").as_str(),
+                &test_generation_id("g3"),
                 "op",
             )
             .unwrap();
@@ -1143,7 +1143,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .unwrap()
             .swap_current(
                 &crate::remote::helper::ExpectedCurrent::Absent,
-                test_generation_id("g3").as_str(),
+                &test_generation_id("g3"),
                 "op",
             )
             .unwrap();
@@ -1235,23 +1235,21 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .unwrap()
             .swap_current(
                 &crate::remote::helper::ExpectedCurrent::Absent,
-                test_generation_id("g2").as_str(),
+                &test_generation_id("g2"),
                 "op",
             )
             .unwrap();
         // A garbage object referenced by nothing — genuinely unretained.
         helper
             .remote()
-            .create_dir_all(&layout::tree_root(
-                test_tree_digest("tree-garbage").as_str(),
-            ))
+            .create_dir_all(&layout::tree_root(&test_tree_digest("tree-garbage")))
             .unwrap();
         // The pin-only trees exist on the receiver; the pinned release's
         // record is the ONLY reference to them.
         for t in pin_trees {
             helper
                 .remote()
-                .create_dir_all(&layout::tree_root(test_tree_digest(t).as_str()))
+                .create_dir_all(&layout::tree_root(&test_tree_digest(t)))
                 .unwrap();
         }
         let variants: BTreeMap<VariantName, TreeDigest> = pin_trees
@@ -1385,7 +1383,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             assert!(
                 helper
                     .remote()
-                    .exists(&layout::tree_root(test_tree_digest(t).as_str())),
+                    .exists(&layout::tree_root(&test_tree_digest(t))),
                 "tree {t} must survive the failed retention"
             );
         }
@@ -1406,14 +1404,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             assert!(
                 helper
                     .remote()
-                    .exists(&layout::tree_root(test_tree_digest(t).as_str())),
+                    .exists(&layout::tree_root(&test_tree_digest(t))),
                 "tree {t} must survive the retry"
             );
         }
         assert!(
-            !helper.remote().exists(&layout::tree_root(
-                test_tree_digest("tree-garbage").as_str()
-            )),
+            !helper
+                .remote()
+                .exists(&layout::tree_root(&test_tree_digest("tree-garbage"))),
             "the true garbage is removed by the retry"
         );
     }
@@ -1475,7 +1473,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             for t in &garbage {
                 helper
                     .remote()
-                    .create_dir_all(&layout::tree_root(test_tree_digest(t).as_str()))
+                    .create_dir_all(&layout::tree_root(&test_tree_digest(t)))
                     .unwrap();
             }
             let mut c = cfg();
@@ -1541,19 +1539,19 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             helper.rotate(&retained, &HashSet::new()).unwrap();
             for t in &pin_trees {
                 assert!(
-                    helper.remote().exists(&layout::tree_root(test_tree_digest(t).as_str())),
+                    helper.remote().exists(&layout::tree_root(&test_tree_digest(t))),
                     "pin tree {t} survives the retry"
                 );
             }
             for t in ["t-cur", "t-prev"] {
                 assert!(
-                    helper.remote().exists(&layout::tree_root(test_tree_digest(t).as_str())),
+                    helper.remote().exists(&layout::tree_root(&test_tree_digest(t))),
                     "live tree {t} survives the retry"
                 );
             }
             for t in &garbage {
                 assert!(
-                    !helper.remote().exists(&layout::tree_root(test_tree_digest(t).as_str())),
+                    !helper.remote().exists(&layout::tree_root(&test_tree_digest(t))),
                     "garbage {t} is removed by the retry"
                 );
             }
@@ -1691,25 +1689,25 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         fn root(&self) -> &Path {
             self.inner.root()
         }
-        fn read(&self, rel: &Path) -> Result<Vec<u8>> {
+        fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
             self.inner.read(rel)
         }
-        fn write(&self, rel: &Path, data: &[u8], mode: u32) -> Result<()> {
+        fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
             self.inner.write(rel, data, mode)
         }
-        fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<CreateNewVerdict> {
+        fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict> {
             self.inner.try_write_new(rel, data)
         }
-        fn create_dir(&self, rel: &Path) -> Result<()> {
+        fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
             self.inner.create_dir(rel)
         }
-        fn create_dir_all(&self, rel: &Path) -> Result<()> {
+        fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
             self.inner.create_dir_all(rel)
         }
-        fn set_mode(&self, rel: &Path, mode: u32) -> Result<()> {
+        fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
             self.inner.set_mode(rel, mode)
         }
-        fn list(&self, rel: &Path) -> Result<Vec<RemoteEntry>> {
+        fn list(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>> {
             if self.fail_root_list.get() && rel == layout::generations() {
                 self.fail_root_list.set(false);
                 return Err(Error::remote(
@@ -1718,28 +1716,28 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             }
             self.inner.list(rel)
         }
-        fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
             self.inner.rename(from, to)
         }
-        fn symlink(&self, target: &Path, link: &Path) -> Result<()> {
+        fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
             self.inner.symlink(target, link)
         }
-        fn read_link(&self, rel: &Path) -> Result<PathBuf> {
+        fn read_link(&self, rel: &RootedRelativePath) -> Result<PathBuf> {
             self.inner.read_link(rel)
         }
-        fn remove_file(&self, rel: &Path) -> Result<()> {
+        fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
             self.inner.remove_file(rel)
         }
-        fn remove_dir_all(&self, rel: &Path) -> Result<()> {
+        fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
             self.inner.remove_dir_all(rel)
         }
-        fn exists(&self, rel: &Path) -> bool {
+        fn exists(&self, rel: &RootedRelativePath) -> bool {
             self.inner.exists(rel)
         }
-        fn metadata(&self, rel: &Path) -> Result<RemoteMeta> {
+        fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta> {
             self.inner.metadata(rel)
         }
-        fn metadata_opt(&self, rel: &Path) -> Result<Option<RemoteMeta>> {
+        fn metadata_opt(&self, rel: &RootedRelativePath) -> Result<Option<RemoteMeta>> {
             if self.fail_root_metadata.get() && rel == layout::generations() {
                 self.fail_root_metadata.set(false);
                 return Err(Error::remote(
@@ -1827,7 +1825,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             for g in &history {
                 helper
                     .remote()
-                    .create_dir_all(&layout::tree_root(&g.tree))
+                    .create_dir_all(&layout::tree_root(&TreeDigest::parse(&g.tree).expect("fixture tree digest")))
                     .unwrap();
                 let asn = GenerationAssignment {
                     deployment_id: DeploymentId::parse(&g.deployment).unwrap(),
@@ -1849,7 +1847,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             let current = history.last().unwrap().clone();
             helper.acquire_lock_guard(&crate::identity::OperationId::new("op".to_string())).unwrap().swap_current(
                     &crate::remote::helper::ExpectedCurrent::Absent,
-                    current.id.as_str(),
+                    &GenerationId::parse(&current.id).expect("fixture generation id"),
                     "op",
                 )
                 .unwrap();
@@ -1858,7 +1856,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             // out-of-window history) while the reference set survives.
             helper
                 .remote()
-                .create_dir_all(&layout::tree_root(test_tree_digest("garbage").as_str()))
+                .create_dir_all(&layout::tree_root(&test_tree_digest("garbage")))
                 .unwrap();
 
             let store = LocalStore::with_base(dir.path().join("store")).unwrap();
@@ -1897,13 +1895,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 _ => None};
             match fault {
                 2 => {
-                    let p = layout::generation(&history[corrupt_idx].id).join("assignment.json");
+                    let p = layout::generation(&GenerationId::parse(&history[corrupt_idx].id).expect("fixture generation id")).join("assignment.json").unwrap();
                     std::fs::write(dir.path().join("remote").join(p), b"{ corrupt !").unwrap();
                 }
                 3 => {
                     let mut a = assignments[corrupt_idx].clone();
                     a.created_at = "not-a-timestamp".into();
-                    let p = layout::generation(&history[corrupt_idx].id).join("assignment.json");
+                    let p = layout::generation(&GenerationId::parse(&history[corrupt_idx].id).expect("fixture generation id")).join("assignment.json").unwrap();
                     std::fs::write(
                         dir.path().join("remote").join(p),
                         serde_json::to_vec_pretty(&a).unwrap(),
@@ -1913,7 +1911,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 4 => {
                     let mut a = assignments[corrupt_idx].clone();
                     a.generation_id = test_generation_id("tampered");
-                    let p = layout::generation(&history[corrupt_idx].id).join("assignment.json");
+                    let p = layout::generation(&GenerationId::parse(&history[corrupt_idx].id).expect("fixture generation id")).join("assignment.json").unwrap();
                     std::fs::write(
                         dir.path().join("remote").join(p),
                         serde_json::to_vec_pretty(&a).unwrap(),
@@ -1954,15 +1952,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             );
             for g in &history {
                 assert!(
-                    helper.remote().exists(&layout::tree_root(&g.tree)),
+                    helper.remote().exists(&layout::tree_root(&TreeDigest::parse(&g.tree).expect("fixture tree digest"))),
                     "history tree {} must survive the failed retention",
                     g.tree
                 );
             }
             assert!(
-                helper.remote().exists(&layout::tree_root(
-                    test_tree_digest("garbage").as_str()
-                )),
+                helper.remote().exists(&layout::tree_root(&test_tree_digest("garbage"))),
                 "the garbage tree must survive the failed retention"
             );
 
@@ -1984,7 +1980,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             // already disarmed itself after firing).
             if fault >= 2 {
                 let asn = &assignments[corrupt_idx];
-                let p = layout::generation(asn.generation_id.as_str()).join("assignment.json");
+                let p = layout::generation(&asn.generation_id).join("assignment.json").unwrap();
                 helper
                     .remote()
                     .write(&p, &serde_json::to_vec_pretty(asn).unwrap(), 0o644)
@@ -2006,16 +2002,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             helper.rotate(&retained, &HashSet::new()).unwrap();
             for g in &history {
                 assert_eq!(
-                    helper.remote().exists(&layout::tree_root(&g.tree)),
+                    helper.remote().exists(&layout::tree_root(&TreeDigest::parse(&g.tree).expect("fixture tree digest"))),
                     expected.contains(&g.tree),
                     "history tree {} must survive iff the reference model retains it",
                     g.tree
                 );
             }
             assert!(
-                !helper.remote().exists(&layout::tree_root(
-                    test_tree_digest("garbage").as_str()
-                )),
+                !helper.remote().exists(&layout::tree_root(&test_tree_digest("garbage"))),
                 "the garbage tree is removed by the retry"
             );
 
@@ -2075,8 +2069,12 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         }
 
         /// The id of a tracked `generations/<id>/assignment.json` path, if any.
-        fn tracked_assignment(&self, rel: &Path) -> Option<String> {
-            let parts: Vec<&str> = rel.iter().map(|c| c.to_str().unwrap_or("")).collect();
+        fn tracked_assignment(&self, rel: &RootedRelativePath) -> Option<String> {
+            let parts: Vec<&str> = rel
+                .as_path()
+                .iter()
+                .map(|c| c.to_str().unwrap_or(""))
+                .collect();
             if parts.len() == 3 && parts[0] == "generations" && parts[2] == "assignment.json" {
                 let id = parts[1];
                 if self.tracked.iter().any(|t| t == id) {
@@ -2096,7 +2094,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         fn root(&self) -> &Path {
             self.inner.root()
         }
-        fn read(&self, rel: &Path) -> Result<Vec<u8>> {
+        fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
             if let Some(id) = self.tracked_assignment(rel) {
                 let mut counts = self.counts.borrow_mut();
                 let n = counts.entry(id.clone()).or_insert(0);
@@ -2111,22 +2109,22 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             }
             self.inner.read(rel)
         }
-        fn write(&self, rel: &Path, data: &[u8], mode: u32) -> Result<()> {
+        fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
             self.inner.write(rel, data, mode)
         }
-        fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<CreateNewVerdict> {
+        fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict> {
             self.inner.try_write_new(rel, data)
         }
-        fn create_dir(&self, rel: &Path) -> Result<()> {
+        fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
             self.inner.create_dir(rel)
         }
-        fn create_dir_all(&self, rel: &Path) -> Result<()> {
+        fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
             self.inner.create_dir_all(rel)
         }
-        fn set_mode(&self, rel: &Path, mode: u32) -> Result<()> {
+        fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
             self.inner.set_mode(rel, mode)
         }
-        fn list(&self, rel: &Path) -> Result<Vec<RemoteEntry>> {
+        fn list(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>> {
             let entries = self.inner.list(rel)?;
             if rel == layout::generations() && !self.hide_from_listing.is_empty() {
                 return Ok(entries
@@ -2136,25 +2134,25 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             }
             Ok(entries)
         }
-        fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
             self.inner.rename(from, to)
         }
-        fn symlink(&self, target: &Path, link: &Path) -> Result<()> {
+        fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
             self.inner.symlink(target, link)
         }
-        fn read_link(&self, rel: &Path) -> Result<PathBuf> {
+        fn read_link(&self, rel: &RootedRelativePath) -> Result<PathBuf> {
             self.inner.read_link(rel)
         }
-        fn remove_file(&self, rel: &Path) -> Result<()> {
+        fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
             self.inner.remove_file(rel)
         }
-        fn remove_dir_all(&self, rel: &Path) -> Result<()> {
+        fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
             self.inner.remove_dir_all(rel)
         }
-        fn exists(&self, rel: &Path) -> bool {
+        fn exists(&self, rel: &RootedRelativePath) -> bool {
             self.inner.exists(rel)
         }
-        fn metadata(&self, rel: &Path) -> Result<RemoteMeta> {
+        fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta> {
             self.inner.metadata(rel)
         }
         fn exec(
@@ -2418,7 +2416,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             for g in &history {
                 helper
                     .remote()
-                    .create_dir_all(&layout::tree_root(&g.tree))
+                    .create_dir_all(&layout::tree_root(&TreeDigest::parse(&g.tree).expect("fixture tree digest")))
                     .unwrap();
                 let asn = GenerationAssignment {
                     deployment_id: DeploymentId::parse(&g.deployment).unwrap(),
@@ -2440,13 +2438,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             let current = history.last().unwrap().clone();
             helper.acquire_lock_guard(&crate::identity::OperationId::new("op".to_string())).unwrap().swap_current(
                     &crate::remote::helper::ExpectedCurrent::Absent,
-                    current.id.as_str(),
+                    &GenerationId::parse(&current.id).expect("fixture generation id"),
                     "op",
                 )
                 .unwrap();
             helper
                 .remote()
-                .create_dir_all(&layout::tree_root(test_tree_digest("garbage").as_str()))
+                .create_dir_all(&layout::tree_root(&test_tree_digest("garbage")))
                 .unwrap();
 
             let store = LocalStore::with_base(dir.path().join("store")).unwrap();
@@ -2484,13 +2482,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             let mut abort_marker: Option<&str> = Some("parse assignment");
             match fault {
                 0 => {
-                    let p = layout::generation(&history[corrupt_idx].id).join("assignment.json");
+                    let p = layout::generation(&GenerationId::parse(&history[corrupt_idx].id).expect("fixture generation id")).join("assignment.json").unwrap();
                     std::fs::write(dir.path().join("remote").join(p), b"{ corrupt !").unwrap();
                 }
                 1 => {
                     let mut a = assignments[corrupt_idx].clone();
                     a.created_at = "not-a-timestamp".into();
-                    let p = layout::generation(&history[corrupt_idx].id).join("assignment.json");
+                    let p = layout::generation(&GenerationId::parse(&history[corrupt_idx].id).expect("fixture generation id")).join("assignment.json").unwrap();
                     std::fs::write(
                         dir.path().join("remote").join(p),
                         serde_json::to_vec_pretty(&a).unwrap(),
@@ -2501,7 +2499,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 2 => {
                     let mut a = assignments[corrupt_idx].clone();
                     a.generation_id = test_generation_id("tampered");
-                    let p = layout::generation(&history[corrupt_idx].id).join("assignment.json");
+                    let p = layout::generation(&GenerationId::parse(&history[corrupt_idx].id).expect("fixture generation id")).join("assignment.json").unwrap();
                     std::fs::write(
                         dir.path().join("remote").join(p),
                         serde_json::to_vec_pretty(&a).unwrap(),
@@ -2516,7 +2514,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     // its record failed the build.
                     let mut a = assignments[n_gens - 1].clone();
                     a.created_at = "not-a-timestamp".into();
-                    let p = layout::generation(&current_id).join("assignment.json");
+                    let p = layout::generation(&GenerationId::parse(&current_id).expect("fixture generation id")).join("assignment.json").unwrap();
                     std::fs::write(
                         dir.path().join("remote").join(p),
                         serde_json::to_vec_pretty(&a).unwrap(),
@@ -2532,7 +2530,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     // prior ABORTS.
                     let mut a = assignments[n_gens - 1].clone();
                     a.prior_generation = Some(test_generation_id("absent-pri"));
-                    let p = layout::generation(&current_id).join("assignment.json");
+                    let p = layout::generation(&GenerationId::parse(&current_id).expect("fixture generation id")).join("assignment.json").unwrap();
                     std::fs::write(
                         dir.path().join("remote").join(p),
                         serde_json::to_vec_pretty(&a).unwrap(),
@@ -2633,15 +2631,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 );
                 for g in &history {
                     assert!(
-                        helper.remote().exists(&layout::tree_root(&g.tree)),
+                        helper.remote().exists(&layout::tree_root(&TreeDigest::parse(&g.tree).expect("fixture tree digest"))),
                         "history tree {} must survive the failed retention",
                         g.tree
                     );
                 }
                 assert!(
-                    helper.remote().exists(&layout::tree_root(
-                        test_tree_digest("garbage").as_str()
-                    )),
+                    helper.remote().exists(&layout::tree_root(&test_tree_digest("garbage"))),
                     "the garbage tree must survive the failed retention"
                 );
 
@@ -2666,7 +2662,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             match fault {
                 0..=2 => {
                     let asn = &assignments[corrupt_idx];
-                    let p = layout::generation(asn.generation_id.as_str()).join("assignment.json");
+                    let p = layout::generation(&asn.generation_id).join("assignment.json").unwrap();
                     helper
                         .remote()
                         .write(&p, &serde_json::to_vec_pretty(asn).unwrap(), 0o644)
@@ -2674,7 +2670,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 }
                 3 | 4 => {
                     let asn = &assignments[n_gens - 1];
-                    let p = layout::generation(asn.generation_id.as_str()).join("assignment.json");
+                    let p = layout::generation(&asn.generation_id).join("assignment.json").unwrap();
                     helper
                         .remote()
                         .write(&p, &serde_json::to_vec_pretty(asn).unwrap(), 0o644)
@@ -2693,16 +2689,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             helper.rotate(&retained, &HashSet::new()).unwrap();
             for g in &history {
                 assert_eq!(
-                    helper.remote().exists(&layout::tree_root(&g.tree)),
+                    helper.remote().exists(&layout::tree_root(&TreeDigest::parse(&g.tree).expect("fixture tree digest"))),
                     expected.contains(&g.tree),
                     "history tree {} must survive iff the reference model retains it",
                     g.tree
                 );
             }
             assert!(
-                !helper.remote().exists(&layout::tree_root(
-                    test_tree_digest("garbage").as_str()
-                )),
+                !helper.remote().exists(&layout::tree_root(&test_tree_digest("garbage"))),
                 "the garbage tree is removed by the retry"
             );
 

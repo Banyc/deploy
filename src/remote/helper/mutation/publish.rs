@@ -4,9 +4,11 @@
 //! ([`copy_host_tree_to_remote`]).
 
 use crate::error::{Error, Result};
-use crate::identity::ReleaseRecord;
+use crate::identity::{DeploymentId, ReleaseId, ReleaseRecord, TreeDigest};
 use crate::remote::layout;
-use crate::remote::transport::{ContentEquivalence, CreateNewVerdict, Remote, VerifiedExisting};
+use crate::remote::transport::{
+    ContentEquivalence, CreateNewVerdict, Remote, RootedRelativePath, VerifiedExisting,
+};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use walkdir::WalkDir;
@@ -18,7 +20,7 @@ impl<'a> RemoteHelper<'a> {
     /// transport failure is an `Err`, never a silent false (the boolean
     /// `exists` collapses NotFound and errors into one false and could mask
     /// a real failure).
-    pub fn tree_exists(&self, digest: &str) -> Result<bool> {
+    pub fn tree_exists(&self, digest: &TreeDigest) -> Result<bool> {
         Ok(self
             .remote
             .metadata_opt(&layout::tree_root(digest))?
@@ -27,7 +29,7 @@ impl<'a> RemoteHelper<'a> {
 
     /// Copy a host-local tree into the remote object store, verifying the
     /// digest after publication. Reuses an existing, verified object.
-    pub fn publish_tree(&self, digest: &str, host_src: &Path) -> Result<()> {
+    pub fn publish_tree(&self, digest: &TreeDigest, host_src: &Path) -> Result<()> {
         if self.tree_exists(digest)? {
             // Best-effort verification already trusted on first publish.
             return Ok(());
@@ -41,7 +43,7 @@ impl<'a> RemoteHelper<'a> {
 
     pub fn publish_release(
         &self,
-        release_id: &str,
+        release_id: &ReleaseId,
         release_json: &str,
         behavior_json: &str,
     ) -> Result<()> {
@@ -54,7 +56,7 @@ impl<'a> RemoteHelper<'a> {
             Error::integrity(format!("malformed release record for {release_id}: {e}"))
         })?;
         crate::verify::release::verify_release_identity(&rec)?;
-        if rec.release_id != release_id {
+        if rec.release_id != release_id.as_str() {
             return Err(Error::integrity(format!(
                 "release record identity {} does not match the publish path {release_id}",
                 rec.release_id
@@ -80,7 +82,7 @@ impl<'a> RemoteHelper<'a> {
         // byte/semantic comparison of the whole record would falsely reject
         // idempotent re-publication. Two records with the same recomputed
         // digest are the same release.
-        let rel = dir.join("release.json");
+        let rel = dir.join("release.json")?;
         if self.remote.metadata_opt(&rel)?.is_none() {
             self.publish_release_file(&rel, release_json.as_bytes())?;
         } else {
@@ -116,7 +118,7 @@ impl<'a> RemoteHelper<'a> {
                 )));
             }
         }
-        self.publish_release_file(&dir.join("behavior.json"), behavior_json.as_bytes())
+        self.publish_release_file(&dir.join("behavior.json")?, behavior_json.as_bytes())
     }
 
     /// Install one immutable release-side file with create-or-compare
@@ -126,7 +128,7 @@ impl<'a> RemoteHelper<'a> {
     /// serializations of the same contract) and byte-exact otherwise — the
     /// caller's requested [`ContentEquivalence::Semantic`] is passed INTO the
     /// transport, so the centralized verification applies it directly.
-    fn publish_release_file(&self, rel: &Path, data: &[u8]) -> Result<()> {
+    fn publish_release_file(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<()> {
         // The TYPED verdict: `Created`/`AlreadyPresent` (the existing entry
         // verified as a regular file with the exact mode and SEMANTICALLY
         // equivalent content — the idempotent re-publication) are success;
@@ -183,7 +185,12 @@ impl<'a> RemoteHelper<'a> {
 
     /// Stage a tree into a deployment-specific incoming directory (invisible to
     /// activation and retention until published).
-    pub fn stage_incoming(&self, deployment_id: &str, digest: &str, host_src: &Path) -> Result<()> {
+    pub fn stage_incoming(
+        &self,
+        deployment_id: &DeploymentId,
+        digest: &TreeDigest,
+        host_src: &Path,
+    ) -> Result<()> {
         let dest = layout::staged_tree(deployment_id, digest);
         copy_host_tree_to_remote(host_src, &dest, self.remote)
     }
@@ -193,13 +200,17 @@ impl<'a> crate::remote::helper::HeldSlotLock<'a> {
     /// Publish a previously staged incoming tree into the object store. Requires
     /// the slot-mutation capability — the receiver is the guard; the helper is the
     /// guard's own. Reuses an existing, verified object.
-    pub fn publish_from_incoming(&self, deployment_id: &str, digest: &str) -> Result<()> {
+    pub fn publish_from_incoming(
+        &self,
+        deployment_id: &DeploymentId,
+        digest: &TreeDigest,
+    ) -> Result<()> {
         if self.helper.tree_exists(digest)? {
             return Ok(());
         }
         let from = layout::staged_tree(deployment_id, digest);
         let to = layout::tree_root(digest);
-        self.helper.remote.create_dir_all(to.parent().unwrap())?;
+        self.helper.remote.create_dir_all(&to.parent().unwrap())?;
         self.helper.remote.rename(&from, &to)?;
         Ok(())
     }
@@ -208,12 +219,12 @@ impl<'a> crate::remote::helper::HeldSlotLock<'a> {
 impl<'a> RemoteHelper<'a> {
     /// Publish a tree object from a host-local path (used when no prior
     /// incoming staging occurred).
-    pub fn publish_tree_from_host(&self, digest: &str, host_src: &Path) -> Result<()> {
+    pub fn publish_tree_from_host(&self, digest: &TreeDigest, host_src: &Path) -> Result<()> {
         self.publish_tree(digest, host_src)
     }
 
     /// Remove a specific incoming directory (used after completion).
-    pub fn remove_incoming(&self, deployment_id: &str) -> Result<()> {
+    pub fn remove_incoming(&self, deployment_id: &DeploymentId) -> Result<()> {
         self.remote
             .remove_dir_all(&layout::incoming_dir(deployment_id))?;
         Ok(())
@@ -248,10 +259,14 @@ fn json_semantically_equal(a: &[u8], b: &[u8]) -> bool {
 ///
 /// Modes are masked to the full 0o7777 (setuid/setgid/sticky included), not
 /// 0o777, so the uploaded tree matches the canonical tree digest exactly.
-pub fn copy_host_tree_to_remote(host: &Path, rel_dest: &Path, remote: &dyn Remote) -> Result<()> {
+pub fn copy_host_tree_to_remote(
+    host: &Path,
+    rel_dest: &RootedRelativePath,
+    remote: &dyn Remote,
+) -> Result<()> {
     remote.create_dir_all(rel_dest)?;
     // (dest, final_mode, depth) collected during the walk for phase 2.
-    let mut dirs: Vec<(std::path::PathBuf, u32, usize)> = Vec::new();
+    let mut dirs: Vec<(RootedRelativePath, u32, usize)> = Vec::new();
     for entry in WalkDir::new(host).min_depth(1).into_iter() {
         let entry = entry.map_err(|e| Error::remote(format!("walk: {e}")))?;
         let path = entry.path();
@@ -259,7 +274,7 @@ pub fn copy_host_tree_to_remote(host: &Path, rel_dest: &Path, remote: &dyn Remot
             .path()
             .strip_prefix(host)
             .map_err(|e| Error::remote(format!("{e}")))?;
-        let dest = rel_dest.join(rel);
+        let dest = rel_dest.join(rel)?;
         let meta = std::fs::symlink_metadata(path)
             .map_err(|e| Error::remote(format!("stat {}: {e}", path.display())))?;
         if meta.is_dir() {
@@ -384,10 +399,18 @@ mod tests_publish {
         // Positive case: the pristine record publishes, and re-publishing the
         // identical release is an idempotent no-op.
         helper
-            .publish_release(rec.release_id.as_str(), &release_json, &behavior_json)
+            .publish_release(
+                &ReleaseId::parse(&rec.release_id).expect("fixture release id"),
+                &release_json,
+                &behavior_json,
+            )
             .expect("pristine record publishes");
         helper
-            .publish_release(rec.release_id.as_str(), &release_json, &behavior_json)
+            .publish_release(
+                &ReleaseId::parse(&rec.release_id).expect("fixture release id"),
+                &release_json,
+                &behavior_json,
+            )
             .expect("identical re-publication is idempotent");
 
         // Tampered record: slot content changed, digest fields retained -> the
@@ -401,7 +424,7 @@ mod tests_publish {
         );
         let err = helper
             .publish_release(
-                rec.release_id.as_str(),
+                &ReleaseId::parse(&rec.release_id).expect("fixture release id"),
                 &serde_json::to_string(&tampered).unwrap(),
                 &behavior_json,
             )
@@ -418,7 +441,11 @@ mod tests_publish {
 
         // A malformed payload is refused outright.
         let err = helper
-            .publish_release(rec.release_id.as_str(), "{}", &behavior_json)
+            .publish_release(
+                &ReleaseId::parse(&rec.release_id).expect("fixture release id"),
+                "{}",
+                &behavior_json,
+            )
             .expect_err("a malformed release record must be refused");
         assert!(err.to_string().contains("malformed release record"));
     }
@@ -447,7 +474,11 @@ mod tests_publish {
         let (rec, behavior_json) = publish_fixture();
         let release_json = serde_json::to_string(&rec).unwrap();
         helper
-            .publish_release(rec.release_id.as_str(), &release_json, &behavior_json)
+            .publish_release(
+                &ReleaseId::parse(&rec.release_id).expect("fixture release id"),
+                &release_json,
+                &behavior_json,
+            )
             .expect("pristine record publishes");
         (dir, remote, rec, release_json, behavior_json)
     }
@@ -512,7 +543,11 @@ mod tests_publish {
                 stored["release_id"], rec.release_id,
                 "{name}: release id must be retained"
             );
-            let rel = layout::remote_release(rec.release_id.as_str()).join("release.json");
+            let rel = layout::remote_release(
+                &ReleaseId::parse(&rec.release_id).expect("fixture release id"),
+            )
+            .join("release.json")
+            .unwrap();
             remote
                 .write(&rel, &serde_json::to_vec(&stored).unwrap(), 0o644)
                 .unwrap();
@@ -520,7 +555,11 @@ mod tests_publish {
             let fail_msg =
                 format!("{name}: republishing against a corrupted remote record must fail closed");
             let err = helper
-                .publish_release(rec.release_id.as_str(), &release_json, &behavior_json)
+                .publish_release(
+                    &ReleaseId::parse(&rec.release_id).expect("fixture release id"),
+                    &release_json,
+                    &behavior_json,
+                )
                 .expect_err(&fail_msg);
             let msg = err.to_string();
             assert!(
@@ -537,11 +576,18 @@ mod tests_publish {
         // snapshot's own create-or-compare content check (release.json is
         // untouched here, so the failure is pinned to behavior.json).
         let (_dir, remote, rec, release_json, behavior_json) = published_release_fixture();
-        let bpath = layout::remote_release(rec.release_id.as_str()).join("behavior.json");
+        let bpath =
+            layout::remote_release(&ReleaseId::parse(&rec.release_id).expect("fixture release id"))
+                .join("behavior.json")
+                .unwrap();
         remote.write(&bpath, b"{\"tampered\":", 0o644).unwrap();
         let helper = RemoteHelper::new(&remote);
         let err = helper
-            .publish_release(rec.release_id.as_str(), &release_json, &behavior_json)
+            .publish_release(
+                &ReleaseId::parse(&rec.release_id).expect("fixture release id"),
+                &release_json,
+                &behavior_json,
+            )
             .expect_err("a corrupted remote behavior.json must fail republish");
         assert!(
             err.to_string().contains("different content"),
@@ -551,11 +597,18 @@ mod tests_publish {
         // Malformed existing release.json is refused outright, never silently
         // replaced.
         let (_dir, remote, rec, release_json, behavior_json) = published_release_fixture();
-        let rel = layout::remote_release(rec.release_id.as_str()).join("release.json");
+        let rel =
+            layout::remote_release(&ReleaseId::parse(&rec.release_id).expect("fixture release id"))
+                .join("release.json")
+                .unwrap();
         remote.write(&rel, b"{ not json", 0o644).unwrap();
         let helper = RemoteHelper::new(&remote);
         let err = helper
-            .publish_release(rec.release_id.as_str(), &release_json, &behavior_json)
+            .publish_release(
+                &ReleaseId::parse(&rec.release_id).expect("fixture release id"),
+                &release_json,
+                &behavior_json,
+            )
             .expect_err("malformed existing release.json must be refused, not silently replaced");
         assert!(
             err.to_string()
@@ -575,7 +628,11 @@ mod tests_publish {
             let (_dir, remote, rec, release_json, behavior_json) = published_release_fixture();
             let mut stored = serde_json::to_value(&rec).unwrap();
             mutate(&mut stored);
-            let rel = layout::remote_release(rec.release_id.as_str()).join("release.json");
+            let rel = layout::remote_release(
+                &ReleaseId::parse(&rec.release_id).expect("fixture release id"),
+            )
+            .join("release.json")
+            .unwrap();
             remote
                 .write(&rel, &serde_json::to_vec(&stored).unwrap(), 0o644)
                 .unwrap();
@@ -583,7 +640,11 @@ mod tests_publish {
             let ok_msg =
                 format!("{name}: a metadata-only difference keeps the republish idempotent");
             helper
-                .publish_release(rec.release_id.as_str(), &release_json, &behavior_json)
+                .publish_release(
+                    &ReleaseId::parse(&rec.release_id).expect("fixture release id"),
+                    &release_json,
+                    &behavior_json,
+                )
                 .expect(&ok_msg);
         }
     }
@@ -609,12 +670,20 @@ mod tests_publish {
 
         // Baseline: the canonical behavior payload publishes.
         helper
-            .publish_release(rid, &release_json, &behavior_json)
+            .publish_release(
+                &ReleaseId::parse(rid).expect("fixture release id"),
+                &release_json,
+                &behavior_json,
+            )
             .expect("pristine behavior publishes");
 
         let publish = |label: &str, payload: &str| {
             let err = helper
-                .publish_release(rid, &release_json, payload)
+                .publish_release(
+                    &ReleaseId::parse(rid).expect("fixture release id"),
+                    &release_json,
+                    payload,
+                )
                 .expect_err("a digest-changing behavior payload must fail closed");
             let msg = err.to_string();
             assert!(
@@ -697,7 +766,11 @@ mod tests_publish {
         // so the publication MUST succeed.
         let reordered = r#"{"standard":{"verification":{"adapter":"command","argv":["true"],"timeout_seconds":30,"attempts":2,"interval_seconds":1},"activation":{"adapter":"systemd","scope":"system","reconcile_managed_units":true,"units":[{"name":"app.service","artifact_path":"integration/systemd/app.service","enable":true,"restart":true}]}}}"#;
         helper
-            .publish_release(rid, &release_json, reordered)
+            .publish_release(
+                &ReleaseId::parse(rid).expect("fixture release id"),
+                &release_json,
+                reordered,
+            )
             .expect("a digest-equal key reorder must publish");
     }
 
@@ -712,7 +785,10 @@ mod tests_publish {
         let (_dir, remote, rec, release_json, behavior_json) = published_release_fixture();
         // Corrupt ONLY the mode of the existing behavior.json (content stays
         // the semantically-equal pristine payload).
-        let bpath = layout::remote_release(rec.release_id.as_str()).join("behavior.json");
+        let bpath =
+            layout::remote_release(&ReleaseId::parse(&rec.release_id).expect("fixture release id"))
+                .join("behavior.json")
+                .unwrap();
         let other_mode = if crate::remote::transport::IMMUTABLE_RECORD_MODE & 0o7777 == 0o600 {
             0o640
         } else {
@@ -722,7 +798,7 @@ mod tests_publish {
         let helper = RemoteHelper::new(&remote);
         let err = helper
             .publish_release(
-                rec.release_id.as_str(),
+                &ReleaseId::parse(&rec.release_id).expect("fixture release id"),
                 &release_json,
                 &behavior_json,
             )
@@ -773,7 +849,7 @@ mod tests_publish {
             LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
                 .unwrap();
         let dest = Path::new("objects/sha256/x/root");
-        copy_host_tree_to_remote(&host, dest, &remote)
+        copy_host_tree_to_remote(&host, &RootedRelativePath::parse(dest).unwrap(), &remote)
             .expect("a tree with read-only directories must upload");
 
         // Final directory modes are the host's read-only modes, not the
@@ -836,7 +912,7 @@ mod tests_publish {
             LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
                 .unwrap();
         let dest = Path::new("objects/sha256/y/root");
-        copy_host_tree_to_remote(&host, dest, &remote)
+        copy_host_tree_to_remote(&host, &RootedRelativePath::parse(dest).unwrap(), &remote)
             .expect("a tree with special modes must upload");
 
         // Exact modes, not masked to 0o777.

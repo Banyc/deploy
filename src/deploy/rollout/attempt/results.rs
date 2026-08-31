@@ -160,7 +160,7 @@ pub(crate) fn observe_actual_servers(
         let status = helper.status(&owner);
         let case = match status {
             Ok(s) => match s.current_generation() {
-                Some(g) => match helper.read_assignment(g.as_str(), &owner) {
+                Some(g) => match helper.read_assignment(g, &owner) {
                     Ok(asn) => LiveObservationCase::Observed {
                         generation: g.clone(),
                         artifact: asn.artifact,

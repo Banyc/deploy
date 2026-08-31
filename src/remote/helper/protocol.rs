@@ -93,10 +93,12 @@ mod tests_protocol {
         // Simulate a writer that died after creating its unique temp and
         // writing only a prefix of the payload.
         let marker = layout::protocol_marker();
-        let tmp = marker.with_file_name(format!(
-            ".{}.tmp.99999.7",
-            marker.file_name().unwrap().to_string_lossy()
-        ));
+        let tmp = marker
+            .with_file_name(format!(
+                ".{}.tmp.99999.7",
+                marker.file_name().unwrap().to_string_lossy()
+            ))
+            .unwrap();
         std::fs::create_dir_all(root.join(marker.parent().unwrap())).unwrap();
         std::fs::write(root.join(&tmp), b"{ \"protocol_ver").unwrap();
         assert!(!root.join(&marker).exists());

@@ -6,7 +6,7 @@ use crate::error::{Error, Result};
 use crate::identity::{BehaviorContract, ReleaseId, ReleaseRecord};
 use crate::remote::layout;
 use crate::store::atomic::{ensure_private_dir, read_json};
-use crate::store::local::{LocalStore, sanitize, write_atomic_cas};
+use crate::store::local::{LocalStore, write_atomic_cas};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -20,16 +20,6 @@ impl LocalStore {
     /// (injective by construction).
     pub fn release_dir(&self, id: &ReleaseId) -> PathBuf {
         self.base.join(layout::RELEASES).join(id.as_str())
-    }
-
-    /// The on-disk directory for a release dir NAME (an arbitrary store dir
-    /// name). The GC computes deletion paths for candidate dirs that may not
-    /// be valid release ids (junk-named dirs are still candidates), so this
-    /// takes the raw name — never a validated [`ReleaseId`] — and keeps the
-    /// [`sanitize`](crate::store::local::sanitize) confinement for
-    /// non-grammar junk (a valid name passes through unchanged).
-    pub(crate) fn release_dir_named(&self, name: &str) -> PathBuf {
-        self.base.join(layout::RELEASES).join(sanitize(name))
     }
 
     pub fn release_exists(&self, id: &ReleaseId) -> bool {

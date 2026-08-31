@@ -366,8 +366,14 @@ pub(crate) mod execute_tests {
             assert!(
                 !remote.exists(
                     &crate::remote::layout::generations()
-                        .join(&e.name)
+                        .join(
+                            crate::identity::GenerationId::parse(&e.name)
+                                .expect("fixture generation id")
+                                .as_str()
+                        )
+                        .unwrap()
                         .join("assignment.json")
+                        .unwrap()
                 ),
                 "no generation record may be durable ({} was never written)",
                 e.name
@@ -542,7 +548,9 @@ pub(crate) mod execute_tests {
                 .read(
                     &crate::remote::layout::generations()
                         .join(cur.as_str())
-                        .join("assignment.json"),
+                        .unwrap()
+                        .join("assignment.json")
+                        .unwrap(),
                 )
                 .unwrap(),
         )
@@ -1184,7 +1192,9 @@ interval_seconds = 0
                 .read(
                     &crate::remote::layout::generations()
                         .join(prior_gen.as_str())
-                        .join("assignment.json"),
+                        .unwrap()
+                        .join("assignment.json")
+                        .unwrap(),
                 )
                 .unwrap(),
         )
@@ -1264,7 +1274,9 @@ interval_seconds = 0
                 .read(
                     &crate::remote::layout::generations()
                         .join(cur.as_str())
-                        .join("assignment.json"),
+                        .unwrap()
+                        .join("assignment.json")
+                        .unwrap(),
                 )
                 .unwrap(),
         )
@@ -1584,14 +1596,13 @@ interval_seconds = 0
                 .unwrap();
         let asn_path = crate::remote::layout::generations()
             .join(gen1.as_str())
-            .join("assignment.json");
+            .unwrap()
+            .join("assignment.json")
+            .unwrap();
         remote.write(&asn_path, b"{ corrupt json !", 0o600).unwrap();
         assert!(
             RemoteHelper::new(&remote)
-                .read_assignment(
-                    gen1.as_str(),
-                    &crate::remote::helper::test_owner("eng", "p1")
-                )
+                .read_assignment(&gen1, &crate::remote::helper::test_owner("eng", "p1"))
                 .is_err(),
             "the assignment must be unreadable after corruption"
         );
@@ -1637,7 +1648,10 @@ interval_seconds = 0
         // mutated the remote.
         assert_eq!(
             remote.read_link(crate::remote::layout::current()).unwrap(),
-            crate::remote::layout::generation(gen1.as_str()).join("root"),
+            crate::remote::layout::generation(&gen1)
+                .join("root")
+                .unwrap()
+                .as_path(),
             "current must still point at the baseline generation"
         );
     }

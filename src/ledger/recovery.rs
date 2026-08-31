@@ -387,7 +387,7 @@ fn observe_recovery_slot(
         Err(e) => BackendObservation::Failed(e.to_string()),
         Ok(status) => match status.current_generation() {
             None => BackendObservation::Absent,
-            Some(generation) => match helper.helper().read_assignment(generation.as_str(), owner) {
+            Some(generation) => match helper.helper().read_assignment(generation, owner) {
                 Ok(_) => BackendObservation::Live(generation.clone()),
                 Err(e) => BackendObservation::Failed(e.to_string()),
             },
@@ -817,7 +817,7 @@ mod tests {
         let base = h.remotes_base.join(server);
         let remote = LocalTransport::new(&crate::testutil::fixture_env(), base).unwrap();
         remote
-            .create_dir_all(&crate::remote::layout::tree_root(artifact.tree.as_str()))
+            .create_dir_all(&crate::remote::layout::tree_root(&artifact.tree))
             .unwrap();
         let helper = RemoteHelper::new(&remote);
         helper
@@ -840,7 +840,7 @@ mod tests {
             .unwrap()
             .swap_current(
                 &ExpectedCurrent::Generation(prior.clone()),
-                generation.as_str(),
+                generation,
                 "op-mint",
             )
             .unwrap();
