@@ -1310,6 +1310,21 @@ impl Remote for SshTransport {
         self.run_remote_ok(&cmd)
     }
 
+    fn fsync_parent(&self, rel: &RootedRelativePath) -> Result<()> {
+        let p = self.root.join(rel).to_string_lossy().into_owned();
+        let parent = Path::new(&p)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ".".to_string());
+        // `sync <dir>` fsyncs the directory on Linux (coreutils >= 8.24) and
+        // macOS (forces pending writes) — the same primitive `write_new_cmd`
+        // already relies on for its parent-dir sync. FAIL-CLOSED: a failed
+        // sync is a propagated error (the mutation's durability is
+        // unconfirmed).
+        let cmd = Self::argv_cmd(&["sync".into(), parent]);
+        self.run_remote_ok(&cmd)
+    }
+
     fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
         let t = target.to_string_lossy().into_owned();
         let l = self.root.join(link).to_string_lossy().into_owned();

@@ -1481,8 +1481,27 @@ impl FailOnceRetentionRemote {
         }))
     }
     fn should_fail(&self, rel: &RootedRelativePath) -> bool {
-        self.armed.load(Ordering::SeqCst)
-            && rel.as_path().to_string_lossy().starts_with(self.fail_path)
+        if !self.armed.load(Ordering::SeqCst) {
+            return false;
+        }
+        let rel = rel.as_path().to_string_lossy();
+        // The durable record replace writes the new bytes to a unique
+        // dot-prefixed TEMP name inside the destination's parent directory
+        // before the atomic rename over the final path — a write fault on the
+        // final path must also fire on that temp write (the write that would
+        // have been the direct write before the durability protocol).
+        let temp_prefix = format!(
+            "{}/.{}.tmp",
+            std::path::Path::new(self.fail_path)
+                .parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            std::path::Path::new(self.fail_path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        );
+        rel.starts_with(self.fail_path) || rel.starts_with(&temp_prefix)
     }
 }
 

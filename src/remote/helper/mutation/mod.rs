@@ -10,7 +10,7 @@
 //! * [`rotate`] — mark-and-sweep retention (guard-bound, owner-verified).
 //! * [`transactions`] — per-operation transaction records.
 
-mod publish;
+pub(crate) mod publish;
 mod rotate;
 mod transactions;
 

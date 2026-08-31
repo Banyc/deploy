@@ -249,6 +249,20 @@ pub trait Remote {
         let _ = rel;
         Ok(())
     }
+    /// Fsync the PARENT DIRECTORY of `rel` so a rename/removal/creation
+    /// inside it survives power loss — the durability commit point of every
+    /// atomic mutation (the staged-publish renames, the `current` symlink
+    /// swap, the record replaces): a mutation's success is reported ONLY
+    /// after this succeeds. FAIL-CLOSED: a failed open OR a failed fsync is
+    /// a propagated `Err` (never a silent success — the directory entry's
+    /// durability is unconfirmed). The DEFAULT is a no-op (test wrappers
+    /// that delegate to an inner transport inherit the inner's
+    /// implementation); the production transports ([`LocalTransport`],
+    /// [`SshTransport`]) realize it for real.
+    fn fsync_parent(&self, rel: &RootedRelativePath) -> Result<()> {
+        let _ = rel;
+        Ok(())
+    }
     /// Atomically remove `rel` ONLY IF its content is byte-identical to
     /// `expected` — the compare-and-delete primitive that makes stale
     /// releases and expired-lease breaks safe. Returns the TYPED verdict
@@ -1615,6 +1629,20 @@ impl Remote for LocalTransport {
                 .map_err(|e| Error::transport(format!("fsync dir {}: {e}", d.display())))?;
         }
         Ok(())
+    }
+
+    fn fsync_parent(&self, rel: &RootedRelativePath) -> Result<()> {
+        let p = join(&self.base, rel);
+        let parent = p.parent().ok_or_else(|| {
+            Error::transport(format!(
+                "fsync parent of {}: no parent directory",
+                p.display()
+            ))
+        })?;
+        let dir = std::fs::File::open(parent)
+            .map_err(|e| Error::transport(format!("open parent dir {}: {e}", parent.display())))?;
+        dir.sync_all()
+            .map_err(|e| Error::transport(format!("fsync parent dir {}: {e}", parent.display())))
     }
 
     fn exists(&self, rel: &RootedRelativePath) -> bool {

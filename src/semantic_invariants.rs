@@ -359,10 +359,13 @@ impl FailOnceRemote {
         if let Some(marker) = &f.fail_write_once {
             let rel = rel.as_path().to_string_lossy().to_string();
             // Commit-marker faults name the `state/commits/` DIRECTORY
-            // (prefix match); the retention-inventory fault names the exact
-            // file. The fault is consumed ONLY by a matching write — a write
-            // to any other path must leave it armed.
-            if rel.starts_with(marker) || rel.ends_with(marker) {
+            // (prefix match); the retention-inventory fault names the durable
+            // record-replace's dot-prefixed TEMP write
+            // (`state/.inventory.json.tmp.*` — the write that would have
+            // been the direct inventory write before the durability
+            // protocol). The fault is consumed ONLY by a matching write — a
+            // write to any other path must leave it armed.
+            if rel.starts_with(marker) || rel.ends_with(marker) || rel.contains(marker) {
                 f.fail_write_once = None;
                 return true;
             }
@@ -1638,7 +1641,7 @@ impl Fixture {
     fn set_remote_fault(&self, step: FailureStep) {
         let suffix = match step {
             FailureStep::CommitMarkerWrite => "state/commits/".to_string(),
-            FailureStep::RetentionInventoryWrite => "state/inventory.json".to_string(),
+            FailureStep::RetentionInventoryWrite => "state/.inventory.json.tmp".to_string(),
             other => panic!("{other:?} is a store step, not a remote step"),
         };
         self.fault.lock().unwrap().fail_write_once = Some(suffix);

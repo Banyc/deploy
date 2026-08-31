@@ -95,7 +95,10 @@ impl<'a> RemoteHelper<'a> {
     /// directories first (a stale staging/quarantine tree may contain
     /// read-only — or even 0o000 — directories whose removal would otherwise
     /// fail with EACCES). A missing tree is a no-op.
-    fn remove_remote_tree_restoring_write(&self, rel: &RootedRelativePath) -> Result<()> {
+    pub(crate) fn remove_remote_tree_restoring_write(
+        &self,
+        rel: &RootedRelativePath,
+    ) -> Result<()> {
         // Phase 1: make every directory owner-traversable, deepest first, so
         // the whole tree can be listed and removed regardless of its modes.
         fn restore_write(remote: &dyn Remote, rel: &RootedRelativePath) -> Result<()> {
@@ -170,7 +173,12 @@ impl<'a> crate::remote::helper::HeldSlotLock<'a> {
     ///    renamed into the final release directory — the final release
     ///    directory is either wholly absent or complete and readable, never
     ///    a partial directory.
-    pub fn publish_release(&self, bundle: &ValidatedReleaseBundle) -> Result<()> {
+    /// 6. **Fsync the changed parent directory**: the PARENT of the final
+    ///    release directory (`releases/`) is fsynced so the renamed
+    ///    directory entry survives power loss — the durability commit point.
+    ///    FAIL-CLOSED: a failed parent fsync is a propagated `Err`, never a
+    ///    reported success.
+    pub fn durable_publish_release(&self, bundle: &ValidatedReleaseBundle) -> Result<()> {
         let release_id = bundle.release_id();
         let dir = layout::remote_release(release_id);
         // Reuse: an existing release directory is verified as the WHOLE
@@ -209,7 +217,20 @@ impl<'a> crate::remote::helper::HeldSlotLock<'a> {
         // complete and readable, never partial.
         self.helper.remote.fsync_tree(&staging)?;
         self.helper.remote.rename(&staging, &dir)?;
+        // Fsync the changed parent directory (`releases/`): the renamed
+        // directory entry survives power loss. FAIL-CLOSED: a failed parent
+        // fsync is a propagated error, never a reported success.
+        self.helper.remote.fsync_parent(&dir)?;
         Ok(())
+    }
+
+    /// Publish a release as ONE AGGREGATE BUNDLE
+    /// ([`crate::verify::release::ValidatedReleaseBundle`]) — the durable
+    /// publication protocol ([`Self::durable_publish_release`]). Requires
+    /// the slot-mutation capability — the receiver is the guard; the helper
+    /// is the guard's own.
+    pub fn publish_release(&self, bundle: &ValidatedReleaseBundle) -> Result<()> {
+        self.durable_publish_release(bundle)
     }
 
     /// Verify the WHOLE bundle in an EXISTING release directory (the
@@ -391,12 +412,16 @@ impl<'a> crate::remote::helper::HeldSlotLock<'a> {
         self.publish_staged_tree(digest, &from)
     }
 
-    /// Publish a host-local tree into the object store. Requires the
-    /// slot-mutation capability. The complete remote object is assembled in a
-    /// deployment-independent staging directory, verified there, and
-    /// atomically published; an existing object is verified before reuse and
-    /// invalid content is quarantined and repaired (under the slot lock).
-    pub fn publish_tree(&self, digest: &TreeDigest, host_src: &Path) -> Result<()> {
+    /// Publish a host-local tree into the object store — the DURABLE
+    /// publication protocol (stage → fsync contents → rename → fsync every
+    /// changed parent directory). Requires the slot-mutation capability. The
+    /// complete remote object is assembled in a deployment-independent
+    /// staging directory, verified there, fsynced, and atomically published;
+    /// an existing object is verified before reuse and invalid content is
+    /// quarantined and repaired (under the slot lock). Success is reported
+    /// only after the parent-directory fsync succeeds (fail closed: a failed
+    /// parent fsync is an `Err`, never a reported success).
+    pub fn durable_publish_tree(&self, digest: &TreeDigest, host_src: &Path) -> Result<()> {
         let to = layout::tree_root(digest);
         // Reuse: verify the existing object; quarantine + repair invalid
         // content (under the slot lock).
@@ -422,6 +447,13 @@ impl<'a> crate::remote::helper::HeldSlotLock<'a> {
         res
     }
 
+    /// Publish a host-local tree into the object store — the durable
+    /// publication protocol ([`Self::durable_publish_tree`]). Requires the
+    /// slot-mutation capability.
+    pub fn publish_tree(&self, digest: &TreeDigest, host_src: &Path) -> Result<()> {
+        self.durable_publish_tree(digest, host_src)
+    }
+
     /// Publish a tree object from a host-local path (used when no prior
     /// incoming staging occurred). Requires the slot-mutation capability.
     pub fn publish_tree_from_host(&self, digest: &TreeDigest, host_src: &Path) -> Result<()> {
@@ -443,11 +475,18 @@ impl<'a> crate::remote::helper::HeldSlotLock<'a> {
         Ok(())
     }
 
-    /// Atomically publish a verified staged tree into the final digest path:
-    /// the staged tree is canonicalized and compared against the required
-    /// digest BEFORE the rename, so the digest path is either absent or
-    /// contains exactly the verified canonical tree — never a partial or
-    /// corrupt object.
+    /// Atomically publish a verified staged tree into the final digest path —
+    /// the DURABLE staged-publish protocol (stage → fsync contents → rename
+    /// → fsync every changed parent directory): the staged tree is
+    /// canonicalized and compared against the required digest BEFORE the
+    /// rename, the whole staged tree is fsynced, and the digest path is
+    /// either absent or contains exactly the verified canonical tree — never
+    /// a partial or corrupt object. After the rename, EVERY changed parent
+    /// directory is fsynced (the digest directory — the rename target's
+    /// parent — and its own parent, whose `<digest>` entry the
+    /// `create_dir_all` above may have just created), so the published
+    /// directory entry survives power loss. FAIL-CLOSED: a failed parent
+    /// fsync is a propagated `Err`, never a reported success.
     fn publish_staged_tree(&self, digest: &TreeDigest, staging: &RootedRelativePath) -> Result<()> {
         let to = layout::tree_root(digest);
         if !self.helper.verify_remote_tree(staging, digest)? {
@@ -457,8 +496,15 @@ impl<'a> crate::remote::helper::HeldSlotLock<'a> {
                 digest.as_str()
             )));
         }
+        // Fsync the whole staged tree before it becomes visible.
+        self.helper.remote.fsync_tree(staging)?;
         self.helper.remote.create_dir_all(&to.parent().unwrap())?;
         self.helper.remote.rename(staging, &to)?;
+        // Fsync every changed parent directory: the digest directory (the
+        // rename target's parent) and its own parent (the `<digest>` entry
+        // may have been created by the `create_dir_all` above).
+        self.helper.remote.fsync_parent(&to)?;
+        self.helper.remote.fsync_parent(&to.parent().unwrap())?;
         Ok(())
     }
 }
@@ -538,7 +584,7 @@ pub fn copy_host_tree_to_remote(
 }
 
 #[cfg(test)]
-mod tests_publish {
+pub(crate) mod tests_publish {
     use super::*;
     use crate::remote::transport::{
         CreateNewVerdict, ExecOutcome, FsBytes, LocalTransport, RemoteEntry, RemoteMeta,
@@ -557,7 +603,7 @@ mod tests_publish {
     /// (adapter `systemd` — non-default, so field deletions change the
     /// digest — plus a command verification), and the serialized behavior JSON
     /// for that same set.
-    fn publish_fixture() -> (crate::identity::ReleaseRecord, String) {
+    pub(crate) fn publish_fixture() -> (crate::identity::ReleaseRecord, String) {
         let contracts: std::collections::BTreeMap<String, crate::identity::BehaviorContract> =
             std::collections::BTreeMap::from([(
                 "standard".to_string(),
@@ -616,14 +662,14 @@ mod tests_publish {
 
     /// The server set the fixture's slots bind (the fixture declares one
     /// slot on server "s1").
-    fn fixture_servers() -> std::collections::BTreeSet<String> {
+    pub(crate) fn fixture_servers() -> std::collections::BTreeSet<String> {
         std::collections::BTreeSet::from(["s1".to_string()])
     }
 
     /// Build the COMPLETE publication bundle from the fixture: the record +
     /// behavior contracts validated into a [`ValidatedRelease`] (the
     /// bundle's validated constructor), then the bundle itself.
-    fn publish_fixture_bundle() -> ValidatedReleaseBundle {
+    pub(crate) fn publish_fixture_bundle() -> ValidatedReleaseBundle {
         let (rec, behavior_json) = publish_fixture();
         let behaviors: std::collections::BTreeMap<String, crate::identity::BehaviorContract> =
             serde_json::from_str(&behavior_json).unwrap();

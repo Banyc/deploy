@@ -134,6 +134,8 @@
 //! the guarantee is that a WELL-BEHAVED deployment (recovery only for dead
 //! holders) never has two live mutators.
 
+#[cfg(test)]
+mod durable;
 mod mutation;
 mod observed;
 mod protocol;
@@ -659,8 +661,10 @@ impl<'a> RemoteHelper<'a> {
         inv.sort();
         let json = serde_json::to_vec_pretty(&inv)
             .map_err(|e| Error::remote(format!("serialize inventory: {e}")))?;
-        self.remote.write(&layout::inventory(), &json, 0o644)?;
-        Ok(())
+        // The inventory is REPLACED durably (stage → fsync → rename →
+        // parent-dir fsync): success is reported only after the
+        // parent-directory fsync succeeds.
+        self.durable_record_replace(&layout::inventory(), &json, 0o644)
     }
 }
 

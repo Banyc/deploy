@@ -1319,8 +1319,14 @@ pub(crate) mod test_remotes {
             }))
         }
         fn fail_inventory(&self, rel: &RootedRelativePath) -> bool {
+            // The durable record replace writes the new bytes to a unique
+            // dot-prefixed TEMP name inside `state/` before the atomic rename
+            // over `state/inventory.json` — the fault fires on that temp
+            // write (the write that would have been the direct inventory
+            // write before the durability protocol).
+            let rel = rel.as_path().to_string_lossy();
             self.armed.load(Ordering::SeqCst)
-                && rel.as_path().to_string_lossy() == "state/inventory.json"
+                && (rel == "state/inventory.json" || rel.starts_with("state/.inventory.json.tmp"))
         }
     }
 

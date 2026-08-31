@@ -297,17 +297,27 @@ impl<'a> crate::remote::helper::HeldSlotLock<'a> {
         Ok(())
     }
 
-    /// Atomically move `current` to the given generation. Requires the
-    /// slot-mutation capability — the receiver is the guard; the helper is the
-    /// guard's own. See [`crate::remote::helper::RemoteHelper::status`] for
-    /// the canonical-target gate.
+    /// Atomically move `current` to the given generation — the DURABLE
+    /// symlink-swap protocol (stage → rename → fsync the changed parent
+    /// directory; a symlink has no content to fsync, so the "fsync contents"
+    /// step is vacuous — the temp symlink is created atomically by
+    /// `symlink(2)`). Requires the slot-mutation capability — the receiver is
+    /// the guard; the helper is the guard's own. See
+    /// [`crate::remote::helper::RemoteHelper::status`] for the
+    /// canonical-target gate.
     ///
     /// THE GENERATION IS VERIFIED BEFORE THE SWAP: the target generation's
     /// COMPLETE chain is validated against THIS guard's owner
     /// ([`Self::verify_generation`]) — a missing, corrupt, or foreign
     /// (transplanted) generation is never installed as `current` (fail
     /// closed).
-    pub fn swap_current(
+    ///
+    /// `current` reports success ONLY AFTER its parent directory is fsynced:
+    /// the swap renames a temp symlink over `current`, then fsyncs the
+    /// deploy_dir root (the parent of `current`) so the renamed directory
+    /// entry survives power loss. FAIL-CLOSED: a failed parent fsync is a
+    /// propagated `Err`, never a reported success.
+    pub fn durable_symlink_swap(
         &self,
         expected: &ExpectedCurrent,
         gen_id: &GenerationId,
@@ -347,12 +357,33 @@ impl<'a> crate::remote::helper::HeldSlotLock<'a> {
         let tmp_name = format!(".current.tmp.{op_id}");
         let tmp = RootedRelativePath::parse(Path::new(&tmp_name))
             .expect("a temp name built from an operation id is a single safe segment");
-        // Remove any stale temp link.
+        // Stage: create the temp symlink (removing any stale temp link from a
+        // crashed earlier attempt first).
         self.helper.remote.remove_file(&tmp)?;
         self.helper.remote.symlink(new_target.as_path(), &tmp)?;
+        // Rename: the temp symlink is atomically renamed over `current`.
         self.helper.remote.rename(&tmp, layout::current())?;
         self.helper.remote.remove_file(&tmp).ok();
+        // Fsync the changed parent directory (the deploy_dir root — the
+        // parent of `current`): the renamed directory entry survives power
+        // loss. FAIL-CLOSED: a failed parent fsync is a propagated error,
+        // never a reported success — `current` reports success only after
+        // its parent fsync succeeds.
+        self.helper.remote.fsync_parent(layout::current())?;
         Ok(())
+    }
+
+    /// Atomically move `current` to the given generation — the durable
+    /// symlink-swap protocol ([`Self::durable_symlink_swap`]). Requires the
+    /// slot-mutation capability — the receiver is the guard; the helper is
+    /// the guard's own.
+    pub fn swap_current(
+        &self,
+        expected: &ExpectedCurrent,
+        gen_id: &GenerationId,
+        op_id: &str,
+    ) -> Result<()> {
+        self.durable_symlink_swap(expected, gen_id, op_id)
     }
 
     /// Remove `current` only if it currently points at `expected`. Requires the
@@ -379,6 +410,11 @@ impl<'a> crate::remote::helper::HeldSlotLock<'a> {
                 // `current` is never removed by a guard that does not own it.
                 self.verify_generation(exp)?;
                 self.helper.remote.remove_file(layout::current())?;
+                // Fsync the changed parent directory (the deploy_dir root):
+                // the removal is a directory-entry change — never report
+                // success while the entry is unsynced. FAIL-CLOSED: a failed
+                // parent fsync is a propagated error.
+                self.helper.remote.fsync_parent(layout::current())?;
                 Ok(true)
             }
             (ExpectedCurrent::Absent, CurrentState::Absent) => Ok(false),

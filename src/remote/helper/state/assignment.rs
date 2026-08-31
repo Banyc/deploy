@@ -7,7 +7,7 @@ use crate::identity::{
     ApplicationStoreKey, ArtifactRef, DeploymentId, GenerationId, SlotId, TargetName,
 };
 use crate::remote::layout;
-use crate::remote::transport::{CreateNewVerdict, VerifiedExisting};
+use crate::remote::transport::CreateNewVerdict;
 use serde::{Deserialize, Serialize};
 
 use super::super::{GenerationOwner, HeldSlotLock, RemoteHelper};
@@ -164,9 +164,11 @@ impl GenerationAssignment {
 }
 
 impl<'a> HeldSlotLock<'a> {
-    /// Create a generation record and its `root` symlink. Does not move
-    /// `current`. Requires the slot-mutation capability — the receiver is the
-    /// guard; the helper is the guard's own.
+    /// Create a generation record and its `root` symlink — the DURABLE
+    /// generation-install protocol (stage → fsync contents → rename → fsync
+    /// every changed parent directory). Does not move `current`. Requires the
+    /// slot-mutation capability — the receiver is the guard; the helper is
+    /// the guard's own.
     ///
     /// The assignment is constructed INTERNALLY from the guard's OWNER
     /// ([`GenerationSpec::into_assignment`]): the caller supplies the
@@ -175,72 +177,149 @@ impl<'a> HeldSlotLock<'a> {
     /// the guard's owner — an assignment can never name a different slot than
     /// the guard authorizes.
     ///
-    /// The assignment record is immutable and installed with create-or-compare
-    /// semantics: a generation ID colliding with different content fails
-    /// integrity instead of silently rewriting history. Generation IDs are
-    /// fresh UUIDv7 values minted while holding the slot lock, so this can
-    /// only fire on corruption or retry-after-crash with divergent state.
-    pub fn create_generation(&self, spec: &GenerationSpec) -> Result<()> {
+    /// The generation is installed with create-or-compare semantics: a
+    /// generation ID colliding with different content fails integrity
+    /// instead of silently rewriting history. Generation IDs are fresh
+    /// UUIDv7 values minted while holding the slot lock, so this can only
+    /// fire on corruption or retry-after-crash with divergent state.
+    ///
+    /// The install protocol:
+    ///
+    /// 1. **Create-or-compare**: an EXISTING generation directory is
+    ///    verified — the assignment must be byte-identical (the identical
+    ///    retry converges; divergent content fails integrity, never
+    ///    rewritten) and the `root` symlink is recreated if missing — and
+    ///    the changed parent directories are fsynced (idempotent durability
+    ///    repair).
+    /// 2. **Stage**: the assignment record and the `root` symlink are
+    ///    written into a UNIQUE SIBLING staging directory
+    ///    (`generations/<gen>.partial-<nonce>`), so a crash or fault at any
+    ///    member write leaves at most a disposable staging sibling.
+    /// 3. **Staged verify**: the staged assignment is re-read and compared
+    ///    against the intended bytes BEFORE anything becomes visible (a
+    ///    fault between a write and its verify must never install unverified
+    ///    content).
+    /// 4. **Fsync**: the whole staged generation is made durable.
+    /// 5. **Atomic install**: the verified, fsynced staging directory is
+    ///    renamed into the final generation directory — the final generation
+    ///    directory is either wholly absent or complete and readable, never
+    ///    partial.
+    /// 6. **Fsync the changed parent directory**: the PARENT of the final
+    ///    generation directory (`generations/`) is fsynced so the renamed
+    ///    directory entry survives power loss — the durability commit point.
+    ///    FAIL-CLOSED: a failed parent fsync is a propagated `Err`, never a
+    ///    reported success.
+    pub fn durable_generation_install(&self, spec: &GenerationSpec) -> Result<()> {
         let assignment = spec.clone().into_assignment(&self.owner);
         let gen_dir = layout::generation(&assignment.generation_id);
-        self.helper.remote.create_dir_all(&gen_dir)?;
         let json = serde_json::to_vec_pretty(&assignment)
             .map_err(|e| Error::remote(format!("serialize assignment: {e}")))?;
         let assignment_path = gen_dir.join("assignment.json")?;
-        // The TYPED verdict: `Created`/`AlreadyPresent` (the identical retry)
-        // skip the read-back; a `Conflict` carries the TYPED reason — the
-        // winner is never replaced, and a metadata conflict (a
-        // directory/symlink where the record should be, a mode mismatch, an
-        // unreadable entry) is a REAL conflict, never accepted as "already
-        // present, fine".
-        match self.helper.remote.try_write_new(&assignment_path, &json)? {
-            CreateNewVerdict::Created | CreateNewVerdict::AlreadyPresent => {}
-            CreateNewVerdict::Conflict(reason) => match reason {
-                VerifiedExisting::ContentMismatch => {
+        let root_link_path = gen_dir.join("root")?;
+        let root_link = layout::generation_root_link(&assignment.artifact.tree);
+
+        // 1. Create-or-compare: an EXISTING generation directory is verified
+        //    (the identical retry converges; divergent content fails
+        //    integrity — history is never rewritten), the `root` symlink is
+        //    recreated if missing, and the changed parent directories are
+        //    fsynced (idempotent durability repair).
+        if self.helper.remote.metadata_opt(&gen_dir)?.is_some() {
+            if self.helper.remote.metadata_opt(&assignment_path)?.is_some() {
+                let existing = self.helper.remote.read(&assignment_path)?;
+                if existing != json {
                     return Err(Error::integrity(format!(
                         "generation {} already exists with different content",
                         assignment.generation_id
                     )));
                 }
-                VerifiedExisting::ModeMismatch { actual, required } => {
-                    return Err(Error::integrity(format!(
-                        "generation {} already exists with mode {actual:o} (required {required:o})",
-                        assignment.generation_id
-                    )));
+                // The `root` symlink lives inside `generations/<gen>/`, so it
+                // must be relative to that directory (../../objects/...). Its
+                // target is derived deterministically from the (now-verified)
+                // assignment, so recreating it after a crash is safe.
+                if self.helper.remote.metadata_opt(&root_link_path)?.is_none() {
+                    self.helper.remote.symlink(&root_link, &root_link_path)?;
                 }
-                VerifiedExisting::NotRegularFile { kind } => {
-                    return Err(Error::integrity(format!(
-                        "generation {} already exists as a {kind:?} entry, not a regular file",
-                        assignment.generation_id
-                    )));
-                }
-                VerifiedExisting::Unreadable(e) => {
-                    return Err(Error::integrity(format!(
-                        "generation {} already exists but could not be verified: {e}",
-                        assignment.generation_id
-                    )));
-                }
-                VerifiedExisting::NotFound => {
-                    return Err(Error::integrity(format!(
-                        "generation {} vanished during verification",
-                        assignment.generation_id
-                    )));
-                }
-                VerifiedExisting::Ok { .. } => {
-                    unreachable!("a verified-ok entry is AlreadyPresent, never Conflict")
-                }
-            },
+                // Fsync the changed parent directories: `generations/` (the
+                // `<gen>` entry) and `generations/<gen>/` (the `root` entry,
+                // if it was just recreated).
+                self.helper.remote.fsync_parent(&gen_dir)?;
+                self.helper.remote.fsync_parent(&root_link_path)?;
+                return Ok(());
+            }
+            // The generation directory exists but the assignment is missing:
+            // a stale empty dir from a crashed earlier attempt. Remove it
+            // (restoring write perms) and reinstall cleanly.
+            self.helper.remove_remote_tree_restoring_write(&gen_dir)?;
         }
-        // The `root` symlink lives inside `generations/<gen>/`, so it must be
-        // relative to that directory (../../objects/...). Its target is derived
-        // deterministically from the (now-verified) assignment, so recreating
-        // it after a crash is safe.
-        let root_link_path = gen_dir.join("root")?;
-        if self.helper.remote.metadata_opt(&root_link_path)?.is_none() {
-            let root_link = layout::generation_root_link(&assignment.artifact.tree);
-            self.helper.remote.symlink(&root_link, &root_link_path)?;
+
+        // 2. Stage: write the assignment + `root` symlink into a unique
+        //    sibling directory. The staged assignment is installed with the
+        //    durable create-new primitive (`try_write_new` — temp + fsync +
+        //    link + parent fsync), the same immutable-record install the old
+        //    direct path used, now into the staging directory.
+        let nonce = uuid::Uuid::now_v7().to_string();
+        let staging = layout::staged_generation(&assignment.generation_id, &nonce);
+        // A stale staging dir from a crashed earlier attempt is removed first
+        // (restoring write perms), so a retry re-stages cleanly instead of
+        // mixing stale and fresh content.
+        if self.helper.remote.metadata_opt(&staging)?.is_some() {
+            self.helper.remove_remote_tree_restoring_write(&staging)?;
         }
-        Ok(())
+        let res = (|| -> Result<()> {
+            self.helper.remote.create_dir_all(&staging)?;
+            match self
+                .helper
+                .remote
+                .try_write_new(&staging.join("assignment.json")?, &json)?
+            {
+                CreateNewVerdict::Created | CreateNewVerdict::AlreadyPresent => {}
+                CreateNewVerdict::Conflict(_) => {
+                    return Err(Error::integrity(format!(
+                        "staged assignment for generation {} conflicts with an existing entry",
+                        assignment.generation_id
+                    )));
+                }
+            }
+            self.helper
+                .remote
+                .symlink(&root_link, &staging.join("root")?)?;
+            // 3. Staged verify: the staged assignment is re-read and compared
+            //    against the intended bytes BEFORE anything becomes visible (a
+            //    fault between a write and its verify must never install
+            //    unverified content).
+            let staged = self.helper.remote.read(&staging.join("assignment.json")?)?;
+            if staged != json {
+                return Err(Error::integrity(format!(
+                    "staged assignment for generation {} does not match the intended record; refusing to install",
+                    assignment.generation_id
+                )));
+            }
+            // 4. Fsync the whole staged generation, then 5. atomically install
+            //    the directory: the final generation directory is either wholly
+            //    absent or complete and readable, never partial.
+            self.helper.remote.fsync_tree(&staging)?;
+            self.helper.remote.rename(&staging, &gen_dir)?;
+            // 6. Fsync the changed parent directory (`generations/`): the
+            //    renamed directory entry survives power loss. FAIL-CLOSED: a
+            //    failed parent fsync is a propagated error, never a reported
+            //    success.
+            self.helper.remote.fsync_parent(&gen_dir)?;
+            Ok(())
+        })();
+        if res.is_err() {
+            // Best-effort cleanup of the disposable staging dir (a failed
+            // install never leaves a partial generation behind).
+            let _ = self.helper.remove_remote_tree_restoring_write(&staging);
+        }
+        res
+    }
+
+    /// Create a generation record and its `root` symlink — the durable
+    /// generation-install protocol ([`Self::durable_generation_install`]).
+    /// Does not move `current`. Requires the slot-mutation capability — the
+    /// receiver is the guard; the helper is the guard's own.
+    pub fn create_generation(&self, spec: &GenerationSpec) -> Result<()> {
+        self.durable_generation_install(spec)
     }
 }
 

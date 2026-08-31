@@ -104,6 +104,21 @@ pub fn generation(gen_id: &GenerationId) -> RootedRelativePath {
         .expect("a validated generation id is a safe path component")
 }
 
+/// A UNIQUE STAGING SIBLING of a generation directory: the assignment record
+/// and the `root` symlink are written here, fsynced, and then the WHOLE
+/// directory is atomically renamed into the final generation directory
+/// ([`generation`]) — the final generation directory is either wholly absent
+/// or complete and readable, never partial. The `.partial` suffix marks the
+/// staging dir as not-yet-installed; `nonce` makes it unique per install
+/// attempt (a crashed earlier attempt's staging dir is removed before
+/// re-staging). `gen_id` is the TYPED generation identity and `nonce` a
+/// freshly minted unique value — a caller cannot stage an arbitrary name.
+pub fn staged_generation(gen_id: &GenerationId, nonce: &str) -> RootedRelativePath {
+    generations()
+        .join(format!("{}.partial-{}", gen_id.as_str(), nonce))
+        .expect("a validated generation id and a nonce are safe path components")
+}
+
 /// The atomically swapped per-server commit pointer.
 pub fn current() -> &'static RootedRelativePath {
     static CURRENT: LazyLock<RootedRelativePath> =
