@@ -1,7 +1,22 @@
 //! Object-store publication and staging: tree/release publication
-//! ([`RemoteHelper::publish_tree`], [`RemoteHelper::publish_release`]),
-//! incoming staging, and the two-phase host-tree upload
-//! ([`copy_host_tree_to_remote`]).
+//! ([`HeldSlotLock::publish_tree`], [`HeldSlotLock::publish_from_incoming`],
+//! [`RemoteHelper::publish_release`]), incoming staging, and the two-phase
+//! host-tree upload ([`copy_host_tree_to_remote`]).
+//!
+//! # The staged-publish protocol (remote tree objects)
+//!
+//! A remote tree object NEVER becomes visible at its digest path
+//! (`objects/sha256/<digest>/root`) with unverified content. The complete
+//! object is assembled in a staging directory (a `.partial`-suffixed path
+//! under `incoming/`), canonicalized THERE and compared against the required
+//! digest, and only then ATOMICALLY published by renaming the whole staging
+//! directory into the final digest path — the digest path is either absent or
+//! contains exactly the verified canonical tree, never a partial/corrupt
+//! object. On REUSE, an existing object is re-canonicalized and compared
+//! against the required digest before it is trusted; invalid content is
+//! QUARANTINED (moved aside, never deleted) and REPAIRED by re-publishing the
+//! verified staged tree — all while holding the slot lock (the publish
+//! operations are [`HeldSlotLock`] methods).
 
 use crate::error::{Error, Result};
 use crate::identity::{DeploymentId, ReleaseId, ReleaseRecord, TreeDigest};
@@ -27,18 +42,65 @@ impl<'a> RemoteHelper<'a> {
             .is_some())
     }
 
-    /// Copy a host-local tree into the remote object store, verifying the
-    /// digest after publication. Reuses an existing, verified object.
-    pub fn publish_tree(&self, digest: &TreeDigest, host_src: &Path) -> Result<()> {
-        if self.tree_exists(digest)? {
-            // Best-effort verification already trusted on first publish.
-            return Ok(());
+    /// Verify that the remote tree at `rel` canonicalizes to `digest`.
+    ///
+    /// `Ok(true)` — the tree verifies (its canonical digest equals the
+    /// required one). `Ok(false)` — the tree is PRESENT but does NOT verify:
+    /// a digest mismatch, uncanonicalizable content (escaping/absolute
+    /// symlink, hard link, device, ...), or unreadable content (a mode
+    /// mutation that removed read permission) — invalid content that must
+    /// never be served under the digest name. `Err` — the tree is MISSING (a
+    /// caller error: the caller checks existence first) or the transport
+    /// itself failed.
+    ///
+    /// The remote tree is materialized into a host temp directory and
+    /// canonicalized THERE: the canonical digest is computed from a directory
+    /// ([`crate::remote::canonical::canonicalize_tree`]), so the remote bytes
+    /// are downloaded and re-hashed with the SAME machinery every other
+    /// verifier uses.
+    fn verify_remote_tree(&self, rel: &RootedRelativePath, digest: &TreeDigest) -> Result<bool> {
+        if self.remote.metadata_opt(rel)?.is_none() {
+            return Err(Error::integrity(format!(
+                "tree {} is missing; cannot verify",
+                rel.display()
+            )));
         }
-        let dest = layout::tree_root(digest);
-        copy_host_tree_to_remote(host_src, &dest, self.remote)?;
-        // Verify the canonical digest of the published object.
-        // (The object was canonicalized by the local store before publication.)
-        Ok(())
+        let tmp = tempfile::tempdir()
+            .map_err(|e| Error::remote(format!("tempdir for tree verification: {e}")))?;
+        // A download failure (unreadable content) means the content is
+        // INVALID — never trusted, never served. Only a missing tree (above)
+        // or a transport failure on the existence probe is an `Err`.
+        if crate::deploy::rollout::download_tree_to_host(self.remote, rel, tmp.path()).is_err() {
+            return Ok(false);
+        }
+        match crate::remote::canonical::canonicalize_tree(tmp.path()) {
+            Ok(meta) => Ok(meta.tree_sha256 == digest.as_str()),
+            Err(_) => Ok(false),
+        }
+    }
+
+    /// Remove a remote directory tree, restoring owner-write on read-only
+    /// directories first (a stale staging/quarantine tree may contain
+    /// read-only — or even 0o000 — directories whose removal would otherwise
+    /// fail with EACCES). A missing tree is a no-op.
+    fn remove_remote_tree_restoring_write(&self, rel: &RootedRelativePath) -> Result<()> {
+        // Phase 1: make every directory owner-traversable, deepest first, so
+        // the whole tree can be listed and removed regardless of its modes.
+        fn restore_write(remote: &dyn Remote, rel: &RootedRelativePath) -> Result<()> {
+            if let Some(meta) = remote.metadata_opt(rel)?
+                && meta.is_dir
+            {
+                remote.set_mode(rel, (meta.mode & 0o7777) | 0o700)?;
+            }
+            for e in remote.list(rel)? {
+                if e.is_dir {
+                    restore_write(remote, &rel.join(&e.name)?)?;
+                }
+            }
+            Ok(())
+        }
+        restore_write(self.remote, rel)?;
+        self.remote.remove_dir_all(rel)
     }
 
     pub fn publish_release(
@@ -184,7 +246,9 @@ impl<'a> RemoteHelper<'a> {
     }
 
     /// Stage a tree into a deployment-specific incoming directory (invisible to
-    /// activation and retention until published).
+    /// activation and retention until published). A stale staging dir from a
+    /// crashed earlier attempt is removed first (restoring write perms), so a
+    /// retry re-stages cleanly instead of mixing stale and fresh content.
     pub fn stage_incoming(
         &self,
         deployment_id: &DeploymentId,
@@ -192,37 +256,131 @@ impl<'a> RemoteHelper<'a> {
         host_src: &Path,
     ) -> Result<()> {
         let dest = layout::staged_tree(deployment_id, digest);
+        if self.remote.metadata_opt(&dest)?.is_some() {
+            self.remove_remote_tree_restoring_write(&dest)?;
+        }
         copy_host_tree_to_remote(host_src, &dest, self.remote)
     }
 }
 
 impl<'a> crate::remote::helper::HeldSlotLock<'a> {
-    /// Publish a previously staged incoming tree into the object store. Requires
-    /// the slot-mutation capability — the receiver is the guard; the helper is the
-    /// guard's own. Reuses an existing, verified object.
+    /// Publish a previously staged incoming tree into the object store.
+    /// Requires the slot-mutation capability — the receiver is the guard; the
+    /// helper is the guard's own.
+    ///
+    /// The digest path is NEVER made visible with unverified content:
+    ///
+    /// 1. **Reuse verifies**: an existing object at the digest path is
+    ///    re-canonicalized and compared against the required digest before it
+    ///    is trusted. Invalid content (a digest mismatch, uncanonicalizable or
+    ///    unreadable content) is QUARANTINED (moved aside, never deleted) and
+    ///    REPAIRED by re-publishing the verified staged tree — all while
+    ///    holding the slot lock.
+    /// 2. **Staged verify**: the complete staged tree is canonicalized and
+    ///    compared against the required digest BEFORE anything becomes
+    ///    visible.
+    /// 3. **Atomic publish**: the verified staging directory is renamed into
+    ///    the final digest path — the digest path is either absent or contains
+    ///    exactly the verified canonical tree, never a partial/corrupt object.
     pub fn publish_from_incoming(
         &self,
         deployment_id: &DeploymentId,
         digest: &TreeDigest,
     ) -> Result<()> {
-        if self.helper.tree_exists(digest)? {
-            return Ok(());
-        }
         let from = layout::staged_tree(deployment_id, digest);
         let to = layout::tree_root(digest);
+        // Reuse: verify the existing object; quarantine + repair invalid
+        // content (under the slot lock).
+        if self.helper.tree_exists(digest)? {
+            if self.helper.verify_remote_tree(&to, digest)? {
+                return Ok(());
+            }
+            self.quarantine_object(digest)?;
+        }
+        // The staged tree must be present and verify BEFORE it becomes
+        // visible.
+        if self.helper.remote.metadata_opt(&from)?.is_none() {
+            return Err(Error::integrity(format!(
+                "staged tree {} is missing; nothing to publish",
+                from.display()
+            )));
+        }
+        self.publish_staged_tree(digest, &from)
+    }
+
+    /// Publish a host-local tree into the object store. Requires the
+    /// slot-mutation capability. The complete remote object is assembled in a
+    /// deployment-independent staging directory, verified there, and
+    /// atomically published; an existing object is verified before reuse and
+    /// invalid content is quarantined and repaired (under the slot lock).
+    pub fn publish_tree(&self, digest: &TreeDigest, host_src: &Path) -> Result<()> {
+        let to = layout::tree_root(digest);
+        // Reuse: verify the existing object; quarantine + repair invalid
+        // content (under the slot lock).
+        if self.helper.tree_exists(digest)? {
+            if self.helper.verify_remote_tree(&to, digest)? {
+                return Ok(());
+            }
+            self.quarantine_object(digest)?;
+        }
+        // Stage the host tree into a deployment-independent staging dir
+        // (removing a stale staging dir from a crashed earlier attempt).
+        let staging = layout::staged_tree_global(digest);
+        if self.helper.remote.metadata_opt(&staging)?.is_some() {
+            self.helper.remove_remote_tree_restoring_write(&staging)?;
+        }
+        copy_host_tree_to_remote(host_src, &staging, self.helper.remote)?;
+        let res = self.publish_staged_tree(digest, &staging);
+        if res.is_err() {
+            // Best-effort cleanup of the disposable staging dir (a failed
+            // publish never leaves a partial object behind).
+            let _ = self.helper.remove_remote_tree_restoring_write(&staging);
+        }
+        res
+    }
+
+    /// Publish a tree object from a host-local path (used when no prior
+    /// incoming staging occurred). Requires the slot-mutation capability.
+    pub fn publish_tree_from_host(&self, digest: &TreeDigest, host_src: &Path) -> Result<()> {
+        self.publish_tree(digest, host_src)
+    }
+
+    /// Quarantine an invalid object at the digest path: move it aside (never
+    /// delete), so the digest path is absent while the invalid content is
+    /// preserved for inspection. A stale quarantine from a crashed earlier
+    /// repair is removed first (restoring write perms), so the rename cannot
+    /// collide.
+    fn quarantine_object(&self, digest: &TreeDigest) -> Result<()> {
+        let to = layout::tree_root(digest);
+        let q = layout::quarantined_tree(digest);
+        if self.helper.remote.metadata_opt(&q)?.is_some() {
+            self.helper.remove_remote_tree_restoring_write(&q)?;
+        }
+        self.helper.remote.rename(&to, &q)?;
+        Ok(())
+    }
+
+    /// Atomically publish a verified staged tree into the final digest path:
+    /// the staged tree is canonicalized and compared against the required
+    /// digest BEFORE the rename, so the digest path is either absent or
+    /// contains exactly the verified canonical tree — never a partial or
+    /// corrupt object.
+    fn publish_staged_tree(&self, digest: &TreeDigest, staging: &RootedRelativePath) -> Result<()> {
+        let to = layout::tree_root(digest);
+        if !self.helper.verify_remote_tree(staging, digest)? {
+            return Err(Error::integrity(format!(
+                "staged tree {} does not canonicalize to {}; refusing to publish",
+                staging.display(),
+                digest.as_str()
+            )));
+        }
         self.helper.remote.create_dir_all(&to.parent().unwrap())?;
-        self.helper.remote.rename(&from, &to)?;
+        self.helper.remote.rename(staging, &to)?;
         Ok(())
     }
 }
 
 impl<'a> RemoteHelper<'a> {
-    /// Publish a tree object from a host-local path (used when no prior
-    /// incoming staging occurred).
-    pub fn publish_tree_from_host(&self, digest: &TreeDigest, host_src: &Path) -> Result<()> {
-        self.publish_tree(digest, host_src)
-    }
-
     /// Remove a specific incoming directory (used after completion).
     pub fn remove_incoming(&self, deployment_id: &DeploymentId) -> Result<()> {
         self.remote
@@ -310,6 +468,8 @@ pub fn copy_host_tree_to_remote(
 mod tests_publish {
     use super::*;
     use crate::remote::transport::LocalTransport;
+    use proptest::prelude::*;
+    use proptest::test_runner::RngSeed;
     use std::os::unix::fs::PermissionsExt;
 
     /// A named (label, mutator) pair driving the publish-rejection mutation
@@ -944,5 +1104,324 @@ mod tests_publish {
             remote_meta.tree_sha256, host_meta.tree_sha256,
             "uploaded tree must match the host tree digest"
         );
+    }
+
+    // ---- THE STAGED-PUBLISH ATOMICITY PROPERTY (remote tree objects) ----
+    //
+    // A remote tree object NEVER becomes visible at its digest path with
+    // unverified content. The property: after a publish — fresh, or reuse
+    // against a MUTATED existing object, or against a MUTATED staged tree —
+    // the final digest path is either ABSENT or contains EXACTLY the required
+    // canonical tree, never a partial/corrupt object. Mutations cover bytes,
+    // modes, symlinks, and paths, applied to either the staged tree (before
+    // publish) or the existing object (before reuse).
+
+    /// One entry of a small deterministic tree (fixed shape, random content).
+    #[derive(Debug, Clone)]
+    enum EntrySpec {
+        File {
+            path: &'static str,
+            data: Vec<u8>,
+            mode: u32,
+        },
+        Dir {
+            path: &'static str,
+            mode: u32,
+        },
+        Symlink {
+            path: &'static str,
+            target: String,
+        },
+    }
+
+    /// A mutation applied to a staged/existing tree before the publish.
+    #[derive(Debug, Clone)]
+    enum Mutation {
+        /// Overwrite a file's bytes.
+        MutateBytes { path: &'static str, data: Vec<u8> },
+        /// Change an entry's mode (may remove read permission).
+        MutateMode { path: &'static str, mode: u32 },
+        /// Retarget the symlink (relative, escaping, or absolute).
+        MutateSymlink { target: String },
+        /// Rename an entry to a new path.
+        MutatePath {
+            path: &'static str,
+            new_path: String,
+        },
+        /// Add a new file.
+        AddFile { path: String, data: Vec<u8> },
+        /// Remove an entry.
+        RemoveEntry { path: &'static str },
+    }
+
+    /// The fixed tree shape: two files, a subdir with a file, a symlink.
+    fn arbitrary_tree() -> impl Strategy<Value = Vec<EntrySpec>> {
+        (
+            any::<Vec<u8>>(), // a: file bytes
+            0o600u32..=0o777, // a: mode
+            any::<Vec<u8>>(), // b: file bytes
+            0o600u32..=0o777, // b: mode
+            any::<Vec<u8>>(), // sub/c: file bytes
+            0o600u32..=0o777, // sub/c: mode
+            "[a-z]{1,4}",     // link: symlink target
+        )
+            .prop_map(|(a, am, b, bm, c, cm, t)| {
+                vec![
+                    EntrySpec::File {
+                        path: "a",
+                        data: a,
+                        mode: am,
+                    },
+                    EntrySpec::File {
+                        path: "b",
+                        data: b,
+                        mode: bm,
+                    },
+                    EntrySpec::Dir {
+                        path: "sub",
+                        mode: 0o755,
+                    },
+                    EntrySpec::File {
+                        path: "sub/c",
+                        data: c,
+                        mode: cm,
+                    },
+                    EntrySpec::Symlink {
+                        path: "link",
+                        target: t,
+                    },
+                ]
+            })
+    }
+
+    /// A mutation over the fixed tree shape: bytes, modes, symlinks, and
+    /// paths. Symlink targets include relative, escaping (`../`), and
+    /// absolute forms; modes include unreadable ones (0o000).
+    fn arbitrary_mutation() -> impl Strategy<Value = Mutation> {
+        prop_oneof![
+            (
+                prop::sample::select(vec!["a", "b", "sub/c"]),
+                any::<Vec<u8>>()
+            )
+                .prop_map(|(path, data)| Mutation::MutateBytes { path, data }),
+            (
+                prop::sample::select(vec!["a", "b", "sub", "sub/c"]),
+                0o000u32..=0o777
+            )
+                .prop_map(|(path, mode)| Mutation::MutateMode { path, mode }),
+            prop_oneof![
+                "[a-z]{1,4}",
+                Just("../escape".to_string()),
+                Just("/abs".to_string()),
+            ]
+            .prop_map(|target| Mutation::MutateSymlink { target }),
+            (
+                prop::sample::select(vec!["a", "b", "sub", "sub/c", "link"]),
+                "[a-z]{1,4}"
+            )
+                .prop_map(|(path, new_path)| Mutation::MutatePath { path, new_path }),
+            ("[a-z]{1,4}", any::<Vec<u8>>())
+                .prop_map(|(path, data)| Mutation::AddFile { path, data }),
+            prop::sample::select(vec!["a", "b", "sub", "sub/c", "link"])
+                .prop_map(|path| Mutation::RemoveEntry { path }),
+        ]
+    }
+
+    /// Build the tree on the host filesystem.
+    fn build_tree(root: &Path, specs: &[EntrySpec]) {
+        for s in specs {
+            match s {
+                EntrySpec::File { path, data, mode } => {
+                    let p = root.join(path);
+                    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                    std::fs::write(&p, data).unwrap();
+                    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(*mode)).unwrap();
+                }
+                EntrySpec::Dir { path, mode } => {
+                    let p = root.join(path);
+                    std::fs::create_dir_all(&p).unwrap();
+                    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(*mode)).unwrap();
+                }
+                EntrySpec::Symlink { path, target } => {
+                    let p = root.join(path);
+                    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                    std::os::unix::fs::symlink(target, &p).unwrap();
+                }
+            }
+        }
+    }
+
+    /// Apply a mutation to a tree on the host filesystem (the remote tree is
+    /// materialized under the LocalTransport root). A mutation that cannot
+    /// apply (e.g. a rename onto an existing path) is a no-op — the property
+    /// holds either way.
+    fn apply_mutation(root: &Path, m: &Mutation) {
+        match m {
+            Mutation::MutateBytes { path, data } => {
+                let p = root.join(path);
+                if p.exists() {
+                    std::fs::write(&p, data).unwrap();
+                }
+            }
+            Mutation::MutateMode { path, mode } => {
+                let p = root.join(path);
+                if p.exists() {
+                    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(*mode)).unwrap();
+                }
+            }
+            Mutation::MutateSymlink { target } => {
+                let p = root.join("link");
+                if p.exists() {
+                    std::fs::remove_file(&p).unwrap();
+                    std::os::unix::fs::symlink(target, &p).unwrap();
+                }
+            }
+            Mutation::MutatePath { path, new_path } => {
+                let p = root.join(path);
+                let np = root.join(new_path);
+                if p.exists() && !np.exists() {
+                    std::fs::rename(&p, &np).unwrap();
+                }
+            }
+            Mutation::AddFile { path, data } => {
+                let p = root.join(path);
+                if !p.exists() {
+                    std::fs::write(&p, data).unwrap();
+                }
+            }
+            Mutation::RemoveEntry { path } => {
+                let p = root.join(path);
+                if p.exists() {
+                    if p.is_dir() {
+                        std::fs::remove_dir_all(&p).unwrap();
+                    } else {
+                        std::fs::remove_file(&p).unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    /// The publish scenario under test: which tree (staged or existing) is
+    /// mutated, and through which publish path the mutation is confronted.
+    #[derive(Clone, Copy, Debug)]
+    enum PublishScenario {
+        /// Stage, mutate the STAGED tree, publish from incoming.
+        Staged,
+        /// Publish from host, mutate the EXISTING object, re-publish from
+        /// host (the repair re-stages from the host).
+        ExistingHost,
+        /// Publish from incoming, mutate the EXISTING object, re-stage,
+        /// re-publish from incoming (the repair re-publishes the staged
+        /// tree).
+        ExistingIncoming,
+    }
+
+    proptest! {
+        // THE STAGED-PUBLISH ATOMICITY PROPERTY: mutate staged/existing
+        // bytes, modes, symlinks, and paths; the final digest path must be
+        // either ABSENT or contain EXACTLY the required canonical tree —
+        // never a partial/corrupt object. Bounded 16 cases, fixed seed
+        // 0x5EED_5EED (house style), no failure persistence.
+        #![proptest_config(ProptestConfig {
+            cases: crate::testutil::proptest_cases(16),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn publish_never_serves_invalid_content(
+            tree in arbitrary_tree(),
+            mutation in arbitrary_mutation(),
+            scenario in prop_oneof![
+                Just(PublishScenario::Staged),
+                Just(PublishScenario::ExistingHost),
+                Just(PublishScenario::ExistingIncoming),
+            ],
+        ) {
+            let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+            let remote = LocalTransport::new(
+                &crate::testutil::fixture_env(),
+                dir.path().join("remote"),
+            )
+            .unwrap();
+            let helper = RemoteHelper::new(&remote);
+            let host = dir.path().join("host");
+            build_tree(&host, &tree);
+            let digest = crate::remote::canonical::canonicalize_tree(&host)
+                .unwrap()
+                .tree_sha256;
+            let digest = TreeDigest::parse(&digest).expect("canonical digest");
+            let dep = crate::identity::test_deployment_id("dep");
+
+            match scenario {
+                PublishScenario::Staged => {
+                    // Stage, then mutate the STAGED tree before publishing.
+                    helper.stage_incoming(&dep, &digest, &host).unwrap();
+                    let staged_path = remote.root().join(layout::staged_tree(&dep, &digest));
+                    apply_mutation(&staged_path, &mutation);
+                    let held = helper
+                        .acquire_lock_guard(&crate::identity::test_operation_id("op-1"))
+                        .unwrap();
+                    let _ = held.publish_from_incoming(&dep, &digest);
+                    drop(held);
+                }
+                PublishScenario::ExistingHost => {
+                    // Publish cleanly first (`publish_tree` re-stages from
+                    // the host each time, so the repair always has a source),
+                    // then mutate the EXISTING object at the final digest
+                    // path and re-publish.
+                    let held = helper
+                        .acquire_lock_guard(&crate::identity::test_operation_id("op-1"))
+                        .unwrap();
+                    held.publish_tree(&digest, &host).unwrap();
+                    drop(held);
+                    let final_path = remote.root().join(layout::tree_root(&digest));
+                    apply_mutation(&final_path, &mutation);
+                    let held = helper
+                        .acquire_lock_guard(&crate::identity::test_operation_id("op-2"))
+                        .unwrap();
+                    let _ = held.publish_tree(&digest, &host);
+                    drop(held);
+                }
+                PublishScenario::ExistingIncoming => {
+                    // Publish from incoming (the staged tree is consumed by
+                    // the rename), mutate the EXISTING object, re-stage, and
+                    // re-publish from incoming: the repair re-publishes the
+                    // verified staged tree.
+                    helper.stage_incoming(&dep, &digest, &host).unwrap();
+                    let held = helper
+                        .acquire_lock_guard(&crate::identity::test_operation_id("op-1"))
+                        .unwrap();
+                    held.publish_from_incoming(&dep, &digest).unwrap();
+                    drop(held);
+                    let final_path = remote.root().join(layout::tree_root(&digest));
+                    apply_mutation(&final_path, &mutation);
+                    helper.stage_incoming(&dep, &digest, &host).unwrap();
+                    let held = helper
+                        .acquire_lock_guard(&crate::identity::test_operation_id("op-2"))
+                        .unwrap();
+                    let _ = held.publish_from_incoming(&dep, &digest);
+                    drop(held);
+                }
+            }
+
+            // THE PROPERTY: the final digest path is either absent or
+            // contains exactly the required canonical tree.
+            let final_path = remote.root().join(layout::tree_root(&digest));
+            match std::fs::symlink_metadata(&final_path) {
+                Err(_) => {}
+                Ok(_) => {
+                    let meta = crate::remote::canonical::canonicalize_tree(&final_path)
+                        .expect("a present digest path must canonicalize");
+                    prop_assert_eq!(
+                        meta.tree_sha256,
+                        digest.as_str(),
+                        "the digest path must contain exactly the required canonical tree"
+                    );
+                }
+            }
+        }
     }
 }

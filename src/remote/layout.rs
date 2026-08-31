@@ -48,6 +48,10 @@ pub const OPERATION_LOCK_SIDECAR: &str = "operation.lock.mutex";
 pub const INVENTORY: &str = "inventory.json";
 /// Suffix appended to a digest while a tree upload is still in flight.
 pub const PARTIAL_SUFFIX: &str = ".partial";
+/// Suffix appended to an invalid tree object moved aside (quarantined) before
+/// repair: the digest path is absent while the invalid content is preserved
+/// for inspection.
+pub const QUARANTINE_SUFFIX: &str = ".quarantined";
 
 /// The deployment-directory layout created before the first mutation.
 /// `LocalTransport::provision_layout` creates these locally;
@@ -122,6 +126,29 @@ pub fn staged_tree(deployment_id: &DeploymentId, digest: &TreeDigest) -> RootedR
             .join(deployment_id.as_str())
             .join(format!("{digest}{PARTIAL_SUFFIX}")),
     )
+}
+
+/// A deployment-independent staging path for a tree upload in flight (used by
+/// [`crate::remote::helper::HeldSlotLock::publish_tree`] when no
+/// deployment-scoped incoming area exists). The `.partial` suffix marks the
+/// upload as not-yet-published; the digest is the TYPED tree identity — a
+/// caller cannot stage an arbitrary name.
+pub fn staged_tree_global(digest: &TreeDigest) -> RootedRelativePath {
+    RootedRelativePath::from_validated(
+        Path::new(INCOMING).join(format!("{digest}{PARTIAL_SUFFIX}")),
+    )
+}
+
+/// Quarantine path for an invalid tree object: the invalid `root` is moved
+/// aside here (never deleted) before repair, so the digest path is absent
+/// while the invalid content is preserved for inspection. `digest` is the
+/// TYPED tree identity — a caller cannot name a quarantine from an arbitrary
+/// string.
+pub fn quarantined_tree(digest: &TreeDigest) -> RootedRelativePath {
+    objects()
+        .join(digest.as_str())
+        .and_then(|p| p.join(format!("root{QUARANTINE_SUFFIX}")))
+        .expect("a validated tree digest is a safe path component")
 }
 
 /// Parent of all published release-side files.
@@ -252,6 +279,8 @@ mod tests {
                 generation(&gid),
                 incoming_dir(&dep),
                 staged_tree(&dep, &digest),
+                staged_tree_global(&digest),
+                quarantined_tree(&digest),
                 remote_release(&rel),
                 state_dir(),
                 operation_lock(),

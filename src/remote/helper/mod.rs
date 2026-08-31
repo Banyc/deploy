@@ -65,7 +65,7 @@
 //! (possesses the RAII [`HeldSlotLock`] capability — a guard can only mutate the slot it was acquired from — the receiver is the guard, the helper is the guard's own; there is no API parameter through which a guard from server A can authorize a mutation on server B) can call
 //! the slot-mutation functions (`create_generation`, `swap_current`,
 //! `transaction_record`, `write_commit_marker`, `remove_current_if`,
-//! `publish_from_incoming`). A mutation never consults the on-disk lock;
+//! `publish_from_incoming`, `publish_tree`). A mutation never consults the on-disk lock;
 //! mutual exclusion comes from acquire-exclusivity plus structural enforcement:
 //! the six slot-mutation operations ARE methods on the [`HeldSlotLock`] guard —
 //! there is no `RemoteHelper::*_locked` entry point and no state-changing helper
@@ -658,7 +658,8 @@ impl<'a> RemoteHelper<'a> {
 /// This is the slot-mutation capability: only a controller that holds this
 /// guard (possesses the capability) may call the slot-mutation functions
 /// (`create_generation`, `swap_current`, `transaction_record`,
-/// `write_commit_marker`, `remove_current_if`, `publish_from_incoming`)
+/// `write_commit_marker`, `remove_current_if`, `publish_from_incoming`,
+/// `publish_tree`)
 /// — a guard can only mutate the slot it was acquired from — the receiver is
 /// the guard, the helper is the guard's own; there is no API parameter through
 /// which a guard from server A can authorize a mutation on server B.

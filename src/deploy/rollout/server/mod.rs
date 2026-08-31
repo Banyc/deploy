@@ -894,7 +894,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     }
 
     #[test]
-    fn corrupted_existing_remote_object_fails_integrity() {
+    fn corrupted_existing_remote_object_is_quarantined_and_repaired() {
         let h = Harness::new(
             &crate::testutil::fixture_env(),
             NONE_TOML,
@@ -927,20 +927,36 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         assert!(obj_file.exists(), "expected object file to exist");
         std::fs::write(&obj_file, "TAMPERED").unwrap();
 
-        // A second generation reuses the corrupted object and must detect the
-        // digest mismatch before advancing `current`.
+        // A second generation reuses the corrupted object: the publish
+        // VERIFIES the existing object, QUARANTINES the invalid content
+        // (moved aside, never deleted), and REPAIRS it by re-publishing the
+        // verified staged tree — the deploy advances with the correct
+        // content, and the final object at the digest path verifies as the
+        // canonical tree.
         let second = h.run(Some(first_gen.clone()));
         assert!(
-            matches!(second.state, SlotExecution::FailedBeforeAdvance { .. }),
-            "the digest mismatch must fail before the swap"
+            matches!(second.state, SlotExecution::Advanced { .. }),
+            "the corrupted object must be quarantined and repaired, never served"
         );
-        assert!(
-            second
-                .state
-                .failed_error()
-                .expect("a pre-swap failure carries its error")
-                .contains("integrity")
+        // The repaired object at the digest path is exactly the canonical
+        // tree.
+        let meta = crate::remote::canonical::canonicalize_tree(
+            &h.remote
+                .root()
+                .join(crate::remote::layout::tree_root(&h.tree)),
+        )
+        .unwrap();
+        assert_eq!(
+            meta.tree_sha256,
+            h.tree.as_str(),
+            "the repaired object must be the canonical tree"
         );
+        // The invalid content was quarantined aside, never deleted.
+        let q = h
+            .remote
+            .root()
+            .join(crate::remote::layout::quarantined_tree(&h.tree));
+        assert!(q.exists(), "the invalid object must be quarantined aside");
     }
 
     #[test]
