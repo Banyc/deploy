@@ -320,6 +320,54 @@ proptest! {
     }
 }
 
+proptest! {
+    // THE SERIALIZE/RELOAD PROPERTY: over VALID configurations (generated
+    // by construction) plus ARBITRARY update operations, every SUCCESSFUL
+    // `with_*` result must survive a serialize/reload round trip through the
+    // SAME constructor (`from_raw_parts` -> `try_build`): the domain graph
+    // is serialized back to the raw wire shapes ([`ProjectConfig::to_raw_parts`])
+    // and reloaded, and the reloaded graph is EQUIVALENT — identical,
+    // including the injective physical locations (endpoint + effective
+    // deploy_dir). The typed leaves serialize to their canonical raw forms
+    // and re-parse to the same typed values, and the canonical deploy_dirs
+    // are a canonicalization fixed point, so the round trip is the identity.
+    // Bounded `proptest_cases(16)` (full 16 with `DEPLOY_FULL_TESTS=1`, fast
+    // default), fixed seed 0x5EED_5EED per house style, no failure
+    // persistence; the generation is pure (no filesystem), so the property
+    // stays fast.
+    #![proptest_config(ProptestConfig {
+        cases: crate::testutil::proptest_cases(16),
+        rng_seed: RngSeed::Fixed(0x5EED_5EED),
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
+
+    #[test]
+    fn successful_with_ops_survive_serialize_reload(
+        project in valid_raw_project(),
+        ops in prop::collection::vec(arbitrary_op(), 0..8),
+    ) {
+        let config = ProjectConfig::from_raw_parts(project.manifest, project.variants)
+            .expect("the generated project is valid by construction");
+        let mut current = config;
+        for op in &ops {
+            if let Ok(next) = op.apply(&current) {
+                current = next;
+            }
+        }
+        // Serialize the domain graph back to the raw wire shapes and reload
+        // through the SAME constructor (from_raw_parts -> try_build): a
+        // config built by successful with_* ops must survive the round trip
+        // unchanged — the reloaded graph is equivalent, and the injective
+        // physical locations are preserved.
+        let raw = current.to_raw_parts();
+        let reloaded = ProjectConfig::from_raw_parts(raw.manifest, raw.variants)
+            .expect("a config built by successful with_* ops must reload");
+        assert_eq!(reloaded, current, "the reloaded graph is equivalent");
+        assert_domain_invariants(&reloaded);
+    }
+}
+
 // ---- deterministic unit tests per update class ----------------------
 
 /// The minimal valid config used by the per-class unit tests.
