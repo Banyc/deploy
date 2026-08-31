@@ -339,8 +339,11 @@ mod tests {
             .map(|k| {
                 (
                     k.clone(),
-                    PhysicalBinding::new(ServerId::parse("s1").expect("safe segment"), "/srv/x")
-                        .expect("the test binding is absolute and traversal-free"),
+                    PhysicalBinding::from_config(
+                        ServerId::parse("s1").expect("safe segment"),
+                        "/srv/x",
+                    )
+                    .expect("the test binding is absolute and traversal-free"),
                 )
             })
             .collect();

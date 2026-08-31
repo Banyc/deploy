@@ -175,6 +175,7 @@ pub fn plan_assignments(
     variant_trees: &BTreeMap<String, TreeDigest>,
     store: &LocalStore,
     config: &ProjectConfig,
+    receiver_uuids: &BTreeMap<SlotId, Option<crate::identity::ReceiverUuid>>,
 ) -> Result<PlannedResolution> {
     if config.target(selection.target.as_str()).is_none() {
         return Err(Error::not_found(format!("target '{}'", selection.target)));
@@ -283,12 +284,16 @@ pub fn plan_assignments(
                 ));
             }
             // The EXACT-ROLLBACK VERIFICATION (A2): every SELECTED member's
-            // COMPLETE physical binding — the server AND the on-server
-            // deploy_dir — must match the one recorded in the snapshot (see
+            // COMPLETE physical binding — the deploy_dir's IMMUTABLE receiver
+            // UUID (the PHYSICAL identity: two ServerIds naming the same
+            // physical host+dir share the receiver, and a slot whose
+            // physical receiver changed under the same ServerId/path must NOT
+            // receive the historical generations) — must match the one
+            // recorded in the snapshot (see
             // [`verify_exact_rollback_bindings`]).
             // Unselected slots are not planned (they remain at the latest
             // current state).
-            verify_exact_rollback_bindings(&members, &entry, deployment_id, ft)?;
+            verify_exact_rollback_bindings(&members, &entry, deployment_id, ft, receiver_uuids)?;
             // The releases the snapshot's slots reference, derived PER SLOT
             // from each slot's OWN artifact binding: a partial snapshot can
             // carry slots from DIFFERENT releases (group pushes over time —
@@ -512,7 +517,7 @@ pub fn plan_assignments(
                         (
                             SlotId::parse(slot.id.as_str())
                                 .expect("validated slot id is a safe segment"),
-                            PhysicalBinding::new(
+                            PhysicalBinding::from_config(
                                 ServerId::parse(sdef.id.as_str())
                                     .expect("validated server id is a safe segment"),
                                 slot.deploy_dir(),
@@ -775,8 +780,11 @@ interval_seconds = 0
                         g.generation.clone(),
                         g.assignment.artifact.clone(),
                         bindings.get(k).cloned().unwrap_or(
-                            PhysicalBinding::new(ServerId::parse("s1").unwrap(), "/srv/eng")
-                                .expect("the fallback binding is absolute and traversal-free"),
+                            PhysicalBinding::from_config(
+                                ServerId::parse("s1").unwrap(),
+                                "/srv/eng",
+                            )
+                            .expect("the fallback binding is absolute and traversal-free"),
                         ),
                     ),
                     pre_push: Observation::KnownAbsent,
@@ -915,6 +923,7 @@ interval_seconds = 0
             &BTreeMap::new(),
             &store,
             &config,
+            &BTreeMap::new(),
         )
         .map(|planned| (planned.assignments, planned.releases, planned.origin))
         .expect("snapshot-carrying release resolves");
@@ -969,6 +978,7 @@ interval_seconds = 0
             &BTreeMap::new(),
             &store,
             &config,
+            &BTreeMap::new(),
         )
         .expect_err("an empty-slot-snapshot release must fail closed at read");
         assert!(
@@ -1013,6 +1023,7 @@ interval_seconds = 0
             &BTreeMap::new(),
             &store,
             &config,
+            &BTreeMap::new(),
         )
         .expect_err("a stored snapshot whose slot set drifts from the target must refuse");
         let msg = err.to_string();
@@ -1113,6 +1124,7 @@ interval_seconds = 0
             &BTreeMap::new(),
             &store,
             &config,
+            &BTreeMap::new(),
         )
         .expect_err("a release whose snapshot lacks a current member slot must refuse");
         let msg = err.to_string();
@@ -1180,6 +1192,7 @@ interval_seconds = 0
             &BTreeMap::new(),
             &store,
             &config,
+            &BTreeMap::new(),
         )
         .expect_err("a release whose snapshot pins a slot the target lacks must refuse");
         let msg = err.to_string();
@@ -1266,6 +1279,7 @@ interval_seconds = 0
             &BTreeMap::new(),
             &store,
             &config,
+            &BTreeMap::new(),
         )
         .map(|planned| (planned.assignments, planned.releases, planned.origin))
         .expect("physical binding drift must not block logical-membership planning");
@@ -1311,6 +1325,7 @@ interval_seconds = 0
             &BTreeMap::new(),
             &store,
             &config,
+            &BTreeMap::new(),
         )
         .expect_err("a release without the resolved variant's tree must refuse");
         assert!(
@@ -1382,6 +1397,7 @@ interval_seconds = 0
             &BTreeMap::new(),
             &store,
             &config,
+            &BTreeMap::new(),
         )
         .map(|planned| (planned.assignments, planned.releases, planned.origin))
         .expect("snapshot-declared release resolves");
@@ -1459,7 +1475,7 @@ interval_seconds = 0
             )]),
             BTreeMap::from([(
                 SlotId::parse("p1").unwrap(),
-                PhysicalBinding::new(ServerId::parse("s1").unwrap(), "/srv/plan")
+                PhysicalBinding::from_config(ServerId::parse("s1").unwrap(), "/srv/plan")
                     .expect("test binding is absolute and traversal-free"),
             )]),
         );
@@ -1477,6 +1493,7 @@ interval_seconds = 0
             &BTreeMap::new(),
             &store,
             &config,
+            &BTreeMap::new(),
         )
         .map(|planned| (planned.assignments, planned.releases, planned.origin))
         .expect("deployment ref resolves");
@@ -1654,8 +1671,11 @@ interval_seconds = 0
             )]),
             BTreeMap::from([(
                 SlotId::parse("p1").unwrap(),
-                PhysicalBinding::new(ServerId::new(old_binding.0.clone()), old_binding.1.clone())
-                    .expect("test binding is absolute and traversal-free"),
+                PhysicalBinding::from_config(
+                    ServerId::new(old_binding.0.clone()),
+                    old_binding.1.clone(),
+                )
+                .expect("test binding is absolute and traversal-free"),
             )]),
         );
 
@@ -1708,6 +1728,8 @@ interval_seconds = 0
                     &BTreeMap::new(),
                     &store,
                     &config,
+                    &BTreeMap::new(),
+
                 )
                     .map(|planned| (planned.assignments, planned.releases, planned.origin))
                 .unwrap_or_else(|e| panic!("release:<id> must plan on target {dest}: {e}"));
@@ -1745,6 +1767,8 @@ interval_seconds = 0
                 &BTreeMap::new(),
                 &store,
                 &config,
+                &BTreeMap::new(),
+
             )
             .expect_err("a snapshot ref whose recorded binding changed must refuse");
             let msg = err.to_string();
@@ -1840,7 +1864,7 @@ interval_seconds = 0
                 slots.clone(),
                 BTreeMap::from([(
                     SlotId::parse("p1").unwrap(),
-                    PhysicalBinding::new(
+                    PhysicalBinding::from_config(
                             ServerId::parse("s1").unwrap(),
                             "/srv/plan",
                         )
@@ -1858,6 +1882,8 @@ interval_seconds = 0
                 &BTreeMap::new(),
                 &store,
                 &config,
+                &BTreeMap::new(),
+
             )
                 .map(|planned| (planned.assignments, planned.releases, planned.origin))
             .unwrap_or_else(|e| panic!("the deployment id must plan its stored state: {e}"));
@@ -1894,6 +1920,8 @@ interval_seconds = 0
                 &BTreeMap::new(),
                 &store,
                 &config,
+                &BTreeMap::new(),
+
             )
             .expect_err("an unknown deployment id must refuse to plan");
             assert!(
@@ -2067,12 +2095,12 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let bindings: BTreeMap<SlotId, PhysicalBinding> = BTreeMap::from([
             (
                 slot_a.clone(),
-                PhysicalBinding::new(ServerId::parse("s1").unwrap(), "/srv/plan-a")
+                PhysicalBinding::from_config(ServerId::parse("s1").unwrap(), "/srv/plan-a")
                     .expect("test binding is absolute and traversal-free"),
             ),
             (
                 slot_b.clone(),
-                PhysicalBinding::new(ServerId::parse("s2").unwrap(), "/srv/plan-b")
+                PhysicalBinding::from_config(ServerId::parse("s2").unwrap(), "/srv/plan-b")
                     .expect("test binding is absolute and traversal-free"),
             ),
         ]);
@@ -2160,6 +2188,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &BTreeMap::new(),
             &store,
             &config,
+            &BTreeMap::new(),
         )
         .map(|planned| (planned.assignments, planned.releases, planned.origin))
         .expect("the deployment id must plan its stored state");
@@ -2444,7 +2473,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             BTreeMap::from([
                 (
                     SlotId::parse("p1").unwrap(),
-                    PhysicalBinding::new(
+                    PhysicalBinding::from_config(
                         ServerId::parse("s1").unwrap(),
                         if binding_drift {
                             "/srv/drifted"
@@ -2456,7 +2485,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 ),
                 (
                     SlotId::parse("p2").unwrap(),
-                    PhysicalBinding::new(ServerId::parse("s2").unwrap(), "/srv/p2")
+                    PhysicalBinding::from_config(ServerId::parse("s2").unwrap(), "/srv/p2")
                         .expect("test binding is absolute and traversal-free"),
                 ),
             ]),
@@ -2512,6 +2541,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &variant_trees,
                 &store,
                 &config,
+                &BTreeMap::new(),
+
             );
             if head_broken {
                 let msg = head
@@ -2562,6 +2593,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &variant_trees,
                 &store,
                 &config,
+                &BTreeMap::new(),
+
             );
             if release_drift {
                 let msg = rel
@@ -2641,6 +2674,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &variant_trees,
                 &store,
                 &config,
+                &BTreeMap::new(),
+
             );
             if binding_drift {
                 let msg = dep

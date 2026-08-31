@@ -107,6 +107,7 @@ pub(crate) fn reconcile_pending_commits(
     config: &ProjectConfig,
     op_id: &OperationId,
     helpers: &HashMap<SlotId, RemoteHelper>,
+    receiver_uuids: &BTreeMap<SlotId, Option<crate::identity::ReceiverUuid>>,
 ) -> Result<Option<RecoveryOutcome>> {
     let mut pending: Vec<DeploymentIntent> = Vec::new();
     for entry in txn.state().entries() {
@@ -124,7 +125,26 @@ pub(crate) fn reconcile_pending_commits(
         .iter()
         .map(|(slot, _)| slot.id.clone())
         .collect();
-    let live_bindings = config.target_slot_bindings(target_name)?;
+    // The CURRENT configured bindings, with each slot's deploy_dir's
+    // IMMUTABLE receiver UUID (read from the provisioned remote during
+    // preflight) filled in — the PHYSICAL identity the binding-drift check
+    // compares. A slot whose receiver is not yet readable (unprovisioned
+    // deploy_dir) keeps its config-derived binding (unknown physical
+    // identity).
+    let live_bindings: BTreeMap<SlotId, PhysicalBinding> = config
+        .target_slot_bindings(target_name)?
+        .into_iter()
+        .map(|(sid, b)| {
+            let uuid = receiver_uuids.get(&sid).cloned().flatten();
+            (
+                sid,
+                match uuid {
+                    Some(u) => b.with_receiver_uuid(u),
+                    None => b,
+                },
+            )
+        })
+        .collect();
 
     // At most ONE pending attempt exists under the strictly-linear model
     // (the store's read path refuses a second unresolved intent); the loop
@@ -167,7 +187,16 @@ pub(crate) fn reconcile_pending_commits(
         let snapshot = attempt.resulting_snapshot();
         for sid in attempt.selected_membership() {
             let frozen_binding = snapshot.get(&sid).expect("selected in snapshot").binding();
-            let equal = live_bindings.get(&sid) == Some(frozen_binding);
+            // THE PHYSICAL-IDENTITY COMPARISON: the deploy_dir's IMMUTABLE
+            // receiver UUID is the physical identity — two ServerIds naming
+            // the same physical host+dir share the receiver, and a slot
+            // whose physical receiver changed (even under the same
+            // ServerId/path) is a drift. A binding whose receiver is unknown
+            // on either side falls back to the legacy `{server, deploy_dir}`
+            // evidence.
+            let equal = live_bindings
+                .get(&sid)
+                .is_some_and(|b| b.same_physical_location(frozen_binding));
             bindings_equal &= equal;
         }
         if !bindings_equal {

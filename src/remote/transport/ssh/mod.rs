@@ -1234,7 +1234,12 @@ impl Remote for SshTransport {
                 .iter()
                 .map(|d| self.root.join(d).to_string_lossy().into_owned()),
         );
-        self.run_remote_ok(&Self::argv_cmd(&argv))
+        self.run_remote_ok(&Self::argv_cmd(&argv))?;
+        // The deploy_dir's IMMUTABLE receiver-UUID marker: the PHYSICAL
+        // identity of this deploy_dir, created ONCE at provisioning and
+        // never changed (a re-provisioning adopts the existing marker).
+        crate::remote::transport::provision_receiver_uuid(self)?;
+        Ok(())
     }
 
     fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {

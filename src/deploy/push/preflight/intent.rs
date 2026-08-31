@@ -50,9 +50,16 @@ pub(crate) fn persist_intent(
     }
 
     // Every SELECTED slot's plan-minted result + observed pre-push state.
+    // The binding recorded in the intent carries the deploy_dir's IMMUTABLE
+    // receiver UUID (read from the provisioned remote during preflight) —
+    // the PHYSICAL identity exact rollback compares. `ServerId`/`deploy_dir`
+    // are display only: two ServerIds naming the same physical host+dir
+    // share the receiver, and a slot whose physical receiver changed (even
+    // under the same ServerId/path) must NOT receive the historical
+    // generations.
     let mut planned: Vec<PlannedDeploy> = Vec::with_capacity(outcome.assignments.len());
     for a in &outcome.assignments {
-        let binding = slot_bindings
+        let config_binding = slot_bindings
             .get(&a.placement_slot)
             .cloned()
             .ok_or_else(|| {
@@ -61,6 +68,18 @@ pub(crate) fn persist_intent(
                     deployment_id, a.placement_slot
                 ))
             })?;
+        let receiver_uuid = outcome
+            .receiver_uuids
+            .get(&a.placement_slot)
+            .cloned()
+            .flatten()
+            .ok_or_else(|| {
+                crate::error::Error::integrity(format!(
+                    "intent {}: no receiver UUID for planned slot '{}' (the deploy_dir was not provisioned)",
+                    deployment_id, a.placement_slot
+                ))
+            })?;
+        let binding = config_binding.with_receiver_uuid(receiver_uuid);
         let generation = outcome.new_gen[&a.placement_slot].clone();
         let result = SnapshotSlot::new(generation, a.artifact.clone(), binding);
         // The intent's pre-push observation IS the map entry — the preflight

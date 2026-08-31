@@ -225,6 +225,18 @@ pub fn inventory() -> RootedRelativePath {
     state_file(INVENTORY)
 }
 
+/// The IMMUTABLE receiver-UUID marker file at the deploy_dir root: the
+/// PHYSICAL identity of one provisioned deploy_dir, created ONCE at
+/// provisioning ([`crate::remote::transport::provision_receiver_uuid`]) and
+/// never changed. Two ServerIds that name the same physical host+dir share
+/// the same receiver; a slot rebound to a different ServerId pointing at the
+/// same physical location keeps it. Read during preflight and recorded in
+/// the ledger's [`crate::ledger::PhysicalBinding`]; exact rollback and
+/// duplicate-location detection compare it.
+pub fn receiver_uuid() -> RootedRelativePath {
+    RootedRelativePath::from_validated(Path::new("receiver-uuid").to_path_buf())
+}
+
 /// Relative link target (from inside a generation directory) to that
 /// generation's tree object. `tree` is the TYPED tree identity. The target
 /// is relative to the LINK's directory (it legitimately traverses up to the

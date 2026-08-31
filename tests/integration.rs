@@ -402,28 +402,32 @@ fn snapshot_records_each_slots_physical_binding() -> Result<()> {
     assert_eq!(snapshots.len(), 1);
     // p1 -> (server-01, /srv/deploy/example), p2 -> (server-02,
     // /srv/deploy/example), p3 -> (server-03, /srv/deploy/example) per the
-    // shared CONFIG's slot declarations.
+    // shared CONFIG's slot declarations. The recorded binding carries the
+    // deploy_dir's receiver UUID (the PHYSICAL identity, minted at
+    // provisioning — unknown to the test), so the comparison is the
+    // physical-location comparison, never full equality.
     let binding = |server: &str| {
-        PhysicalBinding::new(ServerId::parse(server).unwrap(), "/srv/deploy/example")
+        PhysicalBinding::from_config(ServerId::parse(server).unwrap(), "/srv/deploy/example")
             .expect("test binding is absolute and traversal-free")
     };
-    assert_eq!(
-        rollback_of(&snapshots[0])
-            .get(&SlotId::parse("p1").unwrap())
-            .map(|e| e.binding()),
-        Some(&binding("server-01"))
+    let snapshot = rollback_of(&snapshots[0]);
+    let recorded = |slot: &str| {
+        snapshot
+            .get(&SlotId::parse(slot).unwrap())
+            .map(|e| e.binding())
+            .expect("the snapshot records the slot")
+    };
+    assert!(
+        recorded("p1").same_physical_location(&binding("server-01")),
+        "p1 records the physical location it was deployed onto"
     );
-    assert_eq!(
-        rollback_of(&snapshots[0])
-            .get(&SlotId::parse("p2").unwrap())
-            .map(|e| e.binding()),
-        Some(&binding("server-02"))
+    assert!(
+        recorded("p2").same_physical_location(&binding("server-02")),
+        "p2 records the physical location it was deployed onto"
     );
-    assert_eq!(
-        rollback_of(&snapshots[0])
-            .get(&SlotId::parse("p3").unwrap())
-            .map(|e| e.binding()),
-        Some(&binding("server-03"))
+    assert!(
+        recorded("p3").same_physical_location(&binding("server-03")),
+        "p3 records the physical location it was deployed onto"
     );
     assert_eq!(rollback_of(&snapshots[0]).len(), 3);
 
@@ -511,13 +515,18 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     assert_eq!(snapshots.len(), 1);
     // The rollback ref is the deployment id (the snapshot's key).
     let dep0 = latest_deployment_id(&store, "production");
-    assert_eq!(
-        rollback_of(&snapshots[0])
-            .get(&SlotId::parse("p1").unwrap())
-            .map(|e| e.binding()),
-        Some(
-            &PhysicalBinding::new(ServerId::parse("server-01").unwrap(), "/srv/deploy/rebind",)
-                .expect("test binding is absolute and traversal-free")
+    let snapshot = rollback_of(&snapshots[0]);
+    let recorded = snapshot
+        .get(&SlotId::parse("p1").unwrap())
+        .map(|e| e.binding())
+        .expect("the snapshot records the slot");
+    assert!(
+        recorded.same_physical_location(
+            &PhysicalBinding::from_config(
+                ServerId::parse("server-01").unwrap(),
+                "/srv/deploy/rebind",
+            )
+            .expect("test binding is absolute and traversal-free"),
         ),
         "the snapshot records the complete physical binding the slot was deployed onto"
     );
@@ -556,9 +565,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     .expect_err("rebound slot must refuse exact rollback");
     let msg = err.to_string();
     assert!(
-        msg.contains(&format!(
-            "slot 'p1' was bound to server 'server-01' at '/srv/deploy/rebind' in deployment '{dep0}' of target 'production'"
-        )),
+        msg.contains("slot 'p1' was bound to server 'server-01' at '/srv/deploy/rebind'")
+            && msg.contains(&format!("in deployment '{dep0}' of target 'production'")),
         "error must name the slot, the recorded server and its deploy_dir, got: {msg}"
     );
     assert!(
@@ -657,12 +665,19 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
     let store = LocalStore::with_base(store_base.clone())?;
     let factory_base = remotes_base.clone();
+    // The transport root models the PHYSICAL deployment location: the
+    // server's directory AND the slot's deploy_dir (like the real
+    // transports, whose root IS the deploy_dir) — so the deploy_dir's
+    // IMMUTABLE receiver UUID lives per deploy_dir, and moving the
+    // deploy_dir provisions a NEW physical location with a NEW receiver.
     let factory = move |s: &deploy::config::ServerDef,
-                        _slot: &deploy::config::SlotConfig|
+                        slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(
             &deploy::env::SysEnv::from_process(),
-            factory_base.join(&s.id),
+            factory_base
+                .join(&s.id)
+                .join(slot.deploy_dir().to_string_lossy().trim_start_matches('/')),
         )?))
     };
 
@@ -683,18 +698,24 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     assert_eq!(r0.status, Some(DeploymentStatus::Successful));
     let snapshots = successful_entries(&store, "production")?;
     assert_eq!(snapshots.len(), 1);
-    assert_eq!(
+    assert!(
         rollback_of(&snapshots[0])
             .get(&SlotId::parse("p1").unwrap())
-            .map(|e| e.binding()),
-        Some(
-            &PhysicalBinding::new(ServerId::parse("server-01").unwrap(), "/srv/move/movedir-a",)
-                .expect("test binding is absolute and traversal-free")
-        ),
+            .map(|e| e.binding())
+            .expect("the snapshot records the slot")
+            .same_physical_location(
+                &PhysicalBinding::from_config(
+                    ServerId::parse("server-01").unwrap(),
+                    "/srv/move/movedir-a",
+                )
+                .expect("test binding is absolute and traversal-free"),
+            ),
         "s0 records the slot's {{server, deploy_dir}} binding"
     );
     assert!(
-        remotes_base.join("server-01/current").exists(),
+        remotes_base
+            .join("server-01/srv/move/movedir-a/current")
+            .exists(),
         "server-01 hosts the deployed slot after s0"
     );
 
@@ -709,19 +730,19 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
     // Exact rollback to s0 must FAIL with the binding mismatch naming the
     // directory change, and must not touch the remote state at either
-    // location (in this harness the transport root is `remotes/server-01`
-    // regardless of deploy_dir, so "the wrong location" shows up as any
-    // change on that root: a new generation, a moved `current`, new
-    // objects).
-    let root = remotes_base.join("server-01");
+    // location (the transport root is the deploy_dir, so the moved
+    // deploy_dir is a NEW physical location with a NEW receiver UUID — the
+    // refused rollback must leave both locations untouched).
+    let root_a = remotes_base.join("server-01/srv/move/movedir-a");
+    let root_b = remotes_base.join("server-01/srv/move/movedir-b");
     let gen_count = |root: &std::path::Path| -> usize {
         std::fs::read_dir(root.join("generations"))
             .map(|it| it.count())
             .unwrap_or(0)
     };
     let current_target = |root: &std::path::Path| std::fs::read_link(root.join("current")).ok();
-    let gens_before = gen_count(&root);
-    let current_before = current_target(&root);
+    let gens_before = gen_count(&root_a);
+    let current_before = current_target(&root_a);
     assert!(
         gens_before >= 1,
         "the first deployment minted at least one generation"
@@ -743,9 +764,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     .expect_err("moved deploy_dir must refuse exact rollback");
     let msg = err.to_string();
     assert!(
-        msg.contains(&format!(
-            "slot 'p1' was bound to server 'server-01' at '/srv/move/movedir-a' in deployment '{dep0}' of target 'production'"
-        )),
+        msg.contains("slot 'p1' was bound to server 'server-01' at '/srv/move/movedir-a'")
+            && msg.contains(&format!("in deployment '{dep0}' of target 'production'")),
         "error must name the slot, the recorded server AND its deploy_dir, got: {msg}"
     );
     assert!(
@@ -757,18 +777,22 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         "error must say the rollback would hit the wrong place, got: {msg}"
     );
     assert_eq!(
-        gen_count(&root),
+        gen_count(&root_a),
         gens_before,
         "refused rollback must not mint a generation on the new location"
     );
     assert_eq!(
-        current_target(&root),
+        current_target(&root_a),
         current_before,
         "refused rollback must not move `current` away from the s0 location"
     );
     assert!(
-        root.join("current").exists(),
+        root_a.join("current").exists(),
         "the s0 location keeps its deployment untouched"
+    );
+    assert!(
+        !root_b.exists(),
+        "the refused rollback must not provision the moved location"
     );
 
     // A fresh HEAD push on the MOVED binding is a REAL deployment: the
@@ -795,12 +819,12 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         "the HEAD push after a slot-only change materializes a new release"
     );
     assert_eq!(
-        gen_count(&root),
-        gens_before + 1,
-        "the HEAD push mints exactly one new generation"
+        gen_count(&root_b),
+        1,
+        "the HEAD push mints exactly one new generation on the moved location"
     );
     assert_ne!(
-        current_target(&root),
+        current_target(&root_b),
         current_before,
         "the HEAD push advances `current` to the new generation"
     );

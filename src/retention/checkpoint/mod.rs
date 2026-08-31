@@ -740,7 +740,7 @@ mod tests {
                         variant: VariantName::parse("standard").unwrap(),
                         tree: test_tree_digest(tree),
                     },
-                    crate::ledger::PhysicalBinding::new(
+                    crate::ledger::PhysicalBinding::from_config(
                         ServerId::parse("s1").unwrap(),
                         "/srv/deploy/p1",
                     )

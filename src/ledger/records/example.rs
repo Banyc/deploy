@@ -102,6 +102,10 @@ pub(crate) fn canonical_doc_pair() -> (LedgerIntentWire, LedgerTerminalWire) {
     let binding_for = |sid: &SlotId, server: &str| crate::ledger::PhysicalBinding {
         server: ServerId::new(server.to_string()),
         deploy_dir: format!("/srv/deploy/{}", sid.as_str()),
+        receiver_uuid: Some(crate::identity::test_receiver_uuid(&format!(
+            "recv-{}",
+            sid.as_str()
+        ))),
     };
 
     let slot_ids: Vec<SlotId> = slots

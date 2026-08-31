@@ -571,6 +571,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &BTreeMap::new(),
                 &store,
                 &config,
+                &BTreeMap::new(),
             )
             .map(|planned| (planned.assignments, planned.releases, planned.origin))
             .unwrap_or_else(|e| panic!("group {group} must plan a direct release: {e}"));
@@ -649,6 +650,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &BTreeMap::new(),
                 &store,
                 &drifted,
+                &BTreeMap::new(),
             )
             .expect_err(&format!(
                 "a 4th slot added to the target must refuse every group ({group})"
@@ -820,6 +822,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &variant_trees,
             &store,
             &config,
+            &BTreeMap::new(),
         )
         .map(|planned| (planned.assignments, planned.releases, planned.origin))
         .expect("HEAD --group G must plan the current partition");
@@ -850,6 +853,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &variant_trees,
             &store,
             &config,
+            &BTreeMap::new(),
         )
         .map(|planned| (planned.assignments, planned.releases, planned.origin))
         .expect("release:<id> --group G must plan the frozen partition");
@@ -943,6 +947,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &variant_trees,
             &store,
             &config2,
+            &BTreeMap::new(),
         )
         .map(|planned| (planned.assignments, planned.releases, planned.origin))
         .expect("a frozen-only group must still resolve for the release ref");
@@ -959,6 +964,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &variant_trees,
             &store,
             &config2,
+            &BTreeMap::new(),
         )
         .expect_err("HEAD must refuse a group unknown in the current config");
         assert!(
@@ -1007,6 +1013,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &variant_trees,
             &store,
             &config,
+            &BTreeMap::new(),
         )
         .expect_err("a frozen group selecting zero slots must be a config error");
         assert!(
@@ -1163,6 +1170,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &variant_trees,
                 &store,
                 &config,
+                &BTreeMap::new(),
+
             )
                 .map(|planned| (planned.assignments, planned.releases, planned.origin))
             .unwrap_or_else(|e| {
@@ -1195,6 +1204,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &variant_trees,
                 &store,
                 &config,
+                &BTreeMap::new(),
+
             )
                 .map(|planned| (planned.assignments, planned.releases, planned.origin))
             .unwrap_or_else(|e| {
@@ -1377,6 +1388,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 )]),
                 &store,
                 &config2,
+                &BTreeMap::new(),
+
             )
             .expect("HEAD resolves the fixture target");
             let resolved = planned.resolved();

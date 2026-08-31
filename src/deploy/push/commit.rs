@@ -350,6 +350,7 @@ pub(crate) mod commit_tests {
     use proptest::prelude::*;
     #[cfg(test)]
     use proptest::test_runner::RngSeed;
+    use std::collections::BTreeMap;
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
@@ -967,7 +968,7 @@ pub(crate) mod commit_tests {
             &id_a,
             &target_a,
             &desired_ref.assignment.artifact,
-            crate::ledger::PhysicalBinding::new(ServerId::parse("s1").unwrap(), "/srv/eng")
+            crate::ledger::PhysicalBinding::from_config(ServerId::parse("s1").unwrap(), "/srv/eng")
                 .expect("test binding is absolute and traversal-free"),
             &baseline.behavior_sha256,
             Some(&head),
@@ -1067,7 +1068,7 @@ pub(crate) mod commit_tests {
             &id_a,
             &desired_ref.generation.clone(),
             &desired_ref.assignment.artifact,
-            crate::ledger::PhysicalBinding::new(ServerId::parse("s1").unwrap(), "/srv/eng")
+            crate::ledger::PhysicalBinding::from_config(ServerId::parse("s1").unwrap(), "/srv/eng")
                 .expect("test binding is absolute and traversal-free"),
             &baseline.behavior_sha256.clone(),
             Some(&head),
@@ -1134,8 +1135,11 @@ pub(crate) mod commit_tests {
                 &test_deployment_id(id),
                 &desired_ref.generation,
                 &desired_ref.assignment.artifact,
-                crate::ledger::PhysicalBinding::new(ServerId::parse("s1").unwrap(), "/srv/eng")
-                    .expect("test binding is absolute and traversal-free"),
+                crate::ledger::PhysicalBinding::from_config(
+                    ServerId::parse("s1").unwrap(),
+                    "/srv/eng",
+                )
+                .expect("test binding is absolute and traversal-free"),
                 &baseline.behavior_sha256,
                 Some(&head),
             )
@@ -1199,7 +1203,7 @@ pub(crate) mod commit_tests {
             &test_deployment_id("deploy-multi-b"),
             &desired_ref.generation,
             &desired_ref.assignment.artifact,
-            crate::ledger::PhysicalBinding::new(ServerId::parse("s1").unwrap(), "/srv/eng")
+            crate::ledger::PhysicalBinding::from_config(ServerId::parse("s1").unwrap(), "/srv/eng")
                 .expect("test binding is absolute and traversal-free"),
             &baseline.behavior_sha256,
             Some(&a),
@@ -1967,7 +1971,7 @@ pub(crate) mod commit_tests {
             let op_id = OperationId::new("op-frozen-binding-prop".to_string());
             let mut txn =
                 crate::store::local::ledger::TargetLedgerTxn::open(&h.store, "t1", "test").unwrap();
-            reconcile_pending_commits(&mut txn, &live, &op_id, &helpers).unwrap();
+            reconcile_pending_commits(&mut txn, &live, &op_id, &helpers, &BTreeMap::new()).unwrap();
 
             let status = h
                 .store
@@ -2279,7 +2283,7 @@ pub(crate) mod commit_tests {
             let op_id = OperationId::new("op-swap-prop".to_string());
             let mut txn =
                 crate::store::local::ledger::TargetLedgerTxn::open(&h.store, "t1", "test").unwrap();
-            reconcile_pending_commits(&mut txn, &h.config, &op_id, &helpers).unwrap();
+            reconcile_pending_commits(&mut txn, &h.config, &op_id, &helpers, &BTreeMap::new()).unwrap();
 
             let status = h
                 .store

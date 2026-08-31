@@ -378,6 +378,8 @@ mod groups_tests {
                         &BTreeMap::new(),
                         &store,
                         &config,
+                        &BTreeMap::new(),
+
                     )
                         .map(|planned| (planned.assignments, planned.releases, planned.origin))
                     .unwrap_or_else(|e| {
@@ -454,6 +456,8 @@ mod groups_tests {
                     &BTreeMap::new(),
                     &store,
                     &config,
+                    &BTreeMap::new(),
+
                 )
                 .expect_err("membership drift must refuse direct release planning");
                 let msg = err.to_string();
@@ -471,6 +475,8 @@ mod groups_tests {
                     &BTreeMap::new(),
                     &store,
                     &config,
+                    &BTreeMap::new(),
+
                 )
                     .map(|planned| (planned.assignments, planned.releases, planned.origin))
                 .expect("t2's membership is unchanged, so it still plans");

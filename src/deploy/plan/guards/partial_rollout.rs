@@ -6,11 +6,12 @@ use crate::deploy::plan::SlotSelection;
 use crate::deploy::plan::latest_successful_rollback;
 use crate::error::Error;
 use crate::error::Result;
+use crate::identity::ReceiverUuid;
 use crate::identity::ServerId;
 use crate::identity::SlotId;
 use crate::ledger::PhysicalBinding;
 use crate::store::local::LocalStore;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 // PARTIAL-ROLLOUT GUARDS (A1): the first-deployment / membership-change
 // rules a group push must satisfy before ANY remote mutation. The guard's
@@ -27,8 +28,9 @@ use std::collections::HashSet;
 /// * After target membership changes, a partial push is allowed only when
 ///   every current UNSELECTED slot has a prior assignment in the base AND its
 ///   physical binding still matches (a slot added to the target after the
-///   base, or rebound/moved since, would otherwise be silently dropped from
-///   the new snapshot).
+///   base, or whose PHYSICAL RECEIVER changed — the deploy_dir's immutable
+///   receiver UUID, the physical identity — would otherwise be silently
+///   dropped from the new snapshot).
 ///
 /// A full-target push (no group) is always allowed: it establishes a new
 /// complete snapshot from its own actuals.
@@ -39,11 +41,15 @@ use std::collections::HashSet;
 /// current configuration: a historical release's frozen group partition may
 /// legitimately differ from the current one, and the guard must compare the
 /// slots the push actually selects against the current membership.
+/// `receiver_uuids` carries each member slot's CURRENT receiver UUID read
+/// from its provisioned remote during preflight (`None` when the deploy_dir
+/// is not yet provisioned).
 pub(crate) fn validate_partial_rollout(
     selection: &SlotSelection,
     selected: &[SlotId],
     config: &ProjectConfig,
     store: &LocalStore,
+    receiver_uuids: &BTreeMap<SlotId, Option<ReceiverUuid>>,
 ) -> Result<()> {
     if selection.group.is_none() {
         return Ok(());
@@ -81,12 +87,21 @@ pub(crate) fn validate_partial_rollout(
                 let slot_id =
                     SlotId::parse(slot.id.as_str()).expect("validated slot id is a safe segment");
 
-                let current_binding = PhysicalBinding::new(
-                    ServerId::parse(sdef.id.as_str())
-                        .expect("validated server id is a safe segment"),
-                    slot.deploy_dir(),
-                )
-                .expect("a config-validated deploy_dir is absolute and traversal-free");
+                let current_binding = match receiver_uuids.get(&slot_id) {
+                    Some(Some(uuid)) => PhysicalBinding::new(
+                        ServerId::parse(sdef.id.as_str())
+                            .expect("validated server id is a safe segment"),
+                        slot.deploy_dir(),
+                        uuid.clone(),
+                    )
+                    .expect("a config-validated deploy_dir is absolute and traversal-free"),
+                    _ => PhysicalBinding::from_config(
+                        ServerId::parse(sdef.id.as_str())
+                            .expect("validated server id is a safe segment"),
+                        slot.deploy_dir(),
+                    )
+                    .expect("a config-validated deploy_dir is absolute and traversal-free"),
+                };
                 if base.get(&slot_id).is_none() {
                     return Err(Error::preflight(format!(
                         "partial rollout of target '{}' with group '{}' is refused: unselected slot \
@@ -106,18 +121,26 @@ pub(crate) fn validate_partial_rollout(
                         slot_id
                     ))
                 })?;
-                if recorded != &current_binding {
+                if !recorded.same_physical_location(&current_binding) {
                     return Err(Error::preflight(format!(
                         "partial rollout of target '{}' with group '{}' is refused: unselected slot \
-                         '{}' was bound to server '{}' at '{}' in the latest successful snapshot, \
-                         now bound to '{}' at '{}'; the new snapshot could not carry it forward",
+                         '{}' was bound to server '{}' at '{}' (receiver '{}') in the latest successful snapshot, \
+                         now bound to '{}' at '{}' (receiver '{}'); the new snapshot could not carry it forward",
                         selection.target,
                         selection.group.as_deref().unwrap_or(""),
                         slot_id,
                         recorded.server(),
                         recorded.deploy_dir(),
+                        recorded
+                            .receiver_uuid()
+                            .map(|u| u.as_str())
+                            .unwrap_or("<unknown>"),
                         current_binding.server(),
-                        current_binding.deploy_dir()
+                        current_binding.deploy_dir(),
+                        current_binding
+                            .receiver_uuid()
+                            .map(|u| u.as_str())
+                            .unwrap_or("<unknown>"),
                     )));
                 }
             }

@@ -1552,7 +1552,7 @@ exec /usr/bin/test "$@"
                 result: SnapshotSlot::new(
                     new_gen.clone(),
                     artifact,
-                    crate::ledger::PhysicalBinding::new(
+                    crate::ledger::PhysicalBinding::from_config(
                         crate::identity::ServerId::parse(server.id.as_str()).unwrap(),
                         slot.deploy_dir(),
                     )

@@ -1070,11 +1070,16 @@ impl ProjectConfig {
     /// ID: the complete `{server, deploy_dir}` binding ([`PhysicalBinding`])
     /// each slot currently has in the configuration — the physical server
     /// AND the absolute on-server directory its deployment state lives in.
-    /// Used to record (and later verify) the exact physical location a
-    /// deployment snapshot's slots were deployed onto: exact rollback must
-    /// see BOTH halves unchanged, because a slot that keeps its server but
-    /// moves its `deploy_dir` would otherwise roll back onto the new
-    /// location.
+    /// The bindings are CONFIG-DERIVED ([`PhysicalBinding::from_config`]):
+    /// their receiver UUID (the deploy_dir's PHYSICAL identity) is a
+    /// runtime fact read from the provisioned remote during preflight and
+    /// filled in by [`PhysicalBinding::with_receiver_uuid`] there — the
+    /// config itself cannot know it. Used to record (and later verify) the
+    /// exact physical location a deployment snapshot's slots were deployed
+    /// onto: exact rollback must see the receiver UUID unchanged, because a
+    /// slot that keeps its server but moves its `deploy_dir` (or whose
+    /// physical receiver changed under the same ServerId/path) would
+    /// otherwise roll back onto the new location.
     pub fn target_slot_bindings(
         &self,
         target_name: &str,
@@ -1085,7 +1090,7 @@ impl ProjectConfig {
             .map(|(slot, server)| {
                 (
                     SlotId::parse(slot.id.as_str()).expect("validated slot id is a safe segment"),
-                    PhysicalBinding::new(
+                    PhysicalBinding::from_config(
                         ServerId::parse(server.id.as_str())
                             .expect("validated server id is a safe segment"),
                         slot.deploy_dir(),

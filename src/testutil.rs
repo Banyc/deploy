@@ -1945,7 +1945,7 @@ pub(crate) mod fixtures {
 
     /// The canonical test binding for a slot.
     pub(crate) fn binding(sid: &SlotId) -> PhysicalBinding {
-        PhysicalBinding::new(
+        PhysicalBinding::from_config(
             crate::identity::ServerId::parse("s1").unwrap(),
             format!("/srv/deploy/{}", sid.as_str()),
         )

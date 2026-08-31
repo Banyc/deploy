@@ -53,6 +53,10 @@ fn valid_acquisition_id(s: &str) -> bool {
     valid_uuid_v7_id(s, "acq-")
 }
 
+fn valid_receiver_uuid(s: &str) -> bool {
+    valid_uuid_v7_id(s, "recv-")
+}
+
 id_newtype!(
     DeploymentId,
     valid_deployment_id,
@@ -77,6 +81,16 @@ id_newtype!(
     "A lock acquisition identity: `acq-<uuid-v7>` (the exact form \
      [`AcquisitionId::generate`] produces)."
 );
+id_newtype!(
+    ReceiverUuid,
+    valid_receiver_uuid,
+    "A receiver UUID: `recv-<uuid-v7>` (the exact form \
+     [`ReceiverUuid::generate`] produces). The IMMUTABLE PHYSICAL identity \
+     of one provisioned deploy_dir — created once at provisioning, never \
+     changed — so two ServerIds that name the same physical host+dir \
+     collapse to the same receiver, and a slot rebound to a different \
+     ServerId pointing at the same physical location keeps its receiver."
+);
 
 impl DeploymentId {
     pub fn generate() -> Self {
@@ -99,6 +113,12 @@ impl OperationId {
 impl AcquisitionId {
     pub fn generate() -> Self {
         AcquisitionId(format!("acq-{}", new_uuid_v7()))
+    }
+}
+
+impl ReceiverUuid {
+    pub fn generate() -> Self {
+        ReceiverUuid(format!("recv-{}", new_uuid_v7()))
     }
 }
 
@@ -148,6 +168,11 @@ pub(crate) fn test_acquisition_id(tag: &str) -> AcquisitionId {
 }
 
 #[cfg(test)]
+pub(crate) fn test_receiver_uuid(tag: &str) -> ReceiverUuid {
+    ReceiverUuid::parse(&format!("recv-{}", test_uuid_v7(tag))).expect("canonical test id")
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::identity::RolloutGroupName;
@@ -181,11 +206,14 @@ mod tests {
         assert_eq!(GenerationId::parse(gid.as_str()).expect("canonical"), gid);
         let op = test_operation_id("ok");
         assert_eq!(OperationId::parse(op.as_str()).expect("canonical"), op);
+        let recv = test_receiver_uuid("ok");
+        assert_eq!(ReceiverUuid::parse(recv.as_str()).expect("canonical"), recv);
         for bad in [
             "",
             "deploy-",
             "gen-",
             "op-",
+            "recv-",
             "deploy",
             "deploy-0192a3b4c5d6e7f8a9b0c1d2e3f4a5b6", // simple form, no hyphens
             "deploy-0192a3b4-c5d6-4e7f-8a9b-0c1d2e3f4a5b6", // v4
@@ -198,12 +226,14 @@ mod tests {
             DeploymentId::parse(bad).expect_err("invalid deployment id rejected");
             GenerationId::parse(bad).expect_err("invalid generation id rejected");
             OperationId::parse(bad).expect_err("invalid operation id rejected");
+            ReceiverUuid::parse(bad).expect_err("invalid receiver uuid rejected");
         }
         // A valid uuid under the WRONG prefix is rejected for that type.
         let u = test_uuid_v7("x");
         DeploymentId::parse(&format!("gen-{u}")).expect_err("wrong prefix rejected");
         GenerationId::parse(&format!("deploy-{u}")).expect_err("wrong prefix rejected");
         OperationId::parse(&format!("deploy-{u}")).expect_err("wrong prefix rejected");
+        ReceiverUuid::parse(&format!("deploy-{u}")).expect_err("wrong prefix rejected");
     }
 
     /// Wire strings go through the validated parse: an invalid wire identity
@@ -341,6 +371,7 @@ mod tests {
             let expected_dep = is_valid_uuid_v7_id(&s, "deploy-");
             let expected_gen = is_valid_uuid_v7_id(&s, "gen-");
             let expected_op = is_valid_uuid_v7_id(&s, "op-");
+            let expected_recv = is_valid_uuid_v7_id(&s, "recv-");
             let expected_digest = is_valid_hex_digest(&s);
             let expected_segment = is_safe_segment(&s);
             assert_eq!(
@@ -357,6 +388,11 @@ mod tests {
                 OperationId::parse(&s).is_ok(),
                 expected_op,
                 "OperationId: {s:?}"
+            );
+            assert_eq!(
+                ReceiverUuid::parse(&s).is_ok(),
+                expected_recv,
+                "ReceiverUuid: {s:?}"
             );
             assert_eq!(
                 TreeDigest::parse(&s).is_ok(),

@@ -108,6 +108,13 @@ pub(crate) struct PreflightOutcome {
     /// three-state observations ([`Observation<PreviousGeneration>`]), used
     /// DIRECTLY (no intermediate re-wrap).
     pub pre_push: BTreeMap<SlotId, Observation<PreviousGeneration>>,
+    /// Each planned slot's deploy_dir's IMMUTABLE receiver UUID — the
+    /// PHYSICAL identity of the provisioned deployment location, read from
+    /// the remote AFTER provisioning (phase B) and recorded in the intent's
+    /// binding. `None` ONLY for a dry run (which never provisions — a
+    /// not-yet-provisioned deploy_dir has no marker yet); a real push's
+    /// provisioned deploy_dir always carries one.
+    pub receiver_uuids: BTreeMap<SlotId, Option<crate::identity::ReceiverUuid>>,
     /// The plan persisted BEFORE any server mutation.
     pub plan: DeploymentPlan,
 }
@@ -234,6 +241,26 @@ pub(crate) fn run_preflight(
     // current physical slots).
     let all_members = config.target_slots(target_name)?;
 
+    // Read each member slot's deploy_dir's IMMUTABLE receiver UUID from its
+    // remote — the PHYSICAL identity of the provisioned deployment location
+    // (created once at provisioning). A not-yet-provisioned deploy_dir has
+    // no marker yet → `None` (the marker is created by `provision_layout`
+    // in phase B below). The guards (recovery binding-drift, exact
+    // rollback, partial rollout) compare the receiver UUID — two ServerIds
+    // naming the same physical host+dir share the receiver, and a slot
+    // whose physical receiver changed (even under the same ServerId/path)
+    // must NOT receive the historical generations.
+    let mut receiver_uuids: BTreeMap<SlotId, Option<crate::identity::ReceiverUuid>> =
+        BTreeMap::new();
+    for (slot, _s) in &all_members {
+        let slot_id = SlotId::parse(slot.id.as_str()).expect("validated slot id is a safe segment");
+        let r = remotes.get(&slot_id).unwrap();
+        receiver_uuids.insert(
+            slot_id,
+            crate::remote::transport::read_receiver_uuid_opt(r.as_ref())?,
+        );
+    }
+
     // Reconcile `PendingCommit` attempts left by earlier pushes BEFORE the
     // ref is resolved and BEFORE the early no-op check: an up-to-date push
     // must complete the missing commit markers (and advance the snapshot log)
@@ -258,7 +285,7 @@ pub(crate) fn run_preflight(
             .as_mut()
             .expect("a real push holds the target ledger txn");
         if let Some(RecoveryOutcome::StillPending) =
-            reconcile_pending_commits(txn, config, op_id, helpers)?
+            reconcile_pending_commits(txn, config, op_id, helpers, &receiver_uuids)?
         {
             return Err(Error::conflict("a previous deployment is still pending"));
         }
@@ -443,6 +470,7 @@ pub(crate) fn run_preflight(
         &variant_trees,
         store,
         config,
+        &receiver_uuids,
     )?;
     // The PROOF-BEARING resolution is consumed BY ACCESSOR (the planner is
     // the only constructor; the engine never builds one).
@@ -499,7 +527,13 @@ pub(crate) fn run_preflight(
     // accessor (`planned.resolved().slots()`), the exact non-empty slot set
     // the planner resolved against the reference's declared temporal source.
     let planned_slot_ids: Vec<SlotId> = resolved_sel.slots().iter().cloned().collect();
-    crate::deploy::plan::validate_partial_rollout(selection, &planned_slot_ids, config, store)?;
+    crate::deploy::plan::validate_partial_rollout(
+        selection,
+        &planned_slot_ids,
+        config,
+        store,
+        &receiver_uuids,
+    )?;
 
     // Behavior coverage gate: EVERY planned assignment's (release, variant)
     // must have a frozen behavior contract BEFORE any remote state is touched
@@ -550,6 +584,23 @@ pub(crate) fn run_preflight(
                 }
             }
         }
+    }
+
+    // Re-read each member slot's receiver UUID AFTER provisioning: a real
+    // push's `provision_layout` above created the marker, so every
+    // provisioned deploy_dir now carries its IMMUTABLE physical identity
+    // (the intent's binding records it; exact rollback compares it). A dry
+    // run never provisions, so a not-yet-provisioned deploy_dir stays
+    // `None` (the dry run records no intent).
+    let mut provisioned_receiver_uuids: BTreeMap<SlotId, Option<crate::identity::ReceiverUuid>> =
+        BTreeMap::new();
+    for (slot, _s) in &members {
+        let slot_id = SlotId::parse(slot.id.as_str()).expect("validated slot id is a safe segment");
+        let r = remotes.get(&slot_id).unwrap();
+        provisioned_receiver_uuids.insert(
+            slot_id,
+            crate::remote::transport::read_receiver_uuid_opt(r.as_ref())?,
+        );
     }
 
     // Build the per-slot plan with expected (pre-push) generation.
@@ -626,6 +677,7 @@ pub(crate) fn run_preflight(
         plan_servers,
         new_gen,
         pre_push,
+        receiver_uuids: provisioned_receiver_uuids,
         plan,
     })
 }
@@ -1941,7 +1993,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             // valid for the ledger to load at all.
             BTreeMap::from([(
                 SlotId::parse("p1").unwrap(),
-                crate::ledger::PhysicalBinding::new(
+                crate::ledger::PhysicalBinding::from_config(
                     crate::identity::ServerId::parse("s1").unwrap(),
                     "/srv/eng",
                 )
@@ -2353,7 +2405,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             assert_eq!(r0.status, Some(DeploymentStatus::Successful));
             let chain_artifact = known_artifact(&r0.attempt.as_ref().expect("attempt").slots[&slot])
                 .clone();
-            let bindings = crate::ledger::PhysicalBinding::new(
+            let bindings = crate::ledger::PhysicalBinding::from_config(
                     crate::identity::ServerId::parse("s1").unwrap(),
                     "/srv/eng",
                 )
@@ -2641,7 +2693,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 release: crate::identity::test_release_id("rel-sha256-1111"),
                 variant: VariantName::parse("p1").unwrap(),
                 tree: test_tree_digest("aa")};
-            let bindings = crate::ledger::PhysicalBinding::new(
+            let bindings = crate::ledger::PhysicalBinding::from_config(
                 crate::identity::ServerId::parse("s1").unwrap(),
                 "/srv/eng",
             )

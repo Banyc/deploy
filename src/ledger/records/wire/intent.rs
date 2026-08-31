@@ -417,7 +417,7 @@ impl Default for DeploymentIntent {
             )
             .unwrap(),
         };
-        let binding = crate::ledger::PhysicalBinding::new(
+        let binding = crate::ledger::PhysicalBinding::from_config(
             crate::identity::ServerId::parse("s1").unwrap(),
             "/srv/deploy/p1",
         )

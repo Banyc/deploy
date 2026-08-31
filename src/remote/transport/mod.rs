@@ -317,15 +317,93 @@ pub trait Remote {
 
     /// Create the deployment-directory layout before the first mutation.
     /// Construction is side-effect-free; layout provisioning happens only after
-    /// the push engine's non-dry-run gate.
+    /// the push engine's non-dry-run gate. The DEFAULT creates the deploy_dir's
+    /// IMMUTABLE receiver-UUID marker (the PHYSICAL identity of the deploy_dir,
+    /// created ONCE at provisioning and never changed) — the transports that
+    /// override this method ([`LocalTransport`], [`SshTransport`]) create the
+    /// full layout AND the marker; the default (test wrappers delegating to an
+    /// inner transport) creates the marker alone.
     fn provision_layout(&self) -> Result<()> {
-        let _ = self;
+        provision_receiver_uuid(self)?;
         Ok(())
     }
 }
 
 fn join(root: &Path, rel: &RootedRelativePath) -> PathBuf {
     root.join(rel.as_path())
+}
+
+/// Read the deploy_dir's IMMUTABLE receiver-UUID marker
+/// ([`crate::remote::layout::receiver_uuid`]) and parse it. Fails closed on
+/// a MISSING marker (the deploy_dir was never provisioned, or was
+/// provisioned before the receiver-UUID feature) and on a MALFORMED marker
+/// (a tampered/foreign marker is never accepted as a physical identity).
+pub(crate) fn read_receiver_uuid<R: Remote + ?Sized>(
+    remote: &R,
+) -> Result<crate::identity::ReceiverUuid> {
+    read_receiver_uuid_opt(remote)?.ok_or_else(|| {
+        Error::transport(format!(
+            "deploy_dir {}: no receiver-UUID marker (the deploy_dir was never provisioned, or was provisioned before the receiver-UUID feature)",
+            remote.root().display()
+        ))
+    })
+}
+
+/// Read the deploy_dir's receiver-UUID marker, returning `Ok(None)` ONLY for
+/// a CONFIRMED absent marker (a not-yet-provisioned deploy_dir — the marker
+/// is created by [`provision_receiver_uuid`] during provisioning). A read
+/// failure or a malformed marker is an `Err` (fail closed — a marker that
+/// exists but cannot be parsed is never silently treated as absent).
+pub(crate) fn read_receiver_uuid_opt<R: Remote + ?Sized>(
+    remote: &R,
+) -> Result<Option<crate::identity::ReceiverUuid>> {
+    let marker = crate::remote::layout::receiver_uuid();
+    if remote.metadata_opt(&marker)?.is_none() {
+        return Ok(None);
+    }
+    let data = remote.read(&marker)?;
+    let s = std::str::from_utf8(&data).map_err(|e| {
+        Error::transport(format!(
+            "deploy_dir {}: the receiver-UUID marker is not valid UTF-8: {e}",
+            remote.root().display()
+        ))
+    })?;
+    crate::identity::ReceiverUuid::parse(s.trim())
+        .map_err(|e| {
+            Error::transport(format!(
+                "deploy_dir {}: the receiver-UUID marker is malformed: {e}",
+                remote.root().display()
+            ))
+        })
+        .map(Some)
+}
+
+/// Provision the deploy_dir's IMMUTABLE receiver-UUID marker: create it ONCE
+/// (a fresh [`crate::identity::ReceiverUuid`]) and return the deploy_dir's
+/// physical identity. The marker is never replaced: a re-provisioning or a
+/// concurrent provisioner adopts the EXISTING marker (the first writer wins —
+/// the deploy_dir's physical identity is whatever was created first), and a
+/// marker with different content is adopted too (fail closed on a malformed
+/// marker, never on a differing-but-valid one: the physical identity is
+/// immutable, so the existing marker is the truth).
+pub(crate) fn provision_receiver_uuid<R: Remote + ?Sized>(
+    remote: &R,
+) -> Result<crate::identity::ReceiverUuid> {
+    let marker = crate::remote::layout::receiver_uuid();
+    // Fast path: the deploy_dir already carries its immutable identity.
+    if remote.metadata_opt(&marker)?.is_some() {
+        return read_receiver_uuid(remote);
+    }
+    let uuid = crate::identity::ReceiverUuid::generate();
+    match remote.try_write_new(&marker, uuid.as_str().as_bytes())? {
+        CreateNewVerdict::Created => Ok(uuid),
+        // A concurrent provisioner won the create-new race (or the marker
+        // exists with different content): the deploy_dir's identity is
+        // whatever was created FIRST — adopt it, never replace it.
+        CreateNewVerdict::AlreadyPresent | CreateNewVerdict::Conflict(_) => {
+            read_receiver_uuid(remote)
+        }
+    }
 }
 
 /// True when `p` has at least one NORMAL path component below the root —
@@ -1330,6 +1408,10 @@ impl Remote for LocalTransport {
                     .map_err(|e| Error::transport(format!("mkdir {}: {e}", p.display())))?;
             }
         }
+        // The deploy_dir's IMMUTABLE receiver-UUID marker: the PHYSICAL
+        // identity of this deploy_dir, created ONCE at provisioning and
+        // never changed (a re-provisioning adopts the existing marker).
+        provision_receiver_uuid(self)?;
         Ok(())
     }
 
@@ -1689,6 +1771,54 @@ impl LocalTransport {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// The deploy_dir's IMMUTABLE receiver-UUID marker: `provision_layout`
+    /// creates it ONCE, a re-provisioning adopts the SAME identity (never a
+    /// new one), and `read_receiver_uuid` reads it back — the PHYSICAL
+    /// identity exact rollback compares.
+    #[test]
+    fn provision_layout_creates_immutable_receiver_uuid() {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let t = LocalTransport::new(&SysEnv::from_process(), dir.path().join("r")).unwrap();
+        t.provision_layout().unwrap();
+        let marker = crate::remote::layout::receiver_uuid();
+        assert!(
+            t.exists(&marker),
+            "provisioning creates the receiver-UUID marker"
+        );
+        let first = read_receiver_uuid(&t).expect("the marker reads back");
+        assert!(
+            first.as_str().starts_with("recv-"),
+            "the marker carries a receiver UUID, got {:?}",
+            first.as_str()
+        );
+        // Re-provisioning (a second push to the same deploy_dir) adopts the
+        // SAME immutable identity — never a new one.
+        t.provision_layout().unwrap();
+        let second = read_receiver_uuid(&t).expect("the marker reads back");
+        assert_eq!(
+            first, second,
+            "the receiver UUID is IMMUTABLE: re-provisioning adopts the existing marker"
+        );
+        // A pre-existing marker with DIFFERENT content is adopted too (the
+        // first writer wins — the physical identity is whatever was created
+        // first), and a malformed marker fails closed.
+        let t2 = LocalTransport::new(&SysEnv::from_process(), dir.path().join("r2")).unwrap();
+        t2.provision_layout().unwrap();
+        let foreign = crate::identity::ReceiverUuid::generate();
+        t2.write(&marker, foreign.as_str().as_bytes(), 0o644)
+            .unwrap();
+        t2.provision_layout().unwrap();
+        assert_eq!(
+            read_receiver_uuid(&t2).expect("the existing marker is adopted"),
+            foreign,
+            "a re-provisioning never replaces the existing marker"
+        );
+        let t3 = LocalTransport::new(&SysEnv::from_process(), dir.path().join("r3")).unwrap();
+        t3.provision_layout().unwrap();
+        t3.write(&marker, b"not-a-uuid", 0o644).unwrap();
+        read_receiver_uuid(&t3).expect_err("a malformed marker fails closed");
+    }
 
     /// Concurrent readers must only ever observe the destination file fully
     /// written: installs happen by hard-linking a synced, complete temporary

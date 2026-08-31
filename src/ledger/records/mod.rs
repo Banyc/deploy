@@ -259,12 +259,18 @@ pub enum ActualSlotState {
 /// The complete PHYSICAL binding of one placement slot at terminal time: the
 /// actual server ([`ServerId`]) AND the absolute `deploy_dir` on that server
 /// where the slot's deployment state (objects, releases, generations,
-/// `current`) lives. Together `{server, deploy_dir}` name the exact on-host
-/// deployment location a terminal successful event's generations were
-/// advanced on. Exact rollback must verify BOTH halves: a slot that keeps
-/// its server but moves its `deploy_dir` would otherwise receive the
-/// historical generations at the new location, silently deploying to the
-/// wrong place on the same host.
+/// `current`) lives, PLUS the deploy_dir's IMMUTABLE receiver UUID
+/// ([`crate::identity::ReceiverUuid`]) — the PHYSICAL identity of the
+/// provisioned deploy_dir, created once at provisioning and read during
+/// preflight. Together `{server, deploy_dir, receiver_uuid}` name the exact
+/// on-host deployment location a terminal successful event's generations were
+/// advanced on. THE RECEIVER UUID IS THE PHYSICAL IDENTITY: two ServerIds
+/// that name the same physical host+dir share the same receiver, and a slot
+/// rebound to a different ServerId pointing at the same physical location
+/// keeps it — so exact rollback and duplicate-location detection compare the
+/// receiver UUID, and `ServerId`/`deploy_dir` are kept for display only. A
+/// slot whose physical receiver changed (even under the same ServerId/path)
+/// must NOT receive the historical generations.
 /// The fields are PRIVATE (invariant-bearing domain value): the
 /// `deploy_dir` carries the ABSOLUTE, TRAVERSAL-FREE on-server path
 /// invariant, enforced by the ONE validated constructor
@@ -272,16 +278,28 @@ pub enum ActualSlotState {
 /// routes every wire string through the same validation (a persisted
 /// record carrying a relative/traversal path fails deserialization — fail
 /// closed). A library caller can never hand-construct a binding with a junk
-/// `deploy_dir`; the wire JSON shape is UNCHANGED (`server` + `deploy_dir`
-/// strings).
+/// `deploy_dir`; the wire JSON shape gains the optional `receiver_uuid`
+/// string (`#[serde(default)]` — records written before the receiver-UUID
+/// feature stay loadable, carrying an UNKNOWN physical identity).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct PhysicalBinding {
     /// The physical server the slot was bound to at the time of the
-    /// deployment.
+    /// deployment (DISPLAY ONLY — the receiver UUID is the physical
+    /// identity exact rollback compares).
     server: ServerId,
     /// The absolute on-server directory the slot's deployment state lives
-    /// in, exactly as declared in the slot's `deploy_dir` at deployment time.
+    /// in, exactly as declared in the slot's `deploy_dir` at deployment time
+    /// (DISPLAY ONLY — the receiver UUID is the physical identity).
     deploy_dir: String,
+    /// The deploy_dir's IMMUTABLE receiver UUID — the PHYSICAL identity of
+    /// the provisioned deployment location. `None` ONLY when the physical
+    /// identity is UNKNOWN: a legacy record written before the
+    /// receiver-UUID feature, or a config-derived binding before the remote
+    /// was read. Exact rollback and duplicate-location detection compare it;
+    /// a binding whose receiver is unknown falls back to the legacy
+    /// `{server, deploy_dir}` comparison (the best available evidence).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receiver_uuid: Option<crate::identity::ReceiverUuid>,
 }
 
 impl PhysicalBinding {
@@ -289,12 +307,49 @@ impl PhysicalBinding {
     /// TRAVERSAL-FREE path with at least one normal component below the
     /// root (the same rule as [`crate::identity::AbsoluteDeployDir`] — the
     /// deployment cleanup/rotation/retention sweeps operate under it, so a
-    /// relative path or the filesystem root is never a legitimate binding).
-    /// The validated string is stored VERBATIM (no normalization — the wire
-    /// round trip is byte-exact).
-    pub fn new(server: ServerId, deploy_dir: impl AsRef<std::path::Path>) -> Result<Self> {
+    /// relative path or the filesystem root is never a legitimate binding),
+    /// and the binding carries the deploy_dir's IMMUTABLE receiver UUID
+    /// (the PHYSICAL identity, read from the provisioned remote during
+    /// preflight). The validated string is stored VERBATIM (no
+    /// normalization — the wire round trip is byte-exact).
+    pub fn new(
+        server: ServerId,
+        deploy_dir: impl AsRef<std::path::Path>,
+        receiver_uuid: crate::identity::ReceiverUuid,
+    ) -> Result<Self> {
         let s = deploy_dir.as_ref().to_string_lossy();
-        let path = std::path::Path::new(s.as_ref());
+        Self::validate_deploy_dir(&s)?;
+        Ok(PhysicalBinding {
+            server,
+            deploy_dir: s.into_owned(),
+            receiver_uuid: Some(receiver_uuid),
+        })
+    }
+
+    /// The CONFIG-DERIVED constructor: the `{server, deploy_dir}` binding
+    /// from the caller's configuration, whose receiver UUID is NOT YET KNOWN
+    /// (the remote has not been provisioned/read — the receiver UUID is a
+    /// runtime fact read from the provisioned deploy_dir during preflight).
+    /// The receiver UUID is filled in by
+    /// [`PhysicalBinding::with_receiver_uuid`] once the remote is read; a
+    /// binding that stays config-derived carries an UNKNOWN physical
+    /// identity (`receiver_uuid: None`) and compares by the legacy
+    /// `{server, deploy_dir}` evidence.
+    pub fn from_config(server: ServerId, deploy_dir: impl AsRef<std::path::Path>) -> Result<Self> {
+        let s = deploy_dir.as_ref().to_string_lossy();
+        Self::validate_deploy_dir(&s)?;
+        Ok(PhysicalBinding {
+            server,
+            deploy_dir: s.into_owned(),
+            receiver_uuid: None,
+        })
+    }
+
+    /// The shared deploy_dir gate: ABSOLUTE, TRAVERSAL-FREE, with at least
+    /// one normal component below the root (the same rule as
+    /// [`crate::identity::AbsoluteDeployDir`]).
+    fn validate_deploy_dir(s: &str) -> Result<()> {
+        let path = std::path::Path::new(s);
         if !path.is_absolute() {
             return Err(Error::config(format!(
                 "invalid physical binding deploy_dir {:?}: must be an absolute path on the server",
@@ -320,25 +375,60 @@ impl PhysicalBinding {
                 s
             )));
         }
-        Ok(PhysicalBinding {
-            server,
-            deploy_dir: s.into_owned(),
-        })
+        Ok(())
     }
 
-    /// The physical server the slot was bound to.
+    /// The binding with the deploy_dir's receiver UUID filled in — the
+    /// preflight-read PHYSICAL identity. `ServerId`/`deploy_dir` are
+    /// unchanged (display only); the validated invariants are preserved.
+    pub fn with_receiver_uuid(&self, receiver_uuid: crate::identity::ReceiverUuid) -> Self {
+        PhysicalBinding {
+            server: self.server.clone(),
+            deploy_dir: self.deploy_dir.clone(),
+            receiver_uuid: Some(receiver_uuid),
+        }
+    }
+
+    /// The physical server the slot was bound to (DISPLAY ONLY — the
+    /// receiver UUID is the physical identity exact rollback compares).
     pub fn server(&self) -> &ServerId {
         &self.server
     }
-    /// The absolute on-server directory the slot's deployment state lives in.
+    /// The absolute on-server directory the slot's deployment state lives in
+    /// (DISPLAY ONLY — the receiver UUID is the physical identity).
     pub fn deploy_dir(&self) -> &str {
         &self.deploy_dir
+    }
+    /// The deploy_dir's IMMUTABLE receiver UUID — the PHYSICAL identity of
+    /// the provisioned deployment location. `None` ONLY when the physical
+    /// identity is UNKNOWN (a legacy record, or a config-derived binding
+    /// before the remote was read).
+    pub fn receiver_uuid(&self) -> Option<&crate::identity::ReceiverUuid> {
+        self.receiver_uuid.as_ref()
+    }
+
+    /// Whether two bindings name the SAME PHYSICAL deployment location. THE
+    /// RECEIVER UUID IS THE PHYSICAL IDENTITY: two bindings with equal
+    /// receiver UUIDs are one physical location (even under different
+    /// ServerIds/paths — two ServerIds naming the same physical host+dir
+    /// share the receiver); two with different receiver UUIDs are different
+    /// locations (even under the same ServerId/path — a slot whose physical
+    /// receiver changed must NOT receive the historical generations). A
+    /// binding whose receiver UUID is UNKNOWN on either side (a legacy
+    /// record, or a config-derived binding before the remote was read) falls
+    /// back to the legacy `{server, deploy_dir}` comparison — the best
+    /// available evidence.
+    pub fn same_physical_location(&self, other: &Self) -> bool {
+        match (&self.receiver_uuid, &other.receiver_uuid) {
+            (Some(a), Some(b)) => a == b,
+            _ => self.server == other.server && self.deploy_dir == other.deploy_dir,
+        }
     }
 }
 
 impl Default for PhysicalBinding {
     fn default() -> Self {
-        Self::new(
+        Self::from_config(
             ServerId::parse("s1").expect("default server is a safe segment"),
             "/srv/deploy/p1",
         )
@@ -349,7 +439,10 @@ impl Default for PhysicalBinding {
 /// Wire strings go through the validated constructor: a persisted record
 /// carrying a relative/traversal/root `deploy_dir` fails deserialization
 /// (fail closed), and any stray key inside the binding object is refused
-/// (`deny_unknown_fields`). The wire JSON shape is unchanged.
+/// (`deny_unknown_fields`). The wire JSON shape gains the OPTIONAL
+/// `receiver_uuid` string (`#[serde(default)]`): a record written before
+/// the receiver-UUID feature stays loadable, carrying an UNKNOWN physical
+/// identity (`receiver_uuid: None`).
 impl<'de> Deserialize<'de> for PhysicalBinding {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
@@ -360,9 +453,16 @@ impl<'de> Deserialize<'de> for PhysicalBinding {
         struct PhysicalBindingWire {
             server: ServerId,
             deploy_dir: String,
+            #[serde(default)]
+            receiver_uuid: Option<crate::identity::ReceiverUuid>,
         }
         let w = PhysicalBindingWire::deserialize(deserializer)?;
-        PhysicalBinding::new(w.server, &w.deploy_dir).map_err(serde::de::Error::custom)
+        match w.receiver_uuid {
+            Some(uuid) => PhysicalBinding::new(w.server, &w.deploy_dir, uuid)
+                .map_err(serde::de::Error::custom),
+            None => PhysicalBinding::from_config(w.server, &w.deploy_dir)
+                .map_err(serde::de::Error::custom),
+        }
     }
 }
 
@@ -984,6 +1084,123 @@ mod tests {
 
     fn slot(i: u32) -> SlotId {
         SlotId::new(format!("slot-{i}"))
+    }
+
+    // ---- THE PHYSICAL-IDENTITY PROPERTY (the review's acceptance): the
+    // receiver UUID is the SOLE physical identity — change every connection
+    // property and alias (the ServerId) and the path (the deploy_dir) while
+    // the receiver UUID stays; rollback succeeds EXACTLY when the receiver
+    // UUID remains unchanged. ---------------------------------------------
+
+    /// A valid binding with an arbitrary (but format-valid) server, absolute
+    /// deploy_dir, and receiver UUID.
+    fn arbitrary_binding() -> impl Strategy<Value = PhysicalBinding> {
+        ("[a-z][a-z0-9-]{0,11}", "/[a-z0-9-]{1,12}", "[a-f0-9]{8}").prop_map(
+            |(server, dir, tag)| {
+                PhysicalBinding::new(
+                    ServerId::parse(&server).expect("the generated server is a safe segment"),
+                    dir,
+                    crate::identity::test_receiver_uuid(&tag),
+                )
+                .expect("the generated deploy_dir is absolute and traversal-free")
+            },
+        )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: crate::testutil::proptest_cases(16),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        /// THE PHYSICAL-IDENTITY PROPERTY: change every connection property
+        /// and alias (the ServerId) and the path (the deploy_dir) while
+        /// retaining the receiver UUID — rollback succeeds EXACTLY when the
+        /// receiver UUID remains unchanged. Two bindings with equal receiver
+        /// UUIDs are ONE physical location (even under different
+        /// ServerIds/paths — two ServerIds naming the same physical host+dir
+        /// share the receiver); two with different receiver UUIDs are
+        /// different locations (even under the same ServerId/path — a slot
+        /// whose physical receiver changed must NOT receive the historical
+        /// generations).
+        #[test]
+        fn rollback_succeeds_exactly_when_receiver_uuid_is_unchanged(
+            a in arbitrary_binding(),
+            b in arbitrary_binding(),
+        ) {
+            prop_assert_eq!(
+                a.same_physical_location(&b),
+                a.receiver_uuid() == b.receiver_uuid(),
+                "the physical-location comparison is EXACTLY the receiver-UUID equality — \
+                 ServerId (the alias) and deploy_dir (the path) are display only"
+            );
+        }
+    }
+
+    /// The legacy fallback: a binding whose receiver UUID is UNKNOWN on
+    /// either side (a legacy record, or a config-derived binding before the
+    /// remote was read) compares by the legacy `{server, deploy_dir}`
+    /// evidence — the best available physical identity.
+    #[test]
+    fn unknown_receiver_falls_back_to_server_and_deploy_dir() {
+        let a =
+            PhysicalBinding::from_config(ServerId::parse("s1").unwrap(), "/srv/deploy/p1").unwrap();
+        let b =
+            PhysicalBinding::from_config(ServerId::parse("s1").unwrap(), "/srv/deploy/p1").unwrap();
+        let c =
+            PhysicalBinding::from_config(ServerId::parse("s2").unwrap(), "/srv/deploy/p1").unwrap();
+        assert!(
+            a.same_physical_location(&b),
+            "same server+dir is one location"
+        );
+        assert!(
+            !a.same_physical_location(&c),
+            "a different server is a different location under the legacy fallback"
+        );
+        // A KNOWN receiver vs an UNKNOWN one falls back to the legacy
+        // evidence too (the physical identity cannot be compared).
+        let known = PhysicalBinding::new(
+            ServerId::parse("s1").unwrap(),
+            "/srv/deploy/p1",
+            crate::identity::test_receiver_uuid("known"),
+        )
+        .unwrap();
+        assert!(
+            known.same_physical_location(&a),
+            "same server+dir is one location even when one receiver is unknown"
+        );
+    }
+
+    /// The wire round trip: a binding with a receiver UUID serializes it
+    /// and deserializes back exactly; a legacy record WITHOUT the field
+    /// stays loadable (unknown physical identity).
+    #[test]
+    fn receiver_uuid_wire_round_trip_and_legacy_load() {
+        let b = PhysicalBinding::new(
+            ServerId::parse("s1").unwrap(),
+            "/srv/deploy/p1",
+            crate::identity::test_receiver_uuid("wire"),
+        )
+        .unwrap();
+        let json = serde_json::to_string(&b).unwrap();
+        assert!(
+            json.contains("receiver_uuid"),
+            "the wire shape carries the receiver UUID: {json}"
+        );
+        let back: PhysicalBinding = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, b, "the wire round trip is exact");
+        // A legacy record (no receiver_uuid field) stays loadable.
+        let legacy = r#"{"server":"s1","deploy_dir":"/srv/deploy/p1"}"#;
+        let legacy_binding: PhysicalBinding = serde_json::from_str(legacy).unwrap();
+        assert_eq!(
+            legacy_binding.receiver_uuid(),
+            None,
+            "a legacy record carries an UNKNOWN physical identity"
+        );
+        assert_eq!(legacy_binding.server().as_str(), "s1");
+        assert_eq!(legacy_binding.deploy_dir(), "/srv/deploy/p1");
     }
 
     // ---- fixtures: a valid full-push intent + every terminal disposition --

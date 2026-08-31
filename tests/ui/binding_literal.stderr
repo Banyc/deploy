@@ -1,9 +1,19 @@
-error[E0451]: fields `server` and `deploy_dir` of struct `PhysicalBinding` are private
-  --> /kache/home/code/deploy/tests/ui/binding_literal.rs:17:9
+error: cannot construct `PhysicalBinding` with struct literal syntax due to private fields
+  --> /kache/home/code/deploy/tests/ui/binding_literal.rs:16:20
    |
 16 |     let _binding = PhysicalBinding {
-   |                    --------------- in this type
+   |                    ^^^^^^^^^^^^^^^
 17 |         server: d(),
-   |         ^^^^^^ private field
+   |         ----------- private field
 18 |         deploy_dir: d(),
-   |         ^^^^^^^^^^ private field
+   |         --------------- private field
+   |
+   = note: ...and other private field `receiver_uuid` that was not provided
+help: consider using the `Default` trait
+   |
+16 -     let _binding = PhysicalBinding {
+17 -         server: d(),
+18 -         deploy_dir: d(),
+19 -     };
+16 +     let _binding = <PhysicalBinding as std::default::Default>::default();
+   |

@@ -964,7 +964,8 @@ Every deployment attempt records TWO lines in the target's ONE ledger: its immut
         },
         "binding": {
           "server": "server-01",
-          "deploy_dir": "/srv/deploy/p1"
+          "deploy_dir": "/srv/deploy/p1",
+          "receiver_uuid": "recv-018f0000-0000-7937-bf70-bbdc1c4f7937"
         }
       },
       "action": {
@@ -985,7 +986,8 @@ Every deployment attempt records TWO lines in the target's ONE ledger: its immut
         },
         "binding": {
           "server": "server-02",
-          "deploy_dir": "/srv/deploy/p2"
+          "deploy_dir": "/srv/deploy/p2",
+          "receiver_uuid": "recv-018f0000-0000-78da-978c-f41dc96dc8da"
         }
       },
       "action": {
@@ -1006,7 +1008,8 @@ Every deployment attempt records TWO lines in the target's ONE ledger: its immut
         },
         "binding": {
           "server": "server-03",
-          "deploy_dir": "/srv/deploy/p3"
+          "deploy_dir": "/srv/deploy/p3",
+          "receiver_uuid": "recv-018f0000-0000-705a-93a5-ef1454cba05a"
         }
       },
       "action": {
@@ -1028,7 +1031,7 @@ Every deployment attempt records TWO lines in the target's ONE ledger: its immut
   "deployment_id": "deploy-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b",
   "status": "successful",
   "recorded_at": "2026-08-21T10:25:00Z",
-  "intent_digest": "d94138dec3aaf354a7edfec6472fe5a773668e56457a9ef6f3154d4bbc5fa264",
+  "intent_digest": "a76e1404f451463be7f08d6b1c7051e0198196e315dbfdac14167c66be3abe0b",
   "outcomes": [],
   "reason": "push completed"
 }
