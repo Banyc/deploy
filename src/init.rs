@@ -433,12 +433,15 @@ fn systemd_variant() -> crate::config::raw::RawVariant {
             adapter: "systemd".to_string(),
             scope: ActivationScope::User,
             reconcile_managed_units: true,
-            units: vec![UnitDef {
-                name: "example.service".to_string(),
-                artifact_path: "app/example.service".to_string(),
-                enable: true,
-                restart: true,
-            }],
+            units: vec![
+                UnitDef::new(
+                    "example.service".to_string(),
+                    "app/example.service".to_string(),
+                    true,
+                    true,
+                )
+                .expect("validated unit"),
+            ],
         },
         verification: command_verification(),
         slots: Vec::new(),
@@ -800,10 +803,10 @@ mod tests {
         let crate::config::Activation::Systemd(sa) = &systemd.activation else {
             panic!("systemd variant must carry the systemd activation");
         };
-        assert_eq!(sa.scope, crate::config::ActivationScope::User);
-        assert_eq!(sa.units.len(), 1);
-        assert_eq!(sa.units[0].name, "example.service");
-        assert_eq!(sa.units[0].artifact_path, "app/example.service");
+        assert_eq!(sa.scope(), &crate::config::ActivationScope::User);
+        assert_eq!(sa.units().len(), 1);
+        assert_eq!(sa.units()[0].name(), "example.service");
+        assert_eq!(sa.units()[0].artifact_path(), "app/example.service");
         assert!(
             report
                 .target

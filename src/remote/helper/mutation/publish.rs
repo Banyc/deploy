@@ -311,28 +311,28 @@ mod tests_publish {
         let contracts: std::collections::BTreeMap<String, crate::identity::BehaviorContract> =
             std::collections::BTreeMap::from([(
                 "standard".to_string(),
-                crate::identity::BehaviorContract {
-                    activation: crate::config::Activation::Systemd(
-                        crate::config::ValidatedSystemd {
-                            scope: crate::config::ActivationScope::System,
-                            reconcile_managed_units: true,
-                            units: vec![crate::config::UnitDef {
-                                name: "app.service".to_string(),
-                                artifact_path: "integration/systemd/app.service".to_string(),
-                                enable: true,
-                                restart: true,
-                            }],
-                        },
+                crate::identity::BehaviorContract::new(
+                    crate::config::Activation::Systemd(
+                        crate::config::ValidatedSystemd::new(
+                            crate::config::ActivationScope::System,
+                            true,
+                            vec![
+                                crate::config::UnitDef::new(
+                                    "app.service".to_string(),
+                                    "integration/systemd/app.service".to_string(),
+                                    true,
+                                    true,
+                                )
+                                .expect("validated unit"),
+                            ],
+                        )
+                        .expect("validated systemd"),
                     ),
-                    verification: crate::config::Verification::Command(
-                        crate::config::ValidatedCommand {
-                            argv: vec!["true".to_string()],
-                            timeout_seconds: 30,
-                            attempts: 2,
-                            interval_seconds: 1,
-                        },
+                    crate::config::Verification::Command(
+                        crate::config::ValidatedCommand::new(vec!["true".to_string()], 30, 2, 1)
+                            .expect("validated command"),
                     ),
-                },
+                ),
             )]);
         let behavior_sha = crate::verify::release::variant_behaviors_digest(&contracts);
         let variants: std::collections::BTreeMap<

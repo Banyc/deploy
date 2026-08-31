@@ -115,10 +115,10 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
             "systemd variant must carry the systemd activation",
         ));
     };
-    assert_eq!(sa.scope, deploy::config::ActivationScope::User);
-    assert_eq!(sa.units.len(), 1);
-    assert_eq!(sa.units[0].name, "example.service");
-    assert_eq!(sa.units[0].artifact_path, "app/example.service");
+    assert_eq!(sa.scope(), &deploy::config::ActivationScope::User);
+    assert_eq!(sa.units().len(), 1);
+    assert_eq!(sa.units()[0].name(), "example.service");
+    assert_eq!(sa.units()[0].artifact_path(), "app/example.service");
     assert!(
         proj.join("releases/v1/artifacts/systemd/example.service")
             .is_file(),

@@ -13,6 +13,7 @@
 //! adapter.
 
 use crate::error::{Error, Result};
+use crate::identity::{Attempts, TimeoutSeconds};
 use crate::remote::canonical::validate_template_variables;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -37,16 +38,68 @@ fn default_interval() -> u64 {
 
 /// The FULLY VALIDATED command-verification payload: a non-empty argv whose
 /// template variables are all known (`validate_template_variables`), a
-/// NONZERO timeout, and NONZERO attempts (a zero attempt count or zero
-/// timeout could never verify — the rules the conversion enforces).
-/// Constructed only through [`Verification::try_from`] / the serde
-/// `Deserialize` impl, never hand-built by production code.
+/// NONZERO timeout ([`TimeoutSeconds`]), and NONZERO attempts
+/// ([`Attempts`]) — a zero attempt count or zero timeout could never
+/// verify (the rules the conversion enforces). The fields are PRIVATE: a
+/// value can only be built through the validated [`ValidatedCommand::new`]
+/// constructor or the serde `Deserialize` impl (which routes through the
+/// same validation), so an invalid payload (empty argv, zero timeout, zero
+/// attempts, an unknown template variable) is unrepresentable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValidatedCommand {
-    pub argv: Vec<String>,
-    pub timeout_seconds: u64,
-    pub attempts: u32,
-    pub interval_seconds: u64,
+    argv: Vec<String>,
+    timeout_seconds: TimeoutSeconds,
+    attempts: Attempts,
+    interval_seconds: u64,
+}
+
+impl ValidatedCommand {
+    /// The validated constructor: enforces the SAME rules the conversion
+    /// enforces — a non-empty argv whose template variables are all known
+    /// (`validate_template_variables`), a NONZERO timeout, and NONZERO
+    /// attempts. Any violation is refused (fail closed) before a value of
+    /// this type can exist.
+    pub fn new(
+        argv: Vec<String>,
+        timeout_seconds: u64,
+        attempts: u32,
+        interval_seconds: u64,
+    ) -> Result<ValidatedCommand> {
+        if argv.is_empty() {
+            return Err(Error::config(
+                "verification argv must not be empty (fail closed)",
+            ));
+        }
+        for a in &argv {
+            validate_template_variables(a)?;
+        }
+        Ok(ValidatedCommand {
+            argv,
+            timeout_seconds: TimeoutSeconds::new(timeout_seconds)?,
+            attempts: Attempts::new(attempts)?,
+            interval_seconds,
+        })
+    }
+
+    /// The validated argv of the command verification.
+    pub fn argv(&self) -> &[String] {
+        &self.argv
+    }
+
+    /// The validated per-attempt timeout in seconds (nonzero).
+    pub fn timeout_seconds(&self) -> TimeoutSeconds {
+        self.timeout_seconds
+    }
+
+    /// The validated attempt count (nonzero).
+    pub fn attempts(&self) -> Attempts {
+        self.attempts
+    }
+
+    /// The validated sleep between attempts in seconds (0 = no sleep).
+    pub fn interval_seconds(&self) -> u64 {
+        self.interval_seconds
+    }
 }
 
 /// A variant's verification policy as a CLOSED enum: exactly
@@ -73,28 +126,28 @@ impl Verification {
     /// The validated argv of the command verification.
     pub fn argv(&self) -> &[String] {
         match self {
-            Verification::Command(vc) => &vc.argv,
+            Verification::Command(vc) => vc.argv(),
         }
     }
 
     /// The validated per-attempt timeout in seconds (nonzero).
-    pub fn timeout_seconds(&self) -> u64 {
+    pub fn timeout_seconds(&self) -> TimeoutSeconds {
         match self {
-            Verification::Command(vc) => vc.timeout_seconds,
+            Verification::Command(vc) => vc.timeout_seconds(),
         }
     }
 
     /// The validated attempt count (nonzero).
-    pub fn attempts(&self) -> u32 {
+    pub fn attempts(&self) -> Attempts {
         match self {
-            Verification::Command(vc) => vc.attempts,
+            Verification::Command(vc) => vc.attempts(),
         }
     }
 
     /// The validated sleep between attempts in seconds (0 = no sleep).
     pub fn interval_seconds(&self) -> u64 {
         match self {
-            Verification::Command(vc) => vc.interval_seconds,
+            Verification::Command(vc) => vc.interval_seconds(),
         }
     }
 }
@@ -109,30 +162,15 @@ impl TryFrom<&VerificationConfig> for Verification {
                 wire.adapter
             )));
         }
-        if wire.argv.is_empty() {
-            return Err(Error::config(
-                "verification argv must not be empty (fail closed)",
-            ));
-        }
-        if wire.attempts == 0 {
-            return Err(Error::config(
-                "verification attempts must be nonzero (fail closed)",
-            ));
-        }
-        if wire.timeout_seconds == 0 {
-            return Err(Error::config(
-                "verification timeout_seconds must be nonzero (fail closed)",
-            ));
-        }
-        for a in &wire.argv {
-            validate_template_variables(a)?;
-        }
-        Ok(Verification::Command(ValidatedCommand {
-            argv: wire.argv.clone(),
-            timeout_seconds: wire.timeout_seconds,
-            attempts: wire.attempts,
-            interval_seconds: wire.interval_seconds,
-        }))
+        // The validated constructor enforces the SAME rules the conversion
+        // always enforced: non-empty argv, known template variables, nonzero
+        // attempts, nonzero timeout.
+        Ok(Verification::Command(ValidatedCommand::new(
+            wire.argv.clone(),
+            wire.timeout_seconds,
+            wire.attempts,
+            wire.interval_seconds,
+        )?))
     }
 }
 
@@ -144,10 +182,10 @@ impl From<&Verification> for VerificationConfig {
         match v {
             Verification::Command(vc) => VerificationConfig {
                 adapter: "command".to_string(),
-                argv: vc.argv.clone(),
-                timeout_seconds: vc.timeout_seconds,
-                attempts: vc.attempts,
-                interval_seconds: vc.interval_seconds,
+                argv: vc.argv().to_vec(),
+                timeout_seconds: vc.timeout_seconds().get(),
+                attempts: vc.attempts().get(),
+                interval_seconds: vc.interval_seconds(),
             },
         }
     }

@@ -18,12 +18,59 @@ use std::path::Path;
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct UnitDef {
-    pub name: String,
-    pub artifact_path: String,
+    name: String,
+    artifact_path: String,
     #[serde(default = "default_true")]
-    pub enable: bool,
+    enable: bool,
     #[serde(default = "default_true")]
-    pub restart: bool,
+    restart: bool,
+}
+
+impl UnitDef {
+    /// The validated constructor: enforces the SAME rules the conversion
+    /// enforces — a single-filename unit name (`validate_unit_name`) and an
+    /// artifact-relative path (`validate_relative_path`). Any violation is
+    /// refused (fail closed) before a value of this type can exist. The
+    /// serde `Deserialize` impl stays a RAW wire parse (a frozen record can
+    /// carry an invalid unit; the [`Activation`] conversion refuses it at
+    /// the record boundary).
+    pub fn new(
+        name: String,
+        artifact_path: String,
+        enable: bool,
+        restart: bool,
+    ) -> Result<UnitDef> {
+        validate_unit_name(&name)?;
+        validate_relative_path(Path::new(&artifact_path)).map_err(|e| {
+            Error::config(format!("systemd unit '{name}' artifact path invalid: {e}"))
+        })?;
+        Ok(UnitDef {
+            name,
+            artifact_path,
+            enable,
+            restart,
+        })
+    }
+
+    /// The validated single-filename unit name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The validated artifact-relative path of the unit file.
+    pub fn artifact_path(&self) -> &str {
+        &self.artifact_path
+    }
+
+    /// Whether the unit is enabled on activation.
+    pub fn enable(&self) -> bool {
+        self.enable
+    }
+
+    /// Whether the unit is restarted on activation.
+    pub fn restart(&self) -> bool {
+        self.restart
+    }
 }
 
 pub(crate) fn default_true() -> bool {
@@ -80,14 +127,53 @@ pub enum Activation {
 }
 
 /// The systemd activation policy: the unit scope, whether managed units are
-/// reconciled, and the unit definitions to install. Constructed only through
-/// the [`Activation`] conversions (which validate every unit), never
-/// hand-built by production code.
+/// reconciled, and the unit definitions to install. The fields are PRIVATE:
+/// a value can only be built through the validated
+/// [`ValidatedSystemd::new`] constructor or the [`Activation`] conversions
+/// (which validate every unit), never hand-built by production code.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValidatedSystemd {
-    pub scope: ActivationScope,
-    pub reconcile_managed_units: bool,
-    pub units: Vec<UnitDef>,
+    scope: ActivationScope,
+    reconcile_managed_units: bool,
+    units: Vec<UnitDef>,
+}
+
+impl ValidatedSystemd {
+    /// The validated constructor: enforces the SAME rules the conversion
+    /// enforces — at least one unit, each already validated by
+    /// [`UnitDef::new`]. Any violation is refused (fail closed) before a
+    /// value of this type can exist.
+    pub fn new(
+        scope: ActivationScope,
+        reconcile_managed_units: bool,
+        units: Vec<UnitDef>,
+    ) -> Result<ValidatedSystemd> {
+        if units.is_empty() {
+            return Err(Error::config(
+                "systemd activation requires at least one unit",
+            ));
+        }
+        Ok(ValidatedSystemd {
+            scope,
+            reconcile_managed_units,
+            units,
+        })
+    }
+
+    /// The unit scope (user or system).
+    pub fn scope(&self) -> &ActivationScope {
+        &self.scope
+    }
+
+    /// Whether managed units are reconciled on activation.
+    pub fn reconcile_managed_units(&self) -> bool {
+        self.reconcile_managed_units
+    }
+
+    /// The validated unit definitions (at least one).
+    pub fn units(&self) -> &[UnitDef] {
+        &self.units
+    }
 }
 
 /// Reject a unit name that could escape the systemd/user directory
@@ -144,20 +230,23 @@ impl TryFrom<&ActivationConfig> for Activation {
                         "systemd activation requires at least one unit",
                     ));
                 }
+                let mut units = Vec::with_capacity(wire.units.len());
                 for u in &wire.units {
-                    validate_unit_name(&u.name)?;
-                    validate_relative_path(Path::new(&u.artifact_path)).map_err(|e| {
-                        Error::config(format!(
-                            "systemd unit '{}' artifact path invalid: {e}",
-                            u.name
-                        ))
-                    })?;
+                    // The validated unit constructor enforces the SAME rules
+                    // the conversion always enforced: a single-filename name
+                    // and an artifact-relative path.
+                    units.push(UnitDef::new(
+                        u.name.clone(),
+                        u.artifact_path.clone(),
+                        u.enable,
+                        u.restart,
+                    )?);
                 }
-                Ok(Activation::Systemd(ValidatedSystemd {
-                    scope: wire.scope.clone(),
-                    reconcile_managed_units: wire.reconcile_managed_units,
-                    units: wire.units.clone(),
-                }))
+                Ok(Activation::Systemd(ValidatedSystemd::new(
+                    wire.scope.clone(),
+                    wire.reconcile_managed_units,
+                    units,
+                )?))
             }
             other => Err(Error::config(format!(
                 "unknown activation adapter '{other}' (supported: none, systemd) — an unsupported adapter is refused, never silently skipped"
@@ -189,9 +278,9 @@ impl From<&Activation> for ActivationConfig {
             },
             Activation::Systemd(sa) => ActivationConfig {
                 adapter: "systemd".to_string(),
-                scope: sa.scope.clone(),
-                reconcile_managed_units: sa.reconcile_managed_units,
-                units: sa.units.clone(),
+                scope: sa.scope().clone(),
+                reconcile_managed_units: sa.reconcile_managed_units(),
+                units: sa.units().to_vec(),
             },
         }
     }

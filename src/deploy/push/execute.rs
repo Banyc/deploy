@@ -405,11 +405,12 @@ pub(crate) mod execute_tests {
         let prior_release = known_artifact(&prior).release.clone();
         // Behavior digest A (verification argv "true") frozen into s0.
         let var_a = h.config.variant("standard").unwrap();
-        let a_digest =
-            crate::verify::release::behavior_contract_digest(&crate::identity::BehaviorContract {
-                activation: var_a.activation.clone(),
-                verification: var_a.verification.clone(),
-            });
+        let a_digest = crate::verify::release::behavior_contract_digest(
+            &crate::identity::BehaviorContract::new(
+                var_a.activation.clone(),
+                var_a.verification.clone(),
+            ),
+        );
 
         // v2: verification argv flips to "false" AND the artifact content
         // changes, so the desired tree + release differ from the prior state
@@ -435,11 +436,12 @@ pub(crate) mod execute_tests {
         .unwrap();
         let config2 = ProjectConfig::load(&h.cfg_path).unwrap();
         let var_b = config2.variant("standard").unwrap();
-        let b_digest =
-            crate::verify::release::behavior_contract_digest(&crate::identity::BehaviorContract {
-                activation: var_b.activation.clone(),
-                verification: var_b.verification.clone(),
-            });
+        let b_digest = crate::verify::release::behavior_contract_digest(
+            &crate::identity::BehaviorContract::new(
+                var_b.activation.clone(),
+                var_b.verification.clone(),
+            ),
+        );
         assert_ne!(a_digest, b_digest, "behaviors must differ");
 
         let id2 = test_deployment_id("deploy-verify-fail");

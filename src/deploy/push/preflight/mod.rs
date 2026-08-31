@@ -204,10 +204,7 @@ pub(crate) fn run_preflight(
         variant_mappings.insert(v.clone(), vcfg.artifact.mappings.clone());
         variant_behaviors.insert(
             v.clone(),
-            BehaviorContract {
-                activation: vcfg.activation.clone(),
-                verification: vcfg.verification.clone(),
-            },
+            BehaviorContract::new(vcfg.activation.clone(), vcfg.verification.clone()),
         );
         variant_slots.insert(v.clone(), vcfg.slots.clone());
     }

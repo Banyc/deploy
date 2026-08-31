@@ -281,7 +281,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     let Activation::Systemd(hc_act) = &hc.activation else {
         panic!("high-capacity variant must carry the systemd activation");
     };
-    assert!(!hc_act.units.is_empty());
+    assert!(!hc_act.units().is_empty());
 
     // Capacity is per-server, not per-variant: the single server carries
     // the policy and the variant files parse without any `[capacity]` block.
@@ -1938,12 +1938,15 @@ fn conversion_rejects_impossible_activation_and_verification() {
         adapter: "none".to_string(),
         scope: ActivationScope::User,
         reconcile_managed_units: true,
-        units: vec![UnitDef {
-            name: "app.service".to_string(),
-            artifact_path: "integration/systemd/app.service".to_string(),
-            enable: true,
-            restart: true,
-        }],
+        units: vec![
+            UnitDef::new(
+                "app.service".to_string(),
+                "integration/systemd/app.service".to_string(),
+                true,
+                true,
+            )
+            .expect("validated unit"),
+        ],
     };
     expect_conversion_err(p, "none activation with units");
 
@@ -1959,35 +1962,41 @@ fn conversion_rejects_impossible_activation_and_verification() {
     expect_conversion_err(p, "none activation with non-default scope");
 
     // A systemd unit whose NAME could escape the systemd directory is
-    // refused at the load, not at activation time.
+    // refused at the load, not at activation time. The invalid unit can only
+    // enter through the RAW WIRE (the validated `UnitDef::new` refuses it).
     let mut p = minimal_raw_project();
-    p.variants.get_mut("standard").unwrap().activation = ActivationConfig {
-        adapter: "systemd".to_string(),
-        scope: ActivationScope::User,
-        reconcile_managed_units: true,
-        units: vec![UnitDef {
-            name: "../app.service".to_string(),
-            artifact_path: "integration/systemd/app.service".to_string(),
-            enable: true,
-            restart: true,
-        }],
-    };
+    p.variants.get_mut("standard").unwrap().activation =
+        serde_json::from_value(serde_json::json!({
+            "adapter": "systemd",
+            "scope": "user",
+            "reconcile_managed_units": true,
+            "units": [{
+                "name": "../app.service",
+                "artifact_path": "integration/systemd/app.service",
+                "enable": true,
+                "restart": true,
+            }],
+        }))
+        .expect("raw activation wire parses");
     expect_conversion_err(p, "traversal unit name");
 
     // A systemd unit whose artifact path is absolute (could escape the
-    // generation tree) is refused at the load.
+    // generation tree) is refused at the load. The invalid unit can only
+    // enter through the RAW WIRE (the validated `UnitDef::new` refuses it).
     let mut p = minimal_raw_project();
-    p.variants.get_mut("standard").unwrap().activation = ActivationConfig {
-        adapter: "systemd".to_string(),
-        scope: ActivationScope::User,
-        reconcile_managed_units: true,
-        units: vec![UnitDef {
-            name: "app.service".to_string(),
-            artifact_path: "/etc/systemd/app.service".to_string(),
-            enable: true,
-            restart: true,
-        }],
-    };
+    p.variants.get_mut("standard").unwrap().activation =
+        serde_json::from_value(serde_json::json!({
+            "adapter": "systemd",
+            "scope": "user",
+            "reconcile_managed_units": true,
+            "units": [{
+                "name": "app.service",
+                "artifact_path": "/etc/systemd/app.service",
+                "enable": true,
+                "restart": true,
+            }],
+        }))
+        .expect("raw activation wire parses");
     expect_conversion_err(p, "absolute unit artifact path");
 }
 
@@ -2220,35 +2229,44 @@ fn conversion_maps_systemd_activation_to_typed_enum() {
         adapter: "systemd".to_string(),
         scope: ActivationScope::System,
         reconcile_managed_units: true,
-        units: vec![UnitDef {
-            name: "app.service".to_string(),
-            artifact_path: "app.service".to_string(),
-            enable: true,
-            restart: true,
-        }],
+        units: vec![
+            UnitDef::new(
+                "app.service".to_string(),
+                "app.service".to_string(),
+                true,
+                true,
+            )
+            .expect("validated unit"),
+        ],
     };
     let cfg =
         ProjectConfig::from_raw_parts(p.manifest, p.variants).expect("systemd variant converts");
     let Activation::Systemd(sa) = &cfg.variant("standard").unwrap().activation else {
         panic!("systemd adapter must convert to Activation::Systemd");
     };
-    assert_eq!(sa.scope, ActivationScope::System);
-    assert_eq!(sa.units.len(), 1);
-    assert_eq!(sa.units[0].name, "app.service");
+    assert_eq!(sa.scope(), &ActivationScope::System);
+    assert_eq!(sa.units().len(), 1);
+    assert_eq!(sa.units()[0].name(), "app.service");
 
     // The domain -> contract conversion is the ONLY path and is
     // canonical: the serialized contract has adapter systemd + the
     // carried scope/units (this is what the behavior digest hashes).
-    let contract = ActivationConfig::from(Activation::Systemd(ValidatedSystemd {
-        scope: ActivationScope::System,
-        reconcile_managed_units: true,
-        units: vec![UnitDef {
-            name: "app.service".to_string(),
-            artifact_path: "app.service".to_string(),
-            enable: true,
-            restart: true,
-        }],
-    }));
+    let contract = ActivationConfig::from(Activation::Systemd(
+        ValidatedSystemd::new(
+            ActivationScope::System,
+            true,
+            vec![
+                UnitDef::new(
+                    "app.service".to_string(),
+                    "app.service".to_string(),
+                    true,
+                    true,
+                )
+                .expect("validated unit"),
+            ],
+        )
+        .expect("validated systemd"),
+    ));
     assert_eq!(contract.adapter, "systemd");
     assert_eq!(contract.scope, ActivationScope::System);
     assert_eq!(contract.units.len(), 1);
@@ -2370,11 +2388,18 @@ fn arbitrary_activation() -> impl Strategy<Value = ActivationConfig> {
                 any::<bool>(),
                 any::<bool>(),
             )
-                .prop_map(|(name, artifact_path, enable, restart)| UnitDef {
-                    name,
-                    artifact_path,
-                    enable,
-                    restart,
+                // The unit is built through the RAW WIRE (the validated
+                // `UnitDef::new` refuses invalid names/paths — the wire is
+                // the ONLY entry for an invalid unit, which the conversion
+                // then refuses).
+                .prop_map(|(name, artifact_path, enable, restart)| {
+                    serde_json::from_value(serde_json::json!({
+                        "name": name,
+                        "artifact_path": artifact_path,
+                        "enable": enable,
+                        "restart": restart,
+                    }))
+                    .expect("raw unit wire parses")
                 }),
             0..2,
         ),
@@ -2611,7 +2636,7 @@ pub(crate) fn assert_domain_invariants(cfg: &ProjectConfig) {
         match &cfg.variant(&name).unwrap().activation {
             Activation::None => {}
             Activation::Systemd(sa) => {
-                assert!(!sa.units.is_empty(), "systemd requires at least one unit")
+                assert!(!sa.units().is_empty(), "systemd requires at least one unit")
             }
         }
     }

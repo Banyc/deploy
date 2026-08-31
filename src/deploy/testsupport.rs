@@ -1411,10 +1411,7 @@ pub(crate) fn membership_drift_fixture(
     let vcfg = config.variant("standard").unwrap();
     let variant_behaviors: BTreeMap<String, BehaviorContract> = BTreeMap::from([(
         "standard".to_string(),
-        BehaviorContract {
-            activation: vcfg.activation.clone(),
-            verification: vcfg.verification.clone(),
-        },
+        BehaviorContract::new(vcfg.activation.clone(), vcfg.verification.clone()),
     )]);
     let behavior_sha = crate::verify::release::variant_behaviors_digest(&variant_behaviors);
     let behavior_json = serde_json::to_value(&variant_behaviors).unwrap();
@@ -1618,10 +1615,7 @@ pub(crate) fn group_membership_fixture(
     let vcfg = config.variant("standard").unwrap();
     let variant_behaviors: BTreeMap<String, BehaviorContract> = BTreeMap::from([(
         "standard".to_string(),
-        BehaviorContract {
-            activation: vcfg.activation.clone(),
-            verification: vcfg.verification.clone(),
-        },
+        BehaviorContract::new(vcfg.activation.clone(), vcfg.verification.clone()),
     )]);
     let behavior_sha = crate::verify::release::variant_behaviors_digest(&variant_behaviors);
     let behavior_json = serde_json::to_value(&variant_behaviors).unwrap();

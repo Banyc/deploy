@@ -168,7 +168,7 @@ pub(crate) fn check_up_to_date(
                 Some(&asn.deployment_id),
                 Some(&asn.generation_id),
             )?;
-            if run_verification(remote, &variant_behavior.verification, &vars).is_err() {
+            if run_verification(remote, variant_behavior.verification(), &vars).is_err() {
                 verified = false;
                 break;
             }

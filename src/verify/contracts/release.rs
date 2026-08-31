@@ -1088,26 +1088,28 @@ mod tests {
         let mut contracts: BTreeMap<String, BehaviorContract> = BTreeMap::new();
         contracts.insert(
             "standard".to_string(),
-            BehaviorContract {
-                activation: crate::config::Activation::Systemd(crate::config::ValidatedSystemd {
-                    scope: crate::config::ActivationScope::System,
-                    reconcile_managed_units: true,
-                    units: vec![crate::config::UnitDef {
-                        name: "app.service".to_string(),
-                        artifact_path: "integration/systemd/app.service".to_string(),
-                        enable: true,
-                        restart: true,
-                    }],
-                }),
-                verification: crate::config::Verification::Command(
-                    crate::config::ValidatedCommand {
-                        argv: vec!["true".to_string()],
-                        timeout_seconds: 30,
-                        attempts: 2,
-                        interval_seconds: 1,
-                    },
+            BehaviorContract::new(
+                crate::config::Activation::Systemd(
+                    crate::config::ValidatedSystemd::new(
+                        crate::config::ActivationScope::System,
+                        true,
+                        vec![
+                            crate::config::UnitDef::new(
+                                "app.service".to_string(),
+                                "integration/systemd/app.service".to_string(),
+                                true,
+                                true,
+                            )
+                            .expect("validated unit"),
+                        ],
+                    )
+                    .expect("validated systemd"),
                 ),
-            },
+                crate::config::Verification::Command(
+                    crate::config::ValidatedCommand::new(vec!["true".to_string()], 30, 2, 1)
+                        .expect("validated command"),
+                ),
+            ),
         );
         let sha = variant_behaviors_digest(&contracts);
         let canonical = serde_json::to_vec(&contracts).unwrap();
@@ -2705,6 +2707,277 @@ mod tests {
             doc in graph_doc_strategy(),
         ) {
             run_typed_projection_contract(&doc);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // THE UNFORGEABILITY PROPERTY: every publicly constructible behavior
+    // round-trips through the wire, and every rejected raw behavior is
+    // unconstructible directly.
+    // -------------------------------------------------------------------
+    //
+    // (a) ROUND-TRIP: every [`BehaviorContract`] built through the validated
+    //     constructors (a closed-enum `Activation`/`Verification` pair)
+    //     serializes to the canonical wire form and deserializes back to an
+    //     EQUAL contract — the wire shape the frozen behavior records and
+    //     the digest functions depend on stays byte-stable.
+    // (b) UNCONSTRUCTIBLE: every systematically-invalid raw behavior the
+    //     wire refuses (empty argv, zero attempts, zero timeout, unknown
+    //     template variables, irrelevant fields, systemd without units, an
+    //     invalid unit name/artifact path) is IMPOSSIBLE to construct
+    //     directly — the validated constructors refuse it, so an invalid
+    //     contract can only ever enter through the raw wire parse (which
+    //     refuses it at the record boundary).
+    //
+    // Bounded `proptest_cases(16)` (full 16 with `DEPLOY_FULL_TESTS=1`, fast
+    // default), fixed seed 0x5EED_5EED (house style), no failure
+    // persistence — the identical vectors on every run.
+
+    use crate::config::{
+        Activation, ActivationScope, UnitDef, ValidatedCommand, ValidatedSystemd, Verification,
+    };
+
+    /// A valid verification argv element: a plain token or a reference to a
+    /// KNOWN template variable (both pass `validate_template_variables`).
+    fn valid_argv_element() -> impl Strategy<Value = String> {
+        prop_oneof![
+            prop::sample::select(vec![
+                "true".to_string(),
+                "health-check".to_string(),
+                "--tag".to_string(),
+                "probe".to_string(),
+            ]),
+            prop::sample::select(vec![
+                "{{ deploy_dir }}".to_string(),
+                "{{ variant }}".to_string(),
+                "{{ target }}".to_string(),
+                "{{ slot }}".to_string(),
+                "{{ server }}".to_string(),
+            ]),
+        ]
+    }
+
+    /// A valid systemd unit: a single-filename name and an artifact-relative
+    /// path (both pass the validated [`UnitDef::new`]).
+    fn valid_unit() -> impl Strategy<Value = UnitDef> {
+        (
+            prop::sample::select(vec![
+                "app.service".to_string(),
+                "example.service".to_string(),
+                "worker.service".to_string(),
+            ]),
+            prop::sample::select(vec![
+                "app/example.service".to_string(),
+                "integration/systemd/app.service".to_string(),
+                "units/app.service".to_string(),
+            ]),
+            any::<bool>(),
+            any::<bool>(),
+        )
+            .prop_map(|(name, artifact_path, enable, restart)| {
+                UnitDef::new(name, artifact_path, enable, restart).expect("validated unit")
+            })
+    }
+
+    /// A valid closed-enum activation: `None`, or `Systemd` with 1..=2
+    /// validated units.
+    fn valid_activation() -> impl Strategy<Value = Activation> {
+        prop_oneof![
+            Just(Activation::None),
+            (
+                prop::sample::select(vec![ActivationScope::User, ActivationScope::System]),
+                any::<bool>(),
+                prop::collection::vec(valid_unit(), 1..=2),
+            )
+                .prop_map(|(scope, reconcile, units)| {
+                    Activation::Systemd(
+                        ValidatedSystemd::new(scope, reconcile, units).expect("validated systemd"),
+                    )
+                }),
+        ]
+    }
+
+    /// A valid closed-enum verification: a `Command` with a non-empty argv
+    /// of known-variable elements and nonzero timeout/attempts.
+    fn valid_verification() -> impl Strategy<Value = Verification> {
+        (
+            prop::collection::vec(valid_argv_element(), 1..=3),
+            1u64..=3600,
+            1u32..=10,
+            0u64..=60,
+        )
+            .prop_map(|(argv, timeout, attempts, interval)| {
+                Verification::Command(
+                    ValidatedCommand::new(argv, timeout, attempts, interval)
+                        .expect("validated command"),
+                )
+            })
+    }
+
+    /// A valid [`BehaviorContract`] built ONLY through the validated
+    /// constructors — the publicly constructible space.
+    fn valid_behavior_contract() -> impl Strategy<Value = BehaviorContract> {
+        (valid_activation(), valid_verification())
+            .prop_map(|(activation, verification)| BehaviorContract::new(activation, verification))
+    }
+
+    /// One systematically-invalid raw behavior class the wire refuses.
+    #[derive(Clone, Copy, Debug)]
+    enum InvalidBehaviorClass {
+        EmptyArgv,
+        ZeroAttempts,
+        ZeroTimeout,
+        UnknownTemplateVariable,
+        SystemdWithoutUnits,
+        InvalidUnitName,
+        InvalidUnitArtifactPath,
+        NoneWithUnits,
+        NoneWithNonDefaultScope,
+    }
+
+    fn invalid_behavior_class() -> impl Strategy<Value = InvalidBehaviorClass> {
+        prop::sample::select(vec![
+            InvalidBehaviorClass::EmptyArgv,
+            InvalidBehaviorClass::ZeroAttempts,
+            InvalidBehaviorClass::ZeroTimeout,
+            InvalidBehaviorClass::UnknownTemplateVariable,
+            InvalidBehaviorClass::SystemdWithoutUnits,
+            InvalidBehaviorClass::InvalidUnitName,
+            InvalidBehaviorClass::InvalidUnitArtifactPath,
+            InvalidBehaviorClass::NoneWithUnits,
+            InvalidBehaviorClass::NoneWithNonDefaultScope,
+        ])
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: crate::testutil::proptest_cases(16),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        // (a) THE ROUND-TRIP PROPERTY: every publicly constructible behavior
+        // contract serializes to the canonical wire form and deserializes
+        // back to an EQUAL contract — the wire shape the frozen behavior
+        // records and the digest functions depend on stays byte-stable.
+        #[test]
+        fn constructible_behaviors_round_trip_the_wire(contract in valid_behavior_contract()) {
+            let wire = serde_json::to_value(&contract).expect("contract serializes");
+            let back: BehaviorContract =
+                serde_json::from_value(wire.clone()).expect("wire form deserializes");
+            assert_eq!(back, contract, "round-trip must preserve the contract");
+            // The wire form is the canonical `ActivationConfig`/`VerificationConfig`
+            // shape (what the digest functions hash).
+            let canonical = serde_json::json!({
+                "activation": contract.activation().to_config(),
+                "verification": contract.verification().to_config(),
+            });
+            assert_eq!(
+                wire, canonical,
+                "the wire form must be the canonical contract shape"
+            );
+        }
+
+        // (b) THE UNCONSTRUCTIBILITY PROPERTY: every rejected raw behavior
+        // (the systematically-invalid wires the config/release tests
+        // enumerate) is IMPOSSIBLE to construct directly — the validated
+        // constructors refuse it, so an invalid contract can only ever
+        // enter through the raw wire parse (which refuses it at the record
+        // boundary).
+        #[test]
+        fn rejected_raw_behaviors_are_unconstructible(class in invalid_behavior_class()) {
+            match class {
+                InvalidBehaviorClass::EmptyArgv => {
+                    assert!(
+                        ValidatedCommand::new(Vec::new(), 5, 1, 0).is_err(),
+                        "empty argv must be refused by the validated constructor"
+                    );
+                }
+                InvalidBehaviorClass::ZeroAttempts => {
+                    assert!(
+                        ValidatedCommand::new(vec!["true".to_string()], 5, 0, 0).is_err(),
+                        "zero attempts must be refused by the validated constructor"
+                    );
+                }
+                InvalidBehaviorClass::ZeroTimeout => {
+                    assert!(
+                        ValidatedCommand::new(vec!["true".to_string()], 0, 1, 0).is_err(),
+                        "zero timeout must be refused by the validated constructor"
+                    );
+                }
+                InvalidBehaviorClass::UnknownTemplateVariable => {
+                    assert!(
+                        ValidatedCommand::new(vec!["{{ bogus }}".to_string()], 5, 1, 0).is_err(),
+                        "an unknown template variable must be refused by the validated constructor"
+                    );
+                }
+                InvalidBehaviorClass::SystemdWithoutUnits => {
+                    assert!(
+                        ValidatedSystemd::new(ActivationScope::User, true, Vec::new()).is_err(),
+                        "systemd without units must be refused by the validated constructor"
+                    );
+                }
+                InvalidBehaviorClass::InvalidUnitName => {
+                    assert!(
+                        UnitDef::new(
+                            "../app.service".to_string(),
+                            "app/x.service".to_string(),
+                            true,
+                            true,
+                        )
+                        .is_err(),
+                        "a traversal unit name must be refused by the validated constructor"
+                    );
+                }
+                InvalidBehaviorClass::InvalidUnitArtifactPath => {
+                    assert!(
+                        UnitDef::new(
+                            "app.service".to_string(),
+                            "/etc/systemd/app.service".to_string(),
+                            true,
+                            true,
+                        )
+                        .is_err(),
+                        "an absolute unit artifact path must be refused by the validated constructor"
+                    );
+                }
+                InvalidBehaviorClass::NoneWithUnits => {
+                    // A `none` activation carrying units is an irrelevant-field
+                    // refusal: the domain enum cannot even represent it
+                    // (`Activation::None` carries no units by construction),
+                    // and the wire parse refuses it.
+                    let wire = serde_json::json!({
+                        "adapter": "none",
+                        "scope": "user",
+                        "reconcile_managed_units": true,
+                        "units": [{
+                            "name": "app.service",
+                            "artifact_path": "app/x.service",
+                            "enable": true,
+                            "restart": true,
+                        }],
+                    });
+                    assert!(
+                        serde_json::from_value::<Activation>(wire).is_err(),
+                        "a none contract carrying units must be refused at the wire"
+                    );
+                }
+                InvalidBehaviorClass::NoneWithNonDefaultScope => {
+                    // A `none` activation carrying a non-default scope is an
+                    // irrelevant-field refusal (same structural argument).
+                    let wire = serde_json::json!({
+                        "adapter": "none",
+                        "scope": "system",
+                        "reconcile_managed_units": true,
+                        "units": [],
+                    });
+                    assert!(
+                        serde_json::from_value::<Activation>(wire).is_err(),
+                        "a none contract carrying a non-default scope must be refused at the wire"
+                    );
+                }
+            }
         }
     }
 }

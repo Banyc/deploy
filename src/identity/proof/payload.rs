@@ -37,11 +37,40 @@ use serde::{Deserialize, Serialize};
 /// template variable), or carries irrelevant fields is REFUSED at the
 /// record boundary — it can never reach the adapters, where an unsupported
 /// adapter used to become a silent no-op.
+///
+/// The fields are PRIVATE: a [`BehaviorContract`] can only be built through
+/// the validated [`BehaviorContract::new`] constructor (which takes already
+/// validated [`Activation`]/[`Verification`] values) or the serde
+/// `Deserialize` impl (which routes through the same closed-enum
+/// validation), so an invalid contract is unrepresentable.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BehaviorContract {
-    pub activation: Activation,
-    pub verification: Verification,
+    activation: Activation,
+    verification: Verification,
+}
+
+impl BehaviorContract {
+    /// The validated constructor: takes already-validated closed-enum
+    /// [`Activation`]/[`Verification`] values (an invalid activation or
+    /// verification cannot be constructed in the first place), so every
+    /// [`BehaviorContract`] is unforgeable.
+    pub fn new(activation: Activation, verification: Verification) -> BehaviorContract {
+        BehaviorContract {
+            activation,
+            verification,
+        }
+    }
+
+    /// The validated activation half of the contract.
+    pub fn activation(&self) -> &Activation {
+        &self.activation
+    }
+
+    /// The validated verification half of the contract.
+    pub fn verification(&self) -> &Verification {
+        &self.verification
+    }
 }
 
 /// One entry in a canonical tree object.

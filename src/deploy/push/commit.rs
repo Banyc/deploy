@@ -1268,10 +1268,10 @@ pub(crate) mod commit_tests {
         let r1 = two_slot_push(&h, &h.config, &RefExpr::Head, None, &id1).unwrap();
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
         let var_a = h.config.variant("standard").unwrap();
-        let digest_a = crate::verify::release::behavior_contract_digest(&BehaviorContract {
-            activation: var_a.activation.clone(),
-            verification: var_a.verification.clone(),
-        });
+        let digest_a = crate::verify::release::behavior_contract_digest(&BehaviorContract::new(
+            var_a.activation.clone(),
+            var_a.verification.clone(),
+        ));
         let attempt1 = r1.attempt.as_ref().expect("attempt recorded");
         let r1_release = attempt1.desired[&slot_a]
             .assignment
@@ -1311,10 +1311,10 @@ pub(crate) mod commit_tests {
         .unwrap();
         let config2 = ProjectConfig::load(&h.cfg_path).unwrap();
         let var_b = config2.variant("standard").unwrap();
-        let digest_b = crate::verify::release::behavior_contract_digest(&BehaviorContract {
-            activation: var_b.activation.clone(),
-            verification: var_b.verification.clone(),
-        });
+        let digest_b = crate::verify::release::behavior_contract_digest(&BehaviorContract::new(
+            var_b.activation.clone(),
+            var_b.verification.clone(),
+        ));
         assert_ne!(
             digest_a, digest_b,
             "the two contracts must be DISTINGUISHABLE"

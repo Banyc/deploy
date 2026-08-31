@@ -171,9 +171,9 @@ pub(crate) fn compensate_server_locked(
             let advanced_behavior =
                 load_generation_behavior(helper, request.advanced_gen.as_str(), &request.owner)?;
             let advanced_units =
-                crate::verify::systemd::declared_user_units(&advanced_behavior.activation);
+                crate::verify::systemd::declared_user_units(advanced_behavior.activation());
             let prior_units =
-                crate::verify::systemd::declared_user_units(&prior_behavior.activation);
+                crate::verify::systemd::declared_user_units(prior_behavior.activation());
             let advanced_only_units: Vec<String> = advanced_units
                 .iter()
                 .filter(|n| !prior_units.iter().any(|p| p == *n))
@@ -182,7 +182,7 @@ pub(crate) fn compensate_server_locked(
             crate::verify::systemd::restore_adapter_to(
                 remote,
                 &root,
-                &prior_behavior.activation,
+                prior_behavior.activation(),
                 &prior_vars,
                 &advanced_only_units,
             )
@@ -190,14 +190,14 @@ pub(crate) fn compensate_server_locked(
             let adapter_restored = crate::verify::systemd::verify_adapter_restored(
                 remote,
                 &root,
-                &prior_behavior.activation,
+                prior_behavior.activation(),
                 &prior_vars,
                 &advanced_only_units,
             )
             .map_err(|e| {
                 Error::remote(format!("compensation adapter restore NOT verified: {e}"))
             })?;
-            run_verification(remote, &prior_behavior.verification, &prior_vars)
+            run_verification(remote, prior_behavior.verification(), &prior_vars)
                 .map_err(|e| Error::remote(format!("compensation verification failed: {e}")))?;
             Ok(CompensationOutcome::Restored { adapter_restored })
         }
@@ -218,7 +218,7 @@ pub(crate) fn compensate_server_locked(
             let advanced_behavior =
                 load_generation_behavior(helper, request.advanced_gen.as_str(), &request.owner)?;
             let advanced_units =
-                crate::verify::systemd::declared_user_units(&advanced_behavior.activation);
+                crate::verify::systemd::declared_user_units(advanced_behavior.activation());
             crate::verify::systemd::restore_adapter_to(
                 remote,
                 remote.root(),

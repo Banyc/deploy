@@ -149,13 +149,13 @@ pub fn activation_commands(
     sa: &ValidatedSystemd,
 ) -> Vec<Vec<String>> {
     let mut cmds = Vec::new();
-    let scope_user = matches!(sa.scope, ActivationScope::User);
+    let scope_user = matches!(sa.scope(), ActivationScope::User);
 
     // 1. Parent directory + install each unit from its rendered staging file
     //    (user scope only).
     if scope_user {
-        for u in &sa.units {
-            let link = user_unit_link_for(config_home, &u.name);
+        for u in sa.units() {
+            let link = user_unit_link_for(config_home, u.name());
             if let Some(parent) = link.parent() {
                 cmds.push(vec![
                     "mkdir".into(),
@@ -163,7 +163,7 @@ pub fn activation_commands(
                     parent.to_string_lossy().into_owned(),
                 ]);
             }
-            let staged = remote_root.join(RENDERED_UNITS_DIR).join(&u.name);
+            let staged = remote_root.join(RENDERED_UNITS_DIR).join(u.name());
             cmds.push(vec![
                 "cp".into(),
                 staged.to_string_lossy().into_owned(),
@@ -187,26 +187,30 @@ pub fn activation_commands(
     }
 
     // 3. enable + restart.
-    for u in &sa.units {
-        if u.enable && scope_user {
+    for u in sa.units() {
+        if u.enable() && scope_user {
             cmds.push(vec![
                 "systemctl".into(),
                 "--user".into(),
                 "enable".into(),
-                u.name.clone(),
+                u.name().to_string(),
             ]);
         }
-        if u.restart {
+        if u.restart() {
             if scope_user {
                 cmds.push(vec![
                     "systemctl".into(),
                     "--user".into(),
                     "restart".into(),
-                    u.name.clone(),
+                    u.name().to_string(),
                 ]);
             } else {
                 // system scope: only a narrowly scoped restart of the wrapper.
-                cmds.push(vec!["systemctl".into(), "restart".into(), u.name.clone()]);
+                cmds.push(vec![
+                    "systemctl".into(),
+                    "restart".into(),
+                    u.name().to_string(),
+                ]);
             }
         }
     }
@@ -243,24 +247,25 @@ pub(crate) fn render_units(
         ))
     })?;
     let mut out = Vec::new();
-    for u in &sa.units {
-        let src = gen_rel.join(&u.artifact_path);
+    for u in sa.units() {
+        let src = gen_rel.join(u.artifact_path());
         let raw = remote.read(&src).map_err(|e| {
             Error::remote(format!(
                 "read unit artifact '{}' from generation tree: {e}",
-                u.artifact_path
+                u.artifact_path()
             ))
         })?;
         let text = std::str::from_utf8(&raw)
-            .map_err(|e| Error::remote(format!("unit '{}' is not UTF-8: {e}", u.name)))?;
+            .map_err(|e| Error::remote(format!("unit '{}' is not UTF-8: {e}", u.name())))?;
         let rendered = crate::remote::canonical::render_template(text, vars).map_err(|e| {
             Error::remote(format!(
                 "render unit '{}' ({}) with slot context: {e}",
-                u.name, u.artifact_path
+                u.name(),
+                u.artifact_path()
             ))
         })?;
         out.push(RenderedUnit {
-            name: u.name.clone(),
+            name: u.name().to_string(),
             content: rendered.as_bytes().to_vec(),
         });
     }
@@ -295,19 +300,19 @@ pub fn validate_artifact_paths(
     generation_root_rel: &Path,
     sa: &ValidatedSystemd,
 ) -> Result<()> {
-    for u in &sa.units {
-        let p = generation_root_rel.join(&u.artifact_path);
+    for u in sa.units() {
+        let p = generation_root_rel.join(u.artifact_path());
         if remote.metadata_opt(&p)?.is_none() {
             return Err(Error::remote(format!(
                 "declared artifact path '{}' missing in desired tree",
-                u.artifact_path
+                u.artifact_path()
             )));
         }
         let meta = remote.metadata(&p)?;
         if !meta.is_file {
             return Err(Error::remote(format!(
                 "declared artifact path '{}' is not a regular file (type error)",
-                u.artifact_path
+                u.artifact_path()
             )));
         }
     }
@@ -454,21 +459,21 @@ impl ActivationTransaction for SystemdActivation<'_> {
         // Defense-in-depth re-check for hand-built payloads (the
         // config/record closed-enum boundary already validated these): a
         // path traversal here would escape the generation root.
-        for u in &sa.units {
-            validate_unit_name(&u.name)?;
-            validate_relative_path(Path::new(&u.artifact_path)).map_err(|e| {
-                Error::remote(format!("unit '{}' artifact path invalid: {e}", u.name))
+        for u in sa.units() {
+            validate_unit_name(u.name())?;
+            validate_relative_path(Path::new(u.artifact_path())).map_err(|e| {
+                Error::remote(format!("unit '{}' artifact path invalid: {e}", u.name()))
             })?;
         }
         // Resolve the unit directory base on the *remote* host, not the
         // controller.
         let config_home = resolve_remote_config_home(self.remote)?;
         self.config_home = Some(config_home.clone());
-        let scope_user = matches!(sa.scope, ActivationScope::User);
+        let scope_user = matches!(sa.scope(), ActivationScope::User);
         let mut prior = Vec::new();
         if scope_user {
-            for u in &sa.units {
-                let link = user_unit_link_for(&config_home, &u.name);
+            for u in sa.units() {
+                let link = user_unit_link_for(&config_home, u.name());
                 // The PRIOR installed content: a clean absence (`cat` exit
                 // != 0) is `None`; a transport failure is an error.
                 let content = match self.remote.exec(
@@ -478,7 +483,10 @@ impl ActivationTransaction for SystemdActivation<'_> {
                     Ok(out) if out.success() => Some(out.stdout.into_bytes()),
                     Ok(_) => None,
                     Err(e) => {
-                        return Err(Error::remote(format!("read prior unit '{}': {e}", u.name)));
+                        return Err(Error::remote(format!(
+                            "read prior unit '{}': {e}",
+                            u.name()
+                        )));
                     }
                 };
                 // The PRIOR enabled state (`systemctl --user is-enabled`; a
@@ -492,14 +500,14 @@ impl ActivationTransaction for SystemdActivation<'_> {
                             "systemctl".into(),
                             "--user".into(),
                             "is-enabled".into(),
-                            u.name.clone(),
+                            u.name().to_string(),
                         ],
                         Duration::from_secs(30),
                     )
                     .map(|o| o.success() && enabledish(&o.stdout))
                     .unwrap_or(false);
                 prior.push(UnitPriorState {
-                    name: u.name.clone(),
+                    name: u.name().to_string(),
                     content,
                     enabled,
                 });
@@ -508,9 +516,9 @@ impl ActivationTransaction for SystemdActivation<'_> {
             // System scope: restart-only, no installed files — the prior
             // state is the unit NAMES (restore re-applies the restart; verify
             // checks the ACTIVE state).
-            for u in &sa.units {
+            for u in sa.units() {
                 prior.push(UnitPriorState {
-                    name: u.name.clone(),
+                    name: u.name().to_string(),
                     content: None,
                     enabled: false,
                 });
@@ -540,7 +548,7 @@ impl ActivationTransaction for SystemdActivation<'_> {
                 )));
             }
         }
-        let managed: Vec<String> = sa.units.iter().map(|u| u.name.clone()).collect();
+        let managed: Vec<String> = sa.units().iter().map(|u| u.name().to_string()).collect();
         let payload = serde_json::json!({ "managed_units": managed });
         let bytes = serde_json::to_vec_pretty(&payload)
             .map_err(|e| Error::remote(format!("serialize systemd state: {e}")))?;
@@ -559,7 +567,7 @@ impl ActivationTransaction for SystemdActivation<'_> {
     fn restore(&mut self, applied: &Self::Applied) -> Result<Self::Restored> {
         let sa = self.sa;
         let config_home = self.config_home.as_ref().expect("prepare ran");
-        if matches!(sa.scope, ActivationScope::User) {
+        if matches!(sa.scope(), ActivationScope::User) {
             for p in &applied.prepared.prior {
                 let link = user_unit_link_for(config_home, &p.name);
                 match &p.content {
@@ -696,7 +704,7 @@ impl ActivationTransaction for SystemdActivation<'_> {
     fn verify_restored(&self, restored: &Self::Restored) -> Result<VerifiedAdapterRestoration> {
         let sa = self.sa;
         let config_home = self.config_home.as_ref().expect("prepare ran");
-        if matches!(sa.scope, ActivationScope::User) {
+        if matches!(sa.scope(), ActivationScope::User) {
             for p in &restored.expected {
                 let link = user_unit_link_for(config_home, &p.name);
                 match &p.content {
@@ -785,10 +793,10 @@ pub(crate) fn declared_user_units(activation: &Activation) -> Vec<String> {
     let Activation::Systemd(sa) = activation else {
         return Vec::new();
     };
-    if !matches!(sa.scope, ActivationScope::User) {
+    if !matches!(sa.scope(), ActivationScope::User) {
         return Vec::new();
     }
-    sa.units.iter().map(|u| u.name.clone()).collect()
+    sa.units().iter().map(|u| u.name().to_string()).collect()
 }
 
 /// RESTORE the adapter side effects to the state the TARGET contract would
@@ -882,7 +890,7 @@ pub(crate) fn verify_adapter_restored(
         }
         return Ok(VerifiedAdapterRestoration::verified());
     };
-    if matches!(sa.scope, ActivationScope::User) {
+    if matches!(sa.scope(), ActivationScope::User) {
         let config_home = resolve_remote_config_home(remote)?;
         // Render the target's units: the EXPECTED installed content.
         for u in render_units(remote, generation_root, sa, vars)? {
@@ -919,7 +927,7 @@ pub(crate) fn verify_adapter_restored(
             }
         }
     } else {
-        let mut names: Vec<&str> = sa.units.iter().map(|u| u.name.as_str()).collect();
+        let mut names: Vec<&str> = sa.units().iter().map(|u| u.name()).collect();
         for n in advanced_only_units {
             names.push(n);
         }
@@ -947,19 +955,18 @@ pub(crate) mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     fn cfg(scope: ActivationScope, units: Vec<&str>) -> ValidatedSystemd {
-        ValidatedSystemd {
+        ValidatedSystemd::new(
             scope,
-            reconcile_managed_units: true,
-            units: units
+            true,
+            units
                 .into_iter()
-                .map(|n| UnitDef {
-                    name: n.into(),
-                    artifact_path: format!("integration/systemd/{n}"),
-                    enable: true,
-                    restart: true,
+                .map(|n| {
+                    UnitDef::new(n.into(), format!("integration/systemd/{n}"), true, true)
+                        .expect("validated unit")
                 })
                 .collect(),
-        }
+        )
+        .expect("validated systemd")
     }
 
     /// Full slot context including the per-server metadata (user, address,

@@ -30,7 +30,7 @@ pub fn behavior_digest(activation: &Activation, verification: &Verification) -> 
 
 /// Canonical digest of a resolved [`BehaviorContract`].
 pub fn behavior_contract_digest(contract: &BehaviorContract) -> String {
-    behavior_digest(&contract.activation, &contract.verification)
+    behavior_digest(contract.activation(), contract.verification())
 }
 
 /// Reconstruct a [`BehaviorContract`] from serialized JSON bytes.

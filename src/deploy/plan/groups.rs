@@ -151,17 +151,13 @@ mod groups_tests {
             .map(|v| {
                 (
                     v.clone(),
-                    BehaviorContract {
-                        activation: crate::config::Activation::None,
-                        verification: crate::config::Verification::Command(
-                            crate::config::ValidatedCommand {
-                                argv: vec!["true".to_string()],
-                                timeout_seconds: 5,
-                                attempts: 1,
-                                interval_seconds: 0,
-                            },
+                    BehaviorContract::new(
+                        crate::config::Activation::None,
+                        crate::config::Verification::Command(
+                            crate::config::ValidatedCommand::new(vec!["true".to_string()], 5, 1, 0)
+                                .expect("validated command"),
                         ),
-                    },
+                    ),
                 )
             })
             .collect();

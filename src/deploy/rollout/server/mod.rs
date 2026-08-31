@@ -303,7 +303,7 @@ pub(crate) fn process_server(
     // 3. Validate all declared artifact paths and types before changing current.
     //    (`Activation::None` declares no units, so there is nothing to
     //    validate; a `Systemd` payload carries the fully validated units.)
-    if let Activation::Systemd(sa) = &behavior.activation
+    if let Activation::Systemd(sa) = behavior.activation()
         && let Err(e) = validate_artifact_paths(remote, &object_rel, sa)
     {
         return Ok(ServerProc::failed_before(format!(
@@ -384,7 +384,7 @@ pub(crate) fn process_server(
     let mut activation_txn = SystemdActivation::new(
         remote,
         &generation_root,
-        &behavior.activation,
+        behavior.activation(),
         template_vars,
     );
     let mut applied: Option<SystemdApplied> = None;
@@ -448,7 +448,7 @@ pub(crate) fn process_server(
     //    ACTIVATION side effect (if any) is reversed via the protocol and
     //    the generation compensated — a `Restored`-class outcome ONLY when
     //    the adapter restoration is VERIFIED, else `FailedAfterAdvance`.
-    if let Err(e) = run_verification(remote, &behavior.verification, template_vars) {
+    if let Err(e) = run_verification(remote, behavior.verification(), template_vars) {
         let failure = format!("verification failed: {e}");
         let request = CompensationRequest {
             op_id: op_id.clone(),
@@ -782,10 +782,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
         pub(crate) fn behave(&self) -> BehaviorContract {
             let v = self.config.variant("standard").unwrap();
-            BehaviorContract {
-                activation: v.activation.clone(),
-                verification: v.verification.clone(),
-            }
+            BehaviorContract::new(v.activation.clone(), v.verification.clone())
         }
 
         /// The canonical digest of THIS harness's `standard` variant behavior

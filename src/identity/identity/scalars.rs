@@ -5,7 +5,8 @@
 //! must be a sha256 digest, an on-server `deploy_dir` must be an absolute
 //! TRAVERSAL-FREE path with at least one normal component below the root,
 //! a batch size must be nonzero, a capacity percent
-//! must fit 0..=100, and a recorded timestamp must parse as RFC 3339. The
+//! must fit 0..=100, a verification timeout and attempt count must be
+//! nonzero, and a recorded timestamp must parse as RFC 3339. The
 //! application name is ONE safe identifier ([`ApplicationStoreKey`]): a
 //! single normal filesystem component used for BOTH display (messages and
 //! rendering) and storage (the one filesystem component that names the
@@ -361,6 +362,93 @@ impl FromStr for BatchSize {
     }
 }
 
+/// A NONZERO verification per-attempt timeout in seconds: how long one
+/// verification exec may run before it is killed. Zero is rejected — a
+/// zero-second timeout could never verify (the rule the conversion
+/// enforces), so a [`crate::config::ValidatedCommand`] can never carry one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TimeoutSeconds(u64);
+
+impl TimeoutSeconds {
+    /// Construct a verification timeout, rejecting zero (the only invalid
+    /// value — a zero-second exec timeout is a malformed verification
+    /// contract).
+    pub fn new(v: u64) -> Result<TimeoutSeconds> {
+        if v == 0 {
+            return Err(Error::config(
+                "invalid verification timeout_seconds 0: a verification timeout must be nonzero",
+            ));
+        }
+        Ok(TimeoutSeconds(v))
+    }
+
+    /// The nonzero timeout in seconds.
+    pub fn get(&self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for TimeoutSeconds {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl FromStr for TimeoutSeconds {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<TimeoutSeconds> {
+        let v: u64 = s.parse().map_err(|_| {
+            Error::config(format!(
+                "invalid verification timeout {s:?}: expected a nonzero integer"
+            ))
+        })?;
+        TimeoutSeconds::new(v)
+    }
+}
+
+/// A NONZERO verification attempt count: how many times a verification
+/// command is retried before the attempt fails. Zero is rejected — a
+/// zero-attempt verification could never verify (the rule the conversion
+/// enforces), so a [`crate::config::ValidatedCommand`] can never carry one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Attempts(u32);
+
+impl Attempts {
+    /// Construct an attempt count, rejecting zero (the only invalid value
+    /// — a zero-attempt verification is a malformed verification contract).
+    pub fn new(v: u32) -> Result<Attempts> {
+        if v == 0 {
+            return Err(Error::config(
+                "invalid verification attempts 0: a verification must attempt at least once",
+            ));
+        }
+        Ok(Attempts(v))
+    }
+
+    /// The nonzero attempt count.
+    pub fn get(&self) -> u32 {
+        self.0
+    }
+}
+
+impl fmt::Display for Attempts {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl FromStr for Attempts {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Attempts> {
+        let v: u32 = s.parse().map_err(|_| {
+            Error::config(format!(
+                "invalid verification attempts {s:?}: expected a nonzero integer"
+            ))
+        })?;
+        Attempts::new(v)
+    }
+}
+
 /// A validated capacity percentage: the percent of the destination
 /// filesystem's TOTAL size a deployment must keep free (0..=100).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
@@ -564,6 +652,30 @@ mod tests {
         assert_eq!(BatchSize::default().get(), 1);
         for bad in ["0", "-1", "abc"] {
             assert!(bad.parse::<BatchSize>().is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn timeout_seconds_requires_nonzero() {
+        for ok in [1u64, 42, u64::MAX] {
+            let t = TimeoutSeconds::new(ok).expect("nonzero timeout parses");
+            assert_eq!(t.get(), ok);
+            assert_eq!(ok.to_string().parse::<TimeoutSeconds>().expect("valid"), t);
+        }
+        for bad in ["0", "-1", "abc"] {
+            assert!(bad.parse::<TimeoutSeconds>().is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn attempts_requires_nonzero() {
+        for ok in [1u32, 42, u32::MAX] {
+            let a = Attempts::new(ok).expect("nonzero attempts parses");
+            assert_eq!(a.get(), ok);
+            assert_eq!(ok.to_string().parse::<Attempts>().expect("valid"), a);
+        }
+        for bad in ["0", "-1", "abc"] {
+            assert!(bad.parse::<Attempts>().is_err(), "{bad:?}");
         }
     }
 

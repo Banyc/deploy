@@ -170,26 +170,28 @@ mod tests {
     fn behavior_fixture() -> (BTreeMap<String, BehaviorContract>, String) {
         let contracts: BTreeMap<String, BehaviorContract> = BTreeMap::from([(
             "standard".to_string(),
-            BehaviorContract {
-                activation: crate::config::Activation::Systemd(crate::config::ValidatedSystemd {
-                    scope: crate::config::ActivationScope::System,
-                    reconcile_managed_units: true,
-                    units: vec![crate::config::UnitDef {
-                        name: "app.service".to_string(),
-                        artifact_path: "integration/systemd/app.service".to_string(),
-                        enable: true,
-                        restart: true,
-                    }],
-                }),
-                verification: crate::config::Verification::Command(
-                    crate::config::ValidatedCommand {
-                        argv: vec!["true".to_string()],
-                        timeout_seconds: 30,
-                        attempts: 2,
-                        interval_seconds: 1,
-                    },
+            BehaviorContract::new(
+                crate::config::Activation::Systemd(
+                    crate::config::ValidatedSystemd::new(
+                        crate::config::ActivationScope::System,
+                        true,
+                        vec![
+                            crate::config::UnitDef::new(
+                                "app.service".to_string(),
+                                "integration/systemd/app.service".to_string(),
+                                true,
+                                true,
+                            )
+                            .expect("validated unit"),
+                        ],
+                    )
+                    .expect("validated systemd"),
                 ),
-            },
+                crate::config::Verification::Command(
+                    crate::config::ValidatedCommand::new(vec!["true".to_string()], 30, 2, 1)
+                        .expect("validated command"),
+                ),
+            ),
         )]);
         let sha = crate::verify::release::variant_behaviors_digest(&contracts);
         (contracts, sha)
@@ -266,7 +268,7 @@ mod tests {
 
         // ...and the stored snapshot is untouched (no torn write).
         let read = store.read_release_behaviors(&id).expect("snapshot exists");
-        assert_eq!(read["standard"].activation.to_config().adapter, "systemd");
+        assert_eq!(read["standard"].activation().to_config().adapter, "systemd");
     }
 
     /// `read_release` recomputes the canonical digest from the record's own

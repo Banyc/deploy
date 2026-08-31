@@ -855,17 +855,13 @@ interval_seconds = 0
             .map(|v| {
                 (
                     v.clone(),
-                    BehaviorContract {
-                        activation: crate::config::Activation::None,
-                        verification: crate::config::Verification::Command(
-                            crate::config::ValidatedCommand {
-                                argv: vec!["true".to_string()],
-                                timeout_seconds: 5,
-                                attempts: 1,
-                                interval_seconds: 0,
-                            },
+                    BehaviorContract::new(
+                        crate::config::Activation::None,
+                        crate::config::Verification::Command(
+                            crate::config::ValidatedCommand::new(vec!["true".to_string()], 5, 1, 0)
+                                .expect("validated command"),
                         ),
-                    },
+                    ),
                 )
             })
             .collect();
@@ -1996,15 +1992,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     /// recomputed from its own content ([`consistent`]) so the store's
     /// recompute-and-verify reads succeed. Returns the release id.
     fn seed_distinct_release(store: &LocalStore, seed: usize) -> ReleaseId {
-        let contract = BehaviorContract {
-            activation: crate::config::Activation::None,
-            verification: crate::config::Verification::Command(crate::config::ValidatedCommand {
-                argv: vec![format!("verify-{seed}")],
-                timeout_seconds: 5,
-                attempts: 1,
-                interval_seconds: 0,
-            }),
-        };
+        let contract = BehaviorContract::new(
+            crate::config::Activation::None,
+            crate::config::Verification::Command(
+                crate::config::ValidatedCommand::new(vec![format!("verify-{seed}")], 5, 1, 0)
+                    .expect("validated command"),
+            ),
+        );
         let behaviors = BTreeMap::from([("standard".to_string(), contract)]);
         let behavior_sha = crate::verify::release::variant_behaviors_digest(&behaviors);
         let mut rec = ReleaseRecord {

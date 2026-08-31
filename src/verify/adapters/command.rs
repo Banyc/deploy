@@ -34,11 +34,11 @@ pub fn run_verification(
     // The payload is fully validated by construction (non-empty argv, nonzero
     // attempts and timeout), so no defensive `max(1)` upgrade is possible or
     // needed — a zero-attempt command was refused at the record boundary.
-    let attempts = vc.attempts;
-    let timeout = Duration::from_secs(vc.timeout_seconds);
+    let attempts = vc.attempts().get();
+    let timeout = Duration::from_secs(vc.timeout_seconds().get());
     // Render BEFORE the first exec: a template error fails the verification
     // loudly instead of executing a half-rendered command.
-    let argv = crate::remote::canonical::render_argv(&vc.argv, vars)?;
+    let argv = crate::remote::canonical::render_argv(vc.argv(), vars)?;
     let mut last_stderr = String::new();
     for attempt in 0..attempts {
         let outcome = remote.exec(&argv, timeout)?;
@@ -46,8 +46,8 @@ pub fn run_verification(
             return Ok(());
         }
         last_stderr = outcome.stderr;
-        if attempt + 1 < attempts && vc.interval_seconds > 0 {
-            std::thread::sleep(Duration::from_secs(vc.interval_seconds));
+        if attempt + 1 < attempts && vc.interval_seconds() > 0 {
+            std::thread::sleep(Duration::from_secs(vc.interval_seconds()));
         }
     }
     Err(Error::remote(format!(
@@ -144,12 +144,10 @@ mod tests {
     }
 
     fn cfg(argv: &[&str]) -> Verification {
-        Verification::Command(ValidatedCommand {
-            argv: argv.iter().map(|a| a.to_string()).collect(),
-            timeout_seconds: 5,
-            attempts: 1,
-            interval_seconds: 0,
-        })
+        Verification::Command(
+            ValidatedCommand::new(argv.iter().map(|a| a.to_string()).collect(), 5, 1, 0)
+                .expect("validated command"),
+        )
     }
 
     fn slot_vars() -> TemplateVars {
@@ -205,17 +203,23 @@ mod tests {
     }
 
     #[test]
-    fn unknown_template_variable_fails_before_exec() {
-        let remote = RecordingRemote::new(PathBuf::from("/fake/root"));
-        let c = cfg(&["{{ bogus }}", "health-check"]);
-        let err = run_verification(&remote, &c, &slot_vars()).unwrap_err();
+    fn unknown_template_variable_is_refused_at_construction() {
+        // An argv element referencing an unknown template variable is refused
+        // by the VALIDATED CONSTRUCTOR (fail closed) — a command carrying it
+        // can never exist, so it can never execute a half-rendered argv. The
+        // "render before exec" property is structural: the record boundary
+        // already refused the unknown variable before a [`Verification`]
+        // could reach the adapter.
+        let err = ValidatedCommand::new(
+            vec!["{{ bogus }}".to_string(), "health-check".to_string()],
+            5,
+            1,
+            0,
+        )
+        .expect_err("unknown template variable must be refused");
         assert!(
             err.to_string()
                 .contains("unknown template variable 'bogus'")
-        );
-        assert!(
-            remote.executed.borrow().is_empty(),
-            "no command executed on a template error"
         );
     }
 }
