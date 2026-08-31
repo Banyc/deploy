@@ -522,12 +522,13 @@ fn collect_recovery_evidence(
             );
             continue;
         };
-        match helper.acquire_lock_guard(op_id) {
+        let owner = crate::remote::helper::GenerationOwner::new(application.clone(), sid.clone());
+        match crate::remote::helper::SlotRemote::new(helper, owner.clone())
+            .acquire_lock_guard(op_id)
+        {
             Err(_) => return Ok(None),
             Ok(guard) => {
                 let configured_binding = live_bindings.get(&sid);
-                let owner =
-                    crate::remote::helper::GenerationOwner::new(application.clone(), sid.clone());
                 evidence.insert(
                     sid.clone(),
                     observe_recovery_slot(&guard, configured_binding, &owner),
@@ -571,7 +572,7 @@ mod tests {
     use crate::kernel::snapshot::{PreviousGeneration, SnapshotSlot};
     use crate::kernel::terminal::{SlotDelta, TerminalDisposition};
     use crate::ledger::{DeploymentStatus, PhysicalBinding};
-    use crate::remote::helper::{ExpectedCurrent, GenerationAssignment, RemoteHelper};
+    use crate::remote::helper::{ExpectedCurrent, GenerationSpec, RemoteHelper};
     use crate::remote::transport::{LocalTransport, Remote};
     use crate::store::local::LocalStore;
     #[cfg(test)]
@@ -712,9 +713,12 @@ mod tests {
         let r1: Box<dyn Remote> =
             Box::new(LocalTransport::new(&env, h.remotes_base.join("s1")).unwrap());
         let helper = RemoteHelper::new(r1.as_ref());
-        let _guard = helper
-            .acquire_lock_guard(&OperationId::new("op-foreign-a".to_string()))
-            .unwrap();
+        let _guard = crate::remote::helper::SlotRemote::new(
+            &helper,
+            crate::remote::helper::test_owner("eng", "p1"),
+        )
+        .acquire_lock_guard(&OperationId::new("op-foreign-a".to_string()))
+        .unwrap();
 
         // Attempt group B (DISJOINT: deploys p2, inherits p1 from the head)
         // through the REAL push path: preflight recovery cannot finish A, so
@@ -849,30 +853,34 @@ mod tests {
             .create_dir_all(&crate::remote::layout::tree_root(&artifact.tree))
             .unwrap();
         let helper = RemoteHelper::new(&remote);
-        helper
-            .acquire_lock_guard(&OperationId::new("op-mint".to_string()))
-            .unwrap()
-            .create_generation(&GenerationAssignment {
-                deployment_id: deployment_id.clone(),
-                generation_id: generation.clone(),
-                artifact: artifact.clone(),
-                behavior_sha256: crate::identity::DIGEST_TEST_HEX_1.to_string(),
-                prior_generation: Some(prior.clone()),
-                created_at: "2026-01-01T00:00:00Z".to_string(),
-                application: crate::identity::ApplicationStoreKey::parse("eng").unwrap(),
-                slot: crate::identity::SlotId::parse("p1").unwrap(),
-                target: Some(TargetName::parse("t1").unwrap()),
-            })
-            .unwrap();
-        helper
-            .acquire_lock_guard(&OperationId::new("op-mint".to_string()))
-            .unwrap()
-            .swap_current(
-                &ExpectedCurrent::Generation(prior.clone()),
-                generation,
-                "op-mint",
-            )
-            .unwrap();
+        crate::remote::helper::SlotRemote::new(
+            &helper,
+            crate::remote::helper::test_owner("eng", "p1"),
+        )
+        .acquire_lock_guard(&OperationId::new("op-mint".to_string()))
+        .unwrap()
+        .create_generation(&GenerationSpec {
+            deployment_id: deployment_id.clone(),
+            generation_id: generation.clone(),
+            artifact: artifact.clone(),
+            behavior_sha256: crate::identity::DIGEST_TEST_HEX_1.to_string(),
+            prior_generation: Some(prior.clone()),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            target: Some(TargetName::parse("t1").unwrap()),
+        })
+        .unwrap();
+        crate::remote::helper::SlotRemote::new(
+            &helper,
+            crate::remote::helper::test_owner("eng", "p1"),
+        )
+        .acquire_lock_guard(&OperationId::new("op-mint".to_string()))
+        .unwrap()
+        .swap_current(
+            &ExpectedCurrent::Generation(prior.clone()),
+            generation,
+            "op-mint",
+        )
+        .unwrap();
     }
 
     // ---- DEGRADED TERMINALS RECORD BACKEND-OBSERVED FACTS (the spec's

@@ -2664,9 +2664,15 @@ fn capacity_retention_compute_retained_failure_releases_lock() -> Result<()> {
         // acquire returned (the release is a compare-and-delete against that
         // EXACT record).
         let probe_op = deploy::identity::OperationId::generate();
-        let probe_guard = helper.acquire_lock_guard(&probe_op).expect(
-            "another operation must be able to acquire the lock after the failure ({server})",
-        );
+        let probe_guard = deploy::remote::helper::SlotRemote::new(
+            &helper,
+            deploy::remote::helper::GenerationOwner::new(
+                deploy::identity::ApplicationStoreKey::parse("example").unwrap(),
+                deploy::identity::SlotId::parse("p1").unwrap(),
+            ),
+        )
+        .acquire_lock_guard(&probe_op)
+        .expect("another operation must be able to acquire the lock after the failure ({server})");
         probe_guard.release()?;
     }
     Ok(())
@@ -2789,9 +2795,15 @@ fn step17_retention_failure_defers_maintenance_until_noop_retry() -> Result<()> 
         // failure; the probe lock is then released through the guard (the
         // release is a compare-and-delete against the guard's EXACT record).
         let probe_op = deploy::identity::OperationId::generate();
-        let probe_guard = helper.acquire_lock_guard(&probe_op).expect(
-            "another operation must be able to acquire the lock after the failure ({server})",
-        );
+        let probe_guard = deploy::remote::helper::SlotRemote::new(
+            &helper,
+            deploy::remote::helper::GenerationOwner::new(
+                deploy::identity::ApplicationStoreKey::parse("example").unwrap(),
+                deploy::identity::SlotId::parse("p1").unwrap(),
+            ),
+        )
+        .acquire_lock_guard(&probe_op)
+        .expect("another operation must be able to acquire the lock after the failure ({server})");
         // Release the probe lock so the end-to-end re-push below starts clean.
         probe_guard.release()?;
     }
@@ -3315,35 +3327,45 @@ fn pending_commit_diverged_generation_is_degraded_not_successful() -> Result<()>
         .remote()
         .create_dir_all(&deploy::remote::layout::tree_root(&foreign_tree))?;
     let foreign_gen = deploy::identity::GenerationId::generate();
-    foreign_helper
-        .acquire_lock_guard(&deploy::identity::OperationId::generate())
-        .unwrap()
-        .create_generation(&GenerationAssignment {
-            deployment_id: deploy::identity::DeploymentId::generate(),
-            generation_id: foreign_gen.clone(),
-            artifact: deploy::identity::ArtifactRef {
-                release: deploy::identity::ReleaseId::parse(
-                    "rel-sha256-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-                )
-                .expect("valid release id"),
-                variant: deploy::identity::VariantName::parse("standard").expect("valid variant"),
-                tree: foreign_tree,
-            },
-            behavior_sha256: "b".to_string(),
-            prior_generation: None,
-            created_at: "2020-01-01T00:00:00Z".to_string(),
-            application: deploy::identity::ApplicationStoreKey::parse("example").unwrap(),
-            slot: deploy::identity::SlotId::parse("p1").unwrap(),
-            target: None,
-        })?;
-    foreign_helper
-        .acquire_lock_guard(&deploy::identity::OperationId::generate())
-        .unwrap()
-        .swap_current(
-            &deploy::remote::helper::ExpectedCurrent::Absent,
-            &foreign_gen,
-            "op-foreign",
-        )?;
+    deploy::remote::helper::SlotRemote::new(
+        &foreign_helper,
+        deploy::remote::helper::GenerationOwner::new(
+            deploy::identity::ApplicationStoreKey::parse("example").unwrap(),
+            deploy::identity::SlotId::parse("p1").unwrap(),
+        ),
+    )
+    .acquire_lock_guard(&deploy::identity::OperationId::generate())
+    .unwrap()
+    .create_generation(&deploy::remote::helper::GenerationSpec {
+        deployment_id: deploy::identity::DeploymentId::generate(),
+        generation_id: foreign_gen.clone(),
+        artifact: deploy::identity::ArtifactRef {
+            release: deploy::identity::ReleaseId::parse(
+                "rel-sha256-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            )
+            .expect("valid release id"),
+            variant: deploy::identity::VariantName::parse("standard").expect("valid variant"),
+            tree: foreign_tree,
+        },
+        behavior_sha256: "b".to_string(),
+        prior_generation: None,
+        created_at: "2020-01-01T00:00:00Z".to_string(),
+        target: None,
+    })?;
+    deploy::remote::helper::SlotRemote::new(
+        &foreign_helper,
+        deploy::remote::helper::GenerationOwner::new(
+            deploy::identity::ApplicationStoreKey::parse("example").unwrap(),
+            deploy::identity::SlotId::parse("p1").unwrap(),
+        ),
+    )
+    .acquire_lock_guard(&deploy::identity::OperationId::generate())
+    .unwrap()
+    .swap_current(
+        &deploy::remote::helper::ExpectedCurrent::Absent,
+        &foreign_gen,
+        "op-foreign",
+    )?;
     write_file(
         &proj
             .join("releases")

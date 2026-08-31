@@ -111,17 +111,24 @@ fn retain_best_effort_for_capacity(
     op_id: &OperationId,
     deployment_id: &DeploymentId,
 ) {
-    if let Ok(_guard) = helper.acquire_lock_guard(op_id) {
+    // The mutation capability is the SLOT-BOUND [`SlotRemote`]: acquisition
+    // returns a guard carrying this slot's owner, and rotation (a destructive
+    // operation) is a guard method.
+    let slot_remote = crate::remote::helper::SlotRemote::new(
+        helper,
+        crate::remote::helper::GenerationOwner::new(
+            config.application().clone(),
+            crate::identity::SlotId::parse(&slot.id).expect("validated slot id is a safe segment"),
+        ),
+    );
+    if let Ok(guard) = slot_remote.acquire_lock_guard(op_id) {
         let retention = config
             .slot_retention(&slot.id)
             .expect("the assignment's slot is declared by its owning variant");
-        let owner = crate::remote::helper::GenerationOwner::new(
-            config.application().clone(),
-            crate::identity::SlotId::parse(&slot.id).expect("validated slot id is a safe segment"),
-        );
-        if let Ok(retained) = compute_retained(helper, config.pins(), store, retention, &owner) {
+        let owner = guard.owner();
+        if let Ok(retained) = compute_retained(helper, config.pins(), store, retention, owner) {
             let active = HashSet::from([deployment_id.as_str().to_string()]);
-            helper.rotate(&retained, &active).ok();
+            guard.rotate(&retained, &active).ok();
         }
     }
 }

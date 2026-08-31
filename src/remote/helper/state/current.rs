@@ -237,10 +237,76 @@ impl<'a> RemoteHelper<'a> {
 }
 
 impl<'a> crate::remote::helper::HeldSlotLock<'a> {
+    /// Verify the COMPLETE generation chain for `gen_id` against THIS
+    /// guard's owner: the generation directory exists, the assignment parses
+    /// with a matching generation id AND owner marker (a generation
+    /// transplanted from another application/slot is refused), the `root`
+    /// symlink is the exact canonical target for the assignment's tree, and
+    /// the tree object exists. A missing/corrupt/foreign generation is an
+    /// integrity error — it is never installed as `current` and never
+    /// removed.
+    fn verify_generation(&self, gen_id: &GenerationId) -> Result<()> {
+        let gen_dir = layout::generation(gen_id);
+        if self.helper.remote.metadata_opt(&gen_dir)?.is_none() {
+            return Err(Error::integrity(format!(
+                "cannot mutate current to generation {gen_id}: generation directory {} is missing",
+                gen_dir.display()
+            )));
+        }
+        let a = self
+            .helper
+            .read_assignment(gen_id, &self.owner)
+            .map_err(|e| {
+                Error::integrity(format!("cannot mutate current to generation {gen_id}: {e}"))
+            })?;
+        if a.generation_id != *gen_id {
+            return Err(Error::integrity(format!(
+                "cannot mutate current to generation {gen_id}: assignment names generation {}",
+                a.generation_id
+            )));
+        }
+        let root_link = gen_dir.join("root")?;
+        let Some(root_meta) = self.helper.remote.metadata_opt(&root_link)? else {
+            return Err(Error::integrity(format!(
+                "cannot mutate current to generation {gen_id}: no root symlink at {}",
+                root_link.display()
+            )));
+        };
+        if !root_meta.is_symlink {
+            return Err(Error::integrity(format!(
+                "cannot mutate current to generation {gen_id}: root entry at {} is not a symlink",
+                root_link.display()
+            )));
+        }
+        let root_target = self.helper.remote.read_link(&root_link)?;
+        let canonical_root = layout::generation_root_link(&a.artifact.tree);
+        if root_target != canonical_root {
+            return Err(Error::integrity(format!(
+                "cannot mutate current to generation {gen_id}: root symlink target {root_target:?} is not the canonical {} for tree {}",
+                canonical_root.display(),
+                a.artifact.tree
+            )));
+        }
+        let tree_root = layout::tree_root(&a.artifact.tree);
+        if self.helper.remote.metadata_opt(&tree_root)?.is_none() {
+            return Err(Error::integrity(format!(
+                "cannot mutate current to generation {gen_id}: tree object {} is missing",
+                tree_root.display()
+            )));
+        }
+        Ok(())
+    }
+
     /// Atomically move `current` to the given generation. Requires the
     /// slot-mutation capability — the receiver is the guard; the helper is the
     /// guard's own. See [`crate::remote::helper::RemoteHelper::status`] for
     /// the canonical-target gate.
+    ///
+    /// THE GENERATION IS VERIFIED BEFORE THE SWAP: the target generation's
+    /// COMPLETE chain is validated against THIS guard's owner
+    /// ([`Self::verify_generation`]) — a missing, corrupt, or foreign
+    /// (transplanted) generation is never installed as `current` (fail
+    /// closed).
     pub fn swap_current(
         &self,
         expected: &ExpectedCurrent,
@@ -272,6 +338,11 @@ impl<'a> crate::remote::helper::HeldSlotLock<'a> {
                 )));
             }
         }
+        // VERIFY THE GENERATION BEFORE SWAPPING: the generation about to be
+        // installed must exist, parse, carry THIS guard's owner marker, have
+        // a canonical root symlink, and have its tree object present — a
+        // missing/corrupt/foreign generation is never installed as `current`.
+        self.verify_generation(gen_id)?;
         let new_target = layout::generation(gen_id).join("root")?;
         let tmp_name = format!(".current.tmp.{op_id}");
         let tmp = RootedRelativePath::parse(Path::new(&tmp_name))
@@ -287,6 +358,12 @@ impl<'a> crate::remote::helper::HeldSlotLock<'a> {
     /// Remove `current` only if it currently points at `expected`. Requires the
     /// slot-mutation capability — the receiver is the guard. `expected` makes
     /// the removal a compare-and-swap.
+    ///
+    /// THE GENERATION IS VERIFIED BEFORE THE REMOVAL: the current generation
+    /// about to be removed must carry THIS guard's owner marker
+    /// ([`Self::verify_generation`]) — a foreign (transplanted) generation's
+    /// `current` is never removed by a guard that does not own it (fail
+    /// closed).
     pub fn remove_current_if(&self, expected: &ExpectedCurrent) -> Result<bool> {
         // Same exact-equality gate as the swap: resolve the actual state once
         // (malformed/transport errors propagate, link byte-identical) and
@@ -296,6 +373,11 @@ impl<'a> crate::remote::helper::HeldSlotLock<'a> {
         let actual = self.helper.resolve_current()?;
         match (expected, &actual) {
             (ExpectedCurrent::Generation(exp), CurrentState::Generation(act)) if exp == act => {
+                // VERIFY THE GENERATION BEFORE REMOVING: the current
+                // generation about to be removed must be THIS guard's own
+                // (owner marker + complete chain) — a foreign generation's
+                // `current` is never removed by a guard that does not own it.
+                self.verify_generation(exp)?;
                 self.helper.remote.remove_file(layout::current())?;
                 Ok(true)
             }
@@ -373,6 +455,30 @@ mod tests_current {
     /// status reads below verify against (application `test-app`, slot `s1`).
     fn owner() -> GenerationOwner {
         super::super::super::test_owner("test-app", "s1")
+    }
+
+    /// Create a generation record + root symlink + tree object through the
+    /// guard (the verify-before-swap contract requires the target generation
+    /// to exist, carry the guard's owner, and have its tree object present
+    /// before `current` moves).
+    fn create_generation_via_guard(
+        slot: &crate::remote::helper::SlotRemote<'_>,
+        gen_id: &GenerationId,
+        tree: &str,
+    ) {
+        let guard = slot
+            .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
+            .unwrap();
+        // The assignment carries the EXACT caller-supplied generation id
+        // (never re-derived from the id string, which would change it).
+        let mut asn = assignment(gen_id.as_str(), tree);
+        asn.generation_id = gen_id.clone();
+        guard.create_generation(&asn.spec()).unwrap();
+        guard
+            .helper()
+            .remote()
+            .create_dir_all(&layout::tree_root(&test_tree_digest(tree)))
+            .unwrap();
     }
 
     // ---- status() validates the complete symlink layout -------------------
@@ -798,7 +904,7 @@ mod tests_current {
             let helper = RemoteHelper::new(&remote);
             let new_gen = GenerationId::generate();
             let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                helper
+                crate::remote::helper::SlotRemote::new(&helper, owner())
                     .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
                     .unwrap()
                     .swap_current(&ExpectedCurrent::Absent, &new_gen, "op")
@@ -817,7 +923,7 @@ mod tests_current {
             );
             // The CAS form (with an expected generation) fails the same way.
             let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                helper
+                crate::remote::helper::SlotRemote::new(&helper, owner())
                     .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
                     .unwrap()
                     .swap_current(
@@ -857,7 +963,7 @@ mod tests_current {
         let helper = RemoteHelper::new(&remote);
         let new_gen = GenerationId::generate();
         let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            helper
+            crate::remote::helper::SlotRemote::new(&helper, owner())
                 .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
                 .unwrap()
                 .swap_current(&ExpectedCurrent::Absent, &new_gen, "op")
@@ -887,10 +993,13 @@ mod tests_current {
         spec.install(&base);
         let remote = LocalTransport::new(&crate::testutil::fixture_env(), base.clone()).unwrap();
         let helper = RemoteHelper::new(&remote);
+        let slot = crate::remote::helper::SlotRemote::new(&helper, owner());
         let new_gen = GenerationId::generate();
+        // The verify-before-swap contract: the target generation must exist
+        // and carry the guard's owner before `current` moves.
+        create_generation_via_guard(&slot, &new_gen, "tree-a");
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            helper
-                .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
+            slot.acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
                 .unwrap()
                 .swap_current(&ExpectedCurrent::Absent, &new_gen, "op")
         }))
@@ -916,6 +1025,7 @@ mod tests_current {
         spec.install(&base);
         let remote = LocalTransport::new(&crate::testutil::fixture_env(), base.clone()).unwrap();
         let helper = RemoteHelper::new(&remote);
+        let slot = crate::remote::helper::SlotRemote::new(&helper, owner());
         let cas_gid = test_generation_id("gen-cas");
         let next_gen = GenerationId::generate();
         let cas_target = format!(
@@ -925,7 +1035,7 @@ mod tests_current {
         );
 
         // Mismatched expected: refuse (remote CAS error), link untouched.
-        let err = helper
+        let err = slot
             .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
             .unwrap()
             .swap_current(
@@ -944,9 +1054,10 @@ mod tests_current {
             "a refused swap must leave the current link unchanged"
         );
 
-        // Matching expected: proceeds and moves the link.
-        helper
-            .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
+        // Matching expected: proceeds and moves the link. The target
+        // generation must exist (verify-before-swap).
+        create_generation_via_guard(&slot, &next_gen, "tree-b");
+        slot.acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
             .unwrap()
             .swap_current(
                 &ExpectedCurrent::Generation(cas_gid.clone()),
@@ -1355,9 +1466,14 @@ mod tests_current {
             // the EXACT gate succeeds ONLY on genuine absence; a present
             // canonical current is a CAS disagreement (remote error), a
             // malformed-present current is an integrity error — both leave
-            // the entry byte-identical. ----
+            // the entry byte-identical. The target generation must EXIST
+            // (verify-before-swap), so it is created through the guard
+            // first. ----
+            let slot = crate::remote::helper::SlotRemote::new(&helper, owner());
+            let new_gid = GenerationId::parse(&new_gen).expect("fixture generation id");
+            create_generation_via_guard(&slot, &new_gid, "tree-a");
             let swap = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                helper.acquire_lock_guard(&crate::identity::OperationId::new("op".to_string())).unwrap().swap_current( &ExpectedCurrent::Absent, &GenerationId::parse(&new_gen).expect("fixture generation id"), "op")
+                slot.acquire_lock_guard(&crate::identity::OperationId::new("op".to_string())).unwrap().swap_current( &ExpectedCurrent::Absent, &new_gid, "op")
             }))
             .expect("swap must never panic on arbitrary symlink layouts");
             match swap {
@@ -1369,7 +1485,7 @@ mod tests_current {
                     // The swap installed the canonical target for the new gen.
                     assert_eq!(
                         std::fs::read_link(base.join("current")).unwrap(),
-                        layout::generation(&GenerationId::parse(&new_gen).expect("fixture generation id")).join("root").unwrap().as_path()
+                        layout::generation(&new_gid).join("root").unwrap().as_path()
                     );
                 }
                 Err(e) => {
@@ -1583,10 +1699,18 @@ mod tests_current {
                     Box::new(inner)
                 };
                 let helper = RemoteHelper::new(remote.as_ref());
+                // The verify-before-swap/remove contract: the target
+                // generations must EXIST and carry the guard's owner before
+                // `current` moves or is removed.
+                let slot = crate::remote::helper::SlotRemote::new(&helper, owner());
+                create_generation_via_guard(&slot, &new_gen, "tree-a");
+                if a == 1 {
+                    create_generation_via_guard(&slot, &actual_g, "tree-b");
+                }
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match name {
-                    "swap" => helper.acquire_lock_guard(&crate::identity::OperationId::new("op".to_string())).unwrap().swap_current( &expected, &new_gen, "op")
+                    "swap" => slot.acquire_lock_guard(&crate::identity::OperationId::new("op".to_string())).unwrap().swap_current( &expected, &new_gen, "op")
                         .map(|_| true),
-                    _ => helper.acquire_lock_guard(&crate::identity::OperationId::new("op".to_string())).unwrap().remove_current_if( &expected),
+                    _ => slot.acquire_lock_guard(&crate::identity::OperationId::new("op".to_string())).unwrap().remove_current_if( &expected),
                 }));
                 match result {
                     Ok(Ok(_)) => {
@@ -1793,8 +1917,8 @@ mod tests_current {
                 let remote = HintedCurrentRemote { inner, exists_hint, meta };
                 let helper = RemoteHelper::new(&remote);
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match name {
-                    "swap" => helper.acquire_lock_guard(&crate::identity::OperationId::new("op".to_string())).unwrap().swap_current( &expected, &new_gen, "op").map(|_| true),
-                    _ => helper.acquire_lock_guard(&crate::identity::OperationId::new("op".to_string())).unwrap().remove_current_if( &expected),
+                    "swap" => crate::remote::helper::SlotRemote::new(&helper, owner()).acquire_lock_guard(&crate::identity::OperationId::new("op".to_string())).unwrap().swap_current( &expected, &new_gen, "op").map(|_| true),
+                    _ => crate::remote::helper::SlotRemote::new(&helper, owner()).acquire_lock_guard(&crate::identity::OperationId::new("op".to_string())).unwrap().remove_current_if( &expected),
                 }));
                 match result {
                     Ok(Ok(_)) => {

@@ -2076,23 +2076,33 @@ pub(crate) mod commit_tests {
             .create_dir_all(&layout::tree_root(&artifact.tree))
             .unwrap();
         let helper = RemoteHelper::new(&remote);
-        helper
+        // The mutation capability is the SLOT-BOUND [`SlotRemote`]: the
+        // guard carries this slot's owner (p1 on s1, p2 on s2), so the
+        // generation it creates and the `current` swap it performs are bound
+        // to the same slot.
+        let slot_id = crate::identity::SlotId::parse(if server == "s1" { "p1" } else { "p2" })
+            .expect("validated slot id is a safe segment");
+        let slot_remote = crate::remote::helper::SlotRemote::new(
+            &helper,
+            crate::remote::helper::GenerationOwner::new(
+                crate::identity::ApplicationStoreKey::parse("eng").unwrap(),
+                slot_id,
+            ),
+        );
+        slot_remote
             .acquire_lock_guard(&crate::identity::OperationId::new("op-mint".to_string()))
             .unwrap()
-            .create_generation(&GenerationAssignment {
+            .create_generation(&crate::remote::helper::GenerationSpec {
                 deployment_id: deployment_id.clone(),
                 generation_id: generation.clone(),
                 artifact: artifact.clone(),
                 behavior_sha256: crate::identity::DIGEST_TEST_HEX_1.to_string(),
                 prior_generation: None,
                 created_at: "2026-01-01T00:00:00Z".to_string(),
-                application: crate::identity::ApplicationStoreKey::parse("eng").unwrap(),
-                slot: crate::identity::SlotId::parse(if server == "s1" { "p1" } else { "p2" })
-                    .expect("validated slot id is a safe segment"),
                 target: Some(TargetName::parse("t1").unwrap()),
             })
             .unwrap();
-        helper
+        slot_remote
             .acquire_lock_guard(&crate::identity::OperationId::new("op-mint".to_string()))
             .unwrap()
             .swap_current(&ExpectedCurrent::Absent, generation, "op-mint")
@@ -2116,19 +2126,25 @@ pub(crate) mod commit_tests {
             .create_dir_all(&layout::tree_root(&foreign_artifact.tree))
             .unwrap();
         let helper = RemoteHelper::new(&remote);
-        helper
+        let slot_id = crate::identity::SlotId::parse(if server == "s1" { "p1" } else { "p2" })
+            .expect("validated slot id is a safe segment");
+        let slot_remote = crate::remote::helper::SlotRemote::new(
+            &helper,
+            crate::remote::helper::GenerationOwner::new(
+                crate::identity::ApplicationStoreKey::parse("eng").unwrap(),
+                slot_id,
+            ),
+        );
+        slot_remote
             .acquire_lock_guard(&crate::identity::OperationId::new("op-foreign".to_string()))
             .unwrap()
-            .create_generation(&GenerationAssignment {
+            .create_generation(&crate::remote::helper::GenerationSpec {
                 deployment_id: test_deployment_id("deploy-foreign"),
                 generation_id: foreign_gen.clone(),
                 artifact: foreign_artifact,
                 behavior_sha256: "b".to_string(),
                 prior_generation: None,
                 created_at: "2026-01-01T00:00:00Z".to_string(),
-                application: crate::identity::ApplicationStoreKey::parse("eng").unwrap(),
-                slot: crate::identity::SlotId::parse(if server == "s1" { "p1" } else { "p2" })
-                    .expect("validated slot id is a safe segment"),
                 target: Some(TargetName::parse("t1").unwrap()),
             })
             .unwrap();

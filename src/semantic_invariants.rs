@@ -1537,10 +1537,19 @@ impl Fixture {
                 {
                     if guard.is_none() {
                         let holder = format!("si-step17-{}", OperationId::generate().as_str());
-                        guard = Some(helper.acquire_lock_guard(&crate::identity::OperationId::new(holder.to_string())).expect(
-                            "the slot mutation lock must be free while the engine is parked \
+                        guard = Some(
+                            crate::remote::helper::SlotRemote::new(
+                                &helper,
+                                crate::remote::helper::test_owner("si", "p1"),
+                            )
+                            .acquire_lock_guard(&crate::identity::OperationId::new(
+                                holder.to_string(),
+                            ))
+                            .expect(
+                                "the slot mutation lock must be free while the engine is parked \
                              at the step-17 hook",
-                        ));
+                            ),
+                        );
                     }
                     if phase == step17_hook::HookPhase::FreshStep17 {
                         // Arm the debt half of the combination ONLY now, at
@@ -1800,10 +1809,11 @@ impl Fixture {
             let owner = crate::remote::helper::test_owner("si", slot);
             self.with_helper_for(server, |helper| {
                 let op = OperationId::generate();
-                let _guard = helper.acquire_lock_guard(&op)?;
+                let guard = crate::remote::helper::SlotRemote::new(&helper, owner.clone())
+                    .acquire_lock_guard(&op)?;
                 let retained =
                     compute_retained(&helper, self.config.pins(), &self.store, retention, &owner)?;
-                helper.rotate(&retained, &HashSet::new())
+                guard.rotate(&retained, &HashSet::new())
             })?;
         }
         Ok(())
@@ -2440,10 +2450,17 @@ fn state_machine_lifecycle_retention_lock_contention_defers_not_silent() {
                 if let Ok(_phase) = hook.wait_at_step17_bounded(std::time::Duration::from_millis(5))
                 {
                     if guard.is_none() {
-                        guard = Some(helper.acquire_lock_guard(&holder).expect(
-                            "the slot lock must be free while the engine is parked at the \
+                        guard = Some(
+                            crate::remote::helper::SlotRemote::new(
+                                &helper,
+                                crate::remote::helper::test_owner("si", "p1"),
+                            )
+                            .acquire_lock_guard(&holder)
+                            .expect(
+                                "the slot lock must be free while the engine is parked at the \
                              step-17 hook",
-                        ));
+                            ),
+                        );
                     }
                     hook.release();
                 }
@@ -2491,10 +2508,17 @@ fn state_machine_lifecycle_retention_lock_contention_defers_not_silent() {
                 if let Ok(_phase) = hook.wait_at_step17_bounded(std::time::Duration::from_millis(5))
                 {
                     if guard.is_none() {
-                        guard = Some(helper.acquire_lock_guard(&holder).expect(
-                            "the slot lock must be free while the engine is parked at the \
+                        guard = Some(
+                            crate::remote::helper::SlotRemote::new(
+                                &helper,
+                                crate::remote::helper::test_owner("si", "p1"),
+                            )
+                            .acquire_lock_guard(&holder)
+                            .expect(
+                                "the slot lock must be free while the engine is parked at the \
                              no-op retry hook",
-                        ));
+                            ),
+                        );
                     }
                     hook.release();
                 }
@@ -7832,6 +7856,7 @@ fn run_three_controller_case(
                     &admin,
                     &obs,
                     &crate::identity::OperationId::new(controller_op(c).to_string()),
+                    &crate::remote::helper::test_owner("si", "p1"),
                 ) {
                     Ok(rec_guard) => {
                         // The successor capability is now this controller's; the

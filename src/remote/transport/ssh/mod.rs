@@ -3806,7 +3806,7 @@ exec /bin/mv "$@"
                     std::fs::read_link(&link).unwrap(),
                 );
                 let helper = RemoteHelper::new(&t);
-                let guard = helper.acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()));
+                let guard = crate::remote::helper::SlotRemote::new(&helper, crate::remote::helper::test_owner("test-app", "s1")).acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()));
                 let err = match guard {
                     Ok(g) => g.swap_current( &ExpectedCurrent::Absent, &crate::identity::test_generation_id("gen-gate"), "op")
                         .unwrap_err(),
@@ -3884,16 +3884,22 @@ exec /bin/mv "$@"
             slot: crate::identity::SlotId::parse("s1").unwrap(),
             target: None,
         };
-        helper
-            .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
-            .unwrap()
-            .create_generation(&mk(&g1, "t1"))
-            .unwrap();
-        helper
-            .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
-            .unwrap()
-            .create_generation(&mk(&g2, "t2"))
-            .unwrap();
+        crate::remote::helper::SlotRemote::new(
+            &helper,
+            crate::remote::helper::test_owner("test-app", "s1"),
+        )
+        .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
+        .unwrap()
+        .create_generation(&mk(&g1, "t1").spec())
+        .unwrap();
+        crate::remote::helper::SlotRemote::new(
+            &helper,
+            crate::remote::helper::test_owner("test-app", "s1"),
+        )
+        .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
+        .unwrap()
+        .create_generation(&mk(&g2, "t2").spec())
+        .unwrap();
         for tree in ["t1", "t2"] {
             let d = test_tree_digest(tree);
             helper
@@ -3901,11 +3907,14 @@ exec /bin/mv "$@"
                 .create_dir_all(&crate::remote::layout::tree_root(&d))
                 .unwrap();
         }
-        helper
-            .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
-            .unwrap()
-            .swap_current(&ExpectedCurrent::Absent, &g2, "op")
-            .unwrap();
+        crate::remote::helper::SlotRemote::new(
+            &helper,
+            crate::remote::helper::test_owner("test-app", "s1"),
+        )
+        .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
+        .unwrap()
+        .swap_current(&ExpectedCurrent::Absent, &g2, "op")
+        .unwrap();
         let garbage = test_tree_digest("garbage");
         helper
             .remote()

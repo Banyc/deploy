@@ -127,8 +127,15 @@ pub(crate) fn retain_slot_post_commit(
     // `#[cfg(test)]`) and in unarmed tests.
     #[cfg(test)]
     store.step17_hook_barrier(deployment_id, HookPhase::FreshStep17);
-    if let Ok(_guard) = helper.acquire_lock_guard(op_id) {
-        match rotate_slot_locked(helper, store, config, sid, slot_retention, deployment_id) {
+    // The mutation capability is the SLOT-BOUND [`SlotRemote`]: acquisition
+    // returns a guard carrying this slot's owner, and rotation (a destructive
+    // operation) is a guard method.
+    let slot_remote = crate::remote::helper::SlotRemote::new(
+        helper,
+        crate::remote::helper::GenerationOwner::new(config.application().clone(), sid.clone()),
+    );
+    if let Ok(guard) = slot_remote.acquire_lock_guard(op_id) {
+        match rotate_slot_locked(&guard, store, config, slot_retention, deployment_id) {
             Ok(()) => {
                 maintenance.extend(clear_retention_deferred(store, target_name, sid));
             }
@@ -171,21 +178,22 @@ pub(crate) fn retain_slot_post_commit(
 /// (policy lives in the caller-supplied `config` settings object, never a
 /// separate argument).
 fn rotate_slot_locked(
-    helper: &RemoteHelper,
+    held: &crate::remote::helper::HeldSlotLock<'_>,
     store: &LocalStore,
     config: &ProjectConfig,
-    slot: &SlotId,
     retention: &RetentionConfig,
     deployment_id: &DeploymentId,
 ) -> Result<()> {
     // The retained-set computation reads every generation record and must
     // verify each record's OWNER MARKER against this application + slot (a
     // transplanted generation is refused — never swept as if it were ours).
-    let owner =
-        crate::remote::helper::GenerationOwner::new(config.application().clone(), slot.clone());
-    let retained = compute_retained(helper, config.pins(), store, retention, &owner)?;
+    // The owner is the GUARD's own — the guard knows which slot it
+    // authorizes mutation on.
+    let helper = held.helper();
+    let owner = held.owner();
+    let retained = compute_retained(helper, config.pins(), store, retention, owner)?;
     let active_incoming = HashSet::from([deployment_id.as_str().to_string()]);
-    helper.rotate(&retained, &active_incoming)?;
+    held.rotate(&retained, &active_incoming)?;
     Ok(())
 }
 
@@ -527,7 +535,11 @@ pub(crate) fn retry_deferred_retentions(
         // here). A no-op in production builds and unarmed tests.
         #[cfg(test)]
         store.step17_hook_barrier(deployment_id, HookPhase::DeferredRetry);
-        if let Ok(_guard) = helper.acquire_lock_guard(op_id) {
+        let slot_remote = crate::remote::helper::SlotRemote::new(
+            helper,
+            crate::remote::helper::GenerationOwner::new(config.application().clone(), sid.clone()),
+        );
+        if let Ok(guard) = slot_remote.acquire_lock_guard(op_id) {
             // The slot's ONE retention policy, from its OWNING VARIANT
             // (resolved from the current config — retention is never a
             // member-target union).
@@ -543,14 +555,7 @@ pub(crate) fn retry_deferred_retentions(
                     continue;
                 }
             };
-            match rotate_slot_locked(
-                helper,
-                store,
-                config,
-                &SlotId::parse(slot_str.as_str()).expect("validated slot id is a safe segment"),
-                slot_retention,
-                deployment_id,
-            ) {
+            match rotate_slot_locked(&guard, store, config, slot_retention, deployment_id) {
                 Ok(()) => serviced.push(slot_str.clone()),
                 Err(e) => {
                     // Keep the marker with the fresh reason.

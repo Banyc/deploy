@@ -151,8 +151,14 @@ pub(crate) fn run_unlock(
             // Explicit recovery under the local administrative lock: a
             // FRESH acquisition id installed as the successor capability (a
             // [`HeldSlotLock`] this command now holds). Release happens ONLY
-            // through the guard — releasing it leaves the slot free.
-            let successor_guard = helper.recover_lock(&_admin_guard, &observed, &op_id)?;
+            // through the guard — releasing it leaves the slot free. The
+            // successor guard carries THIS slot's owner (the resource
+            // identity it authorizes mutation on).
+            let owner = crate::remote::helper::GenerationOwner::new(
+                config.application().clone(),
+                slot_id.clone(),
+            );
+            let successor_guard = helper.recover_lock(&_admin_guard, &observed, &op_id, &owner)?;
             let successor = successor_guard.record().clone();
             successor_guard.release()?;
 
@@ -258,9 +264,12 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
     fn acquire_via_guard(helper: &RemoteHelper, op_str: &str) -> crate::remote::helper::LockRecord {
         let op = crate::identity::OperationId::new(op_str.to_string());
-        let guard = helper
-            .acquire_lock_guard(&crate::identity::OperationId::new(op.to_string()))
-            .unwrap();
+        let guard = crate::remote::helper::SlotRemote::new(
+            helper,
+            crate::remote::helper::test_owner("unlock-test", "p1"),
+        )
+        .acquire_lock_guard(&crate::identity::OperationId::new(op.to_string()))
+        .unwrap();
         let bytes = helper
             .remote()
             .read(&crate::remote::layout::operation_lock())

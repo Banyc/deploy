@@ -105,20 +105,86 @@ impl<'a> RemoteHelper<'a> {
     }
 }
 
+/// The NON-OWNER fields of a generation assignment: the caller supplies the
+/// deployment/generation/artifact/behavior/prior/target, and the OWNER
+/// (application + slot) is bound by the [`HeldSlotLock`] guard at creation
+/// time ([`HeldSlotLock::create_generation`]) — an assignment can never name
+/// a different slot than the guard authorizes. The owner is the resource
+/// identity the guard was acquired for; a caller cannot pass it as a free
+/// parameter.
+#[derive(Clone, Debug)]
+pub struct GenerationSpec {
+    pub deployment_id: DeploymentId,
+    pub generation_id: GenerationId,
+    pub artifact: ArtifactRef,
+    pub behavior_sha256: String,
+    pub prior_generation: Option<GenerationId>,
+    pub created_at: String,
+    pub target: Option<TargetName>,
+}
+
+impl GenerationSpec {
+    /// Build the full assignment, binding the OWNER from the guard: the
+    /// record's `application`/`slot` are ALWAYS the guard's owner — never a
+    /// caller-supplied value that could name a different slot.
+    pub(crate) fn into_assignment(self, owner: &GenerationOwner) -> GenerationAssignment {
+        GenerationAssignment {
+            deployment_id: self.deployment_id,
+            generation_id: self.generation_id,
+            artifact: self.artifact,
+            behavior_sha256: self.behavior_sha256,
+            prior_generation: self.prior_generation,
+            created_at: self.created_at,
+            application: owner.application.clone(),
+            slot: owner.slot.clone(),
+            target: self.target,
+        }
+    }
+}
+
+impl GenerationAssignment {
+    /// The NON-OWNER fields as a [`GenerationSpec`]: the owner (application +
+    /// slot) is bound by the guard at creation time
+    /// ([`HeldSlotLock::create_generation`]) — an assignment can never name
+    /// a different slot than the guard authorizes. Used by fixtures that
+    /// keep the full record for repair/read-back while creating it through
+    /// the guard.
+    #[cfg(test)]
+    pub(crate) fn spec(&self) -> GenerationSpec {
+        GenerationSpec {
+            deployment_id: self.deployment_id.clone(),
+            generation_id: self.generation_id.clone(),
+            artifact: self.artifact.clone(),
+            behavior_sha256: self.behavior_sha256.clone(),
+            prior_generation: self.prior_generation.clone(),
+            created_at: self.created_at.clone(),
+            target: self.target.clone(),
+        }
+    }
+}
+
 impl<'a> HeldSlotLock<'a> {
     /// Create a generation record and its `root` symlink. Does not move
     /// `current`. Requires the slot-mutation capability — the receiver is the
     /// guard; the helper is the guard's own.
+    ///
+    /// The assignment is constructed INTERNALLY from the guard's OWNER
+    /// ([`GenerationSpec::into_assignment`]): the caller supplies the
+    /// non-owner fields (deployment, generation, artifact, behavior, prior,
+    /// target) and the record's `application`/`slot` owner marker is ALWAYS
+    /// the guard's owner — an assignment can never name a different slot than
+    /// the guard authorizes.
     ///
     /// The assignment record is immutable and installed with create-or-compare
     /// semantics: a generation ID colliding with different content fails
     /// integrity instead of silently rewriting history. Generation IDs are
     /// fresh UUIDv7 values minted while holding the slot lock, so this can
     /// only fire on corruption or retry-after-crash with divergent state.
-    pub fn create_generation(&self, assignment: &GenerationAssignment) -> Result<()> {
+    pub fn create_generation(&self, spec: &GenerationSpec) -> Result<()> {
+        let assignment = spec.clone().into_assignment(&self.owner);
         let gen_dir = layout::generation(&assignment.generation_id);
         self.helper.remote.create_dir_all(&gen_dir)?;
-        let json = serde_json::to_vec_pretty(assignment)
+        let json = serde_json::to_vec_pretty(&assignment)
             .map_err(|e| Error::remote(format!("serialize assignment: {e}")))?;
         let assignment_path = gen_dir.join("assignment.json")?;
         // The TYPED verdict: `Created`/`AlreadyPresent` (the identical retry)
@@ -186,8 +252,8 @@ mod tests_assignment {
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
 
-    fn assignment(gen_id: &str, tree: &str) -> GenerationAssignment {
-        GenerationAssignment {
+    fn assignment(gen_id: &str, tree: &str) -> GenerationSpec {
+        GenerationSpec {
             deployment_id: test_deployment_id("deploy-1"),
             generation_id: test_generation_id(gen_id),
             artifact: ArtifactRef {
@@ -198,8 +264,6 @@ mod tests_assignment {
             behavior_sha256: "b".to_string(),
             prior_generation: None,
             created_at: "2020-01-01T00:00:00Z".to_string(),
-            application: crate::identity::ApplicationStoreKey::parse("test-app").unwrap(),
-            slot: crate::identity::SlotId::parse("s1").unwrap(),
             target: Some(TargetName::new("t1")),
         }
     }
@@ -220,7 +284,8 @@ mod tests_assignment {
             LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
                 .unwrap();
         let helper = RemoteHelper::new(&remote);
-        let _guard = helper
+        let slot = crate::remote::helper::SlotRemote::new(&helper, owner());
+        let _guard = slot
             .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
             .unwrap();
 
@@ -291,8 +356,10 @@ mod tests_assignment {
                     .unwrap();
             let helper = RemoteHelper::new(&remote);
 
-            // Build the record bytes, then apply the tamper class.
-            let asn = assignment(&tag, "tree-a");
+            // Build the record bytes, then apply the tamper class. The
+            // record is the FULL assignment (owner bound from the fixture
+            // owner — the same owner the reads verify against).
+            let asn = assignment(&tag, "tree-a").into_assignment(&owner());
             let mut value = serde_json::to_value(&asn).unwrap();
             let tampered = match tamper {
                 0 => None,

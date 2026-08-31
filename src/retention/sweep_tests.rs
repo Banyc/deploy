@@ -41,7 +41,7 @@ use crate::identity::{
     test_deployment_id, test_generation_id, test_tree_digest,
 };
 use crate::ledger::{DeploymentIntent, DeploymentStatus, LedgerTerminal};
-use crate::remote::helper::{GenerationAssignment, RemoteHelper};
+use crate::remote::helper::{GenerationSpec, RemoteHelper};
 use crate::remote::layout;
 use crate::remote::transport::{LocalTransport, Remote};
 use crate::retention::checkpoint::run_checkpoint_unlocked;
@@ -167,10 +167,10 @@ fn make_gen(
         .remote()
         .create_dir_all(&layout::tree_root(&canonical_tree))
         .unwrap();
-    helper
+    crate::remote::helper::SlotRemote::new(helper, crate::remote::helper::test_owner("sw", "p1"))
         .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
         .unwrap()
-        .create_generation(&GenerationAssignment {
+        .create_generation(&GenerationSpec {
             deployment_id: test_deployment_id(deployment_id),
             generation_id: test_generation_id(generation_id),
             artifact: ArtifactRef {
@@ -181,8 +181,6 @@ fn make_gen(
             behavior_sha256: "b".into(),
             prior_generation: prior_generation.map(test_generation_id),
             created_at: created.into(),
-            application: crate::identity::ApplicationStoreKey::parse("sw").unwrap(),
-            slot: crate::identity::SlotId::parse("p1").unwrap(),
             target: None,
         })
         .unwrap();
@@ -385,7 +383,7 @@ fn run_no_leak_case(
             prior.as_deref(),
         );
     }
-    helper
+    crate::remote::helper::SlotRemote::new(&helper, crate::remote::helper::test_owner("sw", "p1"))
         .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
         .unwrap()
         .swap_current(
@@ -456,7 +454,11 @@ fn run_no_leak_case(
         &crate::remote::helper::test_owner("sw", "p1"),
     )
     .unwrap();
-    helper.rotate(&retained, &HashSet::new()).unwrap();
+    crate::remote::helper::SlotRemote::new(&helper, crate::remote::helper::test_owner("sw", "p1"))
+        .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
+        .unwrap()
+        .rotate(&retained, &HashSet::new())
+        .unwrap();
     // The receiver retains EXACTLY the policy-retained trees: stale ones are
     // gone, retained + pinned content survives.
     for t in &receiver_trees {

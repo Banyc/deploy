@@ -117,7 +117,12 @@ pub(crate) fn finalize_successful_locked(
                 slot: sid.clone(),
             });
         };
-        match helper.acquire_lock_guard(op_id) {
+        match crate::remote::helper::SlotRemote::new(
+            helper,
+            crate::remote::helper::GenerationOwner::new((*application).clone(), sid.clone()),
+        )
+        .acquire_lock_guard(op_id)
+        {
             Ok(guard) => guards.push(guard),
             Err(_) => return Ok(FinalizeOutcome::Pending),
         }

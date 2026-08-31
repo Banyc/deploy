@@ -1361,7 +1361,7 @@ mod tests_publish {
                     helper.stage_incoming(&dep, &digest, &host).unwrap();
                     let staged_path = remote.root().join(layout::staged_tree(&dep, &digest));
                     apply_mutation(&staged_path, &mutation);
-                    let held = helper
+                    let held = crate::remote::helper::SlotRemote::new(&helper, crate::remote::helper::test_owner("test-app", "s1"))
                         .acquire_lock_guard(&crate::identity::test_operation_id("op-1"))
                         .unwrap();
                     let _ = held.publish_from_incoming(&dep, &digest);
@@ -1372,14 +1372,14 @@ mod tests_publish {
                     // the host each time, so the repair always has a source),
                     // then mutate the EXISTING object at the final digest
                     // path and re-publish.
-                    let held = helper
+                    let held = crate::remote::helper::SlotRemote::new(&helper, crate::remote::helper::test_owner("test-app", "s1"))
                         .acquire_lock_guard(&crate::identity::test_operation_id("op-1"))
                         .unwrap();
                     held.publish_tree(&digest, &host).unwrap();
                     drop(held);
                     let final_path = remote.root().join(layout::tree_root(&digest));
                     apply_mutation(&final_path, &mutation);
-                    let held = helper
+                    let held = crate::remote::helper::SlotRemote::new(&helper, crate::remote::helper::test_owner("test-app", "s1"))
                         .acquire_lock_guard(&crate::identity::test_operation_id("op-2"))
                         .unwrap();
                     let _ = held.publish_tree(&digest, &host);
@@ -1391,7 +1391,7 @@ mod tests_publish {
                     // re-publish from incoming: the repair re-publishes the
                     // verified staged tree.
                     helper.stage_incoming(&dep, &digest, &host).unwrap();
-                    let held = helper
+                    let held = crate::remote::helper::SlotRemote::new(&helper, crate::remote::helper::test_owner("test-app", "s1"))
                         .acquire_lock_guard(&crate::identity::test_operation_id("op-1"))
                         .unwrap();
                     held.publish_from_incoming(&dep, &digest).unwrap();
@@ -1399,7 +1399,7 @@ mod tests_publish {
                     let final_path = remote.root().join(layout::tree_root(&digest));
                     apply_mutation(&final_path, &mutation);
                     helper.stage_incoming(&dep, &digest, &host).unwrap();
-                    let held = helper
+                    let held = crate::remote::helper::SlotRemote::new(&helper, crate::remote::helper::test_owner("test-app", "s1"))
                         .acquire_lock_guard(&crate::identity::test_operation_id("op-2"))
                         .unwrap();
                     let _ = held.publish_from_incoming(&dep, &digest);

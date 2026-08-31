@@ -13,3 +13,4 @@ pub mod current;
 mod markers;
 
 pub use assignment::GenerationAssignment;
+pub use assignment::GenerationSpec;

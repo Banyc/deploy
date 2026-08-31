@@ -231,10 +231,21 @@ pub(crate) fn process_server(
     template_vars: &crate::remote::canonical::TemplateVars,
     config: &ProjectConfig,
 ) -> Result<ServerProc> {
+    // The expected OWNER of this remote's generations: this application, this
+    // slot. Every status read and generation write carries it — a remote
+    // whose state was transplanted from another application/slot is refused.
+    let owner =
+        crate::remote::helper::GenerationOwner::new(config.application().clone(), slot.clone());
+
     // Acquire the slot's mutation lock via an RAII guard so every return path
     // (including errors) releases it. Held in a named binding so in-process
-    // compensation can borrow it without re-acquiring.
-    let held = match helper.acquire_lock_guard(op_id) {
+    // compensation can borrow it without re-acquiring. The mutation capability
+    // is the SLOT-BOUND [`SlotRemote`]: acquisition returns a guard carrying
+    // THIS slot's owner, so the guard knows which slot it authorizes mutation
+    // on (assignments are constructed from it, the `current` swap verifies
+    // the generation it installs against it).
+    let slot_remote = crate::remote::helper::SlotRemote::new(helper, owner.clone());
+    let held = match slot_remote.acquire_lock_guard(op_id) {
         Ok(g) => g,
         Err(e) => {
             return Ok(ServerProc::failed_before(format!(
@@ -242,12 +253,6 @@ pub(crate) fn process_server(
             )));
         }
     };
-
-    // The expected OWNER of this remote's generations: this application, this
-    // slot. Every status read and generation write carries it — a remote
-    // whose state was transplanted from another application/slot is refused.
-    let owner =
-        crate::remote::helper::GenerationOwner::new(config.application().clone(), slot.clone());
 
     // Compare-and-swap precondition on current generation.
     let status = match helper.status(&owner) {
@@ -320,21 +325,19 @@ pub(crate) fn process_server(
             "publish release failed: {e}"
         )));
     }
-    let assignment = crate::remote::helper::GenerationAssignment {
+    // The generation SPEC carries the non-owner fields; the OWNER MARKER
+    // (application + slot) is bound by the guard itself — an assignment can
+    // never name a different slot than the guard authorizes.
+    let spec = crate::remote::helper::GenerationSpec {
         deployment_id: deployment_id.clone(),
         generation_id: new_gen.clone(),
         artifact: artifact.clone(),
         behavior_sha256: behavior_sha256.to_string(),
         prior_generation: expected_gen.cloned(),
         created_at: crate::remote::helper::now_rfc3339(),
-        // THE OWNER MARKER: the generation record carries this application +
-        // slot, and every later read verifies it matches (fail closed on
-        // transplanted/copied state).
-        application: config.application().clone(),
-        slot: slot.clone(),
         target: Some(TargetName::parse(target_name).expect("target name is a safe segment")),
     };
-    if let Err(e) = held.create_generation(&assignment) {
+    if let Err(e) = held.create_generation(&spec) {
         return Ok(ServerProc::failed_before(format!(
             "create generation failed: {e}"
         )));

@@ -287,7 +287,9 @@ mod tests {
         TreeDigest, VariantName, test_deployment_id, test_generation_id, test_release_id,
         test_tree_digest,
     };
-    use crate::remote::helper::{CurrentAssignment, GenerationAssignment, RemoteHelper};
+    use crate::remote::helper::{
+        CurrentAssignment, GenerationAssignment, GenerationSpec, RemoteHelper,
+    };
     use crate::remote::layout;
     use crate::remote::transport::{
         CreateNewVerdict, LocalTransport, Remote, RemoteEntry, RemoteMeta, RootedRelativePath,
@@ -385,10 +387,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .remote()
             .create_dir_all(&layout::tree_root(&test_tree_digest("t2")))
             .unwrap();
-        helper
+        crate::remote::helper::SlotRemote::new(&helper, owner())
             .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
             .unwrap()
-            .create_generation(&GenerationAssignment {
+            .create_generation(&GenerationSpec {
                 deployment_id: test_deployment_id("d1"),
                 generation_id: test_generation_id("g1"),
                 artifact: crate::identity::ArtifactRef {
@@ -399,15 +401,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 behavior_sha256: "b".into(),
                 prior_generation: None,
                 created_at: "2020-01-01T00:00:00Z".into(),
-                application: crate::identity::ApplicationStoreKey::parse("rot").unwrap(),
-                slot: crate::identity::SlotId::parse("p1").unwrap(),
                 target: None,
             })
             .unwrap();
-        helper
+        crate::remote::helper::SlotRemote::new(&helper, owner())
             .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
             .unwrap()
-            .create_generation(&GenerationAssignment {
+            .create_generation(&GenerationSpec {
                 deployment_id: test_deployment_id("d2"),
                 generation_id: test_generation_id("g2"),
                 artifact: crate::identity::ArtifactRef {
@@ -418,12 +418,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 behavior_sha256: "b".into(),
                 prior_generation: Some(test_generation_id("g1")),
                 created_at: "2020-01-02T00:00:00Z".into(),
-                application: crate::identity::ApplicationStoreKey::parse("rot").unwrap(),
-                slot: crate::identity::SlotId::parse("p1").unwrap(),
                 target: None,
             })
             .unwrap();
-        helper
+        crate::remote::helper::SlotRemote::new(&helper, owner())
             .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
             .unwrap()
             .swap_current(
@@ -544,10 +542,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .remote()
             .create_dir_all(&layout::tree_root(&canonical_tree))
             .unwrap();
-        helper
+        crate::remote::helper::SlotRemote::new(helper, owner())
             .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
             .unwrap()
-            .create_generation(&crate::remote::helper::GenerationAssignment {
+            .create_generation(&crate::remote::helper::GenerationSpec {
                 deployment_id: test_deployment_id(deployment_id),
                 generation_id: test_generation_id(generation_id),
                 artifact: crate::identity::ArtifactRef {
@@ -558,8 +556,6 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 behavior_sha256: "b".into(),
                 prior_generation: prior_generation.map(test_generation_id),
                 created_at: created.into(),
-                application: crate::identity::ApplicationStoreKey::parse("rot").unwrap(),
-                slot: crate::identity::SlotId::parse("p1").unwrap(),
                 target: target.map(|t| crate::identity::TargetName::new(t.to_string())),
             })
             .unwrap();
@@ -603,7 +599,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             Some("g2"),
             None,
         );
-        helper
+        crate::remote::helper::SlotRemote::new(&helper, owner())
             .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
             .unwrap()
             .swap_current(
@@ -665,7 +661,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let recent = (now - jiff::SignedDuration::from_hours(5 * 24)).to_string();
         make_gen(&helper, "d1", "g1", "t-old", &old, None, None);
         make_gen(&helper, "d2", "g2", "t-recent", &recent, Some("g1"), None);
-        helper
+        crate::remote::helper::SlotRemote::new(&helper, owner())
             .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
             .unwrap()
             .swap_current(
@@ -755,7 +751,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             Some("g2"),
             None,
         );
-        helper
+        crate::remote::helper::SlotRemote::new(&helper, owner())
             .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
             .unwrap()
             .swap_current(
@@ -831,7 +827,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             None,
         );
         // current -> g2, whose assignment records g1 as prior.
-        helper
+        crate::remote::helper::SlotRemote::new(&helper, owner())
             .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
             .unwrap()
             .swap_current(
@@ -898,7 +894,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             None,
             None,
         );
-        helper
+        crate::remote::helper::SlotRemote::new(&helper, owner())
             .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
             .unwrap()
             .swap_current(
@@ -1005,7 +1001,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             Some("g2"),
             Some("production"),
         );
-        helper
+        crate::remote::helper::SlotRemote::new(&helper, owner())
             .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
             .unwrap()
             .swap_current(
@@ -1138,7 +1134,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             Some("g2"),
             None,
         );
-        helper
+        crate::remote::helper::SlotRemote::new(&helper, owner())
             .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
             .unwrap()
             .swap_current(
@@ -1230,7 +1226,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             Some("g1"),
             None,
         );
-        helper
+        crate::remote::helper::SlotRemote::new(helper, owner())
             .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
             .unwrap()
             .swap_current(
@@ -1396,7 +1392,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 && retained.contains(test_tree_digest("tree-pin-b").as_str()),
             "the repaired record restores the pin's protection"
         );
-        helper.rotate(&retained, &HashSet::new()).unwrap();
+        crate::remote::helper::SlotRemote::new(&helper, owner())
+            .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
+            .unwrap()
+            .rotate(&retained, &HashSet::new())
+            .unwrap();
 
         // EXACT deletions: the genuinely unretained garbage is removed while
         // the pin-only trees (and the policy-retained live trees) survive.
@@ -1536,7 +1536,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             // survive, the true garbage is removed — and the marker clears.
             repair_pin_record(&store, &rec);
             let retained = compute_retained(&helper, c.pins(), &store, ret(&c), &owner()).unwrap();
-            helper.rotate(&retained, &HashSet::new()).unwrap();
+            crate::remote::helper::SlotRemote::new(&helper, owner())
+            .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
+            .unwrap()
+            .rotate(&retained, &HashSet::new())
+            .unwrap();
             for t in &pin_trees {
                 assert!(
                     helper.remote().exists(&layout::tree_root(&test_tree_digest(t))),
@@ -1841,11 +1845,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     slot: crate::identity::SlotId::parse("p1").unwrap(),
                     target: None,
                 };
-                helper.acquire_lock_guard(&crate::identity::OperationId::new("op".to_string())).unwrap().create_generation( &asn).unwrap();
+                crate::remote::helper::SlotRemote::new(&helper, owner()).acquire_lock_guard(&crate::identity::OperationId::new("op".to_string())).unwrap().create_generation(&asn.spec()).unwrap();
                 assignments.push(asn);
             }
             let current = history.last().unwrap().clone();
-            helper.acquire_lock_guard(&crate::identity::OperationId::new("op".to_string())).unwrap().swap_current(
+            crate::remote::helper::SlotRemote::new(&helper, owner()).acquire_lock_guard(&crate::identity::OperationId::new("op".to_string())).unwrap().swap_current(
                     &crate::remote::helper::ExpectedCurrent::Absent,
                     &GenerationId::parse(&current.id).expect("fixture generation id"),
                     "op",
@@ -1999,7 +2003,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 retained, expected,
                 "the retried retention must retain exactly the reference-model set"
             );
-            helper.rotate(&retained, &HashSet::new()).unwrap();
+            crate::remote::helper::SlotRemote::new(&helper, owner())
+            .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
+            .unwrap()
+            .rotate(&retained, &HashSet::new())
+            .unwrap();
             for g in &history {
                 assert_eq!(
                     helper.remote().exists(&layout::tree_root(&TreeDigest::parse(&g.tree).expect("fixture tree digest"))),
@@ -2432,11 +2440,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     slot: crate::identity::SlotId::parse("p1").unwrap(),
                     target: None,
                 };
-                helper.acquire_lock_guard(&crate::identity::OperationId::new("op".to_string())).unwrap().create_generation( &asn).unwrap();
+                crate::remote::helper::SlotRemote::new(&helper, owner()).acquire_lock_guard(&crate::identity::OperationId::new("op".to_string())).unwrap().create_generation(&asn.spec()).unwrap();
                 assignments.push(asn);
             }
             let current = history.last().unwrap().clone();
-            helper.acquire_lock_guard(&crate::identity::OperationId::new("op".to_string())).unwrap().swap_current(
+            crate::remote::helper::SlotRemote::new(&helper, owner()).acquire_lock_guard(&crate::identity::OperationId::new("op".to_string())).unwrap().swap_current(
                     &crate::remote::helper::ExpectedCurrent::Absent,
                     &GenerationId::parse(&current.id).expect("fixture generation id"),
                     "op",
@@ -2686,7 +2694,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 retained, expected,
                 "the retried retention must retain exactly the reference-model set"
             );
-            helper.rotate(&retained, &HashSet::new()).unwrap();
+            crate::remote::helper::SlotRemote::new(&helper, owner())
+            .acquire_lock_guard(&crate::identity::OperationId::new("op".to_string()))
+            .unwrap()
+            .rotate(&retained, &HashSet::new())
+            .unwrap();
             for g in &history {
                 assert_eq!(
                     helper.remote().exists(&layout::tree_root(&TreeDigest::parse(&g.tree).expect("fixture tree digest"))),

@@ -33,6 +33,13 @@
 //! * `rebinding_deserialize.rs` — the proof is serde-free: a wire string
 //!   can deserialize into the CLAIM `RebindingPlan`, never into a "verified"
 //!   proof — only the verification (`TryFrom`) mints it.
+//! * `unguarded_rotate.rs` — `RemoteHelper` has no `rotate` method: rotation
+//!   is a destructive operation and therefore a `HeldSlotLock` method (a
+//!   caller must HOLD the slot's mutation lock to sweep it).
+//! * `unguarded_create_generation.rs` — `RemoteHelper` has no
+//!   `create_generation` method: generation creation is a destructive
+//!   operation and therefore a `HeldSlotLock` method (the assignment's
+//!   OWNER is bound by the guard itself).
 //!
 //! The `.pass()` case is the CONTRAST: the non-Successful dispositions are
 //! constructible by any caller (there is nothing to fabricate).
@@ -48,5 +55,7 @@ fn sealed_ledger_writes_are_compile_enforced() {
     t.compile_fail("tests/ui/binding_literal.rs");
     t.compile_fail("tests/ui/rebinding_proof.rs");
     t.compile_fail("tests/ui/rebinding_deserialize.rs");
+    t.compile_fail("tests/ui/unguarded_rotate.rs");
+    t.compile_fail("tests/ui/unguarded_create_generation.rs");
     t.pass("tests/ui/non_successful_terminal_ok.rs");
 }

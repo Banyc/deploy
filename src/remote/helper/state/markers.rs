@@ -116,9 +116,12 @@ mod tests_markers {
         .unwrap();
 
         let helper = RemoteHelper::new(&remote);
-        let _guard = helper
-            .acquire_lock_guard(&crate::identity::OperationId::new("op-marker".to_string()))
-            .unwrap();
+        let _guard = crate::remote::helper::SlotRemote::new(
+            &helper,
+            crate::remote::helper::test_owner("test-app", "s1"),
+        )
+        .acquire_lock_guard(&crate::identity::OperationId::new("op-marker".to_string()))
+        .unwrap();
         _guard
             .write_commit_marker(
                 &test_deployment_id("deploy-0"),
@@ -172,9 +175,12 @@ mod tests_markers {
         std::os::unix::fs::symlink(&target, root.join(&marker)).unwrap();
 
         let helper = RemoteHelper::new(&remote);
-        let _guard = helper
-            .acquire_lock_guard(&crate::identity::OperationId::new("op-symlink".to_string()))
-            .unwrap();
+        let _guard = crate::remote::helper::SlotRemote::new(
+            &helper,
+            crate::remote::helper::test_owner("test-app", "s1"),
+        )
+        .acquire_lock_guard(&crate::identity::OperationId::new("op-symlink".to_string()))
+        .unwrap();
         let err = _guard
             .write_commit_marker(
                 &test_deployment_id("deploy-0"),
@@ -235,9 +241,12 @@ mod tests_markers {
                 // Acquire a single guard covering the burst of marker writes
                 // (the capability is per-slot, reused across writes in this
                 // test harness).
-                let _guard = h
-                    .acquire_lock_guard(&crate::identity::OperationId::new("op-burst".to_string()))
-                    .unwrap();
+                let _guard = crate::remote::helper::SlotRemote::new(
+                    &h,
+                    crate::remote::helper::test_owner("test-app", "s1"),
+                )
+                .acquire_lock_guard(&crate::identity::OperationId::new("op-burst".to_string()))
+                .unwrap();
                 for i in 0..80 {
                     if let Err(e) = _guard.write_commit_marker(
                         &test_deployment_id(&format!("deploy-{i}")),

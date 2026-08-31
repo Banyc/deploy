@@ -6,6 +6,21 @@
 //! banners. Every mutating operation is keyed by an operation ID and is
 //! idempotent.
 //!
+//! # The mutation capability: [`SlotRemote`] + the owner-carrying guard
+//!
+//! The mutation capability is a [`SlotRemote`]: a [`RemoteHelper`] BOUND to
+//! its OWNER — the application + placement slot it was created for. The
+//! capability does not float free: acquisition goes through
+//! [`SlotRemote::acquire_lock_guard`], which returns a [`HeldSlotLock`]
+//! carrying that owner, so the guard knows WHICH slot it authorizes mutation
+//! on. Every destructive operation — generation creation, the `current`
+//! swap/removal, publication, transaction records, commit markers, AND
+//! rotation — is a [`HeldSlotLock`] method; there is no unguarded path that
+//! mutates a slot. Assignments are constructed INTERNALLY from the guard's
+//! owner (never passed in as a free parameter that could name a different
+//! slot), and the `current` swap VERIFIES the generation it is about to
+//! install (owner marker + complete chain) before swapping.
+//!
 //! # Submodules
 //!
 //! * `state` — the generation-state facets: `current` status/chain +
@@ -65,11 +80,15 @@
 //! (possesses the RAII [`HeldSlotLock`] capability — a guard can only mutate the slot it was acquired from — the receiver is the guard, the helper is the guard's own; there is no API parameter through which a guard from server A can authorize a mutation on server B) can call
 //! the slot-mutation functions (`create_generation`, `swap_current`,
 //! `transaction_record`, `write_commit_marker`, `remove_current_if`,
-//! `publish_from_incoming`, `publish_tree`). A mutation never consults the on-disk lock;
+//! `publish_from_incoming`, `publish_tree`, `rotate`). A mutation never consults the on-disk lock;
 //! mutual exclusion comes from acquire-exclusivity plus structural enforcement:
-//! the six slot-mutation operations ARE methods on the [`HeldSlotLock`] guard —
+//! every destructive operation IS a method on the [`HeldSlotLock`] guard —
 //! there is no `RemoteHelper::*_locked` entry point and no state-changing helper
-//! method that mutates a slot without a guard. Cross-slot mutation is structurally
+//! method that mutates a slot without a guard. The guard carries its OWNER
+//! (the slot it was acquired for): assignments are constructed internally
+//! from that owner, the `current` swap verifies the generation it installs,
+//! and rotation verifies the generation inventory before sweeping — a guard
+//! for slot A can never mutate slot B. Cross-slot mutation is structurally
 //! unrepresentable. The single documented non-guard state change is
 //! `write_inventory` (inventory bookkeeping, not a slot mutation).
 //!
@@ -126,6 +145,7 @@ pub use observed::{
     ObservedTarget,
 };
 pub use state::GenerationAssignment;
+pub use state::GenerationSpec;
 pub use state::current::{CurrentState, ExpectedCurrent};
 
 use crate::deploy::lock::AdministrativeRecoveryGuard;
@@ -494,11 +514,17 @@ impl<'a> RemoteHelper<'a> {
     /// caller cannot perform a recovery without first holding the local
     /// lock (the administrative path, the CLI's recovery invocation, is the
     /// only construction site).
+    ///
+    /// `owner` is the slot identity the successor capability is bound to:
+    /// the returned [`HeldSlotLock`] carries it, so the recovered guard
+    /// knows WHICH slot it authorizes mutation on (the same owner the
+    /// recovering controller uses for its slot's generations).
     pub(crate) fn recover_lock(
         &self,
         guard: &AdministrativeRecoveryGuard,
         observed: &LockRecord,
         new_operation_id: &OperationId,
+        owner: &GenerationOwner,
     ) -> Result<HeldSlotLock<'_>> {
         let _ = guard; // the capability is the type+ownership enforcement
         let p = &layout::operation_lock();
@@ -516,6 +542,7 @@ impl<'a> RemoteHelper<'a> {
         if let Some(()) = self.remote.atomic_recover(p, &observed_bytes, &new_bytes)? {
             return Ok(HeldSlotLock {
                 helper: self,
+                owner: owner.clone(),
                 record: new_record,
                 active: true,
             });
@@ -559,6 +586,7 @@ impl<'a> RemoteHelper<'a> {
             match self.remote.try_write_new(p, &new_bytes)? {
                 CreateNewVerdict::Created | CreateNewVerdict::AlreadyPresent => Ok(HeldSlotLock {
                     helper: self,
+                    owner: owner.clone(),
                     record: new_record.clone(),
                     active: true,
                 }),
@@ -583,15 +611,13 @@ impl<'a> RemoteHelper<'a> {
     /// ownership; only the acquisition id created by THIS call identifies the
     /// lock owner. Nested routines must receive the held `&HeldSlotLock`
     /// capability instead of re-acquiring.
-    pub fn acquire_lock_guard(&self, op_id: &OperationId) -> Result<HeldSlotLock<'_>> {
-        let record = self.acquire_lock_record(op_id)?;
-        Ok(HeldSlotLock {
-            helper: self,
-            record,
-            active: true,
-        })
-    }
-
+    ///
+    /// PRIVATE BY DESIGN: production acquisition happens ONLY through
+    /// [`SlotRemote::acquire_lock_guard`] (the capability that binds the
+    /// guard to its OWNER — the slot it authorizes mutation on). The raw
+    /// record acquisition is exercised only by in-module record-protocol
+    /// tests and by the `#[cfg(test)]` seams that preserve their raw-record
+    /// coverage.
     /// TEST-ONLY SEAM: acquire a raw lock record WITHOUT a guard, so test
     /// modules outside `remote::helper` (which cannot call the private
     /// [`Self::acquire_lock_record`]) can seed a held lock for contention /
@@ -638,6 +664,71 @@ impl<'a> RemoteHelper<'a> {
     }
 }
 
+/// THE MUTATION CAPABILITY: a [`RemoteHelper`] BOUND to its OWNER — the
+/// application + placement slot it was created for. The capability does not
+/// float free: a bare [`RemoteHelper`] can read/status but CANNOT mutate a
+/// slot; mutation requires a [`SlotRemote`] (which knows WHICH slot it
+/// authorizes) and, for every destructive operation, the [`HeldSlotLock`]
+/// guard its acquisition returns.
+///
+/// Acquisition ([`SlotRemote::acquire_lock_guard`]) returns a
+/// [`HeldSlotLock`] carrying THIS slot's owner, so the guard knows which
+/// slot it authorizes mutation on: assignments are constructed internally
+/// from the guard's owner, the `current` swap verifies the generation it
+/// installs, and rotation verifies the generation inventory before
+/// sweeping — a guard for slot A can never mutate slot B.
+pub struct SlotRemote<'a> {
+    pub(crate) helper: &'a RemoteHelper<'a>,
+    pub(crate) owner: GenerationOwner,
+}
+
+impl<'a> SlotRemote<'a> {
+    /// Bind a [`RemoteHelper`] to its OWNER — the application + placement
+    /// slot this capability authorizes mutation on. The owner is the
+    /// resource identity every destructive operation verifies against (the
+    /// generation owner marker, the assignment construction, the rotation
+    /// inventory).
+    pub fn new(helper: &'a RemoteHelper<'a>, owner: GenerationOwner) -> Self {
+        SlotRemote { helper, owner }
+    }
+
+    /// The OWNER this capability is bound to — the application + placement
+    /// slot it authorizes mutation on.
+    pub fn owner(&self) -> &GenerationOwner {
+        &self.owner
+    }
+
+    /// The underlying helper (the shared read/status surface).
+    pub fn helper(&self) -> &'a RemoteHelper<'a> {
+        self.helper
+    }
+
+    /// Acquire the server mutation lock as a CREATE-ONCE OWNERSHIP record
+    /// and return a guard that releases it on drop, so every return path
+    /// (including early errors) releases the lock. Returns an error only if
+    /// the lock is held by a different acquisition. The returned
+    /// [`HeldSlotLock`] carries THIS slot's owner — the guard knows WHICH
+    /// slot it authorizes mutation on, and every destructive operation
+    /// (generation creation, the `current` swap/removal, publication,
+    /// transaction records, commit markers, rotation) is a guard method.
+    ///
+    /// Reentrancy is rejected by the ownership rule: a same-operation
+    /// re-acquire mints a NEW acquisition id, so the on-disk record (a
+    /// different acquisition) is contention — an operation id never confers
+    /// ownership; only the acquisition id created by THIS call identifies the
+    /// lock owner. Nested routines must receive the held `&HeldSlotLock`
+    /// capability instead of re-acquiring.
+    pub fn acquire_lock_guard(&self, op_id: &OperationId) -> Result<HeldSlotLock<'a>> {
+        let record = self.helper.acquire_lock_record(op_id)?;
+        Ok(HeldSlotLock {
+            helper: self.helper,
+            owner: self.owner.clone(),
+            record,
+            active: true,
+        })
+    }
+}
+
 /// RAII guard for the server mutation lock: releases it on drop (every
 /// return path, including early errors). The release is a compare-and-delete
 /// against the record acquired ([`HeldSlotLock::release`] surfaces the outcome
@@ -659,10 +750,14 @@ impl<'a> RemoteHelper<'a> {
 /// guard (possesses the capability) may call the slot-mutation functions
 /// (`create_generation`, `swap_current`, `transaction_record`,
 /// `write_commit_marker`, `remove_current_if`, `publish_from_incoming`,
-/// `publish_tree`)
+/// `publish_tree`, `rotate`)
 /// — a guard can only mutate the slot it was acquired from — the receiver is
 /// the guard, the helper is the guard's own; there is no API parameter through
 /// which a guard from server A can authorize a mutation on server B.
+/// The guard carries its OWNER (the slot it was acquired for): assignments
+/// are constructed internally from that owner, the `current` swap verifies
+/// the generation it installs, and rotation verifies the generation
+/// inventory before sweeping — a guard for slot A can never mutate slot B.
 /// The guard is OPAQUE — the held [`LockRecord`] is private and cannot be
 /// forged.
 ///
@@ -674,6 +769,13 @@ impl<'a> RemoteHelper<'a> {
 /// created with, compare-and-delete).
 pub struct HeldSlotLock<'a> {
     helper: &'a RemoteHelper<'a>,
+    /// THE OWNER this guard authorizes mutation on: the application +
+    /// placement slot it was acquired for (bound by [`SlotRemote`] at
+    /// acquisition). Every destructive operation verifies against it —
+    /// assignments are constructed from it, the `current` swap verifies the
+    /// generation it installs against it, and rotation verifies the
+    /// generation inventory against it before sweeping.
+    owner: GenerationOwner,
     /// The authoritative lock record (owner + unique acquisition id)
     /// this guard holds; release compares the on-disk lock against EXACTLY
     /// this record, so a stale release can never delete a successor's lock.
@@ -683,6 +785,15 @@ pub struct HeldSlotLock<'a> {
 impl<'a> HeldSlotLock<'a> {
     pub(crate) fn helper(&self) -> &'a RemoteHelper<'a> {
         self.helper
+    }
+
+    /// The OWNER this guard authorizes mutation on — the application +
+    /// placement slot it was acquired for. Crate-internal: the guard stays
+    /// opaque to library callers; the owner is the resource identity the
+    /// destructive operations verify against (assignment construction, the
+    /// `current`-swap generation verification, the rotation inventory).
+    pub(crate) fn owner(&self) -> &GenerationOwner {
+        &self.owner
     }
 
     /// The authoritative record this guard holds (its own acquisition).
@@ -845,9 +956,10 @@ mod tests {
             LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
                 .unwrap();
         let helper = RemoteHelper::new(&remote);
+        let slot = SlotRemote::new(&helper, test_owner("test-app", "s1"));
 
         {
-            let _guard = helper
+            let _guard = slot
                 .acquire_lock_guard(&crate::identity::OperationId::new("op-1".to_string()))
                 .expect("lock acquired");
             // While the guard is alive the lock is held: a second operation
@@ -978,6 +1090,7 @@ mod tests {
                 &admin,
                 &a,
                 &crate::identity::OperationId::new("B".to_string()),
+                &test_owner("test-app", "s1"),
             )
             .expect("explicit recovery of the confirmed-dead controller succeeds");
         let b = b_guard.record().clone();
@@ -1046,6 +1159,7 @@ mod tests {
                 &admin,
                 &a,
                 &crate::identity::OperationId::new("B".to_string()),
+                &test_owner("test-app", "s1"),
             )
             .unwrap();
         let b = b_guard.record().clone();
@@ -1057,6 +1171,7 @@ mod tests {
             &admin,
             &a,
             &crate::identity::OperationId::new("C".to_string()),
+            &test_owner("test-app", "s1"),
         ) {
             Err(e) => e,
             Ok(_) => panic!("a recovery with a stale observed record must be refused"),
@@ -1077,6 +1192,7 @@ mod tests {
                 &admin,
                 &b,
                 &crate::identity::OperationId::new("C".to_string()),
+                &test_owner("test-app", "s1"),
             )
             .unwrap();
         let c = c_guard.record().clone();
@@ -1108,6 +1224,7 @@ mod tests {
             &admin,
             &record,
             &crate::identity::OperationId::new("op-2".to_string()),
+            &test_owner("test-app", "s1"),
         ) {
             Err(e) => e,
             Ok(_) => panic!("recovering a free slot must be refused"),
@@ -1384,13 +1501,14 @@ mod nested_guard_proptest {
             LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
                 .unwrap();
         let helper = RemoteHelper::new(&remote);
+        let slot = SlotRemote::new(&helper, test_owner("test-app", "s1"));
         let op_a = format!("op-reentrant-{op_suffix}");
-        let outer = helper
+        let outer = slot
             .acquire_lock_guard(&crate::identity::OperationId::new(op_a.to_string()))
             .expect("outer acquire must succeed");
         let initial_bytes = remote.read(&layout::operation_lock()).unwrap();
         let err =
-            match helper.acquire_lock_guard(&crate::identity::OperationId::new(op_a.to_string())) {
+            match slot.acquire_lock_guard(&crate::identity::OperationId::new(op_a.to_string())) {
                 Ok(_) => panic!("reentrant acquire must be rejected"),
                 Err(e) => e,
             };
@@ -1445,9 +1563,10 @@ mod nested_guard_proptest {
                 .unwrap();
         let helper_a = RemoteHelper::new(&remote);
         let helper_b = RemoteHelper::new(&remote);
+        let slot_a = SlotRemote::new(&helper_a, test_owner("test-app", "s1"));
         let op_a = format!("op-cap-{variant}");
         let op_b = "op-B-cap";
-        let outer = helper_a
+        let outer = slot_a
             .acquire_lock_guard(&crate::identity::OperationId::new(op_a.to_string()))
             .unwrap();
         let initial_bytes = remote.read(&layout::operation_lock()).unwrap();
@@ -1509,12 +1628,14 @@ mod nested_guard_proptest {
         );
         let helper_a = RemoteHelper::new(&remote_a);
         let helper_b = RemoteHelper::new(&remote_b);
+        let slot_a = SlotRemote::new(&helper_a, test_owner("test-app", "s1"));
+        let slot_b = SlotRemote::new(&helper_b, test_owner("test-app", "s1"));
         let op_a = "op-iso-A";
         let op_b = "op-iso-B";
-        let guard_a = helper_a
+        let guard_a = slot_a
             .acquire_lock_guard(&crate::identity::OperationId::new(op_a.to_string()))
             .unwrap();
-        let guard_b = helper_b
+        let guard_b = slot_b
             .acquire_lock_guard(&crate::identity::OperationId::new(op_b.to_string()))
             .unwrap();
         // Each lock file lives in its own real directory.
@@ -1847,10 +1968,15 @@ mod cross_remote_guard_mutation {
         seed_minimal_fixture(&remote_b);
         let helper_a = RemoteHelper::new(&remote_a);
         let helper_b = RemoteHelper::new(&remote_b);
+        // The mutation capability is the SLOT-BOUND [`SlotRemote`]: the
+        // fixture's generations carry owner test-app/s1, so the guards are
+        // acquired for that owner.
+        let slot_a = SlotRemote::new(&helper_a, test_owner("test-app", "s1"));
+        let slot_b = SlotRemote::new(&helper_b, test_owner("test-app", "s1"));
         // Snapshot B before
         let before_b = snapshot_tree(remote_b.root());
         // Acquire A's guard
-        let guard_a = helper_a
+        let guard_a = slot_a
             .acquire_lock_guard(&crate::identity::OperationId::new("op-A".to_string()))
             .unwrap();
         // Randomized sequence on A's guard
@@ -1893,7 +2019,11 @@ mod cross_remote_guard_mutation {
                     target.as_deref(),
                 ),
                 GuardOp::CreateGeneration { gen_tag, tree_tag } => {
-                    let asn = GenerationAssignment {
+                    // The generation SPEC carries the non-owner fields; the
+                    // OWNER (application + slot) is bound by the guard
+                    // itself — an assignment can never name a different slot
+                    // than the guard authorizes.
+                    let spec = GenerationSpec {
                         deployment_id: crate::identity::test_deployment_id("deploy-op"),
                         generation_id: crate::identity::test_generation_id(gen_tag),
                         artifact: ArtifactRef {
@@ -1904,12 +2034,9 @@ mod cross_remote_guard_mutation {
                         behavior_sha256: "b".to_string(),
                         prior_generation: None,
                         created_at: "2020-01-01T00:00:00Z".to_string(),
-                        application: crate::identity::ApplicationStoreKey::parse("test-app")
-                            .unwrap(),
-                        slot: crate::identity::SlotId::parse("s1").unwrap(),
                         target: Some(TargetName::new("t1")),
                     };
-                    guard_a.create_generation(&asn)
+                    guard_a.create_generation(&spec)
                 }
             };
         }
@@ -1930,7 +2057,7 @@ mod cross_remote_guard_mutation {
         // Reverse: acquire B's guard, assert A unchanged
         drop(guard_a);
         let before_a = snapshot_tree(remote_a.root());
-        let guard_b = helper_b
+        let guard_b = slot_b
             .acquire_lock_guard(&crate::identity::OperationId::new("op-B".to_string()))
             .unwrap();
         for op in &ops {
@@ -1972,7 +2099,7 @@ mod cross_remote_guard_mutation {
                     target.as_deref(),
                 ),
                 GuardOp::CreateGeneration { gen_tag, tree_tag } => {
-                    let asn = GenerationAssignment {
+                    let spec = GenerationSpec {
                         deployment_id: crate::identity::test_deployment_id("deploy-op"),
                         generation_id: crate::identity::test_generation_id(gen_tag),
                         artifact: ArtifactRef {
@@ -1983,12 +2110,9 @@ mod cross_remote_guard_mutation {
                         behavior_sha256: "b".to_string(),
                         prior_generation: None,
                         created_at: "2020-01-01T00:00:00Z".to_string(),
-                        application: crate::identity::ApplicationStoreKey::parse("test-app")
-                            .unwrap(),
-                        slot: crate::identity::SlotId::parse("s1").unwrap(),
                         target: Some(TargetName::new("t1")),
                     };
-                    guard_b.create_generation(&asn)
+                    guard_b.create_generation(&spec)
                 }
             };
         }
@@ -2024,6 +2148,234 @@ mod cross_remote_guard_mutation {
                 return Ok(());
             }
             run_cross_remote_guard_case(ops)?;
+        }
+    }
+}
+
+/// THE OWNER-MISMATCH PROPERTY: a guard for slot A used to mutate slot B
+/// produces ZERO filesystem changes. The guard carries its OWNER (the slot
+/// it was acquired for); every destructive operation verifies against it —
+/// the `current` swap verifies the generation it installs, the removal
+/// verifies the generation it removes, and rotation verifies the generation
+/// inventory before sweeping. A remote seeded with slot B's state (a
+/// generation owned by B, `current` → B's generation, B's tree objects) is
+/// driven with a guard for slot A: every op FAILS CLOSED (owner mismatch,
+/// missing generation, or CAS disagreement) and the remote stays
+/// byte-for-byte unchanged.
+#[cfg(test)]
+mod owner_mismatch_proptest {
+    use super::*;
+    use crate::identity::{ArtifactRef, VariantName};
+    use crate::remote::helper::{ExpectedCurrent, GenerationAssignment};
+    use crate::remote::transport::LocalTransport;
+    #[cfg(test)]
+    use proptest::prelude::*;
+    #[cfg(test)]
+    use proptest::test_runner::RngSeed;
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
+    fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, (Vec<u8>, u32, bool)> {
+        let mut map = BTreeMap::new();
+        if !root.exists() {
+            return map;
+        }
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(p) = stack.pop() {
+            let meta = match std::fs::symlink_metadata(&p) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let rel = p.strip_prefix(root).unwrap().to_path_buf();
+            if meta.file_type().is_symlink() {
+                let target = std::fs::read_link(&p).unwrap_or_default();
+                map.insert(
+                    rel,
+                    (
+                        target.as_os_str().as_encoded_bytes().to_vec(),
+                        meta.permissions().mode() & 0o7777,
+                        true,
+                    ),
+                );
+            } else if meta.is_dir() {
+                map.insert(
+                    rel.clone(),
+                    (Vec::new(), meta.permissions().mode() & 0o7777, false),
+                );
+                if let Ok(entries) = std::fs::read_dir(&p) {
+                    for e in entries.flatten() {
+                        stack.push(e.path());
+                    }
+                }
+            } else {
+                let data = std::fs::read(&p).unwrap_or_default();
+                map.insert(rel, (data, meta.permissions().mode() & 0o7777, false));
+            }
+        }
+        map
+    }
+
+    /// Seed the remote with slot B's state: a generation OWNED by B
+    /// (application `app-b`, slot `s-b`), `current` → B's generation, and
+    /// B's tree objects. The guard for slot A (a DIFFERENT owner) must not
+    /// be able to mutate any of it.
+    fn seed_foreign_slot_state(remote: &LocalTransport) {
+        let gen_id = crate::identity::test_generation_id("gen-b");
+        let tree = crate::identity::test_tree_digest("tree-b");
+        // Tree object.
+        let tree_root = remote.root().join(crate::remote::layout::tree_root(&tree));
+        std::fs::create_dir_all(&tree_root).unwrap();
+        std::fs::write(tree_root.join("file"), b"b").unwrap();
+        // Generation assignment OWNED BY B.
+        let asn = GenerationAssignment {
+            deployment_id: crate::identity::test_deployment_id("deploy-b"),
+            generation_id: gen_id.clone(),
+            artifact: ArtifactRef {
+                release: crate::identity::test_release_id("rel-b"),
+                variant: VariantName::parse("standard").unwrap(),
+                tree: tree.clone(),
+            },
+            behavior_sha256: "b".to_string(),
+            prior_generation: None,
+            created_at: "2020-01-01T00:00:00Z".to_string(),
+            application: crate::identity::ApplicationStoreKey::parse("app-b").unwrap(),
+            slot: crate::identity::SlotId::parse("s-b").unwrap(),
+            target: None,
+        };
+        let gen_dir = remote
+            .root()
+            .join(crate::remote::layout::generation(&gen_id));
+        std::fs::create_dir_all(&gen_dir).unwrap();
+        std::fs::write(
+            gen_dir.join("assignment.json"),
+            serde_json::to_vec(&asn).unwrap(),
+        )
+        .unwrap();
+        let root_link = crate::remote::layout::generation_root_link(&tree);
+        std::os::unix::fs::symlink(&root_link, gen_dir.join("root")).unwrap();
+        // current → generations/<gen-b>/root
+        let cur_target = PathBuf::from(format!(
+            "{}/{}/root",
+            crate::remote::layout::GENERATIONS_COMPONENT,
+            gen_id.as_str()
+        ));
+        std::os::unix::fs::symlink(&cur_target, remote.root().join("current")).unwrap();
+    }
+
+    #[derive(Clone, Debug)]
+    enum OwnerMismatchOp {
+        SwapCurrent {
+            expected: ExpectedCurrent,
+            gen_id: String,
+            op_id: String,
+        },
+        RemoveCurrentIf {
+            expected: ExpectedCurrent,
+        },
+        Rotate {
+            retained: Vec<String>,
+        },
+    }
+
+    fn arb_expected() -> impl Strategy<Value = ExpectedCurrent> {
+        prop_oneof![
+            Just(ExpectedCurrent::Absent),
+            "[a-z0-9]{1,8}".prop_map(|tag| ExpectedCurrent::Generation(
+                crate::identity::test_generation_id(&tag)
+            )),
+        ]
+    }
+
+    fn arb_owner_mismatch_op() -> impl Strategy<Value = OwnerMismatchOp> {
+        prop_oneof![
+            (arb_expected(), "[a-z0-9]{1,8}", "[a-z0-9]{1,8}").prop_map(
+                |(expected, gen_tag, op_tag)| OwnerMismatchOp::SwapCurrent {
+                    expected,
+                    gen_id: crate::identity::test_generation_id(&gen_tag)
+                        .as_str()
+                        .to_string(),
+                    op_id: format!("op-{op_tag}")
+                }
+            ),
+            arb_expected().prop_map(|expected| OwnerMismatchOp::RemoveCurrentIf { expected }),
+            prop::collection::vec("[a-z0-9]{1,8}", 0..4).prop_map(|retained| {
+                OwnerMismatchOp::Rotate {
+                    retained: retained
+                        .iter()
+                        .map(|t| crate::identity::test_tree_digest(t).as_str().to_string())
+                        .collect(),
+                }
+            }),
+        ]
+    }
+
+    fn run_owner_mismatch_case(
+        ops: Vec<OwnerMismatchOp>,
+    ) -> std::result::Result<(), TestCaseError> {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let remote =
+            LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
+                .unwrap();
+        seed_foreign_slot_state(&remote);
+        // The mutation capability is the SLOT-BOUND [`SlotRemote`]: the
+        // guard is acquired for slot A (owner app-a/s-a) — a DIFFERENT slot
+        // than the remote's state (owned by B).
+        let helper = RemoteHelper::new(&remote);
+        let owner_a = GenerationOwner::new(
+            crate::identity::ApplicationStoreKey::parse("app-a").unwrap(),
+            crate::identity::SlotId::parse("s-a").unwrap(),
+        );
+        let slot_a = SlotRemote::new(&helper, owner_a);
+        let guard = slot_a
+            .acquire_lock_guard(&crate::identity::OperationId::new("op-A".to_string()))
+            .unwrap();
+        // Snapshot AFTER acquiring the guard (the lock file is in the
+        // baseline).
+        let before = snapshot_tree(remote.root());
+        for op in &ops {
+            let _ = match op {
+                OwnerMismatchOp::SwapCurrent {
+                    expected,
+                    gen_id,
+                    op_id,
+                } => guard.swap_current(
+                    expected,
+                    &crate::identity::GenerationId::parse(gen_id).expect("fixture generation id"),
+                    op_id,
+                ),
+                OwnerMismatchOp::RemoveCurrentIf { expected } => {
+                    guard.remove_current_if(expected).map(|_| ())
+                }
+                OwnerMismatchOp::Rotate { retained } => {
+                    let retained_set: std::collections::HashSet<String> =
+                        retained.iter().cloned().collect();
+                    guard.rotate(&retained_set, &std::collections::HashSet::new())
+                }
+            };
+        }
+        let after = snapshot_tree(remote.root());
+        prop_assert_eq!(
+            before,
+            after,
+            "a guard for slot A used to mutate slot B must produce ZERO filesystem changes"
+        );
+        Ok(())
+    }
+
+    proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: crate::testutil::proptest_cases(16),
+            max_shrink_iters: 10000,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..proptest::test_runner::Config::default()
+        })]
+        #[test]
+        fn mismatched_owner_guard_produces_zero_filesystem_changes(
+            ops in prop::collection::vec(arb_owner_mismatch_op(), 0..=8),
+        ) {
+            run_owner_mismatch_case(ops)?;
         }
     }
 }
@@ -2179,8 +2531,9 @@ mod barrier_proptest {
         let tx1 = tx.clone();
         let h1 = std::thread::spawn(move || {
             let helper = RemoteHelper::new(w1.as_ref() as &dyn Remote);
-            let res = helper
-                .acquire_lock_guard(&crate::identity::OperationId::new("op-race".to_string()));
+            let slot = SlotRemote::new(&helper, test_owner("test-app", "s1"));
+            let res =
+                slot.acquire_lock_guard(&crate::identity::OperationId::new("op-race".to_string()));
             let is_ok = res.is_ok();
             let err_msg = res.as_ref().err().map(|e| e.to_string());
             tx1.send((is_ok, err_msg)).unwrap();
@@ -2194,8 +2547,9 @@ mod barrier_proptest {
         let tx2 = tx.clone();
         let h2 = std::thread::spawn(move || {
             let helper = RemoteHelper::new(w2.as_ref() as &dyn Remote);
-            let res = helper
-                .acquire_lock_guard(&crate::identity::OperationId::new("op-race".to_string()));
+            let slot = SlotRemote::new(&helper, test_owner("test-app", "s1"));
+            let res =
+                slot.acquire_lock_guard(&crate::identity::OperationId::new("op-race".to_string()));
             let is_ok = res.is_ok();
             let err_msg = res.as_ref().err().map(|e| e.to_string());
             tx2.send((is_ok, err_msg)).unwrap();
@@ -2448,7 +2802,8 @@ mod guard_release_retry {
             calls: calls.clone(),
         };
         let helper = RemoteHelper::new(&fault_remote);
-        let guard = helper
+        let slot = SlotRemote::new(&helper, test_owner("test-app", "s1"));
+        let guard = slot
             .acquire_lock_guard(&crate::identity::OperationId::new(
                 "op-predecessor".to_string(),
             ))
@@ -2465,6 +2820,7 @@ mod guard_release_retry {
                     &admin,
                     &predecessor_rec,
                     &crate::identity::OperationId::new("op-successor".to_string()),
+                    &test_owner("test-app", "s1"),
                 )
                 .unwrap();
             let successor_bytes = direct.read(&layout::operation_lock()).unwrap();
@@ -2572,9 +2928,10 @@ mod ordinary_acquisition_never_takes_over {
             LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
                 .unwrap();
         let helper = RemoteHelper::new(&remote);
+        let slot = SlotRemote::new(&helper, test_owner("test-app", "s1"));
         let admin = admin_guard_for_test(&dir, "recovery-op");
         let holder_op = crate::identity::OperationId::new(format!("holder-{holder_tag}"));
-        let guard = helper
+        let guard = slot
             .acquire_lock_guard(&holder_op)
             .expect("holder acquire must succeed");
         let original_bytes = remote.read(&layout::operation_lock()).unwrap();
@@ -2599,7 +2956,7 @@ mod ordinary_acquisition_never_takes_over {
                 &original_bytes,
                 "lock bytes must be identical after failed ordinary acquisition"
             );
-            let res_guard = helper.acquire_lock_guard(&contender_op);
+            let res_guard = slot.acquire_lock_guard(&contender_op);
             prop_assert!(
                 res_guard.is_err(),
                 "ordinary guard acquisition must also fail"
@@ -2623,6 +2980,7 @@ mod ordinary_acquisition_never_takes_over {
             &admin,
             &wrong_record,
             &crate::identity::OperationId::new(format!("successor-wrong-{wrong_tag}")),
+            &test_owner("test-app", "s1"),
         );
         prop_assert!(wrong_res.is_err(), "recover with wrong observed must fail");
         let after_wrong = remote.read(&layout::operation_lock()).unwrap();
@@ -2635,7 +2993,12 @@ mod ordinary_acquisition_never_takes_over {
         // Exact observed must succeed and install fresh acquisition
         let successor_op = crate::identity::OperationId::new(format!("successor-{holder_tag}"));
         let successor_guard = helper
-            .recover_lock(&admin, &observed, &successor_op)
+            .recover_lock(
+                &admin,
+                &observed,
+                &successor_op,
+                &test_owner("test-app", "s1"),
+            )
             .expect("recover with exact observed must succeed");
         let successor = successor_guard.record().clone();
         prop_assert_ne!(
