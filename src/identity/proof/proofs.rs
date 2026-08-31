@@ -12,14 +12,16 @@
 //!
 //! [`MatchingMembership`] is the PROOF that two memberships match: the ONLY
 //! way to obtain one is [`MatchingMembership::verify`] (the membership gate
-//! produces it; the planner consumes it). The serde impls serialize the
-//! agreed set and deserialize only a non-empty set — the persisted-wire
-//! replay of an already-verified proof (the record's wire -> domain
-//! conversion re-checks the plan's key-set projections on read).
+//! produces it; the planner consumes it). THE PROOF IMPLEMENTS NEITHER
+//! `Serialize` NOR `Deserialize` — a proof is produced ONLY by verification,
+//! never parsed from the wire. The persisted wire form of an agreed
+//! membership is the plain agreed slot set carried by the CLAIM
+//! ([`crate::ledger::RebindingPlan`]); the wire -> domain conversion
+//! RE-MINTS the proof by re-verifying the claimed set against the release
+//! graph ([`crate::verify::release::ValidatedRelease`]) on read.
 
 use crate::error::{Error, Result};
 use crate::identity::SlotId;
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 /// A slot-ID set (possibly EMPTY) — the INPUT form of a membership
@@ -105,10 +107,11 @@ impl NonEmptySlotSet {
 /// agreed NON-EMPTY slot set. The ONLY construction path is
 /// [`MatchingMembership::verify`] — the membership gate produces the proof
 /// and the planner consumes it (a [`crate::ledger::RebindingPlan`] records
-/// it as the membership check that ran). The serde impls serialize the
-/// agreed set and deserialize only a NON-EMPTY set (the persisted-wire
-/// replay of an already-verified proof; the record's wire -> domain
-/// conversion re-checks the plan's key-set projections on read).
+/// the AGREED SET as a claim component; the proof itself is re-minted by
+/// re-verification on read). THE PROOF IMPLEMENTS NEITHER `Serialize` NOR
+/// `Deserialize`: a proof is produced only by verification, never parsed
+/// from the wire — the persisted wire form of the agreement is the plain
+/// agreed slot set on the claim.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MatchingMembership {
     slots: NonEmptySlotSet,
@@ -152,30 +155,9 @@ impl MatchingMembership {
     }
 }
 
-impl Serialize for MatchingMembership {
-    /// The persisted wire form is the agreed slot set (the frozen/current
-    /// halves were verified equal at plan time; the record keeps the agreed
-    /// set).
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        self.slots.as_set().serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for MatchingMembership {
-    /// Wire replay of a verified proof: reconstructs the proof from the
-    /// persisted agreed set, refusing an EMPTY set (the non-empty invariant
-    /// holds on the wire too).
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let ids: BTreeSet<SlotId> = Deserialize::deserialize(deserializer)?;
-        let slots = NonEmptySlotSet::try_new(ids).ok_or_else(|| {
-            serde::de::Error::custom("a membership proof must carry a non-empty slot set")
-        })?;
-        Ok(MatchingMembership { slots })
-    }
-}
+// DELIBERATELY NO serde impls: a proof is produced ONLY by verification
+// ([`MatchingMembership::verify`]), never parsed from the wire. The
+// persisted wire form of an agreement is the plain agreed slot set carried
+// by the CLAIM ([`crate::ledger::RebindingPlan`]); the wire -> domain
+// conversion re-mints the proof by re-verifying the claimed set against the
+// release graph on read.

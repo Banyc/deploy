@@ -230,14 +230,14 @@ pub(crate) fn check_up_to_date(
                         assignment:
                             ObservedAssignment::Known {
                                 generation: prior_generation,
-                                owner: Some(prior_owner),
-                                version: Some(prior_version),
+                                owner: prior_owner,
+                                version: prior_version,
                                 ..
                             },
                     })) if prior_generation == asn.generation_id && prior_owner == owner => {
-                        prior_version.clone()
+                        prior_version
                     }
-                    _ => crate::remote::helper::now_rfc3339(),
+                    _ => crate::remote::helper::now_rfc3339_ts(),
                 };
                 observed_servers.insert(
                     slot_id.clone(),
@@ -247,8 +247,8 @@ pub(crate) fn check_up_to_date(
                             generation: asn.generation_id.clone(),
                             artifact: asn.artifact.clone(),
                             last_deployment: asn.deployment_id.clone(),
-                            owner: Some(owner),
-                            version: Some(version),
+                            owner,
+                            version,
                         },
                     },
                 );

@@ -20,8 +20,8 @@ pub(crate) use crate::identity::{
     TreeDigest, VariantName, test_generation_id, test_tree_digest,
 };
 pub(crate) use crate::ledger::{
-    self, ActualSlotState, DeploymentIntent, DeploymentPlan, DeploymentStatus, LedgerEntry,
-    LedgerIntentReport, ObservationWire, ObservedAssignment, ObservedGenerationWire, RefExpr,
+    self, ActualSlotState, DeploymentIntent, DeploymentStatus, LedgerEntry, LedgerIntentReport,
+    ObservationWire, ObservedAssignment, ObservedGenerationWire, RefExpr,
 };
 pub(crate) use crate::remote::transport::{
     CreateNewVerdict, FsBytes, LocalTransport, Remote, RootedRelativePath, scripted::ScriptedExec,

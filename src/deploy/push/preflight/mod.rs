@@ -2645,12 +2645,16 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
             // THE ASSERTION: the SELECTED deployment recorded in the plan
             // equals post-reconciliation position (latest + 1) - depth from
-            // the newest — the deployment id at that chain position.
-            let plan: DeploymentPlan = serde_json::from_str(
+            // the newest — the deployment id at that chain position. The
+            // plan is loaded through the VERIFYING conversion (a
+            // deployment-keyed plan carries no rebinding claim, so no
+            // release graph is needed).
+            let plan: crate::ledger::DeploymentPlanWire = serde_json::from_str(
                 &std::fs::read_to_string(h.store.deployment_dir(&ref_id).join("plan.json"))
                     .unwrap(),
             )
             .unwrap();
+            let plan = plan.into_domain(None).unwrap();
             assert_eq!(
                 plan.source(),
                 &crate::ledger::PlanOrigin::Deployment(

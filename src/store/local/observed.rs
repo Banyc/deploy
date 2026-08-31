@@ -219,7 +219,7 @@ impl LocalStore {
                     } => Some(last_deployment.as_str()),
                     _ => None,
                 }),
-            state.last_seen_target.as_ref(),
+            Some(&state.last_seen_target),
         ) && self.fault_registry.consume_target(
             FaultKind::WriteServer,
             deployment_id,

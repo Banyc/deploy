@@ -1410,11 +1410,14 @@ pub(crate) mod commit_tests {
         // The persisted plan carries the frozen PER-RELEASE behavior index
         // for the rollback's referenced release (R1 — the baseline's own
         // release) and the referenced-release set derived from the
-        // snapshot's slots.
-        let plan: DeploymentPlan = serde_json::from_str(
+        // snapshot's slots. The plan is loaded through the VERIFYING
+        // conversion (a deployment-keyed plan carries no rebinding claim,
+        // so no release graph is needed).
+        let plan: crate::ledger::DeploymentPlanWire = serde_json::from_str(
             &std::fs::read_to_string(h.store.deployment_dir(&id4).join("plan.json")).unwrap(),
         )
         .unwrap();
+        let plan = plan.into_domain(None).unwrap();
         assert_eq!(
             plan.releases(),
             BTreeSet::from([r1_release.clone()]),

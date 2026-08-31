@@ -147,6 +147,18 @@
 /// frozen bindings are REQUIRED, no serde default). A hypothetical
 /// pre-rekeying shape that keyed these maps by server ID with flat
 /// artifact fields is NOT the current schema and never loads.
+///
+/// THE OBSERVED-STATE RECORDS (`slots/<slot-id>/observed.json` and
+/// `servers/<id>.json` — [`crate::ledger::ObservedSlot`] /
+/// [`crate::ledger::ServerState`]) carry NO schema-version field: they are
+/// NOT ledger lines, so `LEDGER_SCHEMA_VERSION` does not gate them. Their
+/// KNOWN-STATE FACTS are MANDATORY instead: the assignment identity of a
+/// `Known` observation (`owner` + `version` — a [`GenerationOwner`] and a
+/// [`Timestamp`]) and a server's `last_seen_target` ([`TargetName`]) are
+/// REQUIRED fields with NO serde default. A legacy record written before
+/// those fields existed (or missing them) is REFUSED at deserialization
+/// (fail closed) — an incomplete "known" fact can never enter the domain,
+/// and an unverifiable identity is never treated as authoritative.
 pub(crate) const LEDGER_SCHEMA_VERSION: u32 = 11;
 
 /// The `pins.json` record format version (`Pins.schema_version`). Pins are

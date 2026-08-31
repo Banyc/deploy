@@ -528,8 +528,8 @@ mod tests {
                     tree: test_tree_digest("evil"),
                 },
                 last_deployment: test_deployment_id("evil"),
-                owner: Some(crate::remote::helper::test_owner("test-app", "evil")),
-                version: Some("2026-01-01T00:00:00Z".to_string()),
+                owner: crate::remote::helper::test_owner("test-app", "evil"),
+                version: crate::identity::Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
             },
         };
         store.write_slot_observed(&ok_slot, &observed).unwrap();
@@ -769,8 +769,8 @@ mod tests {
                     tree: TreeDigest::new(tree.to_string()),
                 },
                 last_deployment: test_deployment_id(dep),
-                owner: Some(crate::remote::helper::test_owner("test-app", "p1")),
-                version: Some("2026-01-01T00:00:00Z".to_string()),
+                owner: crate::remote::helper::test_owner("test-app", "p1"),
+                version: crate::identity::Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
             },
         }
     }
@@ -780,7 +780,7 @@ mod tests {
     fn server_state(id: ServerId, tree: &str, dep: &str) -> ServerState {
         ServerState {
             id,
-            last_seen_target: Some(TargetName::parse("t1").unwrap()),
+            last_seen_target: TargetName::parse("t1").unwrap(),
             last_observed: Some(observed_record(tree, &format!("gen-{dep}"), dep)),
         }
     }
@@ -1333,12 +1333,12 @@ mod tests {
                 let server_b = ServerId::parse(&tag_b).unwrap();
                 let state_a = ServerState {
                     id: server_a.clone(),
-                    last_seen_target: None,
+                    last_seen_target: TargetName::parse("t1").unwrap(),
                     last_observed: None,
                 };
                 let state_b = ServerState {
                     id: server_b.clone(),
-                    last_seen_target: None,
+                    last_seen_target: TargetName::parse("t1").unwrap(),
                     last_observed: None,
                 };
                 store.write_server(&state_a).unwrap();

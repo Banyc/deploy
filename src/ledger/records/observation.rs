@@ -25,7 +25,8 @@
 
 use crate::error::{Error, Result};
 use crate::identity::{
-    ArtifactRef, DeploymentId, GenerationId, ReleaseId, SlotId, TargetName, TreeDigest, VariantName,
+    ArtifactRef, DeploymentId, GenerationId, ReleaseId, SlotId, TargetName, Timestamp, TreeDigest,
+    VariantName,
 };
 use crate::remote::helper::GenerationOwner;
 use serde::{Deserialize, Serialize};
@@ -235,11 +236,12 @@ impl TryFrom<ObservationWire<ObservedGenerationWire>> for Observation<ObservedGe
 /// could smuggle stray keys into the record; the adjacently tagged wire
 /// rejects any key that is not `state`/`value` AND, together with
 /// `deny_unknown_fields`, any key inside the value that is not one of the
-/// variant's OWN fields. The `owner`/`version` fields are OPTIONAL on the
-/// wire (`#[serde(default)]`): a legacy observed record written before the
-/// identity fields existed still loads (with `None` — and the FAIL-CLOSED
-/// staleness rule below treats an unverifiable identity as STALE, never
-/// authoritative).
+/// variant's OWN fields. The `owner`/`version` fields are MANDATORY on the
+/// wire (the assignment identity is a KNOWN-STATE fact): a legacy observed
+/// record written before the identity fields existed is REFUSED at
+/// deserialization (fail closed) — an incomplete "known" fact can never
+/// enter the domain, and an unverifiable identity is never treated as
+/// authoritative.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "state",
@@ -264,17 +266,15 @@ pub enum ObservedAssignment {
         /// status/assignment read checked against at observation time. A read
         /// comparing the projection against the live assignment treats an
         /// owner mismatch as STALE ([`ObservedAssignment::is_stale_against`]).
-        /// `None` only on a LEGACY record written before the identity fields
-        /// existed — and an unverifiable identity is STALE (fail closed),
-        /// never authoritative.
-        #[serde(default)]
-        owner: Option<GenerationOwner>,
+        /// MANDATORY (a KNOWN-STATE fact): a record missing it is refused at
+        /// deserialization (fail closed) — an unverifiable identity is never
+        /// authoritative.
+        owner: GenerationOwner,
         /// THE ASSIGNMENT IDENTITY (version half): the read version/timestamp
         /// (RFC 3339) that produced this projection — the freshness link to
-        /// the remote source. `None` only on a legacy record (treated as
-        /// stale, fail closed).
-        #[serde(default)]
-        version: Option<String>,
+        /// the remote source. MANDATORY (a KNOWN-STATE fact): a record
+        /// missing it is refused at deserialization (fail closed).
+        version: Timestamp,
     },
     /// The status read succeeded but the ASSIGNMENT read failed: the
     /// generation is known, the artifact is not — the error is preserved.
@@ -318,11 +318,8 @@ impl ObservedAssignment {
     /// * a `Known` projection with NO live generation (the slot is absent
     ///   now) is STALE;
     /// * an `Absent` projection with a LIVE generation is STALE;
-    /// * FAIL CLOSED: a `Known` projection WITHOUT a recorded owner identity
-    ///   (a legacy record written before the identity fields existed)
-    ///   cannot be verified against the live assignment — it is STALE,
-    ///   never authoritative; `AssignmentUnknown`/`Unknown` projections
-    ///   carry no assignable identity and are never ground truth — STALE.
+    /// * `AssignmentUnknown`/`Unknown` projections carry no assignable
+    ///   identity and are never ground truth — STALE.
     ///
     /// A consumer that finds a STALE projection must skip it / refresh it,
     /// never decide on it.
@@ -335,7 +332,7 @@ impl ObservedAssignment {
             (
                 ObservedAssignment::Known {
                     generation,
-                    owner: Some(recorded_owner),
+                    owner: recorded_owner,
                     ..
                 },
                 Some(live_gen),
@@ -352,11 +349,6 @@ impl ObservedAssignment {
             (ObservedAssignment::Absent, Some(_)) => {
                 // The projection says absent but the live assignment is
                 // present: stale.
-                true
-            }
-            (ObservedAssignment::Known { owner: None, .. }, _) => {
-                // A legacy record without a recorded owner identity cannot be
-                // verified — fail closed: stale.
                 true
             }
             (ObservedAssignment::AssignmentUnknown { .. }, _)
@@ -511,18 +503,19 @@ mod tests {
     /// THE RAW-FIELD-COMBINATION PROPERTY: the wire accepts ONLY
     /// representations that correspond to EXACTLY ONE [`ObservedAssignment`]
     /// variant — `Known` needs generation + artifact + last_deployment +
-    /// the assignment identity (owner + version), `AssignmentUnknown` needs
-    /// generation + error, `Unknown` needs error, `Absent` needs NO value at
-    /// all. EVERY other combination is REJECTED (fail closed): a raw
-    /// document can never deserialize into a half-known assignment (a
-    /// generation without an artifact, an uncertainty without its preserved
-    /// error) and never into a self-contradictory one (a `Known` carrying a
-    /// stray `error`, an `Absent` carrying any fields at all) — the
-    /// adjacently tagged wire + `deny_unknown_fields` reject any missing
-    /// required field, any extra/unknown field, and any field from another
-    /// variant. NOTE: a `Known` without the identity fields (a LEGACY
-    /// record) still deserializes (owner/version default to `None` — the
-    /// fail-closed staleness rule treats it as STALE, never authoritative).
+    /// the assignment identity (owner + version — MANDATORY known-state
+    /// facts), `AssignmentUnknown` needs generation + error, `Unknown` needs
+    /// error, `Absent` needs NO value at all. EVERY other combination is
+    /// REJECTED (fail closed): a raw document can never deserialize into a
+    /// half-known assignment (a generation without an artifact, an
+    /// uncertainty without its preserved error) and never into a
+    /// self-contradictory one (a `Known` carrying a stray `error`, an
+    /// `Absent` carrying any fields at all) — the adjacently tagged wire +
+    /// `deny_unknown_fields` reject any missing required field, any
+    /// extra/unknown field, and any field from another variant. NOTE: a
+    /// `Known` WITHOUT the identity fields (a LEGACY record) is REFUSED —
+    /// the assignment identity is a known-state fact, and an incomplete
+    /// "known" fact can never enter the domain.
     fn run_raw_combo_case(
         (tag_idx, value_present, gen_present, art, err, ld, owner_present, version_present, extra): (
             u8,
@@ -601,9 +594,10 @@ mod tests {
         // Accepted iff the value object carries EXACTLY the variant's OWN
         // fields — nothing missing, nothing extra (no other variant's field,
         // no unknown key). `Absent` accepts NO value at all (a unit cannot
-        // take an object). A `Known` may omit the identity fields (a legacy
-        // record loads with `None`); a `Known` that carries the identity
-        // fields must carry BOTH.
+        // take an object). A `Known` MUST carry the assignment identity
+        // (owner + version — MANDATORY known-state facts): a `Known`
+        // missing either is REFUSED (fail closed — an incomplete "known"
+        // fact can never enter the domain).
         let valid = match tag {
             "absent" => !value_present,
             "known" => {
@@ -613,7 +607,8 @@ mod tests {
                     && ld
                     && !err
                     && !extra
-                    && (owner_present == version_present)
+                    && owner_present
+                    && version_present
             }
             "assignment_unknown" => {
                 value_present
@@ -645,8 +640,8 @@ mod tests {
                     generation: test_generation_id("g"),
                     artifact: artifact_ref("a"),
                     last_deployment: test_deployment_id("d"),
-                    owner: owner_present.then(owner),
-                    version: version_present.then(|| "2026-01-01T00:00:00Z".to_string()),
+                    owner: owner(),
+                    version: Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
                 },
                 "assignment_unknown" => ObservedAssignment::AssignmentUnknown {
                     generation: test_generation_id("g"),
@@ -696,8 +691,8 @@ mod tests {
                 generation: test_generation_id("g"),
                 artifact: artifact_ref("a"),
                 last_deployment: test_deployment_id("d"),
-                owner: Some(owner()),
-                version: Some("2026-01-01T00:00:00Z".to_string()),
+                owner: owner(),
+                version: Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
             }
         );
         // An extra field NEXT TO the tag/content pair is rejected.
@@ -781,8 +776,9 @@ mod tests {
                     generation: test_generation_id(&format!("gen-seq-{i}")),
                     artifact: artifact_ref(&format!("art-seq-{i}-{j}")),
                     last_deployment: test_deployment_id(&format!("dep-seq-{i}-{j}")),
-                    owner: Some(owner()),
-                    version: Some(format!("2026-01-0{}T00:00:00Z", (i + j) % 9 + 1))
+                    owner: owner(),
+                    version: Timestamp::parse(&format!("2026-01-0{}T00:00:00Z", (i + j) % 9 + 1))
+                        .unwrap()
                 }
             }),
             (0..3usize, 0..3usize).prop_map(move |(i, j)| ObservedSlot {
@@ -891,6 +887,113 @@ mod tests {
         }
     }
 
+    /// An arbitrary ALTERATION of a valid `Known` assignment's identity
+    /// fields (owner + version — the MANDATORY known-state facts): the
+    /// owner becomes a wrong-typed value, a wrong-shaped object (missing a
+    /// field), or a non-owner string; the version becomes a non-timestamp
+    /// string, an out-of-range timestamp, or a wrong-typed value. The tuple
+    /// is (alter owner, alter version, kind).
+    fn arbitrary_identity_alteration() -> impl Strategy<Value = (bool, bool, u8)> {
+        (proptest::bool::ANY, proptest::bool::ANY, 0u8..4)
+    }
+
+    /// THE ALTERATION PROPERTY: a valid `Known` assignment whose identity
+    /// fields (owner + version) are ALTERED — wrong-typed, wrong-shaped, or
+    /// non-timestamp — is REFUSED at deserialization (fail closed): the
+    /// assignment identity is a KNOWN-STATE fact, and an altered identity
+    /// can never enter the domain as a verified projection.
+    fn run_identity_alteration_case((alter_owner, alter_version, kind): (bool, bool, u8)) {
+        // A valid Known wire value.
+        let mut value = serde_json::Map::new();
+        value.insert(
+            "generation".to_string(),
+            json!(test_generation_id("g").as_str()),
+        );
+        value.insert(
+            "artifact".to_string(),
+            json!({
+                "release": test_release_id("a").as_str(),
+                "variant": "standard",
+                "tree": test_tree_digest("a").as_str()}),
+        );
+        value.insert(
+            "last_deployment".to_string(),
+            json!(test_deployment_id("d").as_str()),
+        );
+        value.insert(
+            "owner".to_string(),
+            json!({ "application": "test-app", "slot": "s1" }),
+        );
+        value.insert("version".to_string(), json!("2026-01-01T00:00:00Z"));
+        // Apply the alteration.
+        if alter_owner {
+            match kind {
+                0 => {
+                    value.insert("owner".to_string(), json!(42));
+                }
+                1 => {
+                    value.insert("owner".to_string(), json!({ "application": "test-app" }));
+                }
+                2 => {
+                    value.insert("owner".to_string(), json!({ "slot": "s1" }));
+                }
+                _ => {
+                    value.insert("owner".to_string(), json!("not-an-owner"));
+                }
+            }
+        }
+        if alter_version {
+            match kind {
+                0 => {
+                    value.insert("version".to_string(), json!(42));
+                }
+                1 => {
+                    value.insert("version".to_string(), json!("not-a-time"));
+                }
+                2 => {
+                    value.insert("version".to_string(), json!("2026-13-45T99:99:99Z"));
+                }
+                _ => {
+                    value.insert("version".to_string(), json!({ "t": 1 }));
+                }
+            }
+        }
+        let doc = json!({
+            "slot": "p1",
+            "assignment": {
+                "state": "known",
+                "value": serde_json::Value::Object(value)
+            }
+        });
+        let result = serde_json::from_value::<ObservedSlot>(doc.clone());
+        if alter_owner || alter_version {
+            assert!(
+                result.is_err(),
+                "an altered identity field must be REJECTED (fail closed), got: {doc}"
+            );
+        } else {
+            result.expect("the unaltered Known assignment deserializes");
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: crate::testutil::proptest_cases(16),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+        // THE USER'S ALTERATION PROPERTY: a valid `Known` assignment whose
+        // MANDATORY identity fields (owner + version) are arbitrarily
+        // ALTERED — wrong-typed, wrong-shaped, or non-timestamp — is
+        // REFUSED (fail closed): no incomplete or altered known-state fact
+        // may enter the domain.
+        #[test]
+        fn altered_identity_fields_are_refused(alteration in arbitrary_identity_alteration()) {
+            run_identity_alteration_case(alteration);
+        }
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig {
             cases: 64,
@@ -931,20 +1034,18 @@ mod tests {
     // ---- THE FRESHNESS/IDENTITY PROPERTY (the review's acceptance) --------
 
     /// An arbitrary OBSERVED projection: all four [`ObservedAssignment`]
-    /// variants, with `Known` carrying the assignment identity (owner +
-    /// version) or NONE (a legacy record written before the identity fields
-    /// existed — the fail-closed staleness case).
+    /// variants, with `Known` ALWAYS carrying the assignment identity
+    /// (owner + version — MANDATORY known-state facts; a `Known` without
+    /// them is unrepresentable in the domain).
     fn arbitrary_assignment() -> impl Strategy<Value = ObservedAssignment> {
         prop_oneof![
             Just(ObservedAssignment::Absent),
-            (0..3usize, 0..3usize, proptest::bool::ANY).prop_map(|(i, j, with_identity)| {
-                ObservedAssignment::Known {
-                    generation: test_generation_id(&format!("gen-p-{i}")),
-                    artifact: artifact_ref(&format!("art-p-{i}-{j}")),
-                    last_deployment: test_deployment_id(&format!("dep-p-{i}-{j}")),
-                    owner: with_identity.then(owner),
-                    version: with_identity.then(|| "2026-01-01T00:00:00Z".to_string()),
-                }
+            (0..3usize, 0..3usize).prop_map(|(i, j)| ObservedAssignment::Known {
+                generation: test_generation_id(&format!("gen-p-{i}")),
+                artifact: artifact_ref(&format!("art-p-{i}-{j}")),
+                last_deployment: test_deployment_id(&format!("dep-p-{i}-{j}")),
+                owner: owner(),
+                version: Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
             }),
             (0..3usize).prop_map(|j| ObservedAssignment::AssignmentUnknown {
                 generation: test_generation_id(&format!("gen-p-{j}")),
@@ -982,20 +1083,17 @@ mod tests {
     /// projection is STALE EXACTLY when its recorded assignment identity
     /// disagrees with the live one — a mismatched OWNER or GENERATION makes
     /// the projection STALE (the consumer refuses to treat it as current),
-    /// never a silently-accepted stale view; a legacy projection without a
-    /// recorded owner is STALE (fail closed — unverifiable, never
-    /// authoritative); `Absent` is current only against a live absence.
+    /// never a silently-accepted stale view; `Absent` is current only
+    /// against a live absence.
     fn run_staleness_case(obs: ObservedAssignment, live: (Option<GenerationId>, GenerationOwner)) {
         let (live_gen, live_owner) = live;
         let stale = obs.is_stale_against(live_gen.as_ref(), &live_owner);
         let expected_stale = match &obs {
             ObservedAssignment::Known {
                 generation,
-                owner: Some(recorded_owner),
+                owner: recorded_owner,
                 ..
             } => live_gen.as_ref() != Some(generation) || recorded_owner != &live_owner,
-            // A legacy Known without a recorded owner cannot be verified.
-            ObservedAssignment::Known { owner: None, .. } => true,
             ObservedAssignment::Absent => live_gen.is_some(),
             ObservedAssignment::AssignmentUnknown { .. } | ObservedAssignment::Unknown { .. } => {
                 true
@@ -1004,7 +1102,7 @@ mod tests {
         assert_eq!(
             stale, expected_stale,
             "a projection is STALE exactly when its recorded assignment identity (owner + \
-             generation) disagrees with the live identity, or cannot be verified — a stale-owner \
+             generation) disagrees with the live identity — a stale-owner \
              or stale-generation observation is never authoritative"
         );
         // The no-silent-stale-view corollary: whenever the projection is
@@ -1015,7 +1113,7 @@ mod tests {
             let silent_accept = match &obs {
                 ObservedAssignment::Known {
                     generation,
-                    owner: Some(recorded_owner),
+                    owner: recorded_owner,
                     ..
                 } => live_gen.as_ref() == Some(generation) && recorded_owner == &live_owner,
                 _ => false,

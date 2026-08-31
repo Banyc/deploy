@@ -102,6 +102,7 @@ use crate::identity::{
     ArtifactRef, BehaviorContract, BehaviorDigest, DeploymentId, GenerationId, GenerationRef,
     PlacementSlotAssignment, ReleaseId, ServerId, SlotId, TargetName, TreeDigest,
 };
+use crate::verify::release::ValidatedRelease;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -664,23 +665,21 @@ impl<'de> Deserialize<'de> for Pins {
 /// ACTUAL server identity ([`ServerId`], transport addressing); the
 /// slot→assignment maps live in [`ObservedTarget`] keyed by
 /// [`SlotId`].
+///
+/// THE KNOWN-STATE FACTS ARE MANDATORY: `last_seen_target` (the target the
+/// server was last seen serving) is a REQUIRED field — a legacy record
+/// written before the field existed (or missing it) is REFUSED at
+/// deserialization (fail closed), never silently defaulted: an incomplete
+/// "known" fact cannot enter the domain. `last_observed` stays optional
+/// (a server may genuinely never have been observed).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerState {
     pub id: ServerId,
-    #[serde(default)]
-    pub last_seen_target: Option<TargetName>,
+    /// The target this server was last seen serving — a KNOWN-STATE fact,
+    /// REQUIRED (a record missing it is refused, never silently defaulted).
+    pub last_seen_target: TargetName,
     #[serde(default)]
     pub last_observed: Option<ObservedSlot>,
-}
-
-impl Default for ServerState {
-    fn default() -> Self {
-        Self {
-            id: ServerId::parse("default").expect("default server is a safe segment"),
-            last_seen_target: None,
-            last_observed: None,
-        }
-    }
 }
 
 /// Where a plan's desired assignment comes from — the WIRE (on-disk) form
@@ -814,8 +813,9 @@ pub struct DeploymentPlanWire {
     /// (`PlanSource::ReleaseRef`), the CLAIMED rebinding context: the
     /// historical release's frozen topology applied onto the CURRENT
     /// physical slots ([`RebindingPlan`]). `None` for HEAD and
-    /// deployment-keyed plans. The VERIFYING CONVERSION recomputes the
-    /// proof from this claimed shape and the plan's own
+    /// deployment-keyed plans. THE CLAIM IS UNTRUSTED: the VERIFYING
+    /// CONVERSION ([`DeploymentPlanWire::into_domain`]) REVALIDATES it
+    /// against the release graph ([`ValidatedRelease`]) plus the plan's own
     /// source/target/membership, refusing any disagreement (a Release
     /// origin without a proof, or a non-Release origin carrying one, is
     /// refused). `#[serde(default)]` keeps deployment records written
@@ -836,7 +836,20 @@ impl DeploymentPlanWire {
     /// the releases derived from the per-slot artifacts, and
     /// `behavior_sha256` equals the canonical digest of `behaviors`. A
     /// disagreement → `Error::integrity` (fail closed).
-    pub fn into_domain(self) -> Result<DeploymentPlan> {
+    ///
+    /// THE REBINDING CLAIM IS REVALIDATED ON LOAD: a Release-origin plan
+    /// (`PlanSource::ReleaseRef`) must be converted WITH the release graph
+    /// (`release: Some(&ValidatedRelease)` — the validated release for the
+    /// plan's source release); the claimed [`RebindingPlan`] is revalidated
+    /// against that graph plus the plan's own membership
+    /// ([`VerifiedReleaseRebinding::revalidate`]). A Release-origin plan
+    /// converted WITHOUT the release graph is refused (fail closed: an
+    /// unverified claim can never enter the domain as a verified fact).
+    /// HEAD and deployment-keyed plans carry no claim and take `None`.
+    pub fn into_domain(
+        self,
+        validated_release: Option<&ValidatedRelease>,
+    ) -> Result<DeploymentPlan> {
         // The stored behavior digest must be a sha256 digest before it can
         // even be compared with the digest derived from `behaviors` (fail
         // closed: a tampered non-digest is refused on format, not just on
@@ -953,16 +966,25 @@ impl DeploymentPlanWire {
                 // RECOMPUTE the proof from the claimed components and the
                 // plan's own membership (the selected plan slots are the
                 // plan's `slots` map keys) — the wire → domain conversion
-                // ([`TryFrom<(RebindingPlan, BTreeSet<SlotId>)>`]) runs the
-                // verification; deserializing a claim NEVER yields a
-                // verified proof.
-                let proof = VerifiedReleaseRebinding::try_from((
-                    claimed,
-                    self.slots.keys().cloned().collect(),
-                ))
+                // ([`VerifiedReleaseRebinding::revalidate`]) runs the
+                // verification against the release graph + the plan;
+                // deserializing a claim NEVER yields a verified proof. The
+                // release graph is REQUIRED: a Release-origin plan loaded
+                // without it cannot verify its claim (fail closed).
+                let vr = validated_release.ok_or_else(|| {
+                    Error::integrity(format!(
+                        "plan {}: a release-origin plan must be revalidated against the release graph (ValidatedRelease) — the claimed rebinding cannot enter the domain unverified",
+                        self.deployment_id
+                    ))
+                })?;
+                let proof = VerifiedReleaseRebinding::revalidate(
+                    &claimed,
+                    vr,
+                    &self.slots.keys().cloned().collect(),
+                )
                 .map_err(|e| {
                     Error::integrity(format!(
-                        "plan {}: the claimed rebinding disagrees with the recomputed proof: {e}",
+                        "plan {}: the claimed rebinding disagrees with the release graph or the plan: {e}",
                         self.deployment_id
                     ))
                 })?;
@@ -1138,16 +1160,12 @@ impl Serialize for DeploymentPlan {
     }
 }
 
-impl<'de> Deserialize<'de> for DeploymentPlan {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let wire = DeploymentPlanWire::deserialize(deserializer)?;
-        wire.into_domain()
-            .map_err(|e| serde::de::Error::custom(e.to_string()))
-    }
-}
+// DELIBERATELY NO `Deserialize` impl for the DOMAIN [`DeploymentPlan`]: a
+// Release-origin plan's rebinding claim must be REVALIDATED against the
+// release graph ([`ValidatedRelease`]) whenever it is loaded, and serde
+// cannot supply that context. The load path is the explicit verifying
+// conversion [`DeploymentPlanWire::into_domain`] with the validated
+// release — a plan can never enter the domain with an unverified claim.
 
 #[cfg(test)]
 mod tests {
@@ -2466,5 +2484,201 @@ mod tests {
             "\"deployment_schema_version\": {}",
             crate::ledger::LEDGER_SCHEMA_VERSION
         )));
+    }
+
+    // ---- THE REBINDING CLAIM IS REVALIDATED ON LOAD (the review's
+    // acceptance): a Release-origin plan's persisted rebinding is an
+    // UNTRUSTED claim — the wire → domain conversion revalidates it against
+    // the release graph ([`ValidatedRelease`]) plus the plan, refuses a
+    // Release-origin plan loaded WITHOUT the release graph (fail closed — an
+    // unverified claim can never enter the domain), and refuses a tampered
+    // claim even with the release graph supplied. -------------------------
+
+    /// A VALIDATED RELEASE whose frozen topology for target `t1` covers
+    /// exactly `{p1, p2}` (variant `standard`, no groups, server `s1`),
+    /// with a consistent identity (the behavior digest matches the record
+    /// provenance).
+    fn release_graph_fixture() -> ValidatedRelease {
+        use crate::config::{Activation, SlotConfig, ValidatedCommand, Verification};
+        use crate::identity::BehaviorContract;
+        let variants: BTreeMap<VariantName, crate::identity::TreeDigest> =
+            BTreeMap::from([(VariantName::new("standard"), test_tree_digest("t"))]);
+        let slots: BTreeMap<String, Vec<SlotConfig>> = BTreeMap::from([(
+            "standard".to_string(),
+            vec![
+                SlotConfig::new(
+                    "p1".to_string(),
+                    "s1".to_string(),
+                    std::path::PathBuf::from("/srv/p1"),
+                    "t1".to_string(),
+                    Vec::new(),
+                ),
+                SlotConfig::new(
+                    "p2".to_string(),
+                    "s1".to_string(),
+                    std::path::PathBuf::from("/srv/p2"),
+                    "t1".to_string(),
+                    Vec::new(),
+                ),
+            ],
+        )]);
+        let behaviors: BTreeMap<String, BehaviorContract> = BTreeMap::from([(
+            "standard".to_string(),
+            BehaviorContract::new(
+                Activation::None,
+                Verification::Command(
+                    ValidatedCommand::new(vec!["true".to_string()], 30, 2, 1)
+                        .expect("validated command"),
+                ),
+            ),
+        )]);
+        let sha = crate::verify::release::variant_behaviors_digest(&behaviors);
+        let rec = crate::verify::release::build_release(
+            "m",
+            &sha,
+            &variants,
+            &slots,
+            std::path::Path::new("."),
+        );
+        let servers: BTreeSet<String> = BTreeSet::from(["s1".to_string()]);
+        ValidatedRelease::try_new(rec, behaviors, &servers)
+            .expect("a consistent release graph validates")
+    }
+
+    /// A Release-origin plan WIRE whose claimed rebinding matches the
+    /// release graph fixture: frozen topology over `{p1, p2}`, agreed
+    /// membership `{p1, p2}`, physical slots `{p1, p2}`, and per-slot plans
+    /// whose artifacts all reference the release.
+    fn release_plan_wire(release: &ValidatedRelease, dep: &str) -> DeploymentPlanWire {
+        let release_id = ReleaseId::parse(&release.record().release_id).expect("release id parses");
+        let p1 = SlotId::parse("p1").unwrap();
+        let p2 = SlotId::parse("p2").unwrap();
+        let mut slots = BTreeMap::new();
+        for (i, s) in [&p1, &p2].iter().enumerate() {
+            slots.insert(
+                (*s).clone(),
+                SlotPlan {
+                    slot_id: (*s).clone(),
+                    artifact: ArtifactRef {
+                        release: release_id.clone(),
+                        variant: VariantName::parse("standard").unwrap(),
+                        tree: test_tree_digest(&format!("t{i}")),
+                    },
+                    expected_generation: None,
+                },
+            );
+        }
+        let frozen_topology: BTreeMap<SlotId, FrozenSlotTopology> = BTreeMap::from([
+            (
+                p1.clone(),
+                FrozenSlotTopology {
+                    variant: "standard".to_string(),
+                    groups: Vec::new(),
+                },
+            ),
+            (
+                p2.clone(),
+                FrozenSlotTopology {
+                    variant: "standard".to_string(),
+                    groups: Vec::new(),
+                },
+            ),
+        ]);
+        let current_physical_slots: BTreeMap<SlotId, PhysicalBinding> = BTreeMap::from([
+            (
+                p1.clone(),
+                PhysicalBinding::from_config(
+                    crate::identity::ServerId::parse("s1").unwrap(),
+                    "/srv/p1",
+                )
+                .expect("the test binding is absolute and traversal-free"),
+            ),
+            (
+                p2.clone(),
+                PhysicalBinding::from_config(
+                    crate::identity::ServerId::parse("s1").unwrap(),
+                    "/srv/p2",
+                )
+                .expect("the test binding is absolute and traversal-free"),
+            ),
+        ]);
+        let behaviors = BehaviorIndex::new();
+        DeploymentPlanWire {
+            deployment_id: test_deployment_id(dep),
+            target: TargetName::parse("t1").unwrap(),
+            behavior_sha256: crate::verify::release::behavior_index_digest(&behaviors),
+            behaviors,
+            slot_ids: vec![p1.clone(), p2.clone()],
+            slots,
+            source: PlanSource::ReleaseRef(release_id.clone()),
+            rebinding: Some(RebindingPlan {
+                release: release_id.clone(),
+                target: TargetName::parse("t1").unwrap(),
+                frozen_topology,
+                membership: BTreeSet::from([p1.clone(), p2.clone()]),
+                current_physical_slots,
+            }),
+            desired_releases: BTreeSet::from([release_id]),
+        }
+    }
+
+    /// THE REVALIDATION-ON-LOAD TEST: a Release-origin plan's persisted
+    /// rebinding is an UNTRUSTED claim — the wire → domain conversion
+    /// revalidates it against the release graph + the plan (a valid claim
+    /// converts), REFUSES a Release-origin plan loaded WITHOUT the release
+    /// graph (fail closed — an unverified claim can never enter the
+    /// domain), and REFUSES a tampered claim (altered topology / agreed
+    /// membership) even with the release graph supplied.
+    #[test]
+    fn release_origin_plan_revalidates_its_claim_on_load() {
+        let release = release_graph_fixture();
+        let wire = release_plan_wire(&release, "deploy-rel");
+
+        // A valid claim revalidates against the release graph + the plan.
+        let plan = wire
+            .clone()
+            .into_domain(Some(&release))
+            .expect("a valid claim revalidates against the release graph + the plan");
+        assert!(
+            matches!(plan.source(), PlanOrigin::Release { .. }),
+            "the converted plan carries the verified Release origin"
+        );
+
+        // FAIL CLOSED: a Release-origin plan loaded WITHOUT the release
+        // graph is refused — the claim cannot enter the domain unverified.
+        let err = wire.clone().into_domain(None).unwrap_err();
+        assert!(
+            err.to_string().contains("release graph"),
+            "a Release-origin plan without the release graph must be refused, got: {err}"
+        );
+
+        // A TAMPERED claim (an invented frozen-topology slot) is refused
+        // even with the release graph supplied.
+        let mut tampered = wire.clone();
+        if let Some(claim) = &mut tampered.rebinding {
+            claim.frozen_topology.insert(
+                SlotId::parse("p9").unwrap(),
+                FrozenSlotTopology {
+                    variant: "standard".to_string(),
+                    groups: Vec::new(),
+                },
+            );
+        }
+        let err = tampered.into_domain(Some(&release)).unwrap_err();
+        assert!(
+            err.to_string().contains("rebinding"),
+            "a tampered frozen topology must be refused, got: {err}"
+        );
+
+        // A tampered AGREED MEMBERSHIP is refused too.
+        let mut tampered2 = wire.clone();
+        if let Some(claim) = &mut tampered2.rebinding {
+            claim.membership = BTreeSet::from([SlotId::parse("p1").unwrap()]);
+        }
+        let err = tampered2.into_domain(Some(&release)).unwrap_err();
+        assert!(
+            err.to_string().contains("rebinding"),
+            "a tampered agreed membership must be refused, got: {err}"
+        );
     }
 }

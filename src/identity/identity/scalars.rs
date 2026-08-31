@@ -492,7 +492,9 @@ impl FromStr for CapacityPercent {
 /// A parsed RFC3339 timestamp ([`jiff::Timestamp`]): the canonical form for
 /// every recorded moment (`attempted_at`, `recorded_at`). Construction
 /// parses the string strictly, so an unparseable timestamp can never enter
-/// the domain.
+/// the domain. The serde impls serialize the canonical RFC 3339 string and
+/// route every wire string through the same strict parse (an invalid wire
+/// timestamp fails deserialization — fail closed).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Timestamp(JiffTimestamp);
 
@@ -510,6 +512,30 @@ impl Timestamp {
     /// The parsed jiff timestamp.
     pub fn inner(&self) -> &JiffTimestamp {
         &self.0
+    }
+}
+
+impl serde::Serialize for Timestamp {
+    /// The canonical RFC 3339 string form (the same form
+    /// [`Timestamp::parse`] accepts).
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Timestamp {
+    /// Wire strings go through the strict parse: an invalid wire timestamp
+    /// fails deserialization (fail closed — a record that carries a
+    /// malformed timestamp is never silently accepted).
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Timestamp::parse(&s).map_err(serde::de::Error::custom)
     }
 }
 

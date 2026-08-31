@@ -318,16 +318,16 @@ pub(crate) fn refresh_observed_from_live(
                                 assignment:
                                     ObservedAssignment::Known {
                                         generation: prior_generation,
-                                        owner: Some(prior_owner),
-                                        version: Some(prior_version),
+                                        owner: prior_owner,
+                                        version: prior_version,
                                         ..
                                     },
                             })) if prior_generation == asn.generation_id
                                 && prior_owner == owner =>
                             {
-                                prior_version.clone()
+                                prior_version
                             }
-                            _ => crate::remote::helper::now_rfc3339(),
+                            _ => crate::remote::helper::now_rfc3339_ts(),
                         };
                         observed_servers.insert(
                             slot_id.clone(),
@@ -337,8 +337,8 @@ pub(crate) fn refresh_observed_from_live(
                                     generation: asn.generation_id.clone(),
                                     artifact: asn.artifact.clone(),
                                     last_deployment: asn.deployment_id.clone(),
-                                    owner: Some(owner.clone()),
-                                    version: Some(version),
+                                    owner: owner.clone(),
+                                    version,
                                 },
                             },
                         );
@@ -447,9 +447,8 @@ pub(crate) fn refresh_observed(
         if let Err(e) = store.write_server(&crate::ledger::ServerState {
             id: crate::identity::ServerId::parse(sdef.id.as_str())
                 .expect("validated server id is a safe segment"),
-            last_seen_target: Some(
-                TargetName::parse(target_name).expect("target name is a safe segment"),
-            ),
+            last_seen_target: TargetName::parse(target_name)
+                .expect("target name is a safe segment"),
             last_observed: Some(observed_server.clone()),
         }) {
             // The durable facts are recorded; only the per-server projection

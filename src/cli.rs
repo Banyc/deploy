@@ -1005,8 +1005,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                             tree: test_tree_digest("tree-2c4f"),
                         },
                         last_deployment: test_deployment_id("deploy-status-1"),
-                        owner: Some(crate::remote::helper::test_owner("test-app", "p1")),
-                        version: Some("2026-01-01T00:00:00Z".to_string()),
+                        owner: crate::remote::helper::test_owner("test-app", "p1"),
+                        version: crate::identity::Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
                     },
                 },
             )
