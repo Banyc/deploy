@@ -35,7 +35,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Install cargo-nextest
-        uses: taiki-e/install-nextest-action@v2
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
       - name: Build
         run: cargo build --all-targets
       - name: Test
@@ -64,7 +66,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Install cargo-nextest
-        uses: taiki-e/install-nextest-action@v2
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
       - name: Build
         run: cargo build --all-targets
       - name: Test (repeat ${{ matrix.repeat }})
@@ -87,7 +91,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Install cargo-nextest
-        uses: taiki-e/install-nextest-action@v2
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
       - name: Full proptest budgets
         run: DEPLOY_FULL_TESTS=1 cargo nextest run
 
@@ -114,7 +120,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Install cargo-nextest
-        uses: taiki-e/install-nextest-action@v2
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
       - name: State-machine proptests under seed ${{ matrix.seed }} (longer traces, persistence on)
         run: |
           DEPLOY_FULL_TESTS=1 \
