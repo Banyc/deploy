@@ -298,8 +298,9 @@ pub(crate) enum FailureStep {
 }
 
 /// Remote-side fault configuration, shared between the fixture and the remote
-/// wrappers the factory hands out.
-#[derive(Clone, Debug, Default)]
+/// wrappers the factory hands out. No blanket `Default` — constructed
+/// explicitly.
+#[derive(Clone, Debug)]
 struct RemoteFault {
     /// Fail the next WRITE whose path ends with this suffix exactly once.
     fail_write_once: Option<String>,
@@ -982,7 +983,12 @@ impl Fixture {
             config,
             store,
             remotes_base,
-            fault: Arc::new(Mutex::new(RemoteFault::default())),
+            fault: Arc::new(Mutex::new(RemoteFault {
+                fail_write_once: None,
+                fail_current_read_after_lock: false,
+                fail_current_read_on_server: None,
+                lock_written: false,
+            })),
             // The deterministic fake exec every transport this fixture builds
             // injects (see [`FailOnceRemote::build`] / [`Fixture::remote_for`]):
             // the state-machine properties exercise the push LOGIC with
@@ -7407,12 +7413,24 @@ enum CtrlFault {
 }
 
 /// The one-shot fault registry shared by the fault-injecting transport.
-#[derive(Default)]
+/// No blanket `Default` — constructed explicitly.
+#[derive(Clone)]
 struct CtrlFaultState {
     fail_claim: bool,
     fail_read: bool,
     fail_remove: bool,
     fail_mutate: bool,
+}
+
+impl CtrlFaultState {
+    fn new() -> Self {
+        CtrlFaultState {
+            fail_claim: false,
+            fail_read: false,
+            fail_remove: false,
+            fail_mutate: false,
+        }
+    }
 }
 
 /// The on-remote path of the slot-mutation probe: a mutation marker the
@@ -7586,7 +7604,7 @@ fn run_three_controller_case(
     let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let inner =
         LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote")).unwrap();
-    let faults = Arc::new(Mutex::new(CtrlFaultState::default()));
+    let faults = Arc::new(Mutex::new(CtrlFaultState::new()));
     let remote = CtrlFaultRemote {
         inner,
         faults: faults.clone(),

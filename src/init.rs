@@ -602,10 +602,21 @@ fn ensure_target_dir(target: &Path) -> Result<(PathBuf, bool)> {
 
 /// Everything this init created inside `target`: target-relative file paths
 /// and directories that did not exist before (recorded while writing).
-#[derive(Debug, Default)]
+/// No blanket `Default` (a fabricated empty record is the exact gap the
+/// hardening closes) — constructed explicitly.
+#[derive(Debug)]
 struct CreatedTree {
     files: Vec<PathBuf>,
     dirs: Vec<PathBuf>,
+}
+
+impl CreatedTree {
+    fn new() -> Self {
+        CreatedTree {
+            files: Vec::new(),
+            dirs: Vec::new(),
+        }
+    }
 }
 
 /// Write every scaffolded file, then require the generated project to load
@@ -621,7 +632,7 @@ fn write_and_verify(
     writes: &[(PathBuf, String)],
     extra_dirs: &[&str],
 ) -> Result<CreatedTree> {
-    let mut created = CreatedTree::default();
+    let mut created = CreatedTree::new();
     for d in extra_dirs {
         let rel = PathBuf::from(d);
         let abs = target.join(&rel);

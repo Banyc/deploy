@@ -611,7 +611,6 @@ mod runner_property_tests {
         }
     }
 
-    #[derive(Default)]
     struct FakeState {
         log: Mutex<Vec<LogEntry>>,
         /// Number of fake wait closures still running (children not yet
@@ -621,6 +620,12 @@ mod runner_property_tests {
     }
 
     impl FakeState {
+        fn new() -> Self {
+            FakeState {
+                log: Mutex::new(Vec::new()),
+                live_waiters: AtomicUsize::new(0),
+            }
+        }
         fn push(&self, entry: LogEntry) {
             self.log.lock().unwrap().push(entry);
         }
@@ -827,7 +832,7 @@ mod runner_property_tests {
             at: DelayAt,
             delay: Duration,
         ) -> (Arc<Self>, Arc<FakeState>) {
-            let state = Arc::new(FakeState::default());
+            let state = Arc::new(FakeState::new());
             let seam = FakeSeam {
                 state: state.clone(),
                 stall,
@@ -1646,7 +1651,7 @@ mod runner_property_tests {
     #[test]
     fn kill_after_reap_is_a_noop_even_when_the_pid_is_reused() {
         let barrier = Arc::new(std::sync::Barrier::new(2));
-        let state = Arc::new(FakeState::default());
+        let state = Arc::new(FakeState::new());
         let seam = Arc::new(FakeSeam {
             state: state.clone(),
             stall: Stall::Hang,
