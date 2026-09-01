@@ -1,0 +1,58 @@
+warning: unreachable statement
+  --> tests/ui/guard_primitives_are_crate_private.rs:15:5
+   |
+14 |     let guard: HeldSlotLock = unimplemented!();
+   |                               ---------------- any code following this expression is unreachable
+15 |     let _ = &guard;
+   |     ^^^^^^^^^^^^^^^ unreachable statement
+   |
+   = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+error[E0624]: method `create_generation` is private
+  --> tests/ui/guard_primitives_are_crate_private.rs:18:11
+   |
+18 |     guard.create_generation(&unimplemented!());
+   |           ^^^^^^^^^^^^^^^^^ private method
+   |
+  --> /kache/workspace/src/remote/helper/state/assignment.rs:380:4
+  ::: /kache/workspace/src/remote/helper/state/assignment.rs:383:57
+   |
+   = note: private method defined here
+
+warning: unreachable expression
+  --> tests/ui/guard_primitives_are_crate_private.rs:18:29
+   |
+18 |     guard.create_generation(&unimplemented!());
+   |                             ^----------------
+   |                             ||
+   |                             |any code following this expression is unreachable
+   |                             unreachable expression
+
+error[E0624]: method `swap_current` is private
+  --> tests/ui/guard_primitives_are_crate_private.rs:19:11
+   |
+19 |     guard.swap_current(&unimplemented!(), &unimplemented!(), "op");
+   |           ^^^^^^^^^^^^ private method
+   |
+  --> /kache/workspace/src/remote/helper/state/current.rs:399:4
+  ::: /kache/workspace/src/remote/helper/state/current.rs:404:54
+   |
+   = note: private method defined here
+
+warning: unreachable expression
+  --> tests/ui/guard_primitives_are_crate_private.rs:19:24
+   |
+19 |     guard.swap_current(&unimplemented!(), &unimplemented!(), "op");
+   |                        ^----------------
+   |                        ||
+   |                        |any code following this expression is unreachable
+   |                        unreachable expression
+
+warning: unreachable expression
+  --> tests/ui/guard_primitives_are_crate_private.rs:19:43
+   |
+19 |     guard.swap_current(&unimplemented!(), &unimplemented!(), "op");
+   |                                           ^----------------
+   |                                           ||
+   |                                           |any code following this expression is unreachable
+   |                                           unreachable expression

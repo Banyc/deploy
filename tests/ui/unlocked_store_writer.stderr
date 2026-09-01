@@ -232,6 +232,6 @@ error[E0624]: method `write_inventory` is private
 26 |     let _ = helper.write_inventory();
    |                    ^^^^^^^^^^^^^^^ private method
    |
-  --> /kache/workspace/src/remote/helper/mod.rs:659:4
+  --> /kache/workspace/src/remote/helper/mod.rs:671:4
    |
    = note: private method defined here

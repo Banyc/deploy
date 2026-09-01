@@ -40,6 +40,13 @@
 //!   `create_generation` method: generation creation is a destructive
 //!   operation and therefore a `HeldSlotLock` method (the assignment's
 //!   OWNER is bound by the guard itself).
+//! * `guard_primitives_are_crate_private.rs` — the guard mutation
+//!   primitives (`create_generation`, `swap_current`, `rotate`,
+//!   `publish_release`, `publish_tree`, `transaction_record`, ...) are
+//!   CRATE-PRIVATE (the structural verdict's point 7 taken to its
+//!   conclusion): even a caller HOLDING a `HeldSlotLock` guard cannot call
+//!   them — the ONLY public mutation path is `deploy::rollout::commit` with
+//!   a `PreparedSlotMutation`.
 //!
 //! * `unlocked_store_writer.rs` — the store's RAW writers (`write_plan`,
 //!   `store_object`, `write_pins`, `write_slot_observed`, `write_server`,
@@ -64,6 +71,7 @@ fn sealed_ledger_writes_are_compile_enforced() {
     t.compile_fail("tests/ui/rebinding_deserialize.rs");
     t.compile_fail("tests/ui/unguarded_rotate.rs");
     t.compile_fail("tests/ui/unguarded_create_generation.rs");
+    t.compile_fail("tests/ui/guard_primitives_are_crate_private.rs");
     t.compile_fail("tests/ui/unlocked_store_writer.rs");
     t.pass("tests/ui/non_successful_terminal_ok.rs");
 }

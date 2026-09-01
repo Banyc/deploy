@@ -29,6 +29,16 @@ mod server;
 pub(crate) use attempt::*;
 pub(crate) use server::*;
 
+/// THE ONE PUBLIC SLOT-MUTATION ENTRY (the structural verdict's point 7
+/// taken to its conclusion): [`commit`] consumes a proof-bearing
+/// [`PreparedSlotMutation`] under the held slot lock and returns the sealed
+/// [`SlotCommitProof`]. The guard mutation primitives (`create_generation`,
+/// `swap_current`, `rotate`, `publish_release`, `publish_tree`,
+/// `transaction_record`, ...) are CRATE-PRIVATE — a library caller can
+/// only mutate a slot by building a [`PreparedSlotMutation`] (typed,
+/// validated values only) and committing it here.
+pub use server::mutation::{PreparedSlotMutation, SlotCommitProof, commit};
+
 /// THE ONE RECORDED PER-SLOT EXECUTION STATE of a deployment attempt (the
 /// review's P2 "rollout state" fix): a slot is EXACTLY ONE of these
 /// mutually exclusive states — the order'd execution table is the SINGLE

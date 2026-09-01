@@ -4,7 +4,11 @@
 //! ([`compensation`]).
 
 mod compensation;
-mod mutation;
+/// The ONE proof-bearing slot mutation ([`commit`], [`PreparedSlotMutation`],
+/// [`SlotCommitProof`]) — re-exported publicly at [`crate::deploy::rollout`]
+/// as THE ONE public mutation entry. `pub(crate)` so the public re-export can
+/// name it; the module's own items are the only public surface it exposes.
+pub(crate) mod mutation;
 
 pub(crate) use compensation::*;
 pub(crate) use mutation::*;
@@ -355,14 +359,10 @@ pub(crate) fn process_server(
     let mutation = match PreparedSlotMutation::new(
         op_id.clone(),
         deployment_id.clone(),
-        &crate::deploy::push::ExecutionRequest {
-            slot: slot.clone(),
-            artifact: artifact.clone(),
-            generation: new_gen.clone(),
-            expected_generation: expected_gen.cloned(),
-            behavior: behavior.clone(),
-            behavior_digest: behavior_digest.clone(),
-        },
+        artifact.clone(),
+        new_gen.clone(),
+        behavior_digest.clone(),
+        expected_gen.cloned(),
         crate::remote::helper::now_rfc3339_ts(),
         target.clone(),
         bundle,

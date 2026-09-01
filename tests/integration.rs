@@ -3344,52 +3344,39 @@ fn pending_commit_diverged_generation_is_degraded_not_successful() -> Result<()>
     let foreign_tree =
         TreeDigest::parse("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
             .expect("valid tree digest");
-    foreign_helper
-        .remote()
-        .create_dir_all(&deploy::remote::layout::tree_root(&foreign_tree))?;
-    let foreign_gen = deploy::identity::GenerationId::generate();
-    deploy::remote::helper::SlotRemote::new(
+    // The fixture goes through the PUBLIC test-support helper
+    // (`deploy::remote::helper::test_support::install_foreign_generation` —
+    // the ONLY public mutation surface besides `deploy::rollout::commit`):
+    // the guard mutation primitives are CRATE-PRIVATE, so an external test
+    // never names them. The helper mints the generation record, creates the
+    // tree object, and points `current` at it under the `Absent`
+    // compare-and-swap precondition.
+    deploy::remote::helper::test_support::install_foreign_generation(
         &foreign_helper,
-        deploy::remote::helper::GenerationOwner::new(
+        &deploy::remote::helper::GenerationOwner::new(
             deploy::identity::ApplicationStoreKey::parse("example").unwrap(),
             deploy::identity::SlotId::parse("p1").unwrap(),
         ),
-    )
-    .acquire_lock_guard(&deploy::identity::OperationId::generate())
-    .unwrap()
-    .create_generation(&deploy::remote::helper::GenerationSpec {
-        deployment_id: deploy::identity::DeploymentId::generate(),
-        generation_id: foreign_gen.clone(),
-        artifact: deploy::identity::ArtifactRef {
-            release: deploy::identity::ReleaseId::parse(
-                "rel-sha256-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        deploy::remote::helper::GenerationSpec {
+            deployment_id: deploy::identity::DeploymentId::generate(),
+            generation_id: deploy::identity::GenerationId::generate(),
+            artifact: deploy::identity::ArtifactRef {
+                release: deploy::identity::ReleaseId::parse(
+                    "rel-sha256-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                )
+                .expect("valid release id"),
+                variant: deploy::identity::VariantName::parse("standard").expect("valid variant"),
+                tree: foreign_tree,
+            },
+            behavior_sha256: deploy::identity::BehaviorDigest::parse(
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             )
-            .expect("valid release id"),
-            variant: deploy::identity::VariantName::parse("standard").expect("valid variant"),
-            tree: foreign_tree,
+            .expect("valid behavior digest"),
+            prior_generation: None,
+            created_at: deploy::identity::Timestamp::parse("2020-01-01T00:00:00Z")
+                .expect("valid timestamp"),
+            target: deploy::identity::TargetName::parse("t1").expect("valid target"),
         },
-        behavior_sha256: deploy::identity::BehaviorDigest::parse(
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        )
-        .expect("valid behavior digest"),
-        prior_generation: None,
-        created_at: deploy::identity::Timestamp::parse("2020-01-01T00:00:00Z")
-            .expect("valid timestamp"),
-        target: deploy::identity::TargetName::parse("t1").expect("valid target"),
-    })?;
-    deploy::remote::helper::SlotRemote::new(
-        &foreign_helper,
-        deploy::remote::helper::GenerationOwner::new(
-            deploy::identity::ApplicationStoreKey::parse("example").unwrap(),
-            deploy::identity::SlotId::parse("p1").unwrap(),
-        ),
-    )
-    .acquire_lock_guard(&deploy::identity::OperationId::generate())
-    .unwrap()
-    .swap_current(
-        &deploy::remote::helper::ExpectedCurrent::Absent,
-        &foreign_gen,
-        "op-foreign",
     )?;
     write_file(
         &proj

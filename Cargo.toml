@@ -3,6 +3,17 @@ name = "deploy"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# TEST-SUPPORT FIXTURE HELPERS (`deploy::remote::helper::test_support`):
+# the crate's EXTERNAL tests build remote fixtures through these PUBLIC
+# helpers — the ONLY public mutation surface besides `deploy::rollout::commit`
+# — so no external test calls a crate-private mutation primitive. The feature
+# is enabled ONLY for the crate's own test builds (the self dev-dependency
+# below), never for a production build: a production library caller sees no
+# test-support API, so the ONLY public mutation path in production is
+# `deploy::rollout::commit` with a `PreparedSlotMutation`.
+test-support = []
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 toml = "1"
@@ -21,6 +32,12 @@ jiff = "0.2.35"
 
 [dev-dependencies]
 assert_fs = "1"
+# The crate as its OWN dev-dependency with the `test-support` feature: the
+# integration tests (`tests/*.rs`) link THIS copy (with the fixture helpers),
+# while `cargo build` and the lib target compile the crate WITHOUT the
+# feature — the test-support API never appears in a production build.
+deploy = { path = ".", features = ["test-support"] }
+
 # The serialized real-process lifecycle target (`tests/process_lifecycle.rs`)
 # probes pids with `kill(2)` / `waitpid(2)` directly (no external `kill`
 # binary — the syscall-level probes the runner contract is about). `libc` is

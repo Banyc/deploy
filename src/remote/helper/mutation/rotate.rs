@@ -24,7 +24,13 @@ impl<'a> HeldSlotLock<'a> {
     /// belongs to a different application/slot — ABORTS rotation with ZERO
     /// deletions (fail closed): it is never swept as if it were ours, and its
     /// trees are never deleted by a guard that does not own them.
-    pub fn rotate(
+    ///
+    /// CRATE-PRIVATE (the structural verdict's point 7 taken to its
+    /// conclusion): the mutation primitives are NOT on the library's public
+    /// surface — the ONLY public mutation path is
+    /// [`crate::deploy::rollout::commit`] with a
+    /// [`crate::deploy::rollout::PreparedSlotMutation`].
+    pub(crate) fn rotate(
         &self,
         retained: &HashSet<String>,
         active_incoming: &HashSet<String>,

@@ -34,7 +34,13 @@ impl<'a> RemoteHelper<'a> {
     /// `Ok(())` therefore implies the new bytes are installed AND the
     /// directory entry is durable. A failed parent fsync is an `Err`, never
     /// a reported success.
-    pub fn durable_record_replace(
+    ///
+    /// CRATE-PRIVATE (the structural verdict's point 7 taken to its
+    /// conclusion): the mutation primitives are NOT on the library's public
+    /// surface — the ONLY public mutation path is
+    /// [`crate::deploy::rollout::commit`] with a
+    /// [`crate::deploy::rollout::PreparedSlotMutation`].
+    pub(crate) fn durable_record_replace(
         &self,
         rel: &RootedRelativePath,
         data: &[u8],
@@ -74,7 +80,13 @@ impl<'a> HeldSlotLock<'a> {
     /// operation's outcome by reading it, not from any per-server history log.
     /// The record is REPLACED durably ([`RemoteHelper::durable_record_replace`]):
     /// success is reported only after the parent-directory fsync succeeds.
-    pub fn transaction_record(&self, op_id: &OperationId, state: &str) -> Result<()> {
+    ///
+    /// CRATE-PRIVATE (the structural verdict's point 7 taken to its
+    /// conclusion): the mutation primitives are NOT on the library's public
+    /// surface — the ONLY public mutation path is
+    /// [`crate::deploy::rollout::commit`] with a
+    /// [`crate::deploy::rollout::PreparedSlotMutation`].
+    pub(crate) fn transaction_record(&self, op_id: &OperationId, state: &str) -> Result<()> {
         let p = layout::transaction_record(op_id);
         let payload = serde_json::json!({
             "operation_id": op_id,

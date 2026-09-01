@@ -143,6 +143,18 @@ mod mutation;
 mod observed;
 mod protocol;
 mod state;
+/// TEST-SUPPORT FIXTURE HELPERS (the `test-support` cargo feature): the
+/// crate's EXTERNAL tests (`tests/*.rs`) build remote fixtures through these
+/// PUBLIC helpers — the ONLY public mutation surface besides
+/// [`crate::deploy::rollout::commit`] — so no external test calls a
+/// crate-private mutation primitive. The module is gated behind the
+/// `test-support` feature (enabled only for the crate's own test builds via
+/// the self dev-dependency in `Cargo.toml`), so a production library caller
+/// never sees it: the ONLY public mutation path in a production build is
+/// [`crate::deploy::rollout::commit`] with a
+/// [`crate::deploy::rollout::PreparedSlotMutation`].
+#[cfg(feature = "test-support")]
+pub mod test_support;
 
 pub use evidence::{
     DurableCurrent, DurableGeneration, DurableObject, DurableRelease, RestorationProof,

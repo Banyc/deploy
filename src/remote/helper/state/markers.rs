@@ -24,7 +24,13 @@ impl<'a> HeldSlotLock<'a> {
     /// and an existing record must match byte-for-byte (deterministic payload
     /// for the same deployment) or the rewrite fails integrity. A concurrent or
     /// retried commit therefore never corrupts a recorded fact.
-    pub fn write_commit_marker(
+    ///
+    /// CRATE-PRIVATE (the structural verdict's point 7 taken to its
+    /// conclusion): the mutation primitives are NOT on the library's public
+    /// surface — the ONLY public mutation path is
+    /// [`crate::deploy::rollout::commit`] with a
+    /// [`crate::deploy::rollout::PreparedSlotMutation`].
+    pub(crate) fn write_commit_marker(
         &self,
         deployment_id: &DeploymentId,
         generation: &str,

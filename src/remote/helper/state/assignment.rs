@@ -240,7 +240,13 @@ impl<'a> HeldSlotLock<'a> {
     /// Returns the [`DurableGeneration`] EVIDENCE of the durably installed
     /// generation (the sealed witness — the only way a caller can learn the
     /// install succeeded; never a bare `()`).
-    pub fn durable_generation_install(
+    ///
+    /// CRATE-PRIVATE (the structural verdict's point 7 taken to its
+    /// conclusion): the mutation primitives are NOT on the library's public
+    /// surface — the ONLY public mutation path is
+    /// [`crate::deploy::rollout::commit`] with a
+    /// [`crate::deploy::rollout::PreparedSlotMutation`].
+    pub(crate) fn durable_generation_install(
         &self,
         spec: &GenerationSpec,
     ) -> Result<crate::remote::helper::DurableGeneration> {
@@ -357,7 +363,21 @@ impl<'a> HeldSlotLock<'a> {
     /// Does not move `current`. Requires the slot-mutation capability — the
     /// receiver is the guard; the helper is the guard's own. Returns the
     /// [`DurableGeneration`] EVIDENCE of the durably installed generation.
-    pub fn create_generation(
+    ///
+    /// CRATE-PRIVATE (the structural verdict's point 7 taken to its
+    /// conclusion): the mutation primitives are NOT on the library's public
+    /// surface — the ONLY public mutation path is
+    /// [`crate::deploy::rollout::commit`] with a
+    /// [`crate::deploy::rollout::PreparedSlotMutation`].
+    ///
+    /// TEST-ONLY WRAPPER: no production caller uses the `create_generation`
+    /// name (production goes through [`Self::durable_generation_install`] via
+    /// [`crate::deploy::rollout::commit`]); the wrapper exists for the
+    /// crate's own test fixtures and the `test-support` fixture helper, so it
+    /// is compiled only in test builds (`cfg(test)` or the `test-support`
+    /// feature) — never in a production build.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn create_generation(
         &self,
         spec: &GenerationSpec,
     ) -> Result<crate::remote::helper::DurableGeneration> {

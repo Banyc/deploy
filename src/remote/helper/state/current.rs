@@ -321,7 +321,13 @@ impl<'a> crate::remote::helper::HeldSlotLock<'a> {
     /// Returns the [`DurableCurrent`] EVIDENCE of the durably swapped
     /// `current` (the sealed witness naming the generation `current` now
     /// points at — never a bare `()`).
-    pub fn durable_symlink_swap(
+    ///
+    /// CRATE-PRIVATE (the structural verdict's point 7 taken to its
+    /// conclusion): the mutation primitives are NOT on the library's public
+    /// surface — the ONLY public mutation path is
+    /// [`crate::deploy::rollout::commit`] with a
+    /// [`crate::deploy::rollout::PreparedSlotMutation`].
+    pub(crate) fn durable_symlink_swap(
         &self,
         expected: &ExpectedCurrent,
         gen_id: &GenerationId,
@@ -384,7 +390,13 @@ impl<'a> crate::remote::helper::HeldSlotLock<'a> {
     /// slot-mutation capability — the receiver is the guard; the helper is
     /// the guard's own. Returns the [`DurableCurrent`] EVIDENCE of the
     /// durably swapped `current`.
-    pub fn swap_current(
+    ///
+    /// CRATE-PRIVATE (the structural verdict's point 7 taken to its
+    /// conclusion): the mutation primitives are NOT on the library's public
+    /// surface — the ONLY public mutation path is
+    /// [`crate::deploy::rollout::commit`] with a
+    /// [`crate::deploy::rollout::PreparedSlotMutation`].
+    pub(crate) fn swap_current(
         &self,
         expected: &ExpectedCurrent,
         gen_id: &GenerationId,
@@ -402,7 +414,13 @@ impl<'a> crate::remote::helper::HeldSlotLock<'a> {
     /// ([`Self::verify_generation`]) — a foreign (transplanted) generation's
     /// `current` is never removed by a guard that does not own it (fail
     /// closed).
-    pub fn remove_current_if(&self, expected: &ExpectedCurrent) -> Result<bool> {
+    ///
+    /// CRATE-PRIVATE (the structural verdict's point 7 taken to its
+    /// conclusion): the mutation primitives are NOT on the library's public
+    /// surface — the ONLY public mutation path is
+    /// [`crate::deploy::rollout::commit`] with a
+    /// [`crate::deploy::rollout::PreparedSlotMutation`].
+    pub(crate) fn remove_current_if(&self, expected: &ExpectedCurrent) -> Result<bool> {
         // Same exact-equality gate as the swap: resolve the actual state once
         // (malformed/transport errors propagate, link byte-identical) and
         // remove ONLY on an exact generation match. `Absent` expectation with
