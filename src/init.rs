@@ -27,6 +27,7 @@ use crate::config::{
     VerificationConfig,
 };
 use crate::error::{Error, Result};
+use crate::identity::KeepDays;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -404,7 +405,7 @@ fn standard_variant(deploy_dir: &Path) -> crate::config::raw::RawVariant {
         retention: RetentionConfig {
             per_server: PerServerRetention {
                 keep_distinct_artifacts: 5,
-                keep_days: 14,
+                keep_days: KeepDays::default(),
                 protect_previous: true,
             },
             deployment: DeploymentRetention {

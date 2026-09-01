@@ -3,6 +3,7 @@
 //! window) and its defaults.
 
 use crate::config::activation::default_true;
+use crate::identity::KeepDays;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -11,7 +12,7 @@ pub struct PerServerRetention {
     #[serde(default = "default_keep_distinct")]
     pub keep_distinct_artifacts: u32,
     #[serde(default = "default_keep_days")]
-    pub keep_days: u64,
+    pub keep_days: KeepDays,
     #[serde(default = "default_true")]
     pub protect_previous: bool,
 }
@@ -19,8 +20,8 @@ pub struct PerServerRetention {
 fn default_keep_distinct() -> u32 {
     5
 }
-fn default_keep_days() -> u64 {
-    14
+fn default_keep_days() -> KeepDays {
+    KeepDays::default()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]

@@ -17,7 +17,8 @@
 //!   [`TargetName`], [`VariantName`]: a single safe path segment).
 //! * [`scalars`] — the validated scalar value types ([`Identifier`],
 //!   [`ApplicationStoreKey`], [`BatchSize`] (nonzero u64),
-//!   [`CapacityPercent`] (0..=100), [`crate::identity::AbsoluteDeployDir`] (absolute,
+//!   [`CapacityPercent`] (0..=100), [`KeepDays`] (bounded so the retention
+//!   cutoff can never overflow), [`crate::identity::AbsoluteDeployDir`] (absolute,
 //!   traversal-free), [`BehaviorDigest`], [`Timestamp`],
 //!   [`RolloutGroupName`], [`Host`], [`SshUser`]).
 //!

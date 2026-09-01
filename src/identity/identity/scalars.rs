@@ -5,8 +5,11 @@
 //! must be a sha256 digest, an on-server `deploy_dir` must be an absolute
 //! TRAVERSAL-FREE path with at least one normal component below the root,
 //! a batch size must be nonzero, a capacity percent
-//! must fit 0..=100, a verification timeout and attempt count must be
-//! nonzero, and a recorded timestamp must parse as RFC 3339. The
+//! must fit 0..=100, a retention window must fit the jiff timestamp span
+//! (a `keep_days` whose `keep_days * 24h` cutoff could overflow the
+//! retention arithmetic is unrepresentable), a verification timeout and
+//! attempt count must be nonzero, and a recorded timestamp must parse as
+//! RFC 3339. The
 //! application name is ONE safe identifier ([`ApplicationStoreKey`]): a
 //! single normal filesystem component used for BOTH display (messages and
 //! rendering) and storage (the one filesystem component that names the
@@ -503,6 +506,112 @@ impl FromStr for CapacityPercent {
     }
 }
 
+/// A validated retention window in days: how many days of successful
+/// artifact activations the slot's retention policy keeps. The retention
+/// computation is `now - keep_days*24h` (a `jiff::SignedDuration` cutoff),
+/// and jiff's `Timestamp` arithmetic PANICS if the cutoff falls below
+/// `Timestamp::MIN` — so the CONSTRUCTION bounds the value: `keep_days`
+/// must keep `keep_days * 24` hours within the span from the Unix epoch to
+/// `Timestamp::MIN` (`keep_days * 24 * 3600 <= -Timestamp::MIN` seconds,
+/// i.e. `keep_days <= 4_371_585` days ≈ 12,000 years). For any `now` at or
+/// after the Unix epoch (every real run), `now - keep_days*24h >=`
+/// `Timestamp::MIN` can never overflow, and the cutoff is always in the
+/// past for a positive `keep_days`; `keep_days * 24` is then trivially
+/// within `i64` (the `SignedDuration::from_hours` argument), so the
+/// retention arithmetic is safe by construction — an overflowing value is
+/// UNREPRESENTABLE, never a runtime check. Zero is valid: it disables the
+/// age window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct KeepDays(u64);
+
+impl KeepDays {
+    /// The maximum `keep_days` (in days): `keep_days * 24 * 3600` must not
+    /// exceed `-Timestamp::MIN` seconds (the span from the Unix epoch to
+    /// jiff's minimum timestamp), so `now - keep_days*24h` stays within
+    /// jiff's `Timestamp` range for any `now` at or after the epoch.
+    /// `-Timestamp::MIN = 377_705_023_201` seconds, so the bound is
+    /// `377_705_023_201 / 86_400 = 4_371_585` days (the largest whole day
+    /// count whose window fits the span).
+    pub const MAX: u64 = 4_371_585;
+
+    /// Construct a retention window, rejecting any value whose `keep_days *
+    /// 24` hours could overflow the retention cutoff (see [`KeepDays::MAX`]).
+    pub fn new(v: u64) -> Result<KeepDays> {
+        if v > KeepDays::MAX {
+            return Err(Error::config(format!(
+                "invalid keep_days {v}: the retention window must be at most {} days \
+                 (a larger window would overflow the retention cutoff)",
+                KeepDays::MAX
+            )));
+        }
+        Ok(KeepDays(v))
+    }
+
+    /// The validated retention window in days.
+    pub fn get(&self) -> u64 {
+        self.0
+    }
+
+    /// The retention window in hours — the `SignedDuration::from_hours`
+    /// argument: `keep_days * 24`, guaranteed by the construction bound to
+    /// fit `i64` (the maximum is `KeepDays::MAX * 24 = 104_918_040` hours).
+    pub fn hours(&self) -> i64 {
+        i64::try_from(self.0 * 24).expect("KeepDays::MAX keeps keep_days * 24 within i64")
+    }
+}
+
+impl Default for KeepDays {
+    fn default() -> Self {
+        KeepDays(14)
+    }
+}
+
+impl fmt::Display for KeepDays {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl FromStr for KeepDays {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<KeepDays> {
+        let v: u64 = s.parse().map_err(|_| {
+            Error::config(format!(
+                "invalid keep_days {s:?}: expected a nonnegative integer"
+            ))
+        })?;
+        KeepDays::new(v)
+    }
+}
+
+/// Wire numbers go through the validated parse: a wire `keep_days` outside
+/// the bound fails deserialization (fail closed — a config that declares an
+/// overflowing retention window is never silently accepted).
+impl Serialize for KeepDays {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_u64(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for KeepDays {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let v = u64::deserialize(deserializer)?;
+        KeepDays::new(v).map_err(serde::de::Error::custom)
+    }
+}
+
+/// A deterministic valid [`KeepDays`] for test fixtures.
+#[cfg(test)]
+pub(crate) fn test_keep_days(days: u64) -> KeepDays {
+    KeepDays::new(days).expect("test keep_days is in range")
+}
+
 /// A parsed RFC3339 timestamp ([`jiff::Timestamp`]): the canonical form for
 /// every recorded moment (`attempted_at`, `recorded_at`). Construction
 /// parses the string strictly, so an unparseable timestamp can never enter
@@ -733,6 +842,38 @@ mod tests {
         for bad in ["101", "-1", "abc"] {
             assert!(bad.parse::<CapacityPercent>().is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn keep_days_requires_in_range() {
+        for ok in [0u64, 14, 42, KeepDays::MAX] {
+            let k = KeepDays::new(ok).expect("in-range keep_days parses");
+            assert_eq!(k.get(), ok);
+            assert_eq!(ok.to_string().parse::<KeepDays>().expect("valid"), k);
+        }
+        assert_eq!(KeepDays::default().get(), 14);
+        for bad in [KeepDays::MAX + 1, u64::MAX] {
+            KeepDays::new(bad).expect_err("out-of-range keep_days rejected");
+        }
+        for bad in ["-1", "abc", "1.5"] {
+            assert!(bad.parse::<KeepDays>().is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn keep_days_serde_routes_through_the_validated_parse() {
+        let k = KeepDays::new(30).expect("in-range keep_days");
+        let wire = serde_json::to_string(&k).expect("serializes as a number");
+        assert_eq!(wire, "30", "the wire form stays a bare number");
+        let back: KeepDays = serde_json::from_str(&wire).expect("valid wire re-parses");
+        assert_eq!(back, k);
+        // A wire value outside the bound fails deserialization (fail closed).
+        let err = serde_json::from_str::<KeepDays>(&(KeepDays::MAX + 1).to_string())
+            .expect_err("out-of-range wire keep_days must fail deserialization");
+        assert!(
+            err.to_string().contains("keep_days"),
+            "the deserialization error names the field, got: {err}"
+        );
     }
 
     #[test]
@@ -1025,6 +1166,62 @@ mod tests {
                 !root_only,
                 "LocalTransport must refuse a root deploy_dir: {s:?}"
             );
+        }
+    }
+
+    proptest! {
+        // THE KEEP_DAYS PROPERTY: over ARBITRARY u64 values, the validated
+        // [`KeepDays`] construction accepts EXACTLY the values whose retention
+        // arithmetic cannot overflow — every accepted value produces a cutoff
+        // `now - keep_days*24h` that is representable (>= `Timestamp::MIN`)
+        // and in the past for a positive `keep_days` — and refuses every
+        // value that could overflow (a window wider than the span from the
+        // Unix epoch to `Timestamp::MIN` would push the cutoff below MIN for
+        // a `now` at the epoch). Bounded 16 cases, fixed seed 0x5EED_5EED
+        // (house style), no failure persistence — the identical vectors on
+        // every run.
+        #![proptest_config(ProptestConfig {
+            cases: crate::testutil::proptest_cases(16),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn keep_days_bound_makes_retention_arithmetic_safe(v in any::<u64>()) {
+            match KeepDays::new(v) {
+                Ok(kd) => {
+                    // Every accepted value produces a retention computation
+                    // that cannot overflow: the cutoff is representable and
+                    // in the past for a positive keep_days.
+                    let now = JiffTimestamp::now();
+                    let cutoff = now - jiff::SignedDuration::from_hours(kd.hours());
+                    assert!(
+                        cutoff >= JiffTimestamp::MIN,
+                        "an accepted keep_days must keep the cutoff representable: {v}"
+                    );
+                    if kd.get() > 0 {
+                        assert!(
+                            cutoff < now,
+                            "a positive keep_days must cut off in the past: {v}"
+                        );
+                    }
+                }
+                Err(_) => {
+                    // Every value that could overflow is refused at
+                    // construction: the window exceeds the span from the
+                    // Unix epoch to Timestamp::MIN, so `now - keep_days*24h`
+                    // would fall below MIN for a now at the epoch.
+                    assert!(
+                        v > KeepDays::MAX,
+                        "only out-of-bound keep_days values are refused: {v}"
+                    );
+                    assert!(
+                        (v as u128) * 24 * 3600 > (-JiffTimestamp::MIN.as_second()) as u128,
+                        "a refused value must be one that could overflow the cutoff: {v}"
+                    );
+                }
+            }
         }
     }
 }

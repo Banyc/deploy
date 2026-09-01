@@ -5,7 +5,7 @@ use crate::config::*;
 use crate::env::SysEnv;
 use crate::error::Error;
 use crate::identity::{
-    AbsoluteDeployDir, ApplicationStoreKey, BatchSize, CapacityPercent, Identifier,
+    AbsoluteDeployDir, ApplicationStoreKey, BatchSize, CapacityPercent, Identifier, KeepDays,
     RolloutGroupName,
 };
 use crate::identity::{ReleaseId, SlotId};
@@ -989,6 +989,74 @@ fn server_capacity_is_validated_and_defaults() {
     let cfg = ProjectConfig::load(&p).expect("inline server capacity parses");
     assert_eq!(cfg.servers_ref()[0].capacity.reserve_bytes, 4096);
     assert_eq!(cfg.servers_ref()[0].capacity.reserve_percent.get(), 10);
+}
+
+/// The retention `keep_days` window is a validated [`KeepDays`]: a wire
+/// value outside the bound (a window whose `keep_days * 24h` cutoff would
+/// overflow the retention arithmetic) is refused AT DESERIALIZATION — the
+/// load fails closed, never silently accepting an overflowing window that
+/// could discard rollback artifacts. The wire form stays a bare number, so
+/// existing configs with a numeric `keep_days` still load.
+#[test]
+fn retention_keep_days_is_validated_and_defaults() {
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+    let project = dir.path().join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+    write_standard_release(&project, "v1");
+    let p = project.join("deploy.toml");
+
+    // Omitted keep_days defaults to 14 days (a variant without a retention
+    // section at all).
+    std::fs::write(
+        project.join("releases/v1/standard.toml"),
+        format!("{MINIMAL_VARIANT}\n{STANDARD_SLOTS}"),
+    )
+    .unwrap();
+    std::fs::write(&p, deploy_toml("v1")).unwrap();
+    let cfg = ProjectConfig::load(&p).expect("variant without keep_days loads");
+    assert_eq!(
+        cfg.variant("standard")
+            .unwrap()
+            .retention
+            .per_server
+            .keep_days
+            .get(),
+        14
+    );
+
+    // A numeric keep_days inside the bound loads (the wire form is
+    // unchanged).
+    write_standard_release(&project, "v1");
+    let ok = std::fs::read_to_string(project.join("releases/v1/standard.toml"))
+        .unwrap()
+        .replace("keep_days = 0", "keep_days = 30");
+    std::fs::write(project.join("releases/v1/standard.toml"), ok).unwrap();
+    let cfg = ProjectConfig::load(&p).expect("in-range keep_days loads");
+    assert_eq!(
+        cfg.variant("standard")
+            .unwrap()
+            .retention
+            .per_server
+            .keep_days
+            .get(),
+        30
+    );
+
+    // A keep_days outside the bound is refused at load (fail closed): the
+    // window would overflow the retention cutoff.
+    let bad = std::fs::read_to_string(project.join("releases/v1/standard.toml"))
+        .unwrap()
+        .replace(
+            "keep_days = 30",
+            &format!("keep_days = {}", KeepDays::MAX + 1),
+        );
+    std::fs::write(project.join("releases/v1/standard.toml"), bad).unwrap();
+    let err = ProjectConfig::load(&p).expect_err("out-of-bound keep_days must fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("keep_days") && msg.contains("retention window"),
+        "error must name the violation, got: {msg}"
+    );
 }
 
 /// SSH addresses require EXACTLY ONE host-identity source; the `local`
@@ -2500,7 +2568,11 @@ fn arbitrary_raw_variant() -> impl Strategy<Value = raw::RawVariant> {
         arbitrary_activation(),
         arbitrary_verification(),
         prop::collection::vec(arbitrary_slot(), 0..3),
-        any::<u64>(),
+        // The raw retention shape IS the typed [`RetentionConfig`], so the
+        // arbitrary keep_days is generated IN-RANGE: an out-of-bound wire
+        // value is refused at DESERIALIZATION (the typed scalar cannot hold
+        // it), which the TOML-level fail-closed test pins separately.
+        (0u64..=KeepDays::MAX).prop_map(|v| KeepDays::new(v).expect("in-range keep_days")),
         any::<u32>(),
     )
         .prop_map(

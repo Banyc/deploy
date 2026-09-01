@@ -38,7 +38,7 @@ use crate::deploy::{PushOptions, push, retry_pending_sweep};
 use crate::error::Result;
 use crate::identity::{
     ArtifactRef, DeploymentId, ReleaseId, ServerId, SlotId, TargetName, TreeDigest, VariantName,
-    test_deployment_id, test_generation_id, test_tree_digest,
+    test_deployment_id, test_generation_id, test_keep_days, test_tree_digest,
 };
 use crate::ledger::{DeploymentIntent, DeploymentStatus, LedgerTerminal};
 use crate::remote::helper::{GenerationSpec, RemoteHelper};
@@ -416,7 +416,7 @@ fn run_no_leak_case(
         .unwrap()
         .retention
         .per_server
-        .keep_days = 0;
+        .keep_days = test_keep_days(0);
     cfg.variant_mut("standard")
         .unwrap()
         .retention

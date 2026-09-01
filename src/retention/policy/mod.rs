@@ -223,8 +223,8 @@ fn retained_for_policy(
     }
 
     let keep_days = retention.per_server.keep_days;
-    if keep_days > 0 {
-        let cutoff = Timestamp::now() - jiff::SignedDuration::from_hours(keep_days as i64 * 24);
+    if keep_days.get() > 0 {
+        let cutoff = Timestamp::now() - jiff::SignedDuration::from_hours(keep_days.hours());
         for ((_, _, tree), ts) in &ordered {
             if *ts >= cutoff {
                 retained.insert(tree.clone());
@@ -277,8 +277,8 @@ mod tests {
     use crate::error::Error;
     use crate::identity::{
         ArtifactRef, DeploymentId, GenerationId, ReleaseId, ReleaseRecord, SlotId, TargetName,
-        TreeDigest, VariantName, test_deployment_id, test_generation_id, test_release_id,
-        test_tree_digest,
+        TreeDigest, VariantName, test_deployment_id, test_generation_id, test_keep_days,
+        test_release_id, test_tree_digest,
     };
     use crate::remote::helper::{
         CurrentAssignment, GenerationAssignment, GenerationSpec, RemoteHelper,
@@ -612,7 +612,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .unwrap()
             .retention
             .per_server
-            .keep_days = 0;
+            .keep_days = test_keep_days(0);
         c.variant_mut("standard")
             .unwrap()
             .retention
@@ -674,7 +674,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .unwrap()
             .retention
             .per_server
-            .keep_days = 30;
+            .keep_days = test_keep_days(30);
         c.variant_mut("standard")
             .unwrap()
             .retention
@@ -698,7 +698,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .unwrap()
             .retention
             .per_server
-            .keep_days = 90;
+            .keep_days = test_keep_days(90);
         let retained = compute_retained(&helper, c.pins(), &store, ret(&c), &owner()).unwrap();
         assert!(
             retained.contains(test_tree_digest("t-old").as_str()),
@@ -764,7 +764,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .unwrap()
             .retention
             .per_server
-            .keep_days = 0;
+            .keep_days = test_keep_days(0);
         c.variant_mut("standard")
             .unwrap()
             .retention
@@ -840,7 +840,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .unwrap()
             .retention
             .per_server
-            .keep_days = 0;
+            .keep_days = test_keep_days(0);
         c.variant_mut("standard")
             .unwrap()
             .retention
@@ -924,7 +924,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .unwrap()
             .retention
             .per_server
-            .keep_days = 0;
+            .keep_days = test_keep_days(0);
         c.variant_mut("standard")
             .unwrap()
             .retention
@@ -1147,7 +1147,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .unwrap()
             .retention
             .per_server
-            .keep_days = 0;
+            .keep_days = test_keep_days(0);
         c.variant_mut("standard")
             .unwrap()
             .retention
@@ -1626,8 +1626,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         }
 
         let keep_days = policy.per_server.keep_days;
-        if keep_days > 0 {
-            let cutoff = Timestamp::now() - jiff::SignedDuration::from_hours(keep_days as i64 * 24);
+        if keep_days.get() > 0 {
+            let cutoff = Timestamp::now() - jiff::SignedDuration::from_hours(keep_days.hours());
             for ((_, _, tree), ts) in &ordered {
                 if *ts >= cutoff {
                     retained.insert(tree.clone());
@@ -1778,7 +1778,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         fn inventory_failure_aborts_before_deletion_debt_then_retry_matches_reference(
             n_gens in 2usize..=4,
             keep_distinct in 0u32..=2,
-            keep_days in prop::sample::select(vec![0u64, 2, 4]),
+            keep_days in prop::sample::select(vec![0u64, 2, 4]).prop_map(test_keep_days),
             protect_previous: bool,
             protect_deployments in 0u32..=2,
             fault in 0u8..=4,
@@ -2193,7 +2193,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         fn protect_previous_resolves_against_the_one_inventory(
             n_gens in 2usize..=4,
             keep_distinct in 0u32..=2,
-            keep_days in prop::sample::select(vec![0u64, 2, 4]),
+            keep_days in prop::sample::select(vec![0u64, 2, 4]).prop_map(test_keep_days),
             protect_deployments in 0u32..=2,
             scenario in 0u8..=3,
         ) {
@@ -2387,7 +2387,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         fn protect_previous_faults_abort_before_deletion_then_retry_matches_reference(
             n_gens in 2usize..=4,
             keep_distinct in 0u32..=2,
-            keep_days in prop::sample::select(vec![0u64, 2, 4]),
+            keep_days in prop::sample::select(vec![0u64, 2, 4]).prop_map(test_keep_days),
             protect_deployments in 0u32..=2,
             fault in 0u8..=6,
             corrupt_idx in 0usize..=3,

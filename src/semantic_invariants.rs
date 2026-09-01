@@ -80,7 +80,7 @@ use crate::deploy::{PushOptions, PushReport, push, push_with_id};
 use crate::error::Result;
 use crate::identity::{
     ArtifactRef, DeploymentId, GenerationId, OperationId, ReleaseId, SlotId, TargetName,
-    TreeDigest, VariantName, test_deployment_id, test_tree_digest,
+    TreeDigest, VariantName, test_deployment_id, test_keep_days, test_tree_digest,
 };
 use crate::ledger;
 use crate::ledger::DeploymentStatus;
@@ -3914,7 +3914,7 @@ fn scope_strengthening_policy_never_reduces_retained() {
         .unwrap()
         .retention
         .per_server
-        .keep_days = 90;
+        .keep_days = test_keep_days(90);
     let wider_retained = baseline(&wider);
     assert!(
         wider_retained.is_superset(&strong),

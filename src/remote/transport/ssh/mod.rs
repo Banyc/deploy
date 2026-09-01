@@ -3873,8 +3873,8 @@ exec /bin/mv "$@"
     fn lstat_eacces_aborts_retention_with_zero_deletions() {
         use crate::config::{DeploymentRetention, PerServerRetention, RetentionConfig};
         use crate::identity::{
-            ArtifactRef, VariantName, test_deployment_id, test_generation_id, test_release_id,
-            test_tree_digest,
+            ArtifactRef, VariantName, test_deployment_id, test_generation_id, test_keep_days,
+            test_release_id, test_tree_digest,
         };
         use crate::remote::helper::GenerationAssignment;
         use crate::retention::policy::compute_retained;
@@ -3970,7 +3970,7 @@ exec /bin/mv "$@"
         let policy = RetentionConfig {
             per_server: PerServerRetention {
                 keep_distinct_artifacts: 5,
-                keep_days: 14,
+                keep_days: test_keep_days(14),
                 protect_previous: true,
             },
             deployment: DeploymentRetention {
