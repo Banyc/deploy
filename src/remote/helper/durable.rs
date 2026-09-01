@@ -337,8 +337,13 @@ proptest! {
                 );
                 crate::verify::release::verify_behavior_json(
                     &behavior_json,
-                    &rec.release_id,
-                    &rec.provenance.behavior_sha256,
+                    &crate::identity::ReleaseId::parse(&rec.release_id).expect(
+                        "a present release directory must carry a parseable release id",
+                    ),
+                    &crate::identity::BehaviorDigest::parse(&rec.provenance.behavior_sha256)
+                        .expect(
+                            "a present release directory must carry a parseable behavior digest",
+                        ),
                 )
                 .expect(
                     "a present release directory must carry a digest-consistent behavior.json",

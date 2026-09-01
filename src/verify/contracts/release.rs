@@ -1189,15 +1189,20 @@ mod tests {
         );
         let sha = variant_behaviors_digest(&contracts);
         let canonical = serde_json::to_vec(&contracts).unwrap();
+        // The typed identities the verification now requires: the release id
+        // and the provenance digest are validated at the boundary, so the
+        // test passes the typed values directly.
+        let release_id = crate::identity::test_release_id("x");
+        let digest = crate::identity::BehaviorDigest::parse(&sha).expect("canonical digest");
 
         // The canonical payload verifies.
-        verify_behavior_json(&canonical, "rel-x", &sha).expect("canonical payload verifies");
+        verify_behavior_json(&canonical, &release_id, &digest).expect("canonical payload verifies");
 
         // Key reordering in the raw bytes parses to the SAME contract set, so
         // the digest stays equal and verification passes (the "unless the
         // canonical behavior digest remains equal" clause).
         let reordered = br#"{"standard":{"verification":{"adapter":"command","argv":["true"],"timeout_seconds":30,"attempts":2,"interval_seconds":1},"activation":{"adapter":"systemd","scope":"system","reconcile_managed_units":true,"units":[{"name":"app.service","artifact_path":"integration/systemd/app.service","enable":true,"restart":true}]}}}"#;
-        verify_behavior_json(reordered, "rel-x", &sha).expect("reordered JSON passes");
+        verify_behavior_json(reordered, &release_id, &digest).expect("reordered JSON passes");
 
         // Every identity-bearing change that still PARSES to a valid (but
         // different) contract set alters the digest -> fail closed with the
@@ -1213,7 +1218,7 @@ mod tests {
         ];
         for (i, m) in mutations.iter().enumerate() {
             let bytes = serde_json::to_vec(m).unwrap();
-            let err = verify_behavior_json(&bytes, "rel-x", &sha)
+            let err = verify_behavior_json(&bytes, &release_id, &digest)
                 .expect_err("every valid-but-different contract set must fail verification");
             assert!(
                 err.to_string().contains("digest mismatch"),
@@ -1246,7 +1251,7 @@ mod tests {
         ];
         for (i, m) in refusals.iter().enumerate() {
             let bytes = serde_json::to_vec(m).unwrap();
-            let err = verify_behavior_json(&bytes, "rel-x", &sha)
+            let err = verify_behavior_json(&bytes, &release_id, &digest)
                 .expect_err("an invalid contract shape must be refused at the closed-enum parse");
             assert!(
                 err.to_string().contains("malformed"),
@@ -1255,7 +1260,7 @@ mod tests {
         }
 
         // Unparseable bytes fail closed as malformed.
-        let err = verify_behavior_json(b"{ not json", "rel-x", &sha)
+        let err = verify_behavior_json(b"{ not json", &release_id, &digest)
             .expect_err("malformed bytes must fail closed");
         assert!(err.to_string().contains("malformed"));
     }

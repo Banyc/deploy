@@ -87,10 +87,7 @@ fn load_generation_behavior(
         ))
     })?;
     helper
-        .read_behavior(
-            &assignment.artifact.release,
-            assignment.artifact.variant.as_str(),
-        )
+        .read_behavior(&assignment.artifact.release, &assignment.artifact.variant)
         .map_err(|e| {
             Error::remote(format!(
                 "compensation: behavior of '{gid}' unavailable: {e}"
@@ -131,7 +128,7 @@ pub(crate) fn compensate_server_locked(
             let prior_behavior = helper
                 .read_behavior(
                     &prior_assignment.artifact.release,
-                    prior_assignment.artifact.variant.as_str(),
+                    &prior_assignment.artifact.variant,
                 )
                 .map_err(|e| {
                     Error::remote(format!("compensation: prior behavior unavailable: {e}"))

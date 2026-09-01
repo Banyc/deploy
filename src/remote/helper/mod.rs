@@ -173,7 +173,7 @@ use crate::deploy::lock::AdministrativeRecoveryGuard;
 use crate::error::{Error, Result};
 use crate::identity::{
     AcquisitionId, ApplicationStoreKey, ArtifactRef, BehaviorContract, GenerationId, OperationId,
-    ReleaseId, ReleaseRecord, SlotId, TreeDigest,
+    ReleaseId, ReleaseRecord, SlotId, TreeDigest, VariantName,
 };
 use crate::remote::layout;
 use crate::remote::transport::{
@@ -346,7 +346,11 @@ impl<'a> RemoteHelper<'a> {
     /// `behavior_sha256` is then the digest the remote `behavior.json` must
     /// match. A tampered behavior document fails closed with an integrity
     /// error — the historical contract is never returned unverified.
-    pub fn read_behavior(&self, release_id: &ReleaseId, variant: &str) -> Result<BehaviorContract> {
+    pub fn read_behavior(
+        &self,
+        release_id: &ReleaseId,
+        variant: &VariantName,
+    ) -> Result<BehaviorContract> {
         let p = layout::remote_release(release_id).join("behavior.json")?;
         let data = self.remote.read(&p)?;
         // Verify the published release record (its own identity is recomputed
@@ -368,10 +372,10 @@ impl<'a> RemoteHelper<'a> {
         }
         let behaviors = crate::verify::release::verify_behavior_json(
             &data,
-            &rec.release_id,
-            &rec.provenance.behavior_sha256,
+            release_id,
+            &crate::identity::BehaviorDigest::parse(&rec.provenance.behavior_sha256)?,
         )?;
-        behaviors.get(variant).cloned().ok_or_else(|| {
+        behaviors.get(variant.as_str()).cloned().ok_or_else(|| {
             Error::remote(format!(
                 "release {release_id} has no behavior for variant '{variant}'"
             ))

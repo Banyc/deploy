@@ -3,7 +3,7 @@
 //! `behavior.json` snapshots — and the verifying read-back.
 
 use crate::error::{Error, Result};
-use crate::identity::{BehaviorContract, ReleaseId, ReleaseRecord};
+use crate::identity::{BehaviorContract, BehaviorDigest, ReleaseId, ReleaseRecord};
 use crate::remote::layout;
 use crate::store::atomic::read_json;
 use crate::store::local::LocalStore;
@@ -155,8 +155,8 @@ impl LocalStore {
             .map_err(|e| Error::store(format!("read behavior {}: {e}", p.display())))?;
         crate::verify::release::verify_behavior_json(
             &bytes,
-            &rec.release_id,
-            &rec.provenance.behavior_sha256,
+            &ReleaseId::parse(&rec.release_id)?,
+            &BehaviorDigest::parse(&rec.provenance.behavior_sha256)?,
         )
     }
 }

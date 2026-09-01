@@ -315,8 +315,8 @@ impl<'a> crate::remote::helper::HeldSlotLock<'a> {
         let bdata = self.helper.remote.read(&bpath)?;
         crate::verify::release::verify_behavior_json(
             &bdata,
-            &existing_rec.release_id,
-            &existing_rec.provenance.behavior_sha256,
+            &crate::identity::ReleaseId::parse(&existing_rec.release_id)?,
+            &crate::identity::BehaviorDigest::parse(&existing_rec.provenance.behavior_sha256)?,
         )?;
         Ok(())
     }
@@ -395,8 +395,8 @@ impl<'a> crate::remote::helper::HeldSlotLock<'a> {
         let bdata = self.helper.remote.read(&bpath)?;
         crate::verify::release::verify_behavior_json(
             &bdata,
-            &rec.release_id,
-            &rec.provenance.behavior_sha256,
+            &crate::identity::ReleaseId::parse(&rec.release_id)?,
+            &crate::identity::BehaviorDigest::parse(&rec.provenance.behavior_sha256)?,
         )?;
         Ok(())
     }
@@ -1450,8 +1450,13 @@ pub(crate) mod tests_publish {
                     );
                     crate::verify::release::verify_behavior_json(
                         &behavior_json,
-                        &rec.release_id,
-                        &rec.provenance.behavior_sha256,
+                        &crate::identity::ReleaseId::parse(&rec.release_id).expect(
+                            "a present release directory must carry a parseable release id",
+                        ),
+                        &crate::identity::BehaviorDigest::parse(&rec.provenance.behavior_sha256)
+                            .expect(
+                                "a present release directory must carry a parseable behavior digest",
+                            ),
                     )
                     .expect(
                         "a present release directory must carry a digest-consistent behavior.json",

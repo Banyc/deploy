@@ -14,7 +14,7 @@
 use crate::config::{Activation, Verification};
 use crate::digest::sha256_bytes;
 use crate::error::{Error, Result};
-use crate::identity::{BehaviorContract, ReleaseId};
+use crate::identity::{BehaviorContract, BehaviorDigest, ReleaseId};
 use std::collections::BTreeMap;
 
 /// Canonical digest of the activation + verification contract. The closed
@@ -85,8 +85,8 @@ pub fn behavior_contracts_from_json(
 /// are returned so callers never parse twice.
 pub fn verify_behavior_json(
     bytes: &[u8],
-    release_id: &str,
-    expected_digest: &str,
+    release_id: &ReleaseId,
+    expected_digest: &BehaviorDigest,
 ) -> Result<BTreeMap<String, BehaviorContract>> {
     let contracts = behavior_contracts_from_json(bytes).map_err(|e| {
         Error::integrity(format!(
@@ -94,7 +94,7 @@ pub fn verify_behavior_json(
         ))
     })?;
     let recomputed = variant_behaviors_digest(&contracts);
-    if recomputed != expected_digest {
+    if recomputed != expected_digest.as_str() {
         return Err(Error::integrity(format!(
             "release {release_id} behavior.json digest mismatch: stored provenance behavior_sha256 {expected_digest} does not match the digest {recomputed} recomputed from the behavior contracts (fail closed)"
         )));
