@@ -443,7 +443,6 @@ pub(crate) fn process_server(
                 // the compensation's own read-back produces the proof.
                 let request = CompensationRequest {
                     op_id: op_id.clone(),
-                    deployment_id: deployment_id.clone(),
                     prior_gen: mutation.prior_generation().cloned(),
                     advanced_gen: mutation.generation_id().clone(),
                     template_vars: template_vars.clone(),
@@ -467,7 +466,6 @@ pub(crate) fn process_server(
                 // restored-class (`FailedAfterAdvance`).
                 let request = CompensationRequest {
                     op_id: op_id.clone(),
-                    deployment_id: deployment_id.clone(),
                     prior_gen: mutation.prior_generation().cloned(),
                     advanced_gen: mutation.generation_id().clone(),
                     template_vars: template_vars.clone(),
@@ -496,7 +494,6 @@ pub(crate) fn process_server(
         let failure = format!("verification failed: {e}");
         let request = CompensationRequest {
             op_id: op_id.clone(),
-            deployment_id: deployment_id.clone(),
             prior_gen: mutation.prior_generation().cloned(),
             advanced_gen: mutation.generation_id().clone(),
             template_vars: template_vars.clone(),

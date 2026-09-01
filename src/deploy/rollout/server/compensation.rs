@@ -4,7 +4,6 @@
 use crate::config::Activation;
 use crate::error::Error;
 use crate::error::Result;
-use crate::identity::DeploymentId;
 use crate::identity::GenerationId;
 use crate::identity::OperationId;
 use crate::remote::helper::HeldSlotLock;
@@ -35,10 +34,8 @@ use crate::verify::command::run_verification;
 /// Pure input data for compensation. The helper, transport and remote root
 /// are derived from the held guard — never passed independently.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub(crate) struct CompensationRequest {
     pub op_id: OperationId,
-    pub deployment_id: DeploymentId,
     pub prior_gen: Option<GenerationId>,
     pub advanced_gen: GenerationId,
     pub template_vars: crate::remote::canonical::TemplateVars,
@@ -270,7 +267,7 @@ mod compensation_tests {
         Harness, NONE_TOML, NONE_VARIANT, SYSTEMD_TOML, SYSTEMD_VARIANT,
     };
     use crate::deploy::rollout::*;
-    use crate::identity::{ArtifactRef, TreeDigest, VariantName, test_deployment_id};
+    use crate::identity::{ArtifactRef, DeploymentId, TreeDigest, VariantName, test_deployment_id};
     use std::os::unix::fs::PermissionsExt;
 
     /// Compensation re-runs the PRIOR generation's activation contract with the
@@ -382,7 +379,6 @@ mod compensation_tests {
             h.publish_harness_release();
             let request = CompensationRequest {
                 op_id: op_id.clone(),
-                deployment_id: failed_deployment_id.clone(),
                 prior_gen: Some(first_gen.clone()),
                 advanced_gen: first_gen.clone(),
                 template_vars: desired_vars,
@@ -569,7 +565,6 @@ mod compensation_tests {
         );
         let request = CompensationRequest {
             op_id: OperationId::generate(),
-            deployment_id: DeploymentId::generate(),
             prior_gen: Some(first_gen.clone()),
             advanced_gen: g2.clone(),
             template_vars: vars,

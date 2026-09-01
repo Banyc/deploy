@@ -97,7 +97,6 @@ pub(crate) fn apply_failure_policy(
                     )?;
                     let request = crate::deploy::rollout::server::CompensationRequest {
                         op_id: op_id.clone(),
-                        deployment_id: deployment_id.clone(),
                         prior_gen: prior.cloned(),
                         advanced_gen: new_gen[sid].clone(),
                         template_vars: vars.clone(),
