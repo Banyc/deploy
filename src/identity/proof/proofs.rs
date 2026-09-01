@@ -89,8 +89,10 @@ impl NonEmptySlotSet {
         self.0.iter()
     }
 
-    /// Whether the set contains the slot id.
-    #[allow(dead_code)]
+    /// Whether the set contains the slot id (test-facing today: the
+    /// planner's membership assertions check the resolved set contains the
+    /// member slot).
+    #[cfg(test)]
     pub(crate) fn contains(&self, id: &SlotId) -> bool {
         self.0.contains(id)
     }

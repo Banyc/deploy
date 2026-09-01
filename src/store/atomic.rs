@@ -134,10 +134,10 @@ pub enum ReplaceOutcome {
 }
 
 /// The [`write_atomic_replace`] stage a test-injected fault fires at. The
-/// seam lives in [`write_atomic_replace_impl`]'s hook so a per-fixture
-/// registry can fault each atomic-replacement stage exactly as the append
-/// path's [`crate::testutil::test_faults::FaultKind::AppendWrite`] family
-/// does; production builds pass a no-op hook.
+/// hook is [`write_atomic_replace`]'s own `fault` parameter, so a
+/// per-fixture registry can fault each atomic-replacement stage exactly as
+/// the append path's [`crate::testutil::test_faults::FaultKind::AppendWrite`]
+/// family does; production passes a no-op hook.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReplaceStage {
     /// The temp-file CREATE/WRITE stage (before any I/O on the temp): the
@@ -185,37 +185,21 @@ pub(crate) enum ReplaceStage {
 /// Ordering: the temp file is chmodded 0o600 BEFORE the rename, so the
 /// marker never becomes visible under its final name with default
 /// permissions.
-pub(crate) fn write_atomic_replace(path: &Path, bytes: &[u8]) -> Result<ReplaceOutcome> {
-    write_atomic_replace_impl(path, bytes, &mut |_stage| None)
-}
-
-/// TEST-ONLY seam: the same replacement as [`write_atomic_replace`] with a
-/// per-stage fault hook, so a per-fixture registry can inject a failure at
-/// EVERY atomic-replacement stage ([`ReplaceStage`]) and assert the
-/// stage→outcome mapping. The hook returns the faulted error for the stage
-/// it wants to fail (`None` passes the stage through). Not part of the
-/// production surface — [`write_atomic_replace`] keeps its exact
-/// production signature `(path, &[u8]) -> Result<ReplaceOutcome>`.
 ///
-/// The fault hook is the caller's closure over ITS OWN fixture registry, so
-/// fault isolation stays per-fixture (never process-global state).
-#[cfg(test)]
-pub(crate) fn write_atomic_replace_seam(
-    path: &Path,
-    bytes: &[u8],
-    fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
-) -> Result<ReplaceOutcome> {
-    write_atomic_replace_impl(path, bytes, fault)
-}
-
-/// The shared replacement body: the four stages with a fault-injection
-/// hook invoked at each stage's entry (production passes a no-op hook; the
-/// test seam passes the fixture's registry-backed closure). The pre-rename
-/// stages (write / sync / rename) propagate a hook error as `Err` — the
-/// old content is still visible; the post-rename parent-directory stage
-/// converts a hook error (or a real open/fsync failure) into
-/// [`ReplaceOutcome::ReplacedDurabilityUnknown`] with the error carried.
-pub(crate) fn write_atomic_replace_impl(
+/// # The per-stage fault hook
+///
+/// `fault` is invoked at each stage's entry and may inject a failure at
+/// EVERY atomic-replacement stage ([`ReplaceStage`]): the hook returns the
+/// faulted error for the stage it wants to fail (`None` passes the stage
+/// through). The pre-rename stages (write / sync / rename) propagate a hook
+/// error as `Err` — the old content is still visible; the post-rename
+/// parent-directory stage converts a hook error (or a real open/fsync
+/// failure) into [`ReplaceOutcome::ReplacedDurabilityUnknown`] with the
+/// error carried. The hook is the caller's closure over ITS OWN fixture
+/// registry, so fault isolation stays per-fixture (never process-global
+/// state); a no-op hook (`|_| None`) is the plain production path — the
+/// SAME function is exercised in test builds with the registry-backed hook.
+pub(crate) fn write_atomic_replace(
     path: &Path,
     bytes: &[u8],
     fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
@@ -686,7 +670,7 @@ fn for_each_dir_entry(dir_fd: &OwnedFd, mut f: impl FnMut(&[u8]) -> Result<()>) 
 }
 
 /// The descriptor-relative atomic replace: the same four-stage protocol as
-/// [`write_atomic_replace_impl`], but every path resolves COMPONENT-WISE
+/// [`write_atomic_replace`], but every path resolves COMPONENT-WISE
 /// relative to `root` with `openat(O_NOFOLLOW)` — a symlink injected into
 /// any path component is refused (ELOOP), never followed. The parent
 /// directory must already exist (the store creates it via
@@ -760,7 +744,7 @@ pub(crate) fn write_atomic_replace_fd(
     }
     renameat_fd(&parent_fd, &tmp_name, &parent_fd, file_name)?;
     // Stage 4: the parent-directory open + fsync — COMMIT POINT 2, AFTER
-    // the rename. FAIL-CLOSED but EXPLICIT (see [`write_atomic_replace_impl`]).
+    // the rename. FAIL-CLOSED but EXPLICIT (see [`write_atomic_replace`]).
     if let Some(e) = fault(ReplaceStage::DirSync) {
         return Ok(ReplaceOutcome::ReplacedDurabilityUnknown { error: e });
     }

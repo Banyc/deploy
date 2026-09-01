@@ -94,11 +94,8 @@ use crate::error::{Error, Result};
 use super::gc::SweepStageStats;
 use crate::identity::DeploymentId;
 use crate::ledger::{LedgerEntry, ObservedAssignment};
-#[cfg(not(test))]
-use crate::store::atomic::write_atomic_replace;
-use crate::store::atomic::{ReplaceOutcome, path_state};
-#[cfg(test)]
-use crate::store::atomic::{ReplaceStage, write_atomic_replace_seam};
+use crate::store::atomic::ReplaceStage;
+use crate::store::atomic::{ReplaceOutcome, path_state, write_atomic_replace};
 use crate::store::local::LocalStore;
 use std::collections::BTreeSet;
 
@@ -294,39 +291,49 @@ impl LocalStore {
             buf.push_str(line);
             buf.push('\n');
         }
-        #[cfg(test)]
-        {
-            // TEST SEAM: inject a failure at EVERY atomic-replacement stage
-            // (write / sync / rename → `Err`, the ledger wholly OLD;
-            // parent-directory sync → `ReplacedDurabilityUnknown`, the
-            // ledger wholly NEW but durability unconfirmed) from the
-            // FIXTURE'S OWN registry — per-fixture isolation, never
-            // process-global state. The production signature
-            // `(target, &[String]) -> Result<ReplaceOutcome>` is unchanged;
-            // only the free [`write_atomic_replace`] call is swapped for the
-            // aligned seam.
-            let reg = std::sync::Arc::clone(self.fault_registry());
-            let key = target.to_string();
-            write_atomic_replace_seam(&path, buf.as_bytes(), &mut move |stage| {
-                let kind = match stage {
-                    ReplaceStage::Write => FaultKind::LedgerReplaceWrite,
-                    ReplaceStage::Sync => FaultKind::LedgerReplaceSync,
-                    ReplaceStage::Rename => FaultKind::LedgerReplaceRename,
-                    ReplaceStage::DirSync => FaultKind::LedgerReplaceDirSync,
-                };
-                if reg.consume(kind, &key) {
-                    Some(Error::store(format!(
-                        "test fault: ledger suffix replacement faulted at the {stage:?} stage"
-                    )))
-                } else {
-                    None
-                }
-            })
+        // THE SINGLE REPLACEMENT PATH: the per-stage fault hook is a no-op
+        // when no fault is armed ([`LocalStore::ledger_replace_hook`]), so
+        // production and the fault-injection tests share the SAME
+        // [`write_atomic_replace`] call — the production path is exercised
+        // in test builds too.
+        let mut hook = self.ledger_replace_hook(target);
+        write_atomic_replace(&path, buf.as_bytes(), &mut hook)
+    }
+
+    /// The per-stage fault hook for the ledger-suffix replacement
+    /// ([`LocalStore::write_ledger_suffix`]): consumes from THIS fixture's
+    /// own registry (never a process-global slot), mapping each
+    /// [`ReplaceStage`] to the checkpoint's [`FaultKind::LedgerReplace*`]
+    /// family keyed by the target. A no-op when no fault is armed — so the
+    /// production path (no faults ever armed) and the test path share the
+    /// SAME [`write_atomic_replace`] call.
+    #[cfg(test)]
+    fn ledger_replace_hook(&self, target: &str) -> impl FnMut(ReplaceStage) -> Option<Error> + '_ {
+        let reg = std::sync::Arc::clone(self.fault_registry());
+        let key = target.to_string();
+        move |stage| {
+            let kind = match stage {
+                ReplaceStage::Write => FaultKind::LedgerReplaceWrite,
+                ReplaceStage::Sync => FaultKind::LedgerReplaceSync,
+                ReplaceStage::Rename => FaultKind::LedgerReplaceRename,
+                ReplaceStage::DirSync => FaultKind::LedgerReplaceDirSync,
+            };
+            if reg.consume(kind, &key) {
+                Some(Error::store(format!(
+                    "test fault: ledger suffix replacement faulted at the {stage:?} stage"
+                )))
+            } else {
+                None
+            }
         }
-        #[cfg(not(test))]
-        {
-            write_atomic_replace(&path, buf.as_bytes())
-        }
+    }
+
+    /// The production hook: no fault is ever armed outside tests, so the
+    /// hook is a no-op — the SAME [`write_atomic_replace`] call the test
+    /// path uses.
+    #[cfg(not(test))]
+    fn ledger_replace_hook(&self, _target: &str) -> impl FnMut(ReplaceStage) -> Option<Error> + '_ {
+        |_stage| None
     }
 
     // ---- the global reachability sweep (step 3 — best-effort) -------------

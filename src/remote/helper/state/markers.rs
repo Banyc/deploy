@@ -1,4 +1,4 @@
-//! Write-once commit markers ([`RemoteHelper::write_commit_marker`]): the
+//! Write-once commit markers ([`crate::remote::helper::RemoteHelper::write_commit_marker`]): the
 //! immutable per-deployment commit record under `state/commits/`.
 
 use crate::error::{Error, Result};
@@ -7,8 +7,6 @@ use crate::remote::layout;
 use crate::remote::transport::{CreateNewVerdict, VerifiedExisting};
 
 use super::super::HeldSlotLock;
-#[allow(unused_imports)]
-use super::super::RemoteHelper;
 
 impl<'a> HeldSlotLock<'a> {
     /// Write a commit marker for a deployment under this server. Requires the
@@ -88,6 +86,7 @@ impl<'a> HeldSlotLock<'a> {
 mod tests_markers {
     use super::*;
     use crate::identity::test_deployment_id;
+    use crate::remote::helper::RemoteHelper;
     use crate::remote::transport::LocalTransport;
     use crate::remote::transport::Remote;
     use std::path::PathBuf;

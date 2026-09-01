@@ -642,22 +642,6 @@ interval_seconds = 0
         id
     }
 
-    /// A deployment's LEDGER record: intent + SUCCESSFUL terminal whose
-    /// rollback references `release` / `tree`.
-    /// A deployment's LEDGER record: intent + SUCCESSFUL terminal whose
-    /// rollback references `release` / `tree`. The intent satisfies EXACT
-    /// key-set equality (`slot_ids == desired == pre_push`).
-    #[allow(dead_code)]
-    fn intent(id: &str) -> DeploymentIntent {
-        intent_full(
-            id,
-            "rel-1",
-            "tree-1",
-            "/srv/deploy/p1",
-            crate::ledger::Observation::KnownAbsent,
-        )
-    }
-
     /// A single-slot (`p1`) VALID intent: the frozen snapshot entry
     /// (generation gen-1, the given artifact release/tree, plan-time
     /// physical binding at the given deploy dir) + the optional KNOWN
@@ -748,7 +732,6 @@ interval_seconds = 0
         ]
     }
 
-    #[allow(dead_code)]
     fn arbitrary_pre_push() -> impl Strategy<Value = crate::ledger::Observation<PreviousGeneration>>
     {
         use crate::kernel::snapshot::PreviousGeneration;
