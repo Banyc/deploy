@@ -40,11 +40,10 @@ use std::collections::BTreeMap;
 /// per-slot outcomes, the remaining-changes derivation) must carry the
 /// `Unknown` through rather than collapsing it into an absent/`None` that
 /// downstream code reads as "unchanged".
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum Observation<T> {
     /// The slot has no observed state (never deployed).
-    #[default]
     KnownAbsent,
     /// A successful read of the slot's observed state.
     Known(T),
@@ -242,7 +241,7 @@ impl TryFrom<ObservationWire<ObservedGenerationWire>> for Observation<ObservedGe
 /// deserialization (fail closed) — an incomplete "known" fact can never
 /// enter the domain, and an unverifiable identity is never treated as
 /// authoritative.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "state",
     content = "value",
@@ -251,7 +250,6 @@ impl TryFrom<ObservationWire<ObservedGenerationWire>> for Observation<ObservedGe
 )]
 pub enum ObservedAssignment {
     /// The live read succeeded showing no state: the slot has no assignment.
-    #[default]
     Absent,
     /// A successful status + assignment read: the slot is running this
     /// generation/artifact, minted by `last_deployment`.

@@ -116,7 +116,7 @@ mod tests {
             ServerConnection::Local {
                 identity: HostIdentity::Local,
             },
-            CapacityConfig::default(),
+            CapacityConfig::empty(),
         );
         (slot, sdef)
     }

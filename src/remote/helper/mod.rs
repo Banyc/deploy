@@ -231,10 +231,9 @@ pub(crate) fn test_owner(application: &str, slot: &str) -> GenerationOwner {
 /// symlink chain behind `current` AND the assignment's OWNER MARKER against
 /// the caller's expected [`GenerationOwner`]); the `owner` inside `Known` is
 /// the VERIFIED owner the status read checked against.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CurrentAssignment {
     /// Genuine absence: no `current` link at all. NEVER carries a tree.
-    #[default]
     Absent,
     /// The complete verified assignment: generation + artifact + the
     /// VERIFIED owner — never a half-known generation/tree combination.
@@ -286,7 +285,7 @@ impl CurrentAssignment {
 /// `current_tree` are DERIVED ACCESSORS over it (consumers keep the same
 /// reads, but the underlying state can never represent a half-known
 /// generation/tree combination).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct RemoteStatus {
     /// THE ONE authoritative current-assignment state: genuine absence or the
     /// complete verified assignment (generation + artifact + verified owner).
@@ -303,6 +302,19 @@ pub struct RemoteStatus {
 }
 
 impl RemoteStatus {
+    /// The empty status — genuine absence with no inventory, lock, or
+    /// pending-incoming entries. Constructed explicitly (the blanket
+    /// `Default` derive used to fabricate it); the ONLY absence case is
+    /// [`CurrentAssignment::Absent`].
+    pub(crate) fn empty() -> Self {
+        RemoteStatus {
+            current: CurrentAssignment::Absent,
+            inventory: Vec::new(),
+            lock: None,
+            pending_incoming: Vec::new(),
+        }
+    }
+
     /// The validated current generation id — DERIVED from the ONE
     /// authoritative assignment ([`CurrentAssignment::current_generation`]).
     /// `None` ONLY for genuine absence.

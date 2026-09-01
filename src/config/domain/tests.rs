@@ -783,7 +783,7 @@ fn two_local_slots_never_share_a_deploy_dir_even_across_servers() {
         port: 22,
         known_hosts: None,
         host_key_fingerprint: None,
-        capacity: raw::RawCapacityConfig::default(),
+        capacity: raw::RawCapacityConfig::empty(),
     });
     p.variants
         .get_mut("standard")
@@ -847,7 +847,7 @@ fn two_ssh_servers_on_the_same_endpoint_and_deploy_dir_are_refused() {
         port: 22,
         known_hosts: None,
         host_key_fingerprint: Some("SHA256:test".to_string()),
-        capacity: raw::RawCapacityConfig::default(),
+        capacity: raw::RawCapacityConfig::empty(),
     });
     p.variants
         .get_mut("standard")
@@ -885,7 +885,7 @@ fn two_ssh_servers_on_the_same_endpoint_and_deploy_dir_are_refused() {
         port: 22,
         known_hosts: None,
         host_key_fingerprint: Some("SHA256:test".to_string()),
-        capacity: raw::RawCapacityConfig::default(),
+        capacity: raw::RawCapacityConfig::empty(),
     });
     p.variants
         .get_mut("standard")
@@ -965,7 +965,7 @@ fn server_capacity_is_validated_and_defaults() {
     // Omitted capacity defaults to 0/0.
     std::fs::write(&p, deploy_toml("v1")).unwrap();
     let cfg = ProjectConfig::load(&p).expect("server without capacity loads");
-    assert_eq!(cfg.servers_ref()[0].capacity, CapacityConfig::default());
+    assert_eq!(cfg.servers_ref()[0].capacity, CapacityConfig::empty());
 
     // reserve_percent above 100 is rejected at load time.
     let bad = deploy_toml("v1").replace(
@@ -1771,7 +1771,7 @@ pub(crate) fn minimal_raw_project() -> RawProject {
                 port: 22,
                 known_hosts: None,
                 host_key_fingerprint: None,
-                capacity: raw::RawCapacityConfig::default(),
+                capacity: raw::RawCapacityConfig::empty(),
             }],
             targets: BTreeMap::from([(
                 "t1".to_string(),
@@ -1810,7 +1810,7 @@ pub(crate) fn minimal_raw_variant() -> raw::RawVariant {
             "t1",
             Vec::new(),
         )],
-        retention: RetentionConfig::default(),
+        retention: RetentionConfig::empty(),
     }
 }
 
@@ -1873,7 +1873,7 @@ fn conversion_rejects_duplicate_identifiers() {
         port: 22,
         known_hosts: None,
         host_key_fingerprint: None,
-        capacity: raw::RawCapacityConfig::default(),
+        capacity: raw::RawCapacityConfig::empty(),
     });
     expect_conversion_err(p, "duplicate server id");
 
@@ -2251,10 +2251,7 @@ fn conversion_accepts_minimal_and_invariants_hold() {
     // the declaring variant owns the slot and the slot owns its target.
     assert_eq!(cfg.slot_variant("p1").unwrap(), "standard");
     assert!(cfg.slot_variant("ghost").is_err());
-    assert_eq!(
-        cfg.slot_retention("p1").unwrap(),
-        &RetentionConfig::default()
-    );
+    assert_eq!(cfg.slot_retention("p1").unwrap(), &RetentionConfig::empty());
     assert_eq!(cfg.target_slot_ids("t1").unwrap(), vec!["p1"]);
     let (slot, server) = cfg.target_slots("t1").unwrap()[0];
     assert_eq!(slot.id, "p1");
@@ -3053,7 +3050,7 @@ fn unknown_failure_policy_spelling_is_rejected_at_load() {
 #[test]
 fn failure_policy_defaults_to_rollback_changed() {
     assert_eq!(
-        RolloutConfig::default().failure_policy,
+        RolloutConfig::empty().failure_policy,
         FailurePolicy::RollbackChanged
     );
     let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
@@ -3578,7 +3575,7 @@ fn raw_project_for(graph: &ArbitraryGraph) -> RawProject {
                 port: 22,
                 known_hosts: None,
                 host_key_fingerprint: is_ssh.then(|| "SHA256:test".to_string()),
-                capacity: raw::RawCapacityConfig::default(),
+                capacity: raw::RawCapacityConfig::empty(),
             }
         })
         .collect();
@@ -3636,7 +3633,7 @@ fn raw_project_for(graph: &ArbitraryGraph) -> RawProject {
                     interval_seconds: 0,
                 },
                 slots,
-                retention: RetentionConfig::default(),
+                retention: RetentionConfig::empty(),
             },
         )]),
     }
@@ -4346,7 +4343,7 @@ fn two_slot_raw_project(
             port: 22,
             known_hosts: None,
             host_key_fingerprint: Some("SHA256:test".to_string()),
-            capacity: raw::RawCapacityConfig::default(),
+            capacity: raw::RawCapacityConfig::empty(),
         },
         raw::RawServer {
             id: s_b.to_string(),
@@ -4355,7 +4352,7 @@ fn two_slot_raw_project(
             port: 22,
             known_hosts: None,
             host_key_fingerprint: Some("SHA256:test".to_string()),
-            capacity: raw::RawCapacityConfig::default(),
+            capacity: raw::RawCapacityConfig::empty(),
         },
     ];
     p.manifest.targets.insert(

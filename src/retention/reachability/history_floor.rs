@@ -123,7 +123,7 @@ use std::collections::BTreeMap;
 /// remainder (candidates identified but not removed: an aborted stage, or a
 /// stage that never ran because an earlier stage failed). A candidate is
 /// never counted as removed unless the filesystem unlink succeeded.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LedgerDiscards {
     /// Deployment ids whose entries were dropped from the ledger
     /// (everything strictly BEFORE the checkpoint deployment's position).
@@ -149,6 +149,24 @@ pub struct LedgerDiscards {
     pub removed_releases: usize,
     /// Tree objects actually unlinked (successful unlinks only).
     pub removed_objects: usize,
+}
+
+impl LedgerDiscards {
+    /// The empty discard set — the value the blanket `Default` derive used
+    /// to fabricate (every list empty, every counter zero). Constructed
+    /// explicitly so an empty set is a DELIBERATE choice, never a derived
+    /// default.
+    pub(crate) fn empty() -> Self {
+        LedgerDiscards {
+            discarded_entries: Vec::new(),
+            sweep_deployments: Vec::new(),
+            sweep_releases: Vec::new(),
+            sweep_objects: Vec::new(),
+            removed_deployments: 0,
+            removed_releases: 0,
+            removed_objects: 0,
+        }
+    }
 }
 
 /// A HYPOTHETICAL LEDGER OVERRIDE for ONE target, consumed by the sweep's
@@ -391,7 +409,11 @@ impl LocalStore {
         config: &ProjectConfig,
         ledger_override: Option<&LedgerOverride>,
     ) -> Result<ReachabilitySnapshot> {
-        let mut out = ReachabilitySnapshot::default();
+        let mut out = ReachabilitySnapshot {
+            deployments: BTreeSet::new(),
+            releases: BTreeSet::new(),
+            trees: BTreeSet::new(),
+        };
         let targets_dir = self.base().join("targets");
         let mut target_names: Vec<String> = Vec::new();
         if path_state(&targets_dir)? {
@@ -606,7 +628,7 @@ impl LocalStore {
                 "test fault: checkpoint sweep directory enumeration forced to fail once",
             ));
         }
-        let mut discards = LedgerDiscards::default();
+        let mut discards = LedgerDiscards::empty();
         let depl_root = self.base().join("deployments");
         if path_state(&depl_root)? {
             let mut names: Vec<String> = std::fs::read_dir(&depl_root)
@@ -962,7 +984,7 @@ impl LocalStore {
 /// pin names — or an unverifiable assignment (an UNKNOWN pre-push /
 /// observed assignment) aborts the computation with an ERROR, and no
 /// deletion may happen from a failed build.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct ReachabilitySnapshot {
     /// Deployment ids reachable (their `deployments/<id>/` dirs stay).
     pub deployments: BTreeSet<String>,

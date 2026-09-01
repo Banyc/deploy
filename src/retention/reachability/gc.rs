@@ -109,7 +109,7 @@ use std::path::Path;
 use crate::testutil::test_faults::FaultKind;
 
 /// The outcome of one artifact garbage-collection pass.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GcOutcome {
     /// True when the FULL scan + unlink pass ran to completion; false when
     /// the pass aborted (fail closed — see the module docs) or was not
@@ -140,7 +140,7 @@ pub struct GcOutcome {
 /// the removed count reflects exactly the successful unlinks and the
 /// remaining candidates stay PENDING (`planned - removed`), never reported
 /// as removed.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SweepStageStats {
     pub planned: usize,
     pub removed: usize,

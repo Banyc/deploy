@@ -141,10 +141,16 @@ impl<T> Index<&SlotId> for OrderedSlotMap<T> {
 /// duplicate keys); the table carries no other invariant. Iteration
 /// (`keys` / `values` / `iter`) is in INSERTION order — the deployment
 /// order — never sorted by slot id.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SlotTable<T>(OrderedSlotMap<T>);
 
 impl<T> SlotTable<T> {
+    /// The empty table. The blanket `Default` derive was deliberately
+    /// removed (an empty table is constructed explicitly via `new()`, never
+    /// fabricated); the `new_without_default` lint is silenced because the
+    /// empty table is the ONE well-defined value and `new()` is its
+    /// deliberate constructor.
+    #[allow(clippy::new_without_default)]
     pub const fn new() -> Self {
         Self(OrderedSlotMap::new())
     }

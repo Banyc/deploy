@@ -464,7 +464,6 @@ pub(crate) mod test_faults {
     /// (factored out so the registry's storage type stays readable).
     type FaultKey = (FaultKind, String, Option<String>);
 
-    #[derive(Default)]
     pub(crate) struct FaultRegistry {
         inner: Mutex<BTreeMap<FaultKey, ()>>,
         /// Per-candidate SEQUENCE-COUNTER arms: (kind, deployment id) ->
@@ -478,6 +477,16 @@ pub(crate) mod test_faults {
     }
 
     impl FaultRegistry {
+        /// The empty registry — no armed faults (the value the blanket
+        /// `Default` derive used to fabricate). Constructed explicitly so an
+        /// unarmed registry is a DELIBERATE choice.
+        pub(crate) fn new() -> Self {
+            FaultRegistry {
+                inner: Mutex::new(BTreeMap::new()),
+                unlinks: Mutex::new(BTreeMap::new()),
+            }
+        }
+
         /// Arm a one-shot fault keyed by deployment id (no target half).
         pub(crate) fn arm(&self, kind: FaultKind, deployment_id: &str) {
             self.inner
@@ -835,12 +844,20 @@ pub(crate) mod step17_hook {
     /// [`Step17Hook::arm`] immediately before the push under test. The
     /// engine-side [`Step17Hook::barrier`] is a no-op while the slot is
     /// empty or the deployment id does not match.
-    #[derive(Default)]
     pub(crate) struct Step17Hook {
         inner: Mutex<Option<Armed>>,
     }
 
     impl Step17Hook {
+        /// The empty hook slot — no arm (the value the blanket `Default`
+        /// derive used to fabricate). Constructed explicitly so an unarmed
+        /// slot is a DELIBERATE choice.
+        pub(crate) fn new() -> Self {
+            Step17Hook {
+                inner: Mutex::new(None),
+            }
+        }
+
         /// Arm the hook for `deployment_id` (replacing any prior arm — a
         /// fired handle already left the slot empty) and return the
         /// TEST-facing handle. The engine of a push carrying THIS deployment
@@ -1643,7 +1660,7 @@ mod registry_property_tests {
         fn two_key_fault_interleavings_consume_exactly_once(
             ops in prop::collection::vec(reg_op_strategy(), 0..24),
         ) {
-            let reg = FaultRegistry::default();
+            let reg = FaultRegistry::new();
             let mut oracle: BTreeSet<(FaultKind, String)> = BTreeSet::new();
             for op in ops {
                 apply(op, &reg, &mut oracle);
@@ -1665,7 +1682,7 @@ mod registry_property_tests {
         interleave(&mut orderings, &seq_a, &seq_b, 0, 0, &mut vec![]);
         assert_eq!(orderings.len(), 20, "C(6,3) order-preserving merges");
         for ops in orderings {
-            let reg = FaultRegistry::default();
+            let reg = FaultRegistry::new();
             let mut oracle: BTreeSet<(FaultKind, String)> = BTreeSet::new();
             for op in ops {
                 apply(op, &reg, &mut oracle);
@@ -1893,7 +1910,7 @@ mod step17_hook_property_tests {
         fn worker_exits_after_handle_drop_at_any_cancellation_point(
             (phases, point) in scenario(),
         ) {
-            run_cancellation_case(&Arc::new(Step17Hook::default()), &DeploymentId::generate(), &phases, point);
+            run_cancellation_case(&Arc::new(Step17Hook::new()), &DeploymentId::generate(), &phases, point);
         }
     }
 
@@ -1918,7 +1935,7 @@ mod step17_hook_property_tests {
             points.extend((1..n).map(CancelPoint::BetweenParks));
             for point in points {
                 run_cancellation_case(
-                    &Arc::new(Step17Hook::default()),
+                    &Arc::new(Step17Hook::new()),
                     &DeploymentId::generate(),
                     &phases,
                     point,

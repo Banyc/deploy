@@ -13,7 +13,7 @@ use crate::identity::CapacityPercent;
 /// The DOMAIN form: `reserve_percent` is a validated [`CapacityPercent`]
 /// (0..=100). Built ONLY by the raw -> domain conversion; the raw
 /// serialization shape is `raw::RawCapacityConfig` (bare integer percent).
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CapacityConfig {
     /// Keep at least this many bytes free on the server after an upload.
     pub reserve_bytes: u64,
@@ -23,4 +23,17 @@ pub struct CapacityConfig {
     /// conversion, which rejects any value outside 0..=100, so a domain
     /// capacity percent is in range by construction.
     pub reserve_percent: CapacityPercent,
+}
+
+impl CapacityConfig {
+    /// The empty capacity policy — no headroom reserved (the value the
+    /// blanket `Default` derive used to fabricate). Constructed explicitly
+    /// so an unconstrained server is a DELIBERATE choice.
+    #[cfg(test)]
+    pub(crate) fn empty() -> Self {
+        CapacityConfig {
+            reserve_bytes: 0,
+            reserve_percent: CapacityPercent::new(0).expect("0 is a valid capacity percent"),
+        }
+    }
 }

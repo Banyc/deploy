@@ -150,12 +150,24 @@ pub(crate) fn default_true() -> bool {
     true
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ActivationScope {
-    #[default]
     User,
     System,
+}
+
+/// The default activation scope — `User` (the value the blanket `Default`
+/// derive used to fabricate by picking the first variant). Named explicitly
+/// so the user scope is a DELIBERATE choice.
+pub(crate) fn default_scope() -> ActivationScope {
+    ActivationScope::User
+}
+
+/// The default unit set — empty (a `Vec`'s own default; named explicitly so
+/// no field-level `#[serde(default)]` leans on a type's blanket `Default`).
+pub(crate) fn default_units() -> Vec<UnitDef> {
+    Vec::new()
 }
 
 /// The serialized activation-contract shape (adapter name + policy), used as
@@ -164,21 +176,35 @@ pub enum ActivationScope {
 /// domain model consumes the typed [`Activation`] enum instead; the
 /// canonical [`ActivationConfig`] form of a domain [`Activation`] is always
 /// produced through [`ActivationConfig::from`] / [`Activation::to_config`].
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ActivationConfig {
     #[serde(default = "default_adapter_none")]
     pub adapter: String,
-    #[serde(default)]
+    #[serde(default = "default_scope")]
     pub scope: ActivationScope,
     #[serde(default = "default_true")]
     pub reconcile_managed_units: bool,
-    #[serde(default)]
+    #[serde(default = "default_units")]
     pub units: Vec<UnitDef>,
 }
 
 fn default_adapter_none() -> String {
     "none".to_string()
+}
+
+/// The default activation contract — the value the blanket `Default` derive
+/// used to fabricate (an EMPTY adapter string, user scope, reconciliation
+/// off, no units). Named explicitly so a missing `[activation]` table keeps
+/// the exact same wire value (an empty adapter is refused by the
+/// conversion, never silently treated as "none").
+pub(crate) fn default_activation() -> ActivationConfig {
+    ActivationConfig {
+        adapter: String::new(),
+        scope: ActivationScope::User,
+        reconcile_managed_units: false,
+        units: Vec::new(),
+    }
 }
 
 /// A variant's activation policy as a closed enum: no activation adapter
@@ -367,7 +393,7 @@ impl From<&Activation> for ActivationConfig {
         match a {
             Activation::None => ActivationConfig {
                 adapter: "none".to_string(),
-                scope: ActivationScope::default(),
+                scope: ActivationScope::User,
                 reconcile_managed_units: true,
                 units: Vec::new(),
             },

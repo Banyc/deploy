@@ -396,7 +396,7 @@ fn checkpoint_inner(
                 deployment_id: deployment_id.clone(),
                 discards: LedgerDiscards {
                     discarded_entries,
-                    ..LedgerDiscards::default()
+                    ..LedgerDiscards::empty()
                 },
                 established: true,
                 sweep_completed: false,
@@ -519,7 +519,7 @@ fn run_post_commit_sweep(
         match store.run_sweep(config, deployment_id, Some(ledger_override)) {
             Ok((sweep, complete)) => (sweep, complete, None),
             Err(e) => (
-                LedgerDiscards::default(),
+                LedgerDiscards::empty(),
                 false,
                 Some(format!(
                     "checkpoint sweep failed after the ledger commit ({e}); the sweep is \

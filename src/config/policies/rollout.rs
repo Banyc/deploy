@@ -19,14 +19,13 @@ use std::str::FromStr;
 /// when the manifest is deserialized), and ANY unsupported spelling is
 /// rejected with a config error naming the valid options. The default stays
 /// [`FailurePolicy::RollbackChanged`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FailurePolicy {
     /// `failure_policy = "rollback_changed"`: when a later batch fails, every
     /// server whose batch already advanced is COMPENSATED back to its
     /// pre-push generation (compare-and-swap). The attempt ends
     /// `failed_rolled_back` when every advanced server is compensated, else
     /// `degraded`. The default.
-    #[default]
     RollbackChanged,
     /// `failure_policy = "leave_changed"`: a later batch failing RETAINS the
     /// already-advanced servers deliberately — no compensation pass runs and
@@ -126,7 +125,7 @@ impl<'de> Deserialize<'de> for FailurePolicy {
 /// is the closed typed enum. The raw serialization shape is
 /// `raw::RawRolloutConfig` (bare integer batch size); this domain type is
 /// never deserialized from the file directly.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RolloutConfig {
     /// How many slots a rollout advances per batch. NONZERO by construction:
     /// a zero batch would stall the rollout without ever progressing.
@@ -137,6 +136,21 @@ pub struct RolloutConfig {
     /// during deserialization, so an unsupported spelling fails the config
     /// load instead of silently behaving as "leave changed".
     pub failure_policy: FailurePolicy,
+}
+
+impl RolloutConfig {
+    /// The empty rollout policy — the value the blanket `Default` derive
+    /// used to fabricate (batch size 1 via the explicit [`BatchSize`]
+    /// default, stop-on-failure off, the fail-closed rollback policy).
+    /// Constructed explicitly so the value is a DELIBERATE choice.
+    #[cfg(test)]
+    pub(crate) fn empty() -> Self {
+        RolloutConfig {
+            batch_size: BatchSize::default(),
+            stop_on_failure: false,
+            failure_policy: FailurePolicy::RollbackChanged,
+        }
+    }
 }
 
 pub(crate) fn default_failure_policy() -> FailurePolicy {

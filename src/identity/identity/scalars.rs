@@ -468,7 +468,7 @@ impl FromStr for Attempts {
 
 /// A validated capacity percentage: the percent of the destination
 /// filesystem's TOTAL size a deployment must keep free (0..=100).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CapacityPercent(u8);
 
 impl CapacityPercent {
@@ -835,7 +835,7 @@ mod tests {
             assert_eq!(c.get(), ok);
             assert_eq!(ok.to_string().parse::<CapacityPercent>().expect("valid"), c);
         }
-        assert_eq!(CapacityPercent::default().get(), 0);
+        assert_eq!(CapacityPercent::new(0).unwrap().get(), 0);
         for bad in [101u8, 200, u8::MAX] {
             CapacityPercent::new(bad).expect_err("out-of-range percent rejected");
         }

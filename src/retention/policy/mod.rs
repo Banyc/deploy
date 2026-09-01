@@ -2382,7 +2382,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     },
                     owner: crate::remote::helper::test_owner("eng", "p1"),
                 },
-                ..RemoteStatus::default()
+                ..RemoteStatus::empty()
             };
 
             // `compute_retained` adds the live current tree from
@@ -2440,7 +2440,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     },
                     owner: crate::remote::helper::test_owner("eng", "p1"),
                 },
-                ..RemoteStatus::default()
+                ..RemoteStatus::empty()
             };
             let expected = reference_retained(&history, last, &policy);
             assert_eq!(

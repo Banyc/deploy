@@ -46,11 +46,17 @@ pub fn validate_relative_path(path: &Path) -> Result<()> {
 /// re-materializing the same push is an idempotent no-op. Because this is the
 /// only variant, any other `conflict = "..."` value is rejected at config
 /// parse.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ConflictPolicy {
-    #[default]
     Error,
+}
+
+/// The default conflict policy — the single `Error` variant (the value the
+/// blanket `Default` derive used to fabricate by picking the first variant).
+/// Named explicitly so a collision is ALWAYS an error by deliberate choice.
+fn default_conflict_policy() -> ConflictPolicy {
+    ConflictPolicy::Error
 }
 
 /// Normalize a mapping destination for comparison: NFC, forward slashes,
@@ -93,7 +99,7 @@ pub struct Mapping {
     pub to: String,
     #[serde(default)]
     pub recursive: bool,
-    #[serde(default)]
+    #[serde(default = "default_conflict_policy")]
     pub conflict: ConflictPolicy,
     /// `preserve` or an explicit octal mode such as `"0644"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]

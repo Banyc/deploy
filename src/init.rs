@@ -448,7 +448,7 @@ fn systemd_variant() -> crate::config::raw::RawVariant {
         slots: Vec::new(),
         // The systemd example declares no slots, so no slot owns it as a
         // retention source; its (unused) policy is the default.
-        retention: RetentionConfig::default(),
+        retention: RetentionConfig::empty(),
     }
 }
 

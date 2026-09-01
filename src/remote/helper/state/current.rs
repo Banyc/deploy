@@ -64,7 +64,7 @@ impl<'a> RemoteHelper<'a> {
     /// owner); the derived `current_generation`/`current_tree` accessors
     /// resolve the validated generation id and tree from it.
     pub fn status(&self, owner: &GenerationOwner) -> Result<RemoteStatus> {
-        let mut status = RemoteStatus::default();
+        let mut status = RemoteStatus::empty();
 
         // Current generation via the top-level `current` symlink. The ONLY
         // absence case is "no `current` entry at all": `exists` FOLLOWS the
@@ -547,7 +547,7 @@ mod tests_current {
     /// One piece of a hand-built remote layout. `None` (or a false flag)
     /// leaves that piece ABSENT, so every deviation from the canonical chain
     /// is expressible.
-    #[derive(Clone, Debug, Default)]
+    #[derive(Clone, Debug)]
     struct LayoutSpec {
         /// The top-level `current` entry; `None` installs no entry at all
         /// (genuine absence — the ONLY absence case).
@@ -563,6 +563,21 @@ mod tests_current {
         /// The tree object directory `objects/sha256/<tree>/root` to create
         /// (keyed by its digest); `None` leaves it absent.
         tree: Option<String>,
+    }
+
+    impl LayoutSpec {
+        /// The all-absent layout — every piece missing (the value the
+        /// blanket `Default` derive used to fabricate). Constructed
+        /// explicitly so an all-absent layout is a DELIBERATE choice.
+        fn empty() -> Self {
+            LayoutSpec {
+                current: None,
+                gen_id: None,
+                assignment: None,
+                root: None,
+                tree: None,
+            }
+        }
     }
 
     #[derive(Clone, Debug)]
@@ -669,7 +684,7 @@ mod tests_current {
 
     #[test]
     fn status_reports_none_when_current_link_absent() {
-        let spec = LayoutSpec::default();
+        let spec = LayoutSpec::empty();
         let st = run_on_layout(&spec, |h| h.status(&owner())).expect("absence is not an error");
         assert!(st.current_generation().is_none());
         assert!(st.current_tree().is_none());
@@ -681,7 +696,7 @@ mod tests_current {
     fn status_fails_integrity_when_current_is_not_a_symlink() {
         let spec = LayoutSpec {
             current: Some(CurrentLink::PlainFile),
-            ..LayoutSpec::default()
+            ..LayoutSpec::empty()
         };
         let err = run_on_layout(&spec, |h| h.status(&owner()))
             .expect_err("a plain-file current must fail closed");
@@ -700,7 +715,7 @@ mod tests_current {
         for target in ["objects/sha256/x/root", "foo/bar", "root"] {
             let spec = LayoutSpec {
                 current: Some(CurrentLink::Symlink(target.to_string())),
-                ..LayoutSpec::default()
+                ..LayoutSpec::empty()
             };
             let err = run_on_layout(&spec, |h| h.status(&owner()))
                 .expect_err("a non-canonical current target must fail closed");
@@ -739,7 +754,7 @@ mod tests_current {
         ] {
             let spec = LayoutSpec {
                 current: Some(CurrentLink::Symlink(target.clone())),
-                ..LayoutSpec::default()
+                ..LayoutSpec::empty()
             };
             let err = run_on_layout(&spec, |h| h.status(&owner()))
                 .expect_err("a malformed current target must fail closed");
@@ -761,7 +776,7 @@ mod tests_current {
                 layout::GENERATIONS_COMPONENT,
                 gid.as_str()
             ))),
-            ..LayoutSpec::default()
+            ..LayoutSpec::empty()
         };
         let err = run_on_layout(&spec, |h| h.status(&owner()))
             .expect_err("a dangling current link must fail closed");
@@ -784,7 +799,7 @@ mod tests_current {
                 gid.as_str()
             ))),
             gen_id: Some(gid.as_str().to_string()),
-            ..LayoutSpec::default()
+            ..LayoutSpec::empty()
         };
         let err = run_on_layout(&spec, |h| h.status(&owner()))
             .expect_err("a generation without an assignment must fail closed");
@@ -808,7 +823,7 @@ mod tests_current {
             ))),
             gen_id: Some(gid.as_str().to_string()),
             assignment: Some(b"{ corrupt json !".to_vec()),
-            ..LayoutSpec::default()
+            ..LayoutSpec::empty()
         };
         let err = run_on_layout(&spec, |h| h.status(&owner()))
             .expect_err("a corrupt assignment must fail closed");
@@ -832,7 +847,7 @@ mod tests_current {
             ))),
             gen_id: Some(dir_gid.as_str().to_string()),
             assignment: Some(assignment_json("gen-other", "tree-a")),
-            ..LayoutSpec::default()
+            ..LayoutSpec::empty()
         };
         let err = run_on_layout(&spec, |h| h.status(&owner()))
             .expect_err("an assignment naming a different generation must fail closed");
@@ -954,7 +969,7 @@ mod tests_current {
         ] {
             let spec = LayoutSpec {
                 current: Some(CurrentLink::Symlink(target.to_string())),
-                ..LayoutSpec::default()
+                ..LayoutSpec::empty()
             };
             let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
             let base = dir.path().join("remote");
@@ -1014,7 +1029,7 @@ mod tests_current {
     fn swap_fails_integrity_when_current_is_not_a_symlink() {
         let spec = LayoutSpec {
             current: Some(CurrentLink::PlainFile),
-            ..LayoutSpec::default()
+            ..LayoutSpec::empty()
         };
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let base = dir.path().join("remote");
@@ -1047,7 +1062,7 @@ mod tests_current {
     /// installs the canonical target.
     #[test]
     fn swap_succeeds_on_genuine_absence() {
-        let spec = LayoutSpec::default();
+        let spec = LayoutSpec::empty();
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let base = dir.path().join("remote");
         std::fs::create_dir_all(&base).unwrap();

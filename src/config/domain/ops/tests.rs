@@ -80,7 +80,7 @@ fn valid_raw_project() -> impl Strategy<Value = RawProject> {
                         port: 22,
                         known_hosts: kh.map(PathBuf::from),
                         host_key_fingerprint: fp.map(|s| s.to_string()),
-                        capacity: raw::RawCapacityConfig::default(),
+                        capacity: raw::RawCapacityConfig::empty(),
                     });
                 }
                 let mut raw_targets = BTreeMap::new();
@@ -393,7 +393,7 @@ fn with_server_adds_and_replaces() {
         .with_server(ServerDef::new(
             Identifier::parse("s2").unwrap(),
             ssh_connection(),
-            CapacityConfig::default(),
+            CapacityConfig::empty(),
         ))
         .unwrap();
     assert_eq!(added.servers().count(), 2);
@@ -408,7 +408,7 @@ fn with_server_adds_and_replaces() {
             ServerConnection::Local {
                 identity: HostIdentity::Local,
             },
-            CapacityConfig::default(),
+            CapacityConfig::empty(),
         ))
         .unwrap();
     assert_eq!(replaced.servers().count(), 2);
@@ -424,7 +424,7 @@ fn with_server_adds_and_replaces() {
             port: NonZeroU16::new(2222).unwrap(),
             identity: HostIdentity::Local,
         },
-        CapacityConfig::default(),
+        CapacityConfig::empty(),
     ));
     assert!(bad.is_err());
     assert_eq!(cfg.servers().count(), 1);
@@ -464,7 +464,7 @@ fn with_target_replaces_and_rejects_empty() {
         .with_target(
             "t1",
             TargetConfig {
-                rollout: RolloutConfig::default(),
+                rollout: RolloutConfig::empty(),
             },
         )
         .unwrap();
@@ -475,7 +475,7 @@ fn with_target_replaces_and_rejects_empty() {
         cfg.with_target(
             "t2",
             TargetConfig {
-                rollout: RolloutConfig::default()
+                rollout: RolloutConfig::empty()
             }
         )
         .is_err()
@@ -547,7 +547,7 @@ fn with_slot_adds_and_rejects_invalid() {
             ServerConnection::Local {
                 identity: HostIdentity::Local,
             },
-            CapacityConfig::default(),
+            CapacityConfig::empty(),
         ))
         .unwrap();
     let added = two

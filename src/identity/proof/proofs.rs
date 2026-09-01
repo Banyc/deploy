@@ -28,7 +28,7 @@ use std::collections::BTreeSet;
 /// verification ([`MatchingMembership::verify`]). A plain set of
 /// [`SlotId`]s; emptiness is legal here (the non-empty requirement
 /// applies to the PROOF result, never to the inputs being compared).
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SlotSet(BTreeSet<SlotId>);
 
 impl SlotSet {

@@ -17,7 +17,7 @@ use crate::identity::{Attempts, TimeoutSeconds};
 use crate::remote::canonical::validate_template_variables;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct VerificationConfig {
     pub adapter: String,

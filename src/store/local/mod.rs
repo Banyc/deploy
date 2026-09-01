@@ -288,9 +288,9 @@ impl LocalStore {
             root: Some(root),
             root_fd,
             #[cfg(test)]
-            fault_registry: Arc::new(FaultRegistry::default()),
+            fault_registry: Arc::new(FaultRegistry::new()),
             #[cfg(test)]
-            step17_hook: Arc::new(Step17Hook::default()),
+            step17_hook: Arc::new(Step17Hook::new()),
         })
     }
 
@@ -343,9 +343,9 @@ impl LocalStore {
             root: None,
             root_fd,
             #[cfg(test)]
-            fault_registry: Arc::new(FaultRegistry::default()),
+            fault_registry: Arc::new(FaultRegistry::new()),
             #[cfg(test)]
-            step17_hook: Arc::new(Step17Hook::default()),
+            step17_hook: Arc::new(Step17Hook::new()),
         })
     }
 

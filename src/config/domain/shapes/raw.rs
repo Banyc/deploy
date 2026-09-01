@@ -3,9 +3,9 @@
 //! raw -> domain conversion enforces.
 
 use super::mapping::ArtifactConfig;
-use crate::config::activation::{ActivationConfig, default_true};
+use crate::config::activation::{ActivationConfig, default_activation, default_true};
 use crate::config::release_name::ReleaseName;
-use crate::config::retention::RetentionConfig;
+use crate::config::retention::{RetentionConfig, default_retention};
 use crate::config::rollout::{FailurePolicy, default_failure_policy};
 use crate::config::servers::default_ssh_port;
 use crate::config::slots::SlotConfig;
@@ -72,7 +72,7 @@ pub(crate) struct RawServer {
     pub known_hosts: Option<PathBuf>,
     #[serde(default)]
     pub host_key_fingerprint: Option<String>,
-    #[serde(default)]
+    #[serde(default = "default_capacity")]
     pub capacity: RawCapacityConfig,
 }
 
@@ -82,13 +82,35 @@ pub(crate) struct RawServer {
 /// [`crate::config::domain::CapacityConfig`]; this raw type keeps the bare integer so
 /// arbitrary out-of-range values remain constructible for the fail-closed
 /// property.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RawCapacityConfig {
-    #[serde(default)]
+    #[serde(default = "default_reserve_bytes")]
     pub reserve_bytes: u64,
-    #[serde(default)]
+    #[serde(default = "default_reserve_percent")]
     pub reserve_percent: u8,
+}
+
+impl RawCapacityConfig {
+    /// The empty raw capacity shape — no headroom reserved (the value the
+    /// blanket `Default` derive used to fabricate). Constructed explicitly
+    /// so an unconstrained server is a DELIBERATE choice.
+    pub(crate) fn empty() -> Self {
+        RawCapacityConfig {
+            reserve_bytes: 0,
+            reserve_percent: 0,
+        }
+    }
+}
+
+fn default_reserve_bytes() -> u64 {
+    0
+}
+fn default_reserve_percent() -> u8 {
+    0
+}
+fn default_capacity() -> RawCapacityConfig {
+    RawCapacityConfig::empty()
 }
 
 /// The raw `[targets.<name>]` entry: rollout with a BARE integer
@@ -96,10 +118,10 @@ pub(crate) struct RawCapacityConfig {
 /// [`crate::config::domain::BatchSize`] and builds the domain [`crate::config::domain::TargetConfig`]; the
 /// raw shape keeps the bare integer so an arbitrary (including zero)
 /// value remains constructible for the fail-closed property.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RawTargetConfig {
-    #[serde(default)]
+    #[serde(default = "default_rollout")]
     pub rollout: RawRolloutConfig,
 }
 
@@ -118,6 +140,14 @@ pub(crate) struct RawRolloutConfig {
 
 fn raw_default_batch_size() -> u32 {
     1
+}
+
+/// The default raw rollout — the explicit [`RawRolloutConfig`] `Default`
+/// impl (batch size 1, stop-on-failure on, rollback policy). Named
+/// explicitly so no field-level `#[serde(default)]` leans on a blanket
+/// derive.
+fn default_rollout() -> RawRolloutConfig {
+    RawRolloutConfig::default()
 }
 
 impl Default for RawRolloutConfig {
@@ -140,12 +170,12 @@ pub(crate) struct RawVariant {
     #[serde(default)]
     pub description: Option<String>,
     pub artifact: ArtifactConfig,
-    #[serde(default)]
+    #[serde(default = "default_activation")]
     pub activation: ActivationConfig,
     pub verification: VerificationConfig,
     #[serde(default)]
     pub slots: Vec<SlotConfig>,
-    #[serde(default)]
+    #[serde(default = "default_retention")]
     pub retention: RetentionConfig,
 }
 
