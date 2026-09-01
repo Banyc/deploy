@@ -49,9 +49,8 @@ use std::path::Path;
 // `process_server` (publish, integrity re-verify, artifact-path validation,
 // generation creation, atomic `current` swap, activation + verification with
 // compensation — the compensation step itself lives in
-// [`compensate_server`]), plus the
-// tree-download helper and the per-process release-JSON publication cache
-// shared with `push::engine`. Extracted from `push::engine`.
+// [`compensate_server`]), plus the tree-download helper. Extracted from
+// `push::engine`.
 
 /// The per-server mutation OUTCOME: the slot's ONE recorded execution state
 /// ([`SlotExecution`]) — the mutually exclusive state the attempt's ordered
@@ -218,13 +217,16 @@ impl ServerProc {
     }
 }
 
-// 13 parameters: the per-server deployment is the full publication context
+// 14 parameters: the per-server deployment is the full publication context
 // (data: store, remote, helper, op_id, deployment_id, target_name, artifact,
 // new_gen, expected_gen; policy: behavior, behavior_sha256, template_vars,
-// config). Bundling the policy half into one settings struct is a dedicated
-// refactor (deferred: `process_server` is the single hottest function in the
-// push path and every caller would change with no behavioral gain); the allow
-// documents the deliberate choice.
+// config) plus the preflight-built release bundles (the in-memory
+// publications for every release this attempt references — passed
+// EXPLICITLY, never through hidden process state). Bundling the policy half
+// into one settings struct is a dedicated refactor (deferred:
+// `process_server` is the single hottest function in the push path and every
+// caller would change with no behavioral gain); the allow documents the
+// deliberate choice.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn process_server(
     _store: &LocalStore,
@@ -241,6 +243,7 @@ pub(crate) fn process_server(
     behavior_digest: &BehaviorDigest,
     template_vars: &crate::remote::canonical::TemplateVars,
     config: &ProjectConfig,
+    bundles: &HashMap<ReleaseId, crate::verify::release::ValidatedReleaseBundle>,
 ) -> Result<ServerProc> {
     // The expected OWNER of this remote's generations: this application, this
     // slot. Every status read and generation write carries it — a remote
@@ -349,8 +352,12 @@ pub(crate) fn process_server(
     })?;
     let target = provisioned.owner();
 
-    let bundle = REMOTE_RELEASE_JSON.with(|c| c.borrow().get(&artifact.release).cloned());
-    let Some(bundle) = bundle else {
+    // The release publication bundle for the artifact's release, consumed
+    // from the EXPLICIT preflight-built set (the in-memory publications
+    // this attempt carries — never hidden process state). A bundle
+    // genuinely absent from the explicit set is still a failure: the
+    // publish cannot proceed without the validated release publication.
+    let Some(bundle) = bundles.get(&artifact.release).cloned() else {
         return Ok(ServerProc::failed_before(format!(
             "release bundle for {} unavailable",
             artifact.release
@@ -574,19 +581,6 @@ pub(crate) fn download_tree_to_host(
 fn set_mode(path: &Path, mode: u32) -> Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o7777))
         .map_err(|e| Error::transport(format!("chmod {}: {e}", path.display())))
-}
-
-// Per-process cache of the release publication bundle for remote
-// publication (avoids re-reading the local store inside the nested helper
-// calls). The bundle is COMPLETE BY CONSTRUCTION
-// ([`crate::verify::release::ValidatedReleaseBundle::from_validated`]): it
-// is built once in preflight from the semantically validated release and
-// consumed by the ONE aggregate publish
-// ([`crate::remote::helper::HeldSlotLock::publish_release`]).
-thread_local! {
-    pub(crate) static REMOTE_RELEASE_JSON: std::cell::RefCell<
-        HashMap<ReleaseId, crate::verify::release::ValidatedReleaseBundle>
-    > = std::cell::RefCell::new(HashMap::new());
 }
 
 #[cfg(test)]
@@ -914,10 +908,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             let behavior = self.behave();
             let sha = crate::verify::release::behavior_contract_digest(&behavior);
             let helper = self.helper();
-            // Populate the per-process release-bundle cache the way preflight
-            // does, so the ONE mutation entry point ([`commit`]) can publish
-            // the validated release bundle (the harness drives `process_server`
-            // directly, bypassing preflight).
+            // Build the release bundle the way preflight does, so the ONE
+            // mutation entry point ([`commit`]) can publish the validated
+            // release bundle (the harness drives `process_server` directly,
+            // bypassing preflight — the bundle is passed EXPLICITLY, never
+            // through hidden process state).
             let servers: std::collections::BTreeSet<String> = self
                 .config
                 .servers()
@@ -931,9 +926,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .expect("the harness release graph validates");
             let bundle = crate::verify::release::ValidatedReleaseBundle::from_validated(vr)
                 .expect("the harness bundle builds");
-            REMOTE_RELEASE_JSON.with(|c| {
-                c.borrow_mut().insert(self.harness_release_id(), bundle);
-            });
+            let bundles: HashMap<ReleaseId, crate::verify::release::ValidatedReleaseBundle> =
+                std::collections::HashMap::from([(self.harness_release_id(), bundle)]);
             // Slot context from the VALIDATED PROJECT's topology (the
             // engine path — one slot p1 target t1): the harness builds the
             // executed topology exactly like `push_inner` does (config +
@@ -1006,6 +1000,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     .expect("behavior digest is 64 lowercase hex characters"),
                 &vars,
                 &self.config,
+                &bundles,
             )
             .unwrap()
         }

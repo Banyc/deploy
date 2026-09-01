@@ -13,6 +13,7 @@ use crate::deploy::push::slot_vars;
 use crate::error::Result;
 use crate::identity::DeploymentId;
 use crate::identity::OperationId;
+use crate::identity::ReleaseId;
 use crate::identity::SlotId;
 use crate::ledger::Observation;
 use crate::ledger::ObservedGeneration;
@@ -239,14 +240,14 @@ pub(crate) struct BatchRun {
     pub(crate) executions: BTreeMap<SlotId, SlotExecution>,
 }
 
-// 13 parameters: one batch run is the full per-slot publication context
+// 14 parameters: one batch run is the full per-slot publication context
 // (data: the prepared deployment — the ONE source of truth whose
 // projections drive the loop — the already-open remotes/helpers; policy:
-// batch_size, stop_on_failure) plus the deployment identity. Bundling the
-// policy half into one settings struct is a dedicated refactor (deferred:
-// `run_batches` is a straight extraction of the `push_inner` batch loop —
-// the allow documents the deliberate choice, mirroring `push_inner`
-// itself).
+// batch_size, stop_on_failure) plus the deployment identity and the
+// preflight-built release bundles. Bundling the policy half into one
+// settings struct is a dedicated refactor (deferred: `run_batches` is a
+// straight extraction of the `push_inner` batch loop — the allow documents
+// the deliberate choice, mirroring `push_inner` itself).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_batches(
     prepared: &crate::deploy::push::PreparedDeployment,
@@ -262,6 +263,7 @@ pub(crate) fn run_batches(
     servers_order: &[SlotId],
     batch_size: usize,
     stop_on_failure: bool,
+    bundles: &HashMap<ReleaseId, crate::verify::release::ValidatedReleaseBundle>,
 ) -> Result<BatchRun> {
     // THE EXECUTION-REQUIREMENTS PROJECTION: every per-slot execution
     // request (artifact, minted generation, expected pre-push generation,
@@ -313,6 +315,7 @@ pub(crate) fn run_batches(
                 &req.behavior_digest,
                 &vars,
                 config,
+                bundles,
             )?;
             let ServerProc { state } = outcome;
             executions.insert(sid.clone(), state);

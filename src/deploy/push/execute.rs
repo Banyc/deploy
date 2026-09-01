@@ -11,6 +11,7 @@ use crate::deploy::push::PushContext;
 use crate::deploy::rollout::BatchRun;
 use crate::deploy::rollout::SlotExecution;
 use crate::error::Result;
+use crate::identity::ReleaseId;
 use crate::identity::SlotId;
 use crate::ledger::ActualSlotState;
 use crate::ledger::Observation;
@@ -18,6 +19,7 @@ use crate::ledger::ObservedGeneration;
 use crate::ledger::SlotOutcome;
 use crate::remote::helper::RemoteHelper;
 use crate::remote::transport::Remote;
+use crate::verify::release::ValidatedReleaseBundle;
 use std::collections::{BTreeMap, HashMap};
 
 // MUTATION phases of the push transaction (steps 10-15): the deployment-order
@@ -170,7 +172,15 @@ pub(crate) struct FailureEvidence {
 /// the executed slots' typed topology (owner/variant/receiver) is consumed
 /// from the sealed [`ValidatedProject`] (point 1) — never re-parsed from
 /// the config's slot views. `servers` carries ONLY the config's
-/// connection metadata (never topology).
+/// connection metadata (never topology). `bundles` is the preflight-built
+/// release publication set (the in-memory bundles for every release this
+/// attempt references) — passed EXPLICITLY, never through hidden process
+/// state.
+// 8 parameters: the execution is the full mutation context (the prepared
+// deployment, the validated project, the open remotes/helpers/statuses,
+// and the preflight-built release bundles). The allow documents the
+// deliberate choice, mirroring `run_batches` / `process_server`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_execution(
     ctx: &PushContext,
     prepared: &PreparedDeployment,
@@ -179,6 +189,7 @@ pub(crate) fn run_execution(
     remotes: &HashMap<SlotId, Box<dyn Remote>>,
     helpers: &HashMap<SlotId, RemoteHelper>,
     statuses: &HashMap<SlotId, crate::remote::helper::RemoteStatus>,
+    bundles: &HashMap<ReleaseId, ValidatedReleaseBundle>,
 ) -> Result<ExecutionOutcome> {
     let store = ctx.store;
     let config = ctx.config;
@@ -223,6 +234,7 @@ pub(crate) fn run_execution(
         &servers_order,
         batch_size,
         stop_on_failure,
+        bundles,
     )?;
 
     // 13 & 14. The FAILURE-POLICY PASS lives in [`crate::deploy::rollout`]:

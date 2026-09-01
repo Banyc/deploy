@@ -19,7 +19,6 @@ use crate::config::Mapping;
 use crate::config::SlotConfig;
 use crate::deploy::plan::PlannedAssignment;
 use crate::deploy::push::PushContext;
-use crate::deploy::rollout::REMOTE_RELEASE_JSON;
 use crate::error::Error;
 use crate::error::Result;
 use crate::identity::BehaviorContract;
@@ -115,6 +114,14 @@ pub(crate) struct PreflightOutcome {
     pub receiver_uuids: BTreeMap<SlotId, Option<crate::identity::ReceiverUuid>>,
     /// The plan persisted BEFORE any server mutation.
     pub plan: DeploymentPlan,
+    /// The COMPLETE release publication bundles built during preflight for
+    /// EVERY release this attempt references (the HEAD release, or every
+    /// release a historical/rollback ref references) — the in-memory
+    /// release publications the execution phase publishes per slot. They
+    /// are NOT persisted (the prepared deployment's wire form is
+    /// unchanged): they flow EXPLICITLY to the mutation phases as a
+    /// parameter, never through hidden process state.
+    pub bundles: HashMap<ReleaseId, crate::verify::release::ValidatedReleaseBundle>,
 }
 
 /// Run every pre-mutation phase from the remote-open point on (steps 3-9,
@@ -305,6 +312,16 @@ pub(crate) fn run_preflight(
         None => ledger::resolve_ref_expr(ref_expr, target_name, store)?,
     };
 
+    // The COMPLETE release publication bundles built during preflight for
+    // EVERY release this attempt references (the HEAD release, or every
+    // release a historical/rollback ref references) — the in-memory
+    // release publications the execution phase publishes per slot. They
+    // are NOT persisted (the prepared deployment's wire form is
+    // unchanged): they flow EXPLICITLY to the mutation phases through the
+    // [`PreflightOutcome`], never through hidden process state.
+    let mut bundles: HashMap<ReleaseId, crate::verify::release::ValidatedReleaseBundle> =
+        HashMap::new();
+
     // Historical and rollback pushes carry EACH referenced release's own
     // per-variant behavior contracts (the per-release, per-variant behavior
     // index); they never fall back to the caller's current config. A rollback
@@ -359,7 +376,7 @@ pub(crate) fn run_preflight(
                 .map_err(|e| {
                     Error::preflight(format!("release {rid} bundle construction failed: {e}"))
                 })?;
-            REMOTE_RELEASE_JSON.with(|c| c.borrow_mut().insert(rid.clone(), bundle));
+            bundles.insert(rid.clone(), bundle);
         }
         (rid.clone(), BTreeMap::from([(rid, variant_behaviors)]))
     } else {
@@ -446,7 +463,7 @@ pub(crate) fn run_preflight(
                             "historical release {rid} bundle construction failed: {e}"
                         ))
                     })?;
-                REMOTE_RELEASE_JSON.with(|c| c.borrow_mut().insert(rid.clone(), bundle));
+                bundles.insert(rid.clone(), bundle);
             }
         }
         (
@@ -692,6 +709,7 @@ pub(crate) fn run_preflight(
         pre_push,
         receiver_uuids: provisioned_receiver_uuids,
         plan,
+        bundles,
     })
 }
 

@@ -681,7 +681,14 @@ pub(crate) fn push_inner<'a>(
     // deployment's PROJECTIONS — the intent is the single source of truth;
     // nothing is re-derived from the preflight outcome.
     let execution = run_execution(
-        &ctx, &prepared, &project, &servers, &remotes, &helpers, &statuses,
+        &ctx,
+        &prepared,
+        &project,
+        &servers,
+        &remotes,
+        &helpers,
+        &statuses,
+        &preflight.bundles,
     )?;
 
     // POST-MUTATION PHASES (steps 16-17) in [`crate::deploy::push`]: the
