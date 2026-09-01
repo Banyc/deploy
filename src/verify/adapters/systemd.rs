@@ -551,7 +551,7 @@ impl ActivationTransaction for SystemdActivation<'_> {
                 )));
             }
         }
-        let managed: Vec<String> = sa.units().iter().map(|u| u.name().to_string()).collect();
+        let managed: Vec<String> = sa.units().map(|u| u.name().to_string()).collect();
         let payload = serde_json::json!({ "managed_units": managed });
         let bytes = serde_json::to_vec_pretty(&payload)
             .map_err(|e| Error::remote(format!("serialize systemd state: {e}")))?;
@@ -811,7 +811,7 @@ pub(crate) fn declared_user_units(activation: &Activation) -> Vec<String> {
     if !matches!(sa.scope(), ActivationScope::User) {
         return Vec::new();
     }
-    sa.units().iter().map(|u| u.name().to_string()).collect()
+    sa.units().map(|u| u.name().to_string()).collect()
 }
 
 /// RESTORE the adapter side effects to the state the TARGET contract would
@@ -942,7 +942,7 @@ pub(crate) fn verify_adapter_restored(
             }
         }
     } else {
-        let mut names: Vec<&str> = sa.units().iter().map(|u| u.name()).collect();
+        let mut names: Vec<&str> = sa.units().map(|u| u.name()).collect();
         for n in advanced_only_units {
             names.push(n);
         }

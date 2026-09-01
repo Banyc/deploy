@@ -281,7 +281,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     let Activation::Systemd(hc_act) = &hc.activation else {
         panic!("high-capacity variant must carry the systemd activation");
     };
-    assert!(!hc_act.units().is_empty());
+    assert!(hc_act.units().next().is_some());
 
     // Capacity is per-server, not per-variant: the single server carries
     // the policy and the variant files parse without any `[capacity]` block.
@@ -1882,6 +1882,34 @@ fn conversion_rejects_impossible_activation_and_verification() {
     };
     expect_conversion_err(p, "systemd without units");
 
+    // Two units with the SAME name (the systemd identity) are refused at
+    // the load: the typed unit set is keyed by the name, so a duplicate
+    // identity is unrepresentable — systemd would silently overwrite one
+    // unit with the other, and the conversion refuses it (fail closed).
+    let mut p = minimal_raw_project();
+    p.variants.get_mut("standard").unwrap().activation = ActivationConfig {
+        adapter: "systemd".to_string(),
+        scope: ActivationScope::User,
+        reconcile_managed_units: true,
+        units: vec![
+            UnitDef::new(
+                "app.service".to_string(),
+                "a/app.service".to_string(),
+                true,
+                true,
+            )
+            .expect("validated unit"),
+            UnitDef::new(
+                "app.service".to_string(),
+                "b/app.service".to_string(),
+                true,
+                true,
+            )
+            .expect("validated unit"),
+        ],
+    };
+    expect_conversion_err(p, "duplicate unit identity");
+
     // Unsupported verification adapter.
     let mut p = minimal_raw_project();
     p.variants.get_mut("standard").unwrap().verification.adapter = "systemctl".to_string();
@@ -2245,8 +2273,8 @@ fn conversion_maps_systemd_activation_to_typed_enum() {
         panic!("systemd adapter must convert to Activation::Systemd");
     };
     assert_eq!(sa.scope(), &ActivationScope::System);
-    assert_eq!(sa.units().len(), 1);
-    assert_eq!(sa.units()[0].name(), "app.service");
+    assert_eq!(sa.units().count(), 1);
+    assert_eq!(sa.units().next().unwrap().name(), "app.service");
 
     // The domain -> contract conversion is the ONLY path and is
     // canonical: the serialized contract has adapter systemd + the
@@ -2636,7 +2664,10 @@ pub(crate) fn assert_domain_invariants(cfg: &ProjectConfig) {
         match &cfg.variant(&name).unwrap().activation {
             Activation::None => {}
             Activation::Systemd(sa) => {
-                assert!(!sa.units().is_empty(), "systemd requires at least one unit")
+                assert!(
+                    sa.units().next().is_some(),
+                    "systemd requires at least one unit"
+                )
             }
         }
     }

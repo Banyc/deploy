@@ -70,7 +70,9 @@ pub(crate) use policies::{
 mod domain;
 mod policies;
 
-pub use activation::{Activation, ActivationConfig, ActivationScope, UnitDef, ValidatedSystemd};
+pub use activation::{
+    Activation, ActivationConfig, ActivationScope, UnitDef, UnitName, ValidatedSystemd,
+};
 pub use capacity::CapacityConfig;
 pub use domain::{
     ArtifactConfig, ConflictPolicy, DomainConfig, Mapping, ProjectConfig, TargetConfig,

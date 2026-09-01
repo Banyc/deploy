@@ -2889,39 +2889,50 @@ mod tests {
         ]
     }
 
-    /// A valid systemd unit: a single-filename name and an artifact-relative
-    /// path (both pass the validated [`UnitDef::new`]).
-    fn valid_unit() -> impl Strategy<Value = UnitDef> {
-        (
-            prop::sample::select(vec![
-                "app.service".to_string(),
-                "example.service".to_string(),
-                "worker.service".to_string(),
-            ]),
-            prop::sample::select(vec![
-                "app/example.service".to_string(),
-                "integration/systemd/app.service".to_string(),
-                "units/app.service".to_string(),
-            ]),
-            any::<bool>(),
-            any::<bool>(),
-        )
-            .prop_map(|(name, artifact_path, enable, restart)| {
-                UnitDef::new(name, artifact_path, enable, restart).expect("validated unit")
-            })
+    /// A valid systemd unit NAME (the unit identity): a single-filename
+    /// name. The typed unit set is keyed by this identity, so the
+    /// generators below build DISTINCT names by construction.
+    fn valid_unit_name() -> impl Strategy<Value = String> {
+        prop::sample::select(vec![
+            "app.service".to_string(),
+            "example.service".to_string(),
+            "worker.service".to_string(),
+        ])
     }
 
     /// A valid closed-enum activation: `None`, or `Systemd` with 1..=2
-    /// validated units.
+    /// units whose NAMES (the unit identities) are DISTINCT — the typed set
+    /// cannot hold two units with the same identity, so the generator builds
+    /// the set from a [`BTreeMap`] of distinct names by construction (a
+    /// duplicate identity is unrepresentable in the type).
     fn valid_activation() -> impl Strategy<Value = Activation> {
         prop_oneof![
             Just(Activation::None),
             (
                 prop::sample::select(vec![ActivationScope::User, ActivationScope::System]),
                 any::<bool>(),
-                prop::collection::vec(valid_unit(), 1..=2),
+                prop::collection::btree_map(
+                    valid_unit_name(),
+                    (
+                        prop::sample::select(vec![
+                            "app/example.service".to_string(),
+                            "integration/systemd/app.service".to_string(),
+                            "units/app.service".to_string(),
+                        ]),
+                        any::<bool>(),
+                        any::<bool>(),
+                    ),
+                    1..=2,
+                ),
             )
                 .prop_map(|(scope, reconcile, units)| {
+                    let units = units
+                        .into_iter()
+                        .map(|(name, (artifact_path, enable, restart))| {
+                            UnitDef::new(name, artifact_path, enable, restart)
+                                .expect("validated unit")
+                        })
+                        .collect();
                     Activation::Systemd(
                         ValidatedSystemd::new(scope, reconcile, units).expect("validated systemd"),
                     )
@@ -2963,6 +2974,7 @@ mod tests {
         SystemdWithoutUnits,
         InvalidUnitName,
         InvalidUnitArtifactPath,
+        DuplicateUnitIdentity,
         NoneWithUnits,
         NoneWithNonDefaultScope,
     }
@@ -2976,6 +2988,7 @@ mod tests {
             InvalidBehaviorClass::SystemdWithoutUnits,
             InvalidBehaviorClass::InvalidUnitName,
             InvalidBehaviorClass::InvalidUnitArtifactPath,
+            InvalidBehaviorClass::DuplicateUnitIdentity,
             InvalidBehaviorClass::NoneWithUnits,
             InvalidBehaviorClass::NoneWithNonDefaultScope,
         ])
@@ -2999,6 +3012,20 @@ mod tests {
             let back: BehaviorContract =
                 serde_json::from_value(wire.clone()).expect("wire form deserializes");
             assert_eq!(back, contract, "round-trip must preserve the contract");
+            // THE SET INVARIANT: every accepted unit set has DISTINCT
+            // identities (the typed set cannot hold a duplicate — the
+            // generator builds distinct names by construction, and the
+            // round-trip preserves them).
+            if let crate::config::Activation::Systemd(sa) = contract.activation() {
+                let mut seen = std::collections::BTreeSet::new();
+                for u in sa.units() {
+                    assert!(
+                        seen.insert(u.name()),
+                        "unit identities must be distinct in an accepted set (duplicate '{}')",
+                        u.name()
+                    );
+                }
+            }
             // The wire form is the canonical `ActivationConfig`/`VerificationConfig`
             // shape (what the digest functions hash).
             let canonical = serde_json::json!({
@@ -3072,6 +3099,41 @@ mod tests {
                         )
                         .is_err(),
                         "an absolute unit artifact path must be refused by the validated constructor"
+                    );
+                }
+                InvalidBehaviorClass::DuplicateUnitIdentity => {
+                    // Two units with the SAME name (the systemd identity)
+                    // cannot coexist in the typed set: the validated
+                    // constructor refuses them, and the wire parse refuses
+                    // them (fail closed — never a silent overwrite).
+                    let dup = UnitDef::new(
+                        "app.service".to_string(),
+                        "a/app.service".to_string(),
+                        true,
+                        true,
+                    )
+                    .expect("validated unit");
+                    assert!(
+                        ValidatedSystemd::new(
+                            ActivationScope::User,
+                            true,
+                            vec![dup.clone(), dup],
+                        )
+                        .is_err(),
+                        "duplicate unit identities must be refused by the validated constructor"
+                    );
+                    let wire = serde_json::json!({
+                        "adapter": "systemd",
+                        "scope": "user",
+                        "reconcile_managed_units": true,
+                        "units": [
+                            { "name": "app.service", "artifact_path": "a/app.service", "enable": true, "restart": true },
+                            { "name": "app.service", "artifact_path": "b/app.service", "enable": true, "restart": true },
+                        ],
+                    });
+                    assert!(
+                        serde_json::from_value::<Activation>(wire).is_err(),
+                        "a wire carrying duplicate unit identities must be refused at deserialization"
                     );
                 }
                 InvalidBehaviorClass::NoneWithUnits => {

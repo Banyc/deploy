@@ -9,16 +9,28 @@
 //! silent no-op during activation. [`Activation::Systemd`] carries the
 //! fully validated payload [`ValidatedSystemd`] (every unit's name and
 //! artifact path validated, at least one unit required).
+//!
+//! THE UNIT SET IS TYPED: [`ValidatedSystemd`] holds its units in a
+//! [`BTreeMap`] keyed by the unit IDENTITY — the unit NAME (systemd
+//! installs units BY NAME into the systemd directory, so two units with
+//! the same name would silently overwrite each other). A duplicate
+//! identity is UNREPRESENTABLE in the type: the conversion and the
+//! validated constructor build the set and REFUSE a duplicate (fail
+//! closed), so a wire config carrying two units with the same name is
+//! rejected at the record boundary, never silently collapsed.
 
 use crate::config::validate_relative_path;
 use crate::error::{Error, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::collections::BTreeMap;
+use std::fmt;
 use std::path::Path;
+use std::str::FromStr;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct UnitDef {
-    name: String,
+    name: UnitName,
     artifact_path: String,
     #[serde(default = "default_true")]
     enable: bool,
@@ -40,7 +52,7 @@ impl UnitDef {
         enable: bool,
         restart: bool,
     ) -> Result<UnitDef> {
-        validate_unit_name(&name)?;
+        let name = UnitName::parse(&name)?;
         validate_relative_path(Path::new(&artifact_path)).map_err(|e| {
             Error::config(format!("systemd unit '{name}' artifact path invalid: {e}"))
         })?;
@@ -54,6 +66,14 @@ impl UnitDef {
 
     /// The validated single-filename unit name.
     pub fn name(&self) -> &str {
+        self.name.as_str()
+    }
+
+    /// The unit IDENTITY — the validated name, the key of the typed unit
+    /// set ([`ValidatedSystemd`]). systemd installs units by name, so the
+    /// name is the identity: two units with the same name would silently
+    /// overwrite each other, which the set makes unrepresentable.
+    pub fn name_identity(&self) -> &UnitName {
         &self.name
     }
 
@@ -70,6 +90,59 @@ impl UnitDef {
     /// Whether the unit is restarted on activation.
     pub fn restart(&self) -> bool {
         self.restart
+    }
+}
+
+/// The systemd unit IDENTITY: the unit NAME (a single-filename name such as
+/// `example.service`). systemd installs units BY NAME into the systemd
+/// directory, so the name is the identity — two units with the same name
+/// would silently overwrite each other. The typed unit set
+/// ([`ValidatedSystemd`]) is keyed by this identity, so a duplicate is
+/// unrepresentable by construction.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct UnitName(String);
+
+impl UnitName {
+    /// Validate `s` as a single-filename unit name and construct a
+    /// [`UnitName`]. This is the PRODUCTION constructor; the raw
+    /// deserialization path stays raw and the [`Activation`] conversion
+    /// re-validates it via [`UnitDef::new`] at the record boundary.
+    pub fn parse(s: &str) -> Result<UnitName> {
+        validate_unit_name(s)?;
+        Ok(UnitName(s.to_string()))
+    }
+
+    /// The validated unit name.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for UnitName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for UnitName {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<UnitName> {
+        UnitName::parse(s)
+    }
+}
+
+/// The raw wire deserialization stays RAW (a frozen record can carry an
+/// invalid unit name; the [`Activation`] conversion re-validates it via
+/// [`UnitDef::new`] at the record boundary — the same pattern as
+/// [`crate::config::ReleaseName`]).
+impl<'de> Deserialize<'de> for UnitName {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Ok(UnitName(s))
     }
 }
 
@@ -127,22 +200,29 @@ pub enum Activation {
 }
 
 /// The systemd activation policy: the unit scope, whether managed units are
-/// reconciled, and the unit definitions to install. The fields are PRIVATE:
+/// reconciled, and the unit definitions to install. The units are a TYPED
+/// SET — a [`BTreeMap`] keyed by the unit IDENTITY ([`UnitName`], the
+/// systemd name) — so two units with the same identity CANNOT coexist in
+/// the type: a duplicate would silently overwrite when systemd installs
+/// them, and the set makes that unrepresentable. The fields are PRIVATE:
 /// a value can only be built through the validated
 /// [`ValidatedSystemd::new`] constructor or the [`Activation`] conversions
-/// (which validate every unit), never hand-built by production code.
+/// (which validate every unit and refuse a duplicate identity), never
+/// hand-built by production code.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValidatedSystemd {
     scope: ActivationScope,
     reconcile_managed_units: bool,
-    units: Vec<UnitDef>,
+    units: BTreeMap<UnitName, UnitDef>,
 }
 
 impl ValidatedSystemd {
     /// The validated constructor: enforces the SAME rules the conversion
     /// enforces — at least one unit, each already validated by
-    /// [`UnitDef::new`]. Any violation is refused (fail closed) before a
-    /// value of this type can exist.
+    /// [`UnitDef::new`], and DISTINCT identities (the set is keyed by the
+    /// unit name, so a duplicate identity is refused, never silently
+    /// collapsed). Any violation is refused (fail closed) before a value of
+    /// this type can exist.
     pub fn new(
         scope: ActivationScope,
         reconcile_managed_units: bool,
@@ -153,10 +233,20 @@ impl ValidatedSystemd {
                 "systemd activation requires at least one unit",
             ));
         }
+        let mut by_identity = BTreeMap::new();
+        for u in units {
+            let identity = u.name_identity().clone();
+            if let Some(prev) = by_identity.insert(identity, u) {
+                return Err(Error::config(format!(
+                    "duplicate systemd unit identity '{}' — a unit name is the systemd identity, and two units with the same name would silently overwrite each other when systemd installs them",
+                    prev.name()
+                )));
+            }
+        }
         Ok(ValidatedSystemd {
             scope,
             reconcile_managed_units,
-            units,
+            units: by_identity,
         })
     }
 
@@ -170,9 +260,10 @@ impl ValidatedSystemd {
         self.reconcile_managed_units
     }
 
-    /// The validated unit definitions (at least one).
-    pub fn units(&self) -> &[UnitDef] {
-        &self.units
+    /// The validated unit definitions (at least one), in DETERMINISTIC
+    /// identity-sorted order (the [`BTreeMap`] key order).
+    pub fn units(&self) -> impl Iterator<Item = &UnitDef> + '_ {
+        self.units.values()
     }
 }
 
@@ -236,12 +327,16 @@ impl TryFrom<&ActivationConfig> for Activation {
                     // the conversion always enforced: a single-filename name
                     // and an artifact-relative path.
                     units.push(UnitDef::new(
-                        u.name.clone(),
+                        u.name.as_str().to_string(),
                         u.artifact_path.clone(),
                         u.enable,
                         u.restart,
                     )?);
                 }
+                // `ValidatedSystemd::new` builds the TYPED SET keyed by the
+                // unit identity: a wire config carrying two units with the
+                // same name is REFUSED here (fail closed), never silently
+                // collapsed.
                 Ok(Activation::Systemd(ValidatedSystemd::new(
                     wire.scope.clone(),
                     wire.reconcile_managed_units,
@@ -280,7 +375,7 @@ impl From<&Activation> for ActivationConfig {
                 adapter: "systemd".to_string(),
                 scope: sa.scope().clone(),
                 reconcile_managed_units: sa.reconcile_managed_units(),
-                units: sa.units().to_vec(),
+                units: sa.units().cloned().collect(),
             },
         }
     }

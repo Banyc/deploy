@@ -69,9 +69,12 @@ fn quickstart_fixture_parses_and_plans() -> Result<()> {
     };
     assert_eq!(sa.scope(), &deploy::config::ActivationScope::User);
     assert!(sa.reconcile_managed_units());
-    assert_eq!(sa.units().len(), 1, "one managed unit");
-    assert_eq!(sa.units()[0].name(), "example.service");
-    assert_eq!(sa.units()[0].artifact_path(), "app/example.service");
+    assert_eq!(sa.units().count(), 1, "one managed unit");
+    assert_eq!(sa.units().next().unwrap().name(), "example.service");
+    assert_eq!(
+        sa.units().next().unwrap().artifact_path(),
+        "app/example.service"
+    );
     assert!(
         proj.join("releases/v1/artifacts/systemd/example.service")
             .is_file(),

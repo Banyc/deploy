@@ -804,9 +804,12 @@ mod tests {
             panic!("systemd variant must carry the systemd activation");
         };
         assert_eq!(sa.scope(), &crate::config::ActivationScope::User);
-        assert_eq!(sa.units().len(), 1);
-        assert_eq!(sa.units()[0].name(), "example.service");
-        assert_eq!(sa.units()[0].artifact_path(), "app/example.service");
+        assert_eq!(sa.units().count(), 1);
+        assert_eq!(sa.units().next().unwrap().name(), "example.service");
+        assert_eq!(
+            sa.units().next().unwrap().artifact_path(),
+            "app/example.service"
+        );
         assert!(
             report
                 .target

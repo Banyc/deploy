@@ -325,7 +325,7 @@ impl ProjectConfig {
                 return Err(Error::config(format!("duplicate variant name '{name}'")));
             }
             if let Activation::Systemd(sa) = &self.variants[name].activation
-                && sa.units().is_empty()
+                && sa.units().next().is_none()
             {
                 return Err(Error::config(format!(
                     "variant '{name}': systemd activation requires at least one unit"

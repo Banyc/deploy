@@ -116,9 +116,12 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
         ));
     };
     assert_eq!(sa.scope(), &deploy::config::ActivationScope::User);
-    assert_eq!(sa.units().len(), 1);
-    assert_eq!(sa.units()[0].name(), "example.service");
-    assert_eq!(sa.units()[0].artifact_path(), "app/example.service");
+    assert_eq!(sa.units().count(), 1);
+    assert_eq!(sa.units().next().unwrap().name(), "example.service");
+    assert_eq!(
+        sa.units().next().unwrap().artifact_path(),
+        "app/example.service"
+    );
     assert!(
         proj.join("releases/v1/artifacts/systemd/example.service")
             .is_file(),
