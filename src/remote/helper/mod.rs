@@ -2389,7 +2389,10 @@ mod owner_mismatch_proptest {
                 OwnerMismatchOp::Rotate { retained } => {
                     let retained_set: std::collections::HashSet<String> =
                         retained.iter().cloned().collect();
-                    guard.rotate(&retained_set, &std::collections::HashSet::new())
+                    guard.rotate(
+                        &crate::retention::RetainedSet::new(None, retained_set),
+                        &std::collections::HashSet::new(),
+                    )
                 }
             };
         }

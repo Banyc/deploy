@@ -79,7 +79,7 @@ pub mod reachability;
 pub use policy::{pins, rotate};
 pub use reachability::{gc, history_floor};
 
-pub use policy::{compute_retained, retained_summary};
+pub use policy::{RetainedSet, compute_retained, retained_summary};
 
 #[cfg(test)]
 mod sweep_tests;

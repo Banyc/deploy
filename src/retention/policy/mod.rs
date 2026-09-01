@@ -40,6 +40,88 @@ struct GenRecord {
     prior_generation: Option<GenerationId>,
 }
 
+/// THE PROOF-BEARING RETAINED SET: the typed result of the retained-set
+/// computation ([`compute_retained`]). The ACTIVE TREE — the tree the
+/// verified `current` assignment points at — is structurally a member: the
+/// type carries it as a typed [`TreeDigest`] field derived from the
+/// verified current state ([`RemoteHelper::status`] — the owner-verified
+/// read), so a retained set that omits the active tree is UNREPRESENTABLE.
+/// The policy-retained trees are the digests every retention window and
+/// durable pin keeps.
+///
+/// Sealed: the fields are private; the constructor is CRATE-INTERNAL (the
+/// production path is [`compute_retained`], which reads the verified current
+/// state). The rotation ([`crate::remote::helper::HeldSlotLock::rotate`])
+/// consumes this proof and derives the active tree from the verified current
+/// state ITSELF — the active tree's protection never depends on the caller's
+/// set, and a crate-internal caller cannot use a bogus retained set to delete
+/// the active tree (the rotation verifies the proof against the verified
+/// current state and refuses a disagreement).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetainedSet {
+    /// The ACTIVE TREE — the tree the verified current assignment points at.
+    /// Structurally a member of the retained set: `contains`/`iter`/`digests`
+    /// always include it, whatever the policy-retained trees contain. `None`
+    /// ONLY for genuine absence (no `current` link at all).
+    active_tree: Option<TreeDigest>,
+    /// The policy-retained trees: every digest every retention window and
+    /// durable pin keeps (the active tree is NOT duplicated here — it is the
+    /// structural member above).
+    retained: HashSet<String>,
+}
+
+impl RetainedSet {
+    /// Build the proof from the verified current state's active tree and the
+    /// policy-retained trees. The active tree is structurally a member —
+    /// `contains`/`iter`/`digests` always include it, whatever the
+    /// policy-retained trees contain. CRATE-INTERNAL: the production path is
+    /// [`compute_retained`]; the rotation verifies the proof against the
+    /// verified current state, so a crate-internal caller cannot use a bogus
+    /// retained set to delete the active tree.
+    pub(crate) fn new(active_tree: Option<TreeDigest>, retained: HashSet<String>) -> Self {
+        RetainedSet {
+            active_tree,
+            retained,
+        }
+    }
+
+    /// The ACTIVE TREE — the tree the verified current assignment points at.
+    /// `None` ONLY for genuine absence. The rotation verifies this against
+    /// the active tree IT derives from the verified current state.
+    pub fn active_tree(&self) -> Option<&TreeDigest> {
+        self.active_tree.as_ref()
+    }
+
+    /// Whether the digest is retained: the active tree is ALWAYS retained
+    /// (the structural member), plus every policy-retained tree.
+    pub fn contains(&self, digest: &str) -> bool {
+        self.active_tree
+            .as_ref()
+            .is_some_and(|t| t.as_str() == digest)
+            || self.retained.contains(digest)
+    }
+
+    /// Whether nothing is retained: no active tree and no policy-retained
+    /// trees.
+    pub fn is_empty(&self) -> bool {
+        self.active_tree.is_none() && self.retained.is_empty()
+    }
+
+    /// Every retained digest — the active tree first, then the policy trees.
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        self.active_tree
+            .iter()
+            .map(|t| t.as_str())
+            .chain(self.retained.iter().map(|s| s.as_str()))
+    }
+
+    /// The full retained digest set as strings (the active tree included) —
+    /// the reference-model comparison surface.
+    pub fn digests(&self) -> HashSet<String> {
+        self.iter().map(|s| s.to_string()).collect()
+    }
+}
+
 /// Compute the set of retained tree digests for one server under the slot's
 /// ONE policy: `retention` is the retention policy of the slot's OWNING
 /// VARIANT, resolved by the caller from the current configuration
@@ -49,29 +131,37 @@ struct GenRecord {
 /// Capacity headroom, by contrast, is a per-server policy declared on the
 /// server entry (`ServerDef.capacity`) and likewise resolved from the
 /// caller's current configuration — it is never part of a release snapshot.
+///
+/// Returns the PROOF-BEARING [`RetainedSet`]: the ACTIVE TREE — the tree the
+/// verified `current` assignment points at — is structurally a member (a
+/// typed field derived from the verified current state), so a retained set
+/// that omits the active tree is unrepresentable.
 pub fn compute_retained(
     helper: &RemoteHelper,
     pins: &[Pin],
     store: &LocalStore,
     retention: &RetentionConfig,
     owner: &crate::remote::helper::GenerationOwner,
-) -> Result<HashSet<String>> {
-    let mut retained: HashSet<String> = HashSet::new();
+) -> Result<RetainedSet> {
     // Every status/assignment read verifies each generation record's OWNER
     // MARKER against the slot's expected owner: a generation transplanted
     // from another application/slot aborts retention (fail closed — it is
     // never swept as if it were ours, and never trusted as evidence).
     let status = helper.status(owner)?;
 
-    // Current generation's tree — the live artifact is ALWAYS in the retained
-    // set. `status()` validates the complete symlink layout, so a missing or
-    // corrupt `assignment.json` under the current generation already failed
-    // closed above (an integrity error — nothing is swept); a successful
-    // status always carries the current tree (DERIVED from the ONE
-    // authoritative assignment — never a separate unvalidated field).
-    if let Some(t) = status.current_tree() {
-        retained.insert(t.as_str().to_string());
-    }
+    // THE ACTIVE TREE — the tree the verified `current` assignment points at
+    // — is DERIVED from the verified current state. `status()` validates the
+    // complete symlink layout AND the owner marker, so a missing or corrupt
+    // `assignment.json` under the current generation already failed closed
+    // above (an integrity error — nothing is swept); a successful status
+    // always carries the current tree (DERIVED from the ONE authoritative
+    // assignment — never a separate unvalidated field). The active tree is
+    // the STRUCTURAL member of the returned proof ([`RetainedSet`]): it is
+    // carried as a typed field, never a loose string in the policy set, so a
+    // retained set that omits the active tree is unrepresentable.
+    let active_tree = status.current_tree().cloned();
+
+    let mut retained: HashSet<String> = HashSet::new();
 
     // Enumerate the server's generation records. Every record is evaluated
     // under the slot's single owning-variant policy (there is no per-target
@@ -158,7 +248,7 @@ pub fn compute_retained(
     // ANY DELETION — the honoring logic lives in [`super::pins`].
     store.expand_retention_pins(&mut retained, pins)?;
 
-    Ok(retained)
+    Ok(RetainedSet::new(active_tree, retained))
 }
 
 /// Apply the slot's ONE retention policy (owned by its declaring variant) to
@@ -261,7 +351,7 @@ fn retained_for_policy(
 }
 
 /// Convenience: serialize retained digests for diagnostics.
-pub fn retained_summary(retained: &HashSet<String>) -> Vec<TreeDigest> {
+pub fn retained_summary(retained: &RetainedSet) -> Vec<TreeDigest> {
     retained
         .iter()
         .map(|s| TreeDigest::parse(s).expect("retained digest is a valid sha256"))
@@ -1870,7 +1960,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             // reference model — this pins behavior-identical-for-healthy-
             // remotes for every generated history + policy.
             assert_eq!(
-                compute_retained(&helper, &[], &store, &policy, &owner()).unwrap(),
+                compute_retained(&helper, &[], &store, &policy, &owner())
+                    .unwrap()
+                    .digests(),
                 expected,
                 "the healthy retained set must match the reference model"
             );
@@ -1995,7 +2087,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 }
                 None => compute_retained(&helper, &[], &store, &policy, &owner()).unwrap()};
             assert_eq!(
-                retained, expected,
+                retained.digests(),
+                expected,
                 "the retried retention must retain exactly the reference-model set"
             );
             crate::remote::helper::SlotRemote::new(&helper, owner())
@@ -2464,7 +2557,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             // reference model (the prior is protected through the ONE
             // inventory — no second read).
             assert_eq!(
-                compute_retained(&helper, &[], &store, &policy, &owner()).unwrap(),
+                compute_retained(&helper, &[], &store, &policy, &owner())
+                    .unwrap()
+                    .digests(),
                 expected,
                 "the healthy retained set must match the reference model"
             );
@@ -2598,8 +2693,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 (None, None) => {
                     let w = wrapper.as_ref().unwrap();
                     assert_eq!(
-                        retained.as_ref().unwrap(),
-                        &expected,
+                        retained.as_ref().unwrap().digests(),
+                        expected,
                         "the outcome must be governed by the ONE inventory, never a second read"
                     );
                     assert_eq!(
@@ -2690,7 +2785,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             // the mark-and-sweep deletes exactly the trees outside it.
             let retained = compute_retained(&helper, &[], &store, &policy, &owner()).unwrap();
             assert_eq!(
-                retained, expected,
+                retained.digests(),
+                expected,
                 "the retried retention must retain exactly the reference-model set"
             );
             crate::remote::helper::SlotRemote::new(&helper, owner())

@@ -2049,7 +2049,7 @@ impl Fixture {
             // Every tree the single policy retains must actually survive the
             // retention the last push (or standalone rotate) performed.
             let remote = self.remote_for(server);
-            for tree in &retained {
+            for tree in retained.iter() {
                 assert!(
                     remote.exists(&layout::tree_root(
                         &TreeDigest::parse(tree).expect("fixture tree digest")
@@ -3889,6 +3889,7 @@ fn scope_strengthening_policy_never_reduces_retained() {
                 &owner,
             )
             .unwrap()
+            .digests()
         })
     };
     let weak = baseline(&f.config);
@@ -7253,6 +7254,7 @@ fn assert_membership_never_changes_retention(
             &owner,
         )
         .unwrap()
+        .digests()
     };
     let before = retained(config);
 
