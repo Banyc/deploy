@@ -192,11 +192,14 @@ pub(crate) fn reconcile_pending_commits(
             // the same physical host+dir share the receiver, and a slot
             // whose physical receiver changed (even under the same
             // ServerId/path) is a drift. A binding whose receiver is unknown
-            // on either side falls back to the legacy `{server, deploy_dir}`
-            // evidence.
-            let equal = live_bindings
-                .get(&sid)
-                .is_some_and(|b| b.same_physical_location(frozen_binding));
+            // on either side REFUSES the comparison (fail closed — an
+            // unknown physical identity can never authorize recovery onto a
+            // location that cannot be proven to be the same; there is NO
+            // fallback to the `{server, deploy_dir}` evidence).
+            let equal = match live_bindings.get(&sid) {
+                Some(b) => b.same_physical_location(frozen_binding)?,
+                None => false,
+            };
             bindings_equal &= equal;
         }
         if !bindings_equal {
@@ -670,7 +673,22 @@ mod tests {
             .find(|e| e.deployment_id == head_id)
             .expect("the head entry exists")
             .intent;
-        let bindings = h.config.target_slot_bindings("t1").unwrap();
+        let config_bindings = h.config.target_slot_bindings("t1").unwrap();
+        // The frozen bindings must carry the provisioned receivers (the
+        // recovery compares receiver UUIDs — a config-derived binding with
+        // an unknown receiver would REFUSE the comparison, fail closed).
+        let bindings: BTreeMap<SlotId, PhysicalBinding> = config_bindings
+            .into_iter()
+            .map(|(sid, b)| {
+                let t = LocalTransport::new(
+                    &crate::testutil::fixture_env(),
+                    h.remotes_base.join(b.server().as_str()),
+                )
+                .unwrap();
+                let recv = crate::remote::transport::provision_receiver_uuid(&t).unwrap();
+                (sid, b.with_receiver_uuid(recv))
+            })
+            .collect();
         // The REAL head push minted p1's live generation at runtime (not a
         // test fixture id) — the prior state A's deployment advances.
         let head_p1 = known_generation(

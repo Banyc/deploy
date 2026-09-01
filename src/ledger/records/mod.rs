@@ -297,8 +297,11 @@ pub struct PhysicalBinding {
     /// identity is UNKNOWN: a legacy record written before the
     /// receiver-UUID feature, or a config-derived binding before the remote
     /// was read. Exact rollback and duplicate-location detection compare it;
-    /// a binding whose receiver is unknown falls back to the legacy
-    /// `{server, deploy_dir}` comparison (the best available evidence).
+    /// a binding whose receiver is unknown on either side REFUSES the
+    /// comparison (fail closed — an unknown physical identity can never
+    /// authorize rollback, inheritance, or recovery onto a location that
+    /// cannot be proven to be the same). There is NO fallback to the
+    /// `{server, deploy_dir}` evidence (display only).
     #[serde(skip_serializing_if = "Option::is_none")]
     receiver_uuid: Option<crate::identity::ReceiverUuid>,
 }
@@ -334,8 +337,9 @@ impl PhysicalBinding {
     /// The receiver UUID is filled in by
     /// [`PhysicalBinding::with_receiver_uuid`] once the remote is read; a
     /// binding that stays config-derived carries an UNKNOWN physical
-    /// identity (`receiver_uuid: None`) and compares by the legacy
-    /// `{server, deploy_dir}` evidence.
+    /// identity (`receiver_uuid: None`) and REFUSES the physical-location
+    /// comparison (fail closed — it never falls back to the `{server,
+    /// deploy_dir}` evidence).
     pub fn from_config(server: ServerId, deploy_dir: impl AsRef<std::path::Path>) -> Result<Self> {
         let s = deploy_dir.as_ref().to_string_lossy();
         Self::validate_deploy_dir(&s)?;
@@ -416,13 +420,26 @@ impl PhysicalBinding {
     /// locations (even under the same ServerId/path — a slot whose physical
     /// receiver changed must NOT receive the historical generations). A
     /// binding whose receiver UUID is UNKNOWN on either side (a legacy
-    /// record, or a config-derived binding before the remote was read) falls
-    /// back to the legacy `{server, deploy_dir}` comparison — the best
-    /// available evidence.
-    pub fn same_physical_location(&self, other: &Self) -> bool {
+    /// record, or a config-derived binding before the remote was read) is an
+    /// `Err` — the comparison REFUSES (fail closed): an unknown physical
+    /// identity can never authorize rollback, inheritance, or recovery onto
+    /// a location that cannot be proven to be the same. There is NO fallback
+    /// to the `{server, deploy_dir}` evidence (display only).
+    pub fn same_physical_location(&self, other: &Self) -> Result<bool> {
         match (&self.receiver_uuid, &other.receiver_uuid) {
-            (Some(a), Some(b)) => a == b,
-            _ => self.server == other.server && self.deploy_dir == other.deploy_dir,
+            (Some(a), Some(b)) => Ok(a == b),
+            _ => Err(Error::integrity(format!(
+                "cannot compare physical locations: the receiver UUID is UNKNOWN on one or both \
+                 sides (self: server '{}' at '{}' with receiver {:?}; other: server '{}' at '{}' \
+                 with receiver {:?}); an unknown physical identity REFUSES the comparison (fail \
+                 closed) — it never falls back to the {{server, deploy_dir}} evidence",
+                self.server,
+                self.deploy_dir,
+                self.receiver_uuid,
+                other.server,
+                other.deploy_dir,
+                other.receiver_uuid,
+            ))),
         }
     }
 }
@@ -1197,18 +1214,27 @@ mod tests {
     // UUID remains unchanged. ---------------------------------------------
 
     /// A valid binding with an arbitrary (but format-valid) server, absolute
-    /// deploy_dir, and receiver UUID.
+    /// deploy_dir, and receiver UUID — HALF the generated bindings carry an
+    /// UNKNOWN receiver (`receiver_uuid: None`, a config-derived binding) so
+    /// the property covers the refusal class.
     fn arbitrary_binding() -> impl Strategy<Value = PhysicalBinding> {
-        ("[a-z][a-z0-9-]{0,11}", "/[a-z0-9-]{1,12}", "[a-f0-9]{8}").prop_map(
-            |(server, dir, tag)| {
-                PhysicalBinding::new(
-                    ServerId::parse(&server).expect("the generated server is a safe segment"),
-                    dir,
-                    crate::identity::test_receiver_uuid(&tag),
-                )
-                .expect("the generated deploy_dir is absolute and traversal-free")
-            },
+        (
+            "[a-z][a-z0-9-]{0,11}",
+            "/[a-z0-9-]{1,12}",
+            "[a-f0-9]{8}",
+            any::<bool>(),
         )
+            .prop_map(|(server, dir, tag, known)| {
+                let server =
+                    ServerId::parse(&server).expect("the generated server is a safe segment");
+                if known {
+                    PhysicalBinding::new(server, dir, crate::identity::test_receiver_uuid(&tag))
+                        .expect("the generated deploy_dir is absolute and traversal-free")
+                } else {
+                    PhysicalBinding::from_config(server, dir)
+                        .expect("the generated deploy_dir is absolute and traversal-free")
+                }
+            })
     }
 
     proptest! {
@@ -1228,52 +1254,80 @@ mod tests {
         /// share the receiver); two with different receiver UUIDs are
         /// different locations (even under the same ServerId/path — a slot
         /// whose physical receiver changed must NOT receive the historical
-        /// generations).
+        /// generations). ANY binding whose receiver UUID is UNKNOWN on either
+        /// side REFUSES the comparison (fail closed — an unknown physical
+        /// identity can never authorize rollback, inheritance, or recovery
+        /// onto a location that cannot be proven to be the same; there is NO
+        /// fallback to the `{server, deploy_dir}` evidence).
         #[test]
         fn rollback_succeeds_exactly_when_receiver_uuid_is_unchanged(
             a in arbitrary_binding(),
             b in arbitrary_binding(),
         ) {
-            prop_assert_eq!(
-                a.same_physical_location(&b),
-                a.receiver_uuid() == b.receiver_uuid(),
-                "the physical-location comparison is EXACTLY the receiver-UUID equality — \
-                 ServerId (the alias) and deploy_dir (the path) are display only"
-            );
+            match (a.receiver_uuid(), b.receiver_uuid()) {
+                (Some(_), Some(_)) => {
+                    prop_assert_eq!(
+                        a.same_physical_location(&b)
+                            .expect("both receivers are known, the comparison cannot refuse"),
+                        a.receiver_uuid() == b.receiver_uuid(),
+                        "the physical-location comparison is EXACTLY the receiver-UUID equality — \
+                         ServerId (the alias) and deploy_dir (the path) are display only"
+                    );
+                }
+                _ => {
+                    prop_assert!(
+                        a.same_physical_location(&b).is_err(),
+                        "an UNKNOWN receiver on either side REFUSES the comparison (fail closed) — \
+                         it never falls back to the {{server, deploy_dir}} evidence"
+                    );
+                }
+            }
         }
     }
 
-    /// The legacy fallback: a binding whose receiver UUID is UNKNOWN on
-    /// either side (a legacy record, or a config-derived binding before the
-    /// remote was read) compares by the legacy `{server, deploy_dir}`
-    /// evidence — the best available physical identity.
+    /// THE UNKNOWN-IDENTITY REFUSAL: a binding whose receiver UUID is
+    /// UNKNOWN on either side (a legacy record, or a config-derived binding
+    /// before the remote was read) REFUSES the physical-location comparison
+    /// (fail closed) — it NEVER falls back to the `{server, deploy_dir}`
+    /// evidence, so a slot whose physical receiver changed (or was never
+    /// provisioned) can never pass the rollback/recovery comparison via the
+    /// fallback.
     #[test]
-    fn unknown_receiver_falls_back_to_server_and_deploy_dir() {
+    fn unknown_receiver_refuses_the_comparison() {
         let a =
             PhysicalBinding::from_config(ServerId::parse("s1").unwrap(), "/srv/deploy/p1").unwrap();
         let b =
             PhysicalBinding::from_config(ServerId::parse("s1").unwrap(), "/srv/deploy/p1").unwrap();
         let c =
             PhysicalBinding::from_config(ServerId::parse("s2").unwrap(), "/srv/deploy/p1").unwrap();
+        // UNKNOWN vs UNKNOWN refuses — even under the SAME server+dir (the
+        // exact case the legacy fallback would have authorized).
+        let err = a
+            .same_physical_location(&b)
+            .expect_err("an unknown receiver must refuse the comparison");
         assert!(
-            a.same_physical_location(&b),
-            "same server+dir is one location"
+            err.to_string().contains("receiver UUID is UNKNOWN"),
+            "the refusal names the unknown physical identity, got: {err}"
         );
         assert!(
-            !a.same_physical_location(&c),
-            "a different server is a different location under the legacy fallback"
+            a.same_physical_location(&c).is_err(),
+            "a different server is refused too — the comparison never falls back to {{server, deploy_dir}}"
         );
-        // A KNOWN receiver vs an UNKNOWN one falls back to the legacy
-        // evidence too (the physical identity cannot be compared).
+        // A KNOWN receiver vs an UNKNOWN one refuses as well (the physical
+        // identity cannot be compared — the unknown side is never silently
+        // assumed to match).
         let known = PhysicalBinding::new(
             ServerId::parse("s1").unwrap(),
             "/srv/deploy/p1",
             crate::identity::test_receiver_uuid("known"),
         )
         .unwrap();
+        let err = known
+            .same_physical_location(&a)
+            .expect_err("a known-vs-unknown comparison must refuse");
         assert!(
-            known.same_physical_location(&a),
-            "same server+dir is one location even when one receiver is unknown"
+            err.to_string().contains("receiver UUID is UNKNOWN"),
+            "the refusal names the unknown physical identity, got: {err}"
         );
     }
 

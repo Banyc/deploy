@@ -68,7 +68,7 @@ pub(crate) fn verify_exact_rollback_bindings(
                 "slot '{slot_id}' has no recorded physical binding in deployment '{deployment_id}' of target '{ft}'; exact rollback cannot verify the deployment location"
             ))
         })?;
-        if !recorded.same_physical_location(&current_binding) {
+        if !recorded.same_physical_location(&current_binding)? {
             return Err(Error::rollback(format!(
                 "slot '{slot_id}' was bound to server '{}' at '{}' (receiver '{}') in deployment '{deployment_id}' of target '{ft}', now bound to '{}' at '{}' (receiver '{}'); exact rollback would deploy to the wrong host",
                 recorded.server(),
@@ -181,11 +181,31 @@ mod tests {
         );
 
         // (3) An UNKNOWN current receiver (the deploy_dir is not yet
-        // provisioned) falls back to the legacy `{server, deploy_dir}`
-        // evidence: same server+dir as the recorded binding → still rolls
-        // back.
+        // provisioned) REFUSES the rollback (fail closed): an unknown
+        // physical identity can never authorize rollback onto a location
+        // that cannot be proven to be the same — even under the same
+        // server+dir (the exact case the legacy fallback would have
+        // authorized).
         let uuids = BTreeMap::from([(SlotId::parse("p1").unwrap(), None)]);
-        verify_exact_rollback_bindings(&members, &snapshot, &dep, &ft, &uuids)
-            .expect("an unknown receiver falls back to the legacy server+dir evidence");
+        let err = verify_exact_rollback_bindings(&members, &snapshot, &dep, &ft, &uuids)
+            .expect_err("an unknown current receiver must refuse the rollback");
+        assert!(
+            err.to_string().contains("receiver UUID is UNKNOWN"),
+            "the refusal names the unknown physical identity, got: {err}"
+        );
+
+        // (4) A recorded binding with an UNKNOWN receiver (a legacy
+        // pre-feature snapshot) vs a KNOWN current receiver refuses too —
+        // the recorded physical identity cannot be verified.
+        let legacy_recorded =
+            PhysicalBinding::from_config(ServerId::parse("s1").unwrap(), "/srv/deploy/p1").unwrap();
+        let snapshot = snapshot_with(legacy_recorded);
+        let uuids = BTreeMap::from([(SlotId::parse("p1").unwrap(), Some(recv_a.clone()))]);
+        let err = verify_exact_rollback_bindings(&members, &snapshot, &dep, &ft, &uuids)
+            .expect_err("a legacy recorded binding must refuse the rollback");
+        assert!(
+            err.to_string().contains("receiver UUID is UNKNOWN"),
+            "the refusal names the unknown physical identity, got: {err}"
+        );
     }
 }

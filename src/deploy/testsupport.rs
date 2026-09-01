@@ -1710,6 +1710,22 @@ pub(crate) fn group_membership_fixture(
         })
         .collect();
     let bindings = config.target_slot_bindings("t1").unwrap();
+    // Provision each member slot's remote (mirroring a previous push): the
+    // partial-rollout guard compares receiver UUIDs, so the seeded bindings
+    // must carry the provisioned receivers — a config-derived binding
+    // (unknown receiver) would REFUSE the comparison (fail closed).
+    let bindings: BTreeMap<SlotId, crate::ledger::PhysicalBinding> = bindings
+        .into_iter()
+        .map(|(sid, b)| {
+            let remote = LocalTransport::new(
+                &crate::testutil::fixture_env(),
+                remotes_base.join(b.server().as_str()),
+            )
+            .unwrap();
+            let recv = crate::remote::transport::provision_receiver_uuid(&remote).unwrap();
+            (sid, b.with_receiver_uuid(recv))
+        })
+        .collect();
     seed_snapshot(
         &store,
         "t1",

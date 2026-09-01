@@ -724,6 +724,20 @@ pub(crate) mod preflight_tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+    /// The receiver UUID minted at provisioning for the remote rooted at
+    /// `root` (the transport's `receiver-uuid` marker file): the PHYSICAL
+    /// identity a seeded snapshot's binding must carry — the exact-rollback
+    /// guard compares receiver UUIDs, so a config-derived binding (unknown
+    /// receiver) would REFUSE the comparison (fail closed).
+    fn provisioned_receiver(root: &std::path::Path) -> crate::identity::ReceiverUuid {
+        let marker = root.join("receiver-uuid");
+        let s = std::fs::read_to_string(&marker).unwrap_or_else(|e| {
+            panic!("the provisioned remote carries its receiver-UUID marker at {marker:?}: {e}")
+        });
+        crate::identity::ReceiverUuid::parse(s.trim())
+            .unwrap_or_else(|e| panic!("the marker carries a valid receiver UUID: {e}"))
+    }
+
     #[test]
     fn dry_run_removes_readonly_staging_tree() {
         // A dry-run staging tree containing read-only directories/files (modes
@@ -2422,7 +2436,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     crate::identity::ServerId::parse("s1").unwrap(),
                     "/srv/eng",
                 )
-                .expect("test binding is absolute and traversal-free");
+                .expect("test binding is absolute and traversal-free")
+                .with_receiver_uuid(provisioned_receiver(&h.remotes_base.join("s1")));
             for i in 1..=latest {
                 crate::deploy::testsupport::seed_snapshot(
                     &h.store,

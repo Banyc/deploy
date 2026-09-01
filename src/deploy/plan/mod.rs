@@ -813,6 +813,27 @@ interval_seconds = 0
             .unwrap();
     }
 
+    /// A binding with a KNOWN receiver UUID (the physical identity a
+    /// provisioned deploy_dir carries): the exact-rollback guard compares
+    /// receiver UUIDs, so a fixture binding must carry one — a
+    /// config-derived binding (unknown receiver) would REFUSE the
+    /// comparison (fail closed).
+    fn known_binding(server: &str, dir: &str) -> PhysicalBinding {
+        PhysicalBinding::new(
+            ServerId::parse(server).expect("safe segment"),
+            dir,
+            crate::identity::test_receiver_uuid(&format!("{server}:{dir}")),
+        )
+        .expect("test binding is absolute and traversal-free")
+    }
+
+    /// The receiver UUID of [`known_binding`] for the same server+dir — the
+    /// CURRENT receiver the exact-rollback guard reads from the provisioned
+    /// remote during preflight.
+    fn known_receiver(server: &str, dir: &str) -> crate::identity::ReceiverUuid {
+        crate::identity::test_receiver_uuid(&format!("{server}:{dir}"))
+    }
+
     fn legacy_record(id: &str, tree: &str) -> ReleaseRecord {
         ReleaseRecord {
             release_schema_version: RELEASE_RECORD_SCHEMA_VERSION,
@@ -1475,8 +1496,7 @@ interval_seconds = 0
             )]),
             BTreeMap::from([(
                 SlotId::parse("p1").unwrap(),
-                PhysicalBinding::from_config(ServerId::parse("s1").unwrap(), "/srv/plan")
-                    .expect("test binding is absolute and traversal-free"),
+                known_binding("s1", "/srv/plan"),
             )]),
         );
 
@@ -1493,7 +1513,10 @@ interval_seconds = 0
             &BTreeMap::new(),
             &store,
             &config,
-            &BTreeMap::new(),
+            &BTreeMap::from([(
+                SlotId::parse("p1").unwrap(),
+                Some(known_receiver("s1", "/srv/plan")),
+            )]),
         )
         .map(|planned| (planned.assignments, planned.releases, planned.origin))
         .expect("deployment ref resolves");
@@ -1671,9 +1694,10 @@ interval_seconds = 0
             )]),
             BTreeMap::from([(
                 SlotId::parse("p1").unwrap(),
-                PhysicalBinding::from_config(
+                PhysicalBinding::new(
                     ServerId::new(old_binding.0.clone()),
                     old_binding.1.clone(),
+                    crate::identity::test_receiver_uuid("old-binding"),
                 )
                 .expect("test binding is absolute and traversal-free"),
             )]),
@@ -1767,7 +1791,10 @@ interval_seconds = 0
                 &BTreeMap::new(),
                 &store,
                 &config,
-                &BTreeMap::new(),
+                &BTreeMap::from([(
+                    SlotId::parse("p1").unwrap(),
+                    Some(crate::identity::test_receiver_uuid("current-p1")),
+                )]),
 
             )
             .expect_err("a snapshot ref whose recorded binding changed must refuse");
@@ -1864,11 +1891,7 @@ interval_seconds = 0
                 slots.clone(),
                 BTreeMap::from([(
                     SlotId::parse("p1").unwrap(),
-                    PhysicalBinding::from_config(
-                            ServerId::parse("s1").unwrap(),
-                            "/srv/plan",
-                        )
-                        .expect("test binding is absolute and traversal-free"),
+                    known_binding("s1", "/srv/plan"),
                 )]),
             );
 
@@ -1882,7 +1905,10 @@ interval_seconds = 0
                 &BTreeMap::new(),
                 &store,
                 &config,
-                &BTreeMap::new(),
+                &BTreeMap::from([(
+                    SlotId::parse("p1").unwrap(),
+                    Some(known_receiver("s1", "/srv/plan")),
+                )]),
 
             )
                 .map(|planned| (planned.assignments, planned.releases, planned.origin))
@@ -2093,16 +2119,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let slot_a = SlotId::parse("p1").unwrap();
         let slot_b = SlotId::parse("p2").unwrap();
         let bindings: BTreeMap<SlotId, PhysicalBinding> = BTreeMap::from([
-            (
-                slot_a.clone(),
-                PhysicalBinding::from_config(ServerId::parse("s1").unwrap(), "/srv/plan-a")
-                    .expect("test binding is absolute and traversal-free"),
-            ),
-            (
-                slot_b.clone(),
-                PhysicalBinding::from_config(ServerId::parse("s2").unwrap(), "/srv/plan-b")
-                    .expect("test binding is absolute and traversal-free"),
-            ),
+            (slot_a.clone(), known_binding("s1", "/srv/plan-a")),
+            (slot_b.clone(), known_binding("s2", "/srv/plan-b")),
         ]);
 
         // Push 0 is the FULL first deployment (a partial group push needs a
@@ -2188,7 +2206,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &BTreeMap::new(),
             &store,
             &config,
-            &BTreeMap::new(),
+            &BTreeMap::from([
+                (slot_a.clone(), Some(known_receiver("s1", "/srv/plan-a"))),
+                (slot_b.clone(), Some(known_receiver("s2", "/srv/plan-b"))),
+            ]),
         )
         .map(|planned| (planned.assignments, planned.releases, planned.origin))
         .expect("the deployment id must plan its stored state");
@@ -2473,21 +2494,16 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             BTreeMap::from([
                 (
                     SlotId::parse("p1").unwrap(),
-                    PhysicalBinding::from_config(
-                        ServerId::parse("s1").unwrap(),
+                    known_binding(
+                        "s1",
                         if binding_drift {
                             "/srv/drifted"
                         } else {
                             "/srv/p1"
                         },
-                    )
-                    .expect("test binding is absolute and traversal-free"),
+                    ),
                 ),
-                (
-                    SlotId::parse("p2").unwrap(),
-                    PhysicalBinding::from_config(ServerId::parse("s2").unwrap(), "/srv/p2")
-                        .expect("test binding is absolute and traversal-free"),
-                ),
+                (SlotId::parse("p2").unwrap(), known_binding("s2", "/srv/p2")),
             ]),
         );
 
@@ -2674,7 +2690,16 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &variant_trees,
                 &store,
                 &config,
-                &BTreeMap::new(),
+                &BTreeMap::from([
+                    (
+                        SlotId::parse("p1").unwrap(),
+                        Some(known_receiver("s1", "/srv/p1")),
+                    ),
+                    (
+                        SlotId::parse("p2").unwrap(),
+                        Some(known_receiver("s2", "/srv/p2")),
+                    ),
+                ]),
 
             );
             if binding_drift {

@@ -352,6 +352,7 @@ pub(crate) mod commit_tests {
 
     use crate::deploy::testsupport::*;
     use crate::identity::{OperationId, ServerId, test_deployment_id};
+    use crate::ledger::PhysicalBinding;
     use crate::ledger::recovery::reconcile_pending_commits;
     use crate::remote::helper::{ExpectedCurrent, GenerationAssignment, RemoteHelper};
     use crate::remote::layout;
@@ -403,6 +404,20 @@ pub(crate) mod commit_tests {
                 .unwrap(),
         })
         .expect("a crafted test intent plans")
+    }
+
+    /// The receiver UUID minted at provisioning for the remote rooted at
+    /// `root` (the transport's `receiver-uuid` marker file): the PHYSICAL
+    /// identity a crafted intent's frozen binding must carry — the recovery
+    /// compares receiver UUIDs, so a config-derived binding (unknown
+    /// receiver) would REFUSE the comparison (fail closed).
+    fn provisioned_receiver(root: &std::path::Path) -> crate::identity::ReceiverUuid {
+        let marker = root.join("receiver-uuid");
+        let s = std::fs::read_to_string(&marker).unwrap_or_else(|e| {
+            panic!("the provisioned remote carries its receiver-UUID marker at {marker:?}: {e}")
+        });
+        crate::identity::ReceiverUuid::parse(s.trim())
+            .unwrap_or_else(|e| panic!("the marker carries a valid receiver UUID: {e}"))
     }
 
     /// The ledger DOMAIN INTENT of the given successful deployment (the
@@ -980,7 +995,8 @@ pub(crate) mod commit_tests {
             &target_a,
             &desired_ref.assignment.artifact,
             crate::ledger::PhysicalBinding::from_config(ServerId::parse("s1").unwrap(), "/srv/eng")
-                .expect("test binding is absolute and traversal-free"),
+                .expect("test binding is absolute and traversal-free")
+                .with_receiver_uuid(provisioned_receiver(&h.remotes_base.join("s1"))),
             &baseline.behavior_sha256,
             Some(&head),
         );
@@ -1080,7 +1096,8 @@ pub(crate) mod commit_tests {
             &desired_ref.generation.clone(),
             &desired_ref.assignment.artifact,
             crate::ledger::PhysicalBinding::from_config(ServerId::parse("s1").unwrap(), "/srv/eng")
-                .expect("test binding is absolute and traversal-free"),
+                .expect("test binding is absolute and traversal-free")
+                .with_receiver_uuid(provisioned_receiver(&h.remotes_base.join("s1"))),
             &baseline.behavior_sha256.clone(),
             Some(&head),
         );
@@ -1885,13 +1902,16 @@ pub(crate) mod commit_tests {
         // (the remote may or may not hold the frozen desired generation),
         // then recover against the mutated config. A SUCCESSFUL terminal is
         // permitted IFF every selected slot's LIVE binding equals the FROZEN
-        // intent binding AND the membership still covers the selected slots
-        // AND every selected slot's live generation equals the frozen
-        // desired generation; otherwise NO SUCCESSFUL TERMINAL MAY APPEAR
-        // (the attempt must end Degraded or stay pending — the property
-        // asserts the actual disposition). On success, the rollback's
-        // bindings/generations EXACTLY equal the frozen intent's values
-        // (finalize-from-frozen — never the live config re-read).
+        // intent binding (the receiver UUID is the physical identity — a
+        // moved deploy_dir under the SAME receiver is the same physical
+        // location in this harness's per-server remote model) AND the
+        // membership still covers the selected slots AND every selected
+        // slot's live generation equals the frozen desired generation;
+        // otherwise NO SUCCESSFUL TERMINAL MAY APPEAR (the attempt must end
+        // Degraded or stay pending — the property asserts the actual
+        // disposition). On success, the rollback's bindings/generations
+        // EXACTLY equal the frozen intent's values (finalize-from-frozen —
+        // never the live config re-read).
         //
         // Bounded `proptest_cases(16)` (full 16 with `DEPLOY_FULL_TESTS=1`,
         // fast default), fixed seed 0x5EED_5EED (house style), no failure
@@ -1927,7 +1947,7 @@ pub(crate) mod commit_tests {
 
             // The MUTATED live config at recovery time.
             let live = mutated_config(&h, mutation);
-            let live_bindings = live.target_slot_bindings("t1").unwrap();
+            let config_bindings = live.target_slot_bindings("t1").unwrap();
 
             // Per-slot helpers over the mutated config's servers. The remote
             // base is the harness's (the s1 remote carries the pending
@@ -1948,22 +1968,56 @@ pub(crate) mod commit_tests {
                 ));
             }
             let mut helpers: HashMap<SlotId, RemoteHelper> = HashMap::new();
+            // The CURRENT receiver UUIDs, read from the provisioned remotes
+            // (mirroring preflight): a provisioned remote carries its
+            // IMMUTABLE physical identity; a remote that was never
+            // provisioned stays UNKNOWN — and the recovery REFUSES (fail
+            // closed) rather than guessing.
+            let mut receiver_uuids: BTreeMap<SlotId, Option<crate::identity::ReceiverUuid>> =
+                BTreeMap::new();
             for (i, (slot, _)) in members.iter().enumerate() {
                 let sid = SlotId::parse(slot.id.as_str()).unwrap();
-                helpers.insert(sid, RemoteHelper::new(remotes[i].as_ref()));
+                helpers.insert(sid.clone(), RemoteHelper::new(remotes[i].as_ref()));
+                receiver_uuids.insert(
+                    sid,
+                    crate::remote::transport::provision_receiver_uuid(remotes[i].as_ref()).ok(),
+                );
             }
+            // The LIVE bindings the recovery compares: the config bindings
+            // with each slot's provisioned receiver filled in.
+            let live_bindings: BTreeMap<SlotId, PhysicalBinding> = config_bindings
+                .into_iter()
+                .map(|(sid, b)| {
+                    let uuid = receiver_uuids.get(&sid).cloned().flatten();
+                    (
+                        sid,
+                        match uuid {
+                            Some(u) => b.with_receiver_uuid(u),
+                            None => b,
+                        },
+                    )
+                })
+                .collect();
 
             // THE SUCCESS-PERMITTED PREDICATE: the live state EXACTLY
-            // matches the frozen intent (selected bindings equal, selected
-            // membership covered, live generations equal the desired ones).
+            // matches the frozen intent (selected bindings equal — the
+            // receiver UUID is the physical identity — selected membership
+            // covered, live generations equal the desired ones).
             let intent_snapshot = intent.resulting_snapshot();
             let membership_ok = intent
                 .full_membership()
                 .iter()
                 .all(|sid| live_bindings.contains_key(sid));
             let bindings_equal = intent.full_membership().iter().all(|sid| {
-                live_bindings.get(sid)
-                    == intent_snapshot.get(sid).map(|e| e.binding())
+                live_bindings.get(sid).is_some_and(|b| {
+                    b.same_physical_location(
+                        intent_snapshot
+                            .get(sid)
+                            .map(|e| e.binding())
+                            .expect("selected in snapshot"),
+                    )
+                    .unwrap_or(false)
+                })
             });
             let gens_match = intent.full_membership().iter().all(|sid| {
                 let desired_gen = intent_snapshot.get(sid).map(|e| e.generation());
@@ -1985,7 +2039,7 @@ pub(crate) mod commit_tests {
             let op_id = OperationId::new("op-frozen-binding-prop".to_string());
             let mut txn =
                 crate::store::local::ledger::TargetLedgerTxn::open(&h.store, "t1", "test").unwrap();
-            reconcile_pending_commits(&mut txn, &live, &op_id, &helpers, &BTreeMap::new()).unwrap();
+            reconcile_pending_commits(&mut txn, &live, &op_id, &helpers, &receiver_uuids).unwrap();
 
             let status = h
                 .store
@@ -2227,11 +2281,51 @@ pub(crate) mod commit_tests {
             let foreign_p1 = mint_foreign_generation(&h, "s1");
             let foreign_p2 = mint_foreign_generation(&h, "s2");
 
+            // The CURRENT receiver UUIDs, read from the provisioned remotes
+            // (mirroring preflight): the frozen bindings and the recovery's
+            // live bindings must carry the SAME known receivers — a
+            // config-derived binding (unknown receiver) would REFUSE the
+            // comparison (fail closed).
+            let recv_p1 = {
+                let t = LocalTransport::new(
+                    &crate::testutil::fixture_env(),
+                    h.remotes_base.join("s1"),
+                )
+                .unwrap();
+                crate::remote::transport::provision_receiver_uuid(&t).unwrap()
+            };
+            let recv_p2 = {
+                let t = LocalTransport::new(
+                    &crate::testutil::fixture_env(),
+                    h.remotes_base.join("s2"),
+                )
+                .unwrap();
+                crate::remote::transport::provision_receiver_uuid(&t).unwrap()
+            };
+
             // The PENDING intent: durable, no terminal, the frozen desired
             // assignments + the plan-time physical bindings (equal to the
             // live config's, so the degrade is the injected swap's
             // divergence, never binding drift).
-            let bindings = h.config.target_slot_bindings("t1").unwrap();
+            let config_bindings = h.config.target_slot_bindings("t1").unwrap();
+            let bindings = BTreeMap::from([
+                (
+                    p1.clone(),
+                    config_bindings
+                        .get(&p1)
+                        .cloned()
+                        .expect("p1 is a target slot")
+                        .with_receiver_uuid(recv_p1.clone()),
+                ),
+                (
+                    p2.clone(),
+                    config_bindings
+                        .get(&p2)
+                        .cloned()
+                        .expect("p2 is a target slot")
+                        .with_receiver_uuid(recv_p2.clone()),
+                ),
+            ]);
             let intent = {
                 use crate::kernel::intent::{PlanInput, PlannedDeploy};
                 use crate::kernel::snapshot::SnapshotSlot;
@@ -2313,7 +2407,12 @@ pub(crate) mod commit_tests {
             let op_id = OperationId::new("op-swap-prop".to_string());
             let mut txn =
                 crate::store::local::ledger::TargetLedgerTxn::open(&h.store, "t1", "test").unwrap();
-            reconcile_pending_commits(&mut txn, &h.config, &op_id, &helpers, &BTreeMap::new()).unwrap();
+            let receiver_uuids = BTreeMap::from([
+                (p1.clone(), Some(recv_p1)),
+                (p2.clone(), Some(recv_p2)),
+            ]);
+            reconcile_pending_commits(&mut txn, &h.config, &op_id, &helpers, &receiver_uuids)
+                .unwrap();
 
             let status = h
                 .store

@@ -121,7 +121,7 @@ pub(crate) fn validate_partial_rollout(
                         slot_id
                     ))
                 })?;
-                if !recorded.same_physical_location(&current_binding) {
+                if !recorded.same_physical_location(&current_binding)? {
                     return Err(Error::preflight(format!(
                         "partial rollout of target '{}' with group '{}' is refused: unselected slot \
                          '{}' was bound to server '{}' at '{}' (receiver '{}') in the latest successful snapshot, \

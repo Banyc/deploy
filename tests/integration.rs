@@ -57,6 +57,19 @@ fn known_generation(s: &deploy::ledger::ActualSlotState) -> &deploy::identity::G
     }
 }
 
+/// The receiver UUID minted at provisioning for the remote rooted at
+/// `root` (the transport's `receiver-uuid` marker file): the PHYSICAL
+/// identity the recorded binding must carry. The marker is written by
+/// provisioning during the push, so a successful push always leaves it.
+fn provisioned_receiver(root: &Path) -> deploy::identity::ReceiverUuid {
+    let marker = root.join("receiver-uuid");
+    let s = std::fs::read_to_string(&marker).unwrap_or_else(|e| {
+        panic!("the provisioned remote carries its receiver-UUID marker at {marker:?}: {e}")
+    });
+    deploy::identity::ReceiverUuid::parse(s.trim())
+        .unwrap_or_else(|e| panic!("the marker carries a valid receiver UUID: {e}"))
+}
+
 /// Shared per-variant policy body. Its mappings use only `{{ variant }}` — the
 /// only variable the template module exposes at materialization (trees are
 /// content-addressed and shared across slots) — so the same file content
@@ -375,12 +388,13 @@ fn snapshot_records_each_slots_physical_binding() -> Result<()> {
 
     let (config, config_path) = setup(&proj);
     let store = LocalStore::with_base(store_base.clone())?;
+    let remotes_for_factory = remotes_base.clone();
     let factory = move |s: &deploy::config::ServerDef,
                         _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(
             &deploy::env::SysEnv::from_process(),
-            remotes_base.join(&s.id),
+            remotes_for_factory.join(&s.id),
         )?))
     };
 
@@ -404,11 +418,12 @@ fn snapshot_records_each_slots_physical_binding() -> Result<()> {
     // /srv/deploy/example), p3 -> (server-03, /srv/deploy/example) per the
     // shared CONFIG's slot declarations. The recorded binding carries the
     // deploy_dir's receiver UUID (the PHYSICAL identity, minted at
-    // provisioning — unknown to the test), so the comparison is the
-    // physical-location comparison, never full equality.
+    // provisioning), so the comparison is the physical-location comparison
+    // against the provisioned remote's marker — never full equality.
     let binding = |server: &str| {
         PhysicalBinding::from_config(ServerId::parse(server).unwrap(), "/srv/deploy/example")
             .expect("test binding is absolute and traversal-free")
+            .with_receiver_uuid(provisioned_receiver(&remotes_base.join(server)))
     };
     let snapshot = rollback_of(&snapshots[0]);
     let recorded = |slot: &str| {
@@ -418,15 +433,21 @@ fn snapshot_records_each_slots_physical_binding() -> Result<()> {
             .expect("the snapshot records the slot")
     };
     assert!(
-        recorded("p1").same_physical_location(&binding("server-01")),
+        recorded("p1")
+            .same_physical_location(&binding("server-01"))
+            .expect("both receivers are known"),
         "p1 records the physical location it was deployed onto"
     );
     assert!(
-        recorded("p2").same_physical_location(&binding("server-02")),
+        recorded("p2")
+            .same_physical_location(&binding("server-02"))
+            .expect("both receivers are known"),
         "p2 records the physical location it was deployed onto"
     );
     assert!(
-        recorded("p3").same_physical_location(&binding("server-03")),
+        recorded("p3")
+            .same_physical_location(&binding("server-03"))
+            .expect("both receivers are known"),
         "p3 records the physical location it was deployed onto"
     );
     assert_eq!(rollback_of(&snapshots[0]).len(), 3);
@@ -521,13 +542,16 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         .map(|e| e.binding())
         .expect("the snapshot records the slot");
     assert!(
-        recorded.same_physical_location(
-            &PhysicalBinding::from_config(
-                ServerId::parse("server-01").unwrap(),
-                "/srv/deploy/rebind",
+        recorded
+            .same_physical_location(
+                &PhysicalBinding::from_config(
+                    ServerId::parse("server-01").unwrap(),
+                    "/srv/deploy/rebind",
+                )
+                .expect("test binding is absolute and traversal-free")
+                .with_receiver_uuid(provisioned_receiver(&remotes_base.join("server-01"))),
             )
-            .expect("test binding is absolute and traversal-free"),
-        ),
+            .expect("both receivers are known"),
         "the snapshot records the complete physical binding the slot was deployed onto"
     );
     let s01 = remotes_base.join("server-01");
@@ -565,17 +589,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     .expect_err("rebound slot must refuse exact rollback");
     let msg = err.to_string();
     assert!(
-        msg.contains("slot 'p1' was bound to server 'server-01' at '/srv/deploy/rebind'")
-            && msg.contains(&format!("in deployment '{dep0}' of target 'production'")),
-        "error must name the slot, the recorded server and its deploy_dir, got: {msg}"
-    );
-    assert!(
-        msg.contains("now bound to 'server-02' at '/srv/deploy/rebind'"),
-        "error must name the current binding (server and deploy_dir), got: {msg}"
-    );
-    assert!(
-        msg.contains("wrong host"),
-        "error must say the rollback would hit the wrong host, got: {msg}"
+        msg.contains("receiver UUID is UNKNOWN")
+            && msg.contains("server-02")
+            && msg.contains("/srv/deploy/rebind"),
+        "an unknown current receiver (the rebound server was never provisioned) must refuse the \
+         rollback (fail closed), naming the current binding, got: {msg}"
     );
     assert!(
         !s02.exists(),
@@ -708,8 +726,12 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     ServerId::parse("server-01").unwrap(),
                     "/srv/move/movedir-a",
                 )
-                .expect("test binding is absolute and traversal-free"),
-            ),
+                .expect("test binding is absolute and traversal-free")
+                .with_receiver_uuid(provisioned_receiver(
+                    &remotes_base.join("server-01/srv/move/movedir-a"),
+                )),
+            )
+            .expect("both receivers are known"),
         "s0 records the slot's {{server, deploy_dir}} binding"
     );
     assert!(
@@ -764,17 +786,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     .expect_err("moved deploy_dir must refuse exact rollback");
     let msg = err.to_string();
     assert!(
-        msg.contains("slot 'p1' was bound to server 'server-01' at '/srv/move/movedir-a'")
-            && msg.contains(&format!("in deployment '{dep0}' of target 'production'")),
-        "error must name the slot, the recorded server AND its deploy_dir, got: {msg}"
-    );
-    assert!(
-        msg.contains("now bound to 'server-01' at '/srv/move/movedir-b'"),
-        "error must name the current binding including the moved deploy_dir, got: {msg}"
-    );
-    assert!(
-        msg.contains("wrong host"),
-        "error must say the rollback would hit the wrong place, got: {msg}"
+        msg.contains("receiver UUID is UNKNOWN")
+            && msg.contains("server-01")
+            && msg.contains("/srv/move/movedir-b"),
+        "an unknown current receiver (the moved deploy_dir was never provisioned) must refuse the \
+         rollback (fail closed), naming the current binding, got: {msg}"
     );
     assert_eq!(
         gen_count(&root_a),
