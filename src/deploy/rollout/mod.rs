@@ -10,7 +10,8 @@ use crate::config::ProjectConfig;
 use crate::config::ServerDef;
 use crate::deploy::plan::PlannedAssignment;
 use crate::deploy::push::slot_vars;
-use crate::error::Result;
+use crate::error::{Error, Result};
+use crate::identity::BatchSize;
 use crate::identity::DeploymentId;
 use crate::identity::OperationId;
 use crate::identity::ReleaseId;
@@ -18,9 +19,7 @@ use crate::identity::SlotId;
 use crate::ledger::Observation;
 use crate::ledger::ObservedGeneration;
 use crate::remote::helper::RemoteHelper;
-use crate::remote::helper::RemoteStatus;
 use crate::remote::transport::Remote;
-use crate::store::local::LocalStore;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 
@@ -240,30 +239,45 @@ pub(crate) struct BatchRun {
     pub(crate) executions: BTreeMap<SlotId, SlotExecution>,
 }
 
-// 14 parameters: one batch run is the full per-slot publication context
+/// THE BATCH-RUN SETTINGS — the rollout POLICY knobs the batch loop
+/// consumes, bundled per the data-then-settings rule (every other
+/// [`run_batches`] argument is pure DATA: the prepared deployment, the
+/// validated topology, the open remotes/helpers, the deployment identity
+/// and order, and the preflight-built release bundles). `batch_size` is the
+/// TYPED nonzero [`BatchSize`] — a zero batch would stall the loop on an
+/// empty batch, so the construction bound makes that unrepresentable (a
+/// `usize` knob would re-open the hole at the type level).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BatchRunSettings {
+    /// The validated NONZERO rollout batch size (construction rejects 0).
+    pub(crate) batch_size: BatchSize,
+    /// Whether the batch loop stops after the first failed batch.
+    pub(crate) stop_on_failure: bool,
+}
+
+// 11 parameters: one batch run is the full per-slot publication context
 // (data: the prepared deployment — the ONE source of truth whose
-// projections drive the loop — the already-open remotes/helpers; policy:
-// batch_size, stop_on_failure) plus the deployment identity and the
-// preflight-built release bundles. Bundling the policy half into one
-// settings struct is a dedicated refactor (deferred: `run_batches` is a
-// straight extraction of the `push_inner` batch loop — the allow documents
-// the deliberate choice, mirroring `push_inner` itself).
+// projections drive the loop — the already-open remotes/helpers) plus the
+// deployment identity, the preflight-built release bundles, and the ONE
+// settings struct carrying the rollout policy knobs. The execution is
+// STORE-FREE: the store argument was dead (the batch loop consumes only the
+// prepared deployment's projections and the open remotes) and is REMOVED —
+// a run_batches caller cannot touch the store mid-execution. The remaining
+// size is the per-slot publication DATA context (deliberate, documented);
+// the policy half was already consolidated into [`BatchRunSettings`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_batches(
     prepared: &crate::deploy::push::PreparedDeployment,
     project: &crate::deploy::project::ValidatedProject,
     servers: &BTreeMap<SlotId, &ServerDef>,
     config: &ProjectConfig,
-    store: &LocalStore,
     remotes: &HashMap<SlotId, Box<dyn Remote>>,
     helpers: &HashMap<SlotId, RemoteHelper>,
-    _statuses: &HashMap<SlotId, RemoteStatus>,
     op_id: &OperationId,
     deployment_id: &DeploymentId,
     servers_order: &[SlotId],
-    batch_size: usize,
-    stop_on_failure: bool,
     bundles: &HashMap<ReleaseId, crate::verify::release::ValidatedReleaseBundle>,
+    settings: &BatchRunSettings,
 ) -> Result<BatchRun> {
     // THE EXECUTION-REQUIREMENTS PROJECTION: every per-slot execution
     // request (artifact, minted generation, expected pre-push generation,
@@ -283,9 +297,23 @@ pub(crate) fn run_batches(
 
     let mut idx = 0;
     'batches: while idx < servers_order.len() {
-        let end = (idx + batch_size).min(servers_order.len());
+        // `batch_size` is the TYPED nonzero [`BatchSize`]: a zero batch
+        // (which would stall the loop on an empty iteration) is
+        // unrepresentable — the `max(1)` guard is unnecessary by
+        // construction.
+        let end = (idx + settings.batch_size.get() as usize).min(servers_order.len());
         for sid in &servers_order[idx..end] {
-            let req = requests.iter().find(|r| &r.slot == sid).unwrap();
+            // THE EXECUTION-REQUIREMENTS COVERAGE: `servers_order` and
+            // `requests` are BOTH derived from the prepared deployment's
+            // assignments projection (a single source), so every slot in
+            // the deployment order has a request — but the lookup REFUSES
+            // (fail closed, never a panic) rather than assuming the
+            // derivation stayed coherent.
+            let req = requests.iter().find(|r| &r.slot == sid).ok_or_else(|| {
+                Error::integrity(format!(
+                    "run_batches: no execution request for slot '{sid}' — the execution requirements must cover every slot in the deployment order"
+                ))
+            })?;
             // The slot's template variables are DERIVED from the VALIDATED
             // PROJECT's typed topology (the slot id and its owner target),
             // the config's transport server, and the OPEN REMOTE's root (the
@@ -301,7 +329,6 @@ pub(crate) fn run_batches(
                 Some(&req.generation),
             )?;
             let outcome = process_server(
-                store,
                 remotes[sid].as_ref(),
                 &helpers[sid],
                 op_id,
@@ -319,7 +346,9 @@ pub(crate) fn run_batches(
             )?;
             let ServerProc { state } = outcome;
             executions.insert(sid.clone(), state);
-            if executions.get(sid).is_some_and(SlotExecution::is_failure) && stop_on_failure {
+            if executions.get(sid).is_some_and(SlotExecution::is_failure)
+                && settings.stop_on_failure
+            {
                 break 'batches;
             }
         }

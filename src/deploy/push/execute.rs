@@ -176,10 +176,15 @@ pub(crate) struct FailureEvidence {
 /// release publication set (the in-memory bundles for every release this
 /// attempt references) — passed EXPLICITLY, never through hidden process
 /// state.
-// 8 parameters: the execution is the full mutation context (the prepared
-// deployment, the validated project, the open remotes/helpers/statuses,
-// and the preflight-built release bundles). The allow documents the
-// deliberate choice, mirroring `run_batches` / `process_server`.
+// 7 parameters: the execution is the full mutation context (the prepared
+// deployment, the validated project, the open remotes/helpers, and the
+// preflight-built release bundles). The allow documents the deliberate
+// choice, mirroring `run_batches` / `process_server`. The `statuses` map
+// was DEAD (threaded into `run_batches`'s unused `_statuses` parameter) and
+// the STORE was DEAD (the execution consumes only the prepared deployment's
+// projections and the open remotes) — both are REMOVED: the execution path
+// is structurally STORE-FREE and carries no observed statuses it never
+// consults.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_execution(
     ctx: &PushContext,
@@ -188,25 +193,27 @@ pub(crate) fn run_execution(
     servers: &BTreeMap<SlotId, &crate::config::ServerDef>,
     remotes: &HashMap<SlotId, Box<dyn Remote>>,
     helpers: &HashMap<SlotId, RemoteHelper>,
-    statuses: &HashMap<SlotId, crate::remote::helper::RemoteStatus>,
     bundles: &HashMap<ReleaseId, ValidatedReleaseBundle>,
 ) -> Result<ExecutionOutcome> {
-    let store = ctx.store;
     let config = ctx.config;
     let target = ctx.target;
     let deployment_id = ctx.deployment_id;
     let op_id = ctx.op_id;
 
-    // 10-13. Process slots in batches. The batch size is a validated NONZERO
-    // [`BatchSize`] (the raw -> domain conversion rejects zero), so the
-    // `max(1)` guard is an invariant-preserving no-op kept for the batch loop.
-    let batch_size = target.rollout.batch_size.get().max(1) as usize;
+    // 10-13. Process slots in batches under the target's rollout POLICY — the
+    // typed [`crate::deploy::rollout::BatchRunSettings`] (the batch size is a
+    // validated NONZERO [`BatchSize`] — zero is rejected at construction — so
+    // the batch loop can never stall on an empty batch; the old `max(1)`
+    // guard was an invariant-preserving no-op and is gone).
+    let batch_settings = crate::deploy::rollout::BatchRunSettings {
+        batch_size: target.rollout.batch_size,
+        stop_on_failure: target.rollout.stop_on_failure,
+    };
     // The TYPED batch-failure policy: never a loose string. It is matched
     // EXHAUSTIVELY below (step 13 compensation and step 14 status) — an
     // unsupported spelling cannot exist (the strict parse rejected it at
     // config load), so there is no implicit fallback to "leave changed".
     let failure_policy = target.rollout.failure_policy;
-    let stop_on_failure = target.rollout.stop_on_failure;
 
     // The deployment-order slot list — the intent's slot-table insertion
     // order (the deployment order), DERIVED from the prepared deployment's
@@ -225,16 +232,13 @@ pub(crate) fn run_execution(
         project,
         servers,
         config,
-        store,
         remotes,
         helpers,
-        statuses,
         op_id,
         deployment_id,
         &servers_order,
-        batch_size,
-        stop_on_failure,
         bundles,
+        &batch_settings,
     )?;
 
     // 13 & 14. The FAILURE-POLICY PASS lives in [`crate::deploy::rollout`]:

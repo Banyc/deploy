@@ -687,7 +687,6 @@ pub(crate) fn push_inner<'a>(
         &servers,
         &remotes,
         &helpers,
-        &statuses,
         &preflight.bundles,
     )?;
 

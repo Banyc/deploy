@@ -85,9 +85,14 @@ pub(crate) fn run_step17_retention(
         // the reported outcome, and the next push's reconciliation removes
         // abandoned incoming dirs explicitly. The mutation lock itself needs
         // no cleanup here: `retain_slot_post_commit` held it through its own
-        // RAII guard (released on every return path), and a stale lock file
-        // is a LEASE that expires and is broken harmlessly next time — it can
-        // never block the slot.
+        // RAII guard (released on every return path). A stale lock file (the
+        // holder crashed between acquire and release) NEVER auto-expires and
+        // NEVER blocks this maintenance (it is only ever released by its own
+        // owner or by the EXPLICIT `deploy unlock` recovery after the
+        // operator confirms the holder died) — it can block a FUTURE
+        // mutation on the slot until that explicit recovery, which is
+        // exactly the documented no-expiry contract; step 17 simply defers
+        // such a slot as a durable debt marker + warning and moves on.
         helpers[sid].remove_incoming(deployment_id).ok();
     }
 }

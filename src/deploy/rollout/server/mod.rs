@@ -35,6 +35,11 @@ use crate::remote::helper::HeldSlotLock;
 use crate::remote::helper::RemoteHelper;
 use crate::remote::layout;
 use crate::remote::transport::{Remote, RootedRelativePath};
+// The store is used ONLY by this file's test harness (the production
+// `process_server` pipeline is STORE-FREE — its store argument was dead and
+// is removed), so the import is test-only and must not leak into the
+// library build.
+#[cfg(test)]
 use crate::store::local::LocalStore;
 use crate::verify::adapters::transaction::{ActivationTransaction, VerifiedAdapterRestoration};
 use crate::verify::command::run_verification;
@@ -218,18 +223,19 @@ impl ServerProc {
 }
 
 // 14 parameters: the per-server deployment is the full publication context
-// (data: store, remote, helper, op_id, deployment_id, target_name, artifact,
+// (data: remote, helper, op_id, deployment_id, target_name, artifact,
 // new_gen, expected_gen; policy: behavior, behavior_sha256, template_vars,
 // config) plus the preflight-built release bundles (the in-memory
 // publications for every release this attempt references — passed
-// EXPLICITLY, never through hidden process state). Bundling the policy half
-// into one settings struct is a dedicated refactor (deferred:
-// `process_server` is the single hottest function in the push path and every
-// caller would change with no behavioral gain); the allow documents the
-// deliberate choice.
+// EXPLICITLY, never through hidden process state). The STORE argument was
+// DEAD (the per-server pipeline consumes only the prepared artifact/
+// generation/behavior inputs and the open remote — it never touches the
+// local store) and is REMOVED: a process_server caller cannot reach the
+// store mid-mutation. The remaining size is the per-slot publication DATA
+// context (deliberate, documented); the policy half of the broader push
+// chain was already consolidated into [`crate::deploy::rollout::BatchRunSettings`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn process_server(
-    _store: &LocalStore,
     remote: &dyn Remote,
     helper: &RemoteHelper,
     op_id: &OperationId,
@@ -985,7 +991,6 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             )
             .expect("the harness slot variables resolve");
             process_server(
-                &self.store,
                 &self.remote,
                 &helper,
                 &op_id,
