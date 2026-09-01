@@ -86,9 +86,13 @@ pub fn canonicalize_tree(root: &Path) -> Result<TreeMetadata> {
             )));
         }
         let normalized: String = rel_str.nfc().collect();
-        if normalized.contains("..") {
+        // Reject TRAVERSAL components — an exact `..` (or `.`) path
+        // COMPONENT, never a substring: a legitimate filename like `a..b`
+        // or `..hidden` contains ".." but is not traversal. The component
+        // check splits on '/' and refuses only the exact traversal names.
+        if normalized.split('/').any(|c| c == ".." || c == ".") {
             return Err(Error::materialization(format!(
-                "path contains '..': {normalized}"
+                "path contains traversal components: {normalized}"
             )));
         }
         if normalized.starts_with('/') {
@@ -304,6 +308,31 @@ mod tests {
         std::fs::write(root.join("file.txt"), b"content").unwrap();
         std::fs::write(root.join("sub").join("nested.txt"), b"nested").unwrap();
         std::os::unix::fs::symlink("file.txt", root.join("sub").join("link")).unwrap();
+    }
+
+    /// A legitimate filename containing `..` as a SUBSTRING (e.g. `a..b`,
+    /// `..hidden`) is NOT traversal — the component-wise check accepts it.
+    /// (An exact `..` path component cannot be created on POSIX — it is the
+    /// parent — so the rejection arm is defensive; the acceptance arm is the
+    /// regression this test pins: the old substring check falsely rejected
+    /// these valid filenames.)
+    #[test]
+    fn dotdot_substring_is_not_traversal() {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let root = dir.path().join("tree");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a..b"), b"content").unwrap();
+        std::fs::write(root.join("..hidden"), b"content").unwrap();
+        let meta = canonicalize_tree(&root).unwrap();
+        let paths: Vec<&str> = meta.entries.iter().map(|e| e.path.as_str()).collect();
+        assert!(
+            paths.contains(&"a..b"),
+            "a filename containing '..' as a substring is valid, got {paths:?}"
+        );
+        assert!(
+            paths.contains(&"..hidden"),
+            "a filename starting with '..' is valid, got {paths:?}"
+        );
     }
 
     /// One systematically-mutated metadata field the verifier must reject
