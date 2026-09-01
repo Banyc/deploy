@@ -3344,13 +3344,15 @@ fn pending_commit_diverged_generation_is_degraded_not_successful() -> Result<()>
     let foreign_tree =
         TreeDigest::parse("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
             .expect("valid tree digest");
-    // The fixture goes through the PUBLIC test-support helper
-    // (`deploy::remote::helper::test_support::install_foreign_generation` —
-    // the ONLY public mutation surface besides `deploy::rollout::commit`):
-    // the guard mutation primitives are CRATE-PRIVATE, so an external test
-    // never names them. The helper mints the generation record, creates the
-    // tree object, and points `current` at it under the `Absent`
-    // compare-and-swap precondition.
+    // The fixture goes through the SANCTIONED public fixture API
+    // (`deploy::remote::helper::test_support::install_foreign_generation`,
+    // enabled for the integration tests via the `test-support` feature in
+    // the self dev-dependency): the guard mutation primitives are
+    // CRATE-PRIVATE, so an external test never names them — the fixture API
+    // is the deliberate, documented public seam (see its module docs). The
+    // helper mints the generation record, creates the tree object, and
+    // points `current` at it under the `Absent` compare-and-swap
+    // precondition.
     deploy::remote::helper::test_support::install_foreign_generation(
         &foreign_helper,
         &deploy::remote::helper::GenerationOwner::new(

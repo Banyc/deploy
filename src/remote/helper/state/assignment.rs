@@ -373,9 +373,10 @@ impl<'a> HeldSlotLock<'a> {
     /// TEST-ONLY WRAPPER: no production caller uses the `create_generation`
     /// name (production goes through [`Self::durable_generation_install`] via
     /// [`crate::deploy::rollout::commit`]); the wrapper exists for the
-    /// crate's own test fixtures and the `test-support` fixture helper, so it
-    /// is compiled only in test builds (`cfg(test)` or the `test-support`
-    /// feature) — never in a production build.
+    /// crate's own test fixtures and the sanctioned `test-support` fixture
+    /// API (`crate::remote::helper::test_support`), so it is compiled only
+    /// in test builds (`cfg(test)` or the `test-support` feature) — never
+    /// in a production build.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn create_generation(
         &self,

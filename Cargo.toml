@@ -4,14 +4,16 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-# TEST-SUPPORT FIXTURE HELPERS (`deploy::remote::helper::test_support`):
-# the crate's EXTERNAL tests build remote fixtures through these PUBLIC
-# helpers — the ONLY public mutation surface besides `deploy::rollout::commit`
-# — so no external test calls a crate-private mutation primitive. The feature
-# is enabled ONLY for the crate's own test builds (the self dev-dependency
-# below), never for a production build: a production library caller sees no
-# test-support API, so the ONLY public mutation path in production is
-# `deploy::rollout::commit` with a `PreparedSlotMutation`.
+# THE REMOTE-FIXTURE API (`deploy::remote::helper::test_support`): the
+# SANCTIONED public seam for building remote state in test fixtures — the
+# crate's own integration tests and any external consumer that needs to
+# build remote fixtures enable this feature to access it. The feature is
+# OPT-IN: the production build (default features) deliberately does not
+# enable it, so the ONLY public mutation path in a production build is
+# `deploy::rollout::commit` with a `PreparedSlotMutation` (plus the
+# capability acquisition `SlotRemote::acquire_lock_guard`). The fixture
+# API is the documented exception for consumers who need it — see the
+# module docs in `src/remote/helper/test_support.rs`.
 test-support = []
 
 [dependencies]
@@ -33,9 +35,9 @@ jiff = "0.2.35"
 [dev-dependencies]
 assert_fs = "1"
 # The crate as its OWN dev-dependency with the `test-support` feature: the
-# integration tests (`tests/*.rs`) link THIS copy (with the fixture helpers),
+# integration tests (`tests/*.rs`) link THIS copy (with the fixture API),
 # while `cargo build` and the lib target compile the crate WITHOUT the
-# feature — the test-support API never appears in a production build.
+# feature — the production build never carries the fixture API.
 deploy = { path = ".", features = ["test-support"] }
 
 # The serialized real-process lifecycle target (`tests/process_lifecycle.rs`)

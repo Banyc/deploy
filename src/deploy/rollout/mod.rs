@@ -36,7 +36,11 @@ pub(crate) use server::*;
 /// `swap_current`, `rotate`, `publish_release`, `publish_tree`,
 /// `transaction_record`, ...) are CRATE-PRIVATE — a library caller can
 /// only mutate a slot by building a [`PreparedSlotMutation`] (typed,
-/// validated values only) and committing it here.
+/// validated values only) and committing it here. The ONE documented
+/// exception is the opt-in `test-support` fixture API
+/// (`crate::remote::helper::test_support`) — a deliberate, feature-gated
+/// public seam for building remote fixtures, which the production build
+/// (default features) does not compile.
 pub use server::mutation::{PreparedSlotMutation, SlotCommitProof, commit};
 
 /// THE ONE RECORDED PER-SLOT EXECUTION STATE of a deployment attempt (the

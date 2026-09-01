@@ -14,8 +14,8 @@ error[E0624]: method `create_generation` is private
 18 |     guard.create_generation(&unimplemented!());
    |           ^^^^^^^^^^^^^^^^^ private method
    |
-  --> /kache/workspace/src/remote/helper/state/assignment.rs:380:4
-  ::: /kache/workspace/src/remote/helper/state/assignment.rs:383:57
+  --> /kache/workspace/src/remote/helper/state/assignment.rs:381:4
+  ::: /kache/workspace/src/remote/helper/state/assignment.rs:384:57
    |
    = note: private method defined here
 

@@ -30,11 +30,15 @@
 //! THE PUBLIC SURFACE (the structural verdict's point 7 taken to its
 //! conclusion): [`commit`], [`PreparedSlotMutation`], and [`SlotCommitProof`]
 //! are PUBLIC (re-exported at [`crate::deploy::rollout`]) — the ONE public
-//! mutation path. The guard mutation primitives (`create_generation`,
-//! `swap_current`, `rotate`, `publish_release`, `publish_tree`,
-//! `transaction_record`, ...) are CRATE-PRIVATE, so a library caller can
-//! only mutate a slot by building a [`PreparedSlotMutation`] and committing
-//! it here.
+//! mutation path in the production build. The guard mutation primitives
+//! (`create_generation`, `swap_current`, `rotate`, `publish_release`,
+//! `publish_tree`, `transaction_record`, ...) are CRATE-PRIVATE, so a
+//! library caller can only mutate a slot by building a
+//! [`PreparedSlotMutation`] and committing it here. The ONE documented
+//! exception is the opt-in `test-support` fixture API
+//! (`crate::remote::helper::test_support`) — a deliberate, feature-gated
+//! public seam for building remote fixtures, which the production build
+//! (default features) does not compile.
 
 use crate::error::Result;
 use crate::identity::{
