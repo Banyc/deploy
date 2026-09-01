@@ -378,4 +378,62 @@ mod tests {
             "the outside directory must be untouched"
         );
     }
+
+    /// THE DESCRIPTOR-RELATIVE READ CONFINEMENT: a symlink injected into a
+    /// path component cannot redirect a store READ outside the owned root —
+    /// the read is REFUSED (the component-wise `openat(O_NOFOLLOW)` open's
+    /// ELOOP), and the outside target is untouched. The mirror of the
+    /// mutation-confinement test above: the enforcement mechanism
+    /// (descriptor-relative, symlink-refusing) covers BOTH directions.
+    #[test]
+    fn symlink_injected_path_component_cannot_redirect_a_read() {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        // An outside directory the injected symlink would point at.
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        // Inject a symlink at the TARGET directory component:
+        // `targets/<target>` is replaced by a symlink to the outside dir.
+        let target = crate::identity::TargetName::parse("t1").unwrap();
+        let target_dir = store
+            .retention_debt_path(&target)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        std::os::unix::fs::symlink(&outside, &target_dir).unwrap();
+        // The READ must be REFUSED (the O_NOFOLLOW open never follows the
+        // symlink), and the outside dir must stay untouched.
+        let err = store
+            .read_retention_debt(&target)
+            .expect_err("a read through a symlink-injected path component must be refused");
+        assert!(
+            err.to_string().contains("openat"),
+            "the refusal must be the O_NOFOLLOW open failure, got: {err}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&outside).unwrap().count(),
+            0,
+            "the outside directory must be untouched"
+        );
+
+        // A symlink at the FINAL component is refused too: `pins.json`
+        // replaced by a symlink to an outside file — the read must error,
+        // never follow the link.
+        let outside_file = dir.path().join("outside-pins.json");
+        std::fs::write(&outside_file, b"{}").unwrap();
+        let pins_path = store.pins_path();
+        std::os::unix::fs::symlink(&outside_file, &pins_path).unwrap();
+        let err = store
+            .read_pins()
+            .expect_err("a read of a symlink final component must be refused");
+        assert!(
+            err.to_string().contains("openat"),
+            "the refusal must be the O_NOFOLLOW open failure, got: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside_file).unwrap(),
+            "{}",
+            "the outside file must be untouched"
+        );
+    }
 }

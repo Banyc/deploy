@@ -5,7 +5,6 @@
 use crate::error::{Error, Result};
 use crate::identity::{BehaviorContract, BehaviorDigest, ReleaseId, ReleaseRecord};
 use crate::remote::layout;
-use crate::store::atomic::read_json;
 use crate::store::local::LocalStore;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -59,7 +58,7 @@ impl LocalStore {
             // (b) Verify the EXISTING record from its content too, then
             // compare the recomputed identities (both records verified above,
             // so `release_sha256` equals the recomputed digest in each).
-            let existing: ReleaseRecord = read_json(&dir.join("release.json"))?;
+            let existing: ReleaseRecord = self.read_json_at(&dir.join("release.json"))?;
             crate::verify::release::verify_release_identity(&existing)?;
             if existing.release_sha256 != rec.release_sha256 {
                 return Err(Error::store(format!(
@@ -90,7 +89,7 @@ impl LocalStore {
     /// different id, or the file relocated — is refused with an integrity
     /// error naming both ids instead of being returned as if it were `id`.
     pub fn read_release(&self, id: &ReleaseId) -> Result<ReleaseRecord> {
-        let rec: ReleaseRecord = read_json(&self.release_dir(id).join("release.json"))?;
+        let rec: ReleaseRecord = self.read_json_at(&self.release_dir(id).join("release.json"))?;
         // Recompute-and-verify: the release's canonical digest is derived from
         // its own content (slot snapshot, bindings, provenance digests), never
         // trusted from the stored `release_sha256`/`release_id` fields. A
@@ -151,8 +150,7 @@ impl LocalStore {
         // provenance is trusted.
         let rec = self.read_release(id)?;
         let p = self.release_dir(id).join("behavior.json");
-        let bytes = std::fs::read(&p)
-            .map_err(|e| Error::store(format!("read behavior {}: {e}", p.display())))?;
+        let bytes = self.read_fd_at(&p)?;
         crate::verify::release::verify_behavior_json(
             &bytes,
             &ReleaseId::parse(&rec.release_id)?,

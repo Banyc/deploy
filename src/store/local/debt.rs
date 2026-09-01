@@ -6,8 +6,7 @@
 use crate::error::Error;
 use crate::error::Result;
 use crate::identity::{DeploymentId, TargetName};
-use crate::store::atomic::{path_state, read_json};
-use crate::store::local::{LocalStore, read_keyed_json};
+use crate::store::local::LocalStore;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -147,9 +146,11 @@ impl LocalStore {
         // Tri-state: only a genuine NotFound is "no maintenance debt" (the
         // empty map); a stat failure propagates as a Store error (an
         // unreadable debt marker must not read as "no debt").
-        if path_state(&p)? {
+        if self.path_state_at(&p)? {
             let rec: RetentionDebt =
-                read_keyed_json(&p, target.as_str(), |r: &RetentionDebt| r.target.as_str())?;
+                self.read_keyed_json_at(&p, target.as_str(), |r: &RetentionDebt| {
+                    r.target.as_str()
+                })?;
             Ok(rec.debt)
         } else {
             Ok(BTreeMap::new())
@@ -188,7 +189,7 @@ impl LocalStore {
             // removal is made DURABLE before returning (a removal is a
             // directory-entry change; never report success while the entry
             // is unsynced).
-            if path_state(&p)? {
+            if self.path_state_at(&p)? {
                 self.remove_file_at(&p)?;
                 self.sync_parent_dir_at(&p)?;
             }
@@ -243,8 +244,8 @@ impl LocalStore {
             ));
         }
         let p = self.sweep_debt_path();
-        if path_state(&p)? {
-            read_json(&p)
+        if self.path_state_at(&p)? {
+            self.read_json_at(&p)
         } else {
             Ok(None)
         }
@@ -270,7 +271,7 @@ impl LocalStore {
                 // The removal is made DURABLE before returning (a removal is
                 // a directory-entry change; never report success while the
                 // entry is unsynced).
-                if path_state(&p)? {
+                if self.path_state_at(&p)? {
                     self.remove_file_at(&p)?;
                     self.sync_parent_dir_at(&p)?;
                 }

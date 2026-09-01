@@ -34,7 +34,7 @@ use crate::env::SysEnv;
 use crate::error::{Error, Result};
 use crate::identity::ApplicationStoreKey;
 use crate::remote::layout as remote_layout;
-use crate::store::atomic::{ReplaceOutcome, ensure_private_dir, read_json};
+use crate::store::atomic::{ReplaceOutcome, ensure_private_dir, read_json_fd};
 use serde::Serialize;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
@@ -71,17 +71,24 @@ pub mod releases;
 /// edited to a consistent-but-different value) is REFUSED with an
 /// [`Error::integrity`] failure naming BOTH identities — never returned as
 /// if it were the requested key. `extract` projects the record's embedded
-/// identity (the value that must equal the path key).
-pub(crate) fn read_keyed_json<T>(path: &Path, key: &str, extract: impl Fn(&T) -> &str) -> Result<T>
+/// identity (the value that must equal the path key). The read resolves
+/// DESCRIPTOR-RELATIVE to `dir_fd` (component-wise `openat(O_NOFOLLOW)` — a
+/// symlink injected into any path component is refused, never followed).
+pub(crate) fn read_keyed_json_fd<T>(
+    dir_fd: &OwnedFd,
+    rel: &Path,
+    key: &str,
+    extract: impl Fn(&T) -> &str,
+) -> Result<T>
 where
     T: serde::de::DeserializeOwned,
 {
-    let rec: T = read_json(path)?;
+    let rec: T = read_json_fd(dir_fd, rel)?;
     let embedded = extract(&rec);
     if embedded != key {
         return Err(Error::integrity(format!(
             "record read from {} declares identity {embedded:?}: the stored record's identity does not match the requested key {key:?} (a record swapped into the wrong storage location)",
-            path.display()
+            rel.display()
         )));
     }
     Ok(rec)
@@ -451,6 +458,43 @@ impl LocalStore {
     fn write_file_at(&self, path: &Path, bytes: &[u8]) -> Result<()> {
         let rel = self.rel(path)?;
         crate::store::atomic::write_file_fd(&self.root_fd, rel, bytes)
+    }
+
+    /// The descriptor-relative whole-file read (see
+    /// [`crate::store::atomic::read_fd`]).
+    fn read_fd_at(&self, path: &Path) -> Result<Vec<u8>> {
+        let rel = self.rel(path)?;
+        crate::store::atomic::read_fd(&self.root_fd, rel)
+    }
+
+    /// The descriptor-relative JSON read (see
+    /// [`crate::store::atomic::read_json_fd`]).
+    fn read_json_at<T: serde::de::DeserializeOwned>(&self, path: &Path) -> Result<T> {
+        let rel = self.rel(path)?;
+        crate::store::atomic::read_json_fd(&self.root_fd, rel)
+    }
+
+    /// The descriptor-relative tri-state existence check (see
+    /// [`crate::store::atomic::path_state_fd`]).
+    fn path_state_at(&self, path: &Path) -> Result<bool> {
+        let rel = self.rel(path)?;
+        crate::store::atomic::path_state_fd(&self.root_fd, rel)
+    }
+
+    /// The descriptor-relative keyed JSON read (see
+    /// [`crate::store::atomic::read_json_fd`] + the embedded-identity
+    /// binding in [`read_keyed_json_fd`]).
+    fn read_keyed_json_at<T>(
+        &self,
+        path: &Path,
+        key: &str,
+        extract: impl Fn(&T) -> &str,
+    ) -> Result<T>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let rel = self.rel(path)?;
+        read_keyed_json_fd(&self.root_fd, rel, key, extract)
     }
 
     /// The fixture's per-fixture one-shot fault registry. A test arms faults

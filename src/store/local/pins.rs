@@ -3,7 +3,7 @@
 
 use crate::error::{Error, Result};
 use crate::ledger::Pins;
-use crate::store::atomic::{ReplaceOutcome, path_state, read_json};
+use crate::store::atomic::ReplaceOutcome;
 use crate::store::local::LocalStore;
 use std::path::PathBuf;
 
@@ -89,10 +89,10 @@ impl LocalStore {
         // stat failure propagates as a Store error (an unreadable pins file
         // must not read as "no pins" — the GC would then delete content a
         // pin might protect).
-        if !path_state(&p)? {
+        if !self.path_state_at(&p)? {
             return Ok(Pins::empty());
         }
-        let pins: Pins = read_json(&p)?;
+        let pins: Pins = self.read_json_at(&p)?;
         if pins.schema_version() != crate::ledger::PINS_SCHEMA_VERSION {
             return Err(Error::integrity(format!(
                 "pins file carries unsupported schema_version {} (expected {}): only PINS_SCHEMA_VERSION is accepted",

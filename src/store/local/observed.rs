@@ -5,8 +5,7 @@
 use crate::error::{Error, Result};
 use crate::identity::{ServerId, SlotId, TargetName};
 use crate::ledger::{ObservedSlot, ObservedTarget, ServerState};
-use crate::store::atomic::path_state;
-use crate::store::local::{LocalStore, read_keyed_json};
+use crate::store::local::LocalStore;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -127,8 +126,9 @@ impl LocalStore {
     /// error naming both identities, never returned as if it were `slot`.
     pub fn read_slot_observed(&self, slot: &SlotId) -> Result<Option<ObservedSlot>> {
         let p = self.slot_observed_path(slot);
-        if path_state(&p)? {
-            read_keyed_json(&p, slot.as_str(), |o: &ObservedSlot| o.slot.as_str()).map(Some)
+        if self.path_state_at(&p)? {
+            self.read_keyed_json_at(&p, slot.as_str(), |o: &ObservedSlot| o.slot.as_str())
+                .map(Some)
         } else {
             Ok(None)
         }
@@ -146,20 +146,25 @@ impl LocalStore {
     pub fn read_global_observed(&self) -> Result<BTreeMap<SlotId, ObservedSlot>> {
         let root = self.base.join("slots");
         let mut out = BTreeMap::new();
-        let entries = match std::fs::read_dir(&root) {
-            Ok(e) => e,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
-            Err(e) => return Err(Error::store(format!("read slots {}: {e}", root.display()))),
-        };
-        for entry in entries {
-            let entry = entry.map_err(|e| Error::store(format!("read slots: {e}")))?;
-            let rec = entry.path().join("observed.json");
-            if !path_state(&rec)? {
+        // Tri-state: only a genuine NotFound of the slots dir is the empty
+        // map; any other stat failure propagates (an unreadable slots dir
+        // must not read as "no observed state").
+        if !self.path_state_at(&root)? {
+            return Ok(out);
+        }
+        let rel_root = self.rel(&root)?;
+        for entry in crate::store::atomic::read_dir_fd(&self.root_fd, rel_root)? {
+            let rec = self
+                .base
+                .join("slots")
+                .join(&entry.name)
+                .join("observed.json");
+            if !self.path_state_at(&rec)? {
                 continue;
             }
-            let observed: ObservedSlot = read_keyed_json(
+            let observed: ObservedSlot = self.read_keyed_json_at(
                 &rec,
-                entry.file_name().to_string_lossy().as_ref(),
+                entry.name.to_string_lossy().as_ref(),
                 |o: &ObservedSlot| o.slot.as_str(),
             )?;
             out.insert(observed.slot.clone(), observed);
@@ -262,7 +267,7 @@ impl LocalStore {
             .base
             .join("servers")
             .join(format!("{}.json", id.as_str()));
-        read_keyed_json(&p, id.as_str(), |s: &ServerState| s.id.as_str())
+        self.read_keyed_json_at(&p, id.as_str(), |s: &ServerState| s.id.as_str())
     }
 
     pub fn server_exists(&self, id: &ServerId) -> bool {

@@ -22,7 +22,7 @@ use crate::ledger::{
     CheckpointWire, DeploymentIntent, DeploymentStatus, LEDGER_SCHEMA_VERSION, LedgerEntry,
     LedgerEventWire, LedgerIntentWire, LedgerTerminal, LedgerTerminalWire,
 };
-use crate::store::atomic::{ReplaceOutcome, openat_no_follow, path_state, temp_file_name};
+use crate::store::atomic::{ReplaceOutcome, openat_no_follow, temp_file_name};
 use crate::store::local::LocalStore;
 use std::io::Write;
 use std::os::fd::OwnedFd;
@@ -289,7 +289,7 @@ impl LocalStore {
         // Tri-state: only a genuine NotFound is "no ledger" (the empty
         // state); a stat failure propagates as a Store error (an unreadable
         // ledger must not read as "no history").
-        if !path_state(&p)? {
+        if !self.path_state_at(&p)? {
             let target_name = TargetName::parse(target).map_err(|e| {
                 Error::integrity(format!(
                     "ledger target {target:?} is not a valid target name: {e}"
@@ -297,8 +297,9 @@ impl LocalStore {
             })?;
             return Ok(DeploymentState::new(target_name));
         }
+        let bytes = self.read_fd_at(&p)?;
         let text =
-            std::fs::read_to_string(&p).map_err(|e| Error::store(format!("read ledger: {e}")))?;
+            String::from_utf8(bytes).map_err(|e| Error::store(format!("read ledger: {e}")))?;
         let target_name = TargetName::parse(target).map_err(|e| {
             Error::integrity(format!(
                 "ledger target {target:?} is not a valid target name: {e}"
@@ -436,15 +437,13 @@ impl LocalStore {
     /// its target; the entry's own intent does).
     pub fn latest_status(&self, id: &str) -> Result<Option<DeploymentStatus>> {
         let targets_dir = self.base.join("targets");
-        if !path_state(&targets_dir)? {
+        if !self.path_state_at(&targets_dir)? {
             return Ok(None);
         }
-        for dir in std::fs::read_dir(&targets_dir)
-            .map_err(|e| Error::store(format!("read_dir targets: {e}")))?
-        {
-            let dir = dir.map_err(|e| Error::store(format!("target entry: {e}")))?;
-            let name = dir.file_name().to_string_lossy().into_owned();
-            if !dir.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+        let rel_targets = self.rel(&targets_dir)?;
+        for entry in crate::store::atomic::read_dir_fd(&self.root_fd, rel_targets)? {
+            let name = entry.name.to_string_lossy().into_owned();
+            if !entry.is_dir {
                 continue;
             }
             for e in self.read_ledger(&name)? {

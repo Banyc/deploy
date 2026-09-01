@@ -42,7 +42,7 @@ error[E0624]: method `write_release` is private
 17 |     let _ = store.write_release(&unimplemented!());
    |                   ^^^^^^^^^^^^^ private method
    |
-  --> /kache/workspace/src/store/local/releases.rs:41:4
+  --> /kache/workspace/src/store/local/releases.rs:40:4
    |
    = note: private method defined here
 
@@ -61,7 +61,7 @@ error[E0624]: method `store_object` is private
 18 |     let _ = store.store_object(&unimplemented!(), &unimplemented!());
    |                   ^^^^^^^^^^^^ private method
    |
-  --> /kache/workspace/src/store/local/objects.rs:108:4
+  --> /kache/workspace/src/store/local/objects.rs:107:4
    |
    = note: private method defined here
 
@@ -89,8 +89,8 @@ error[E0624]: method `recover_if_missing` is private
 19 |     let _ = store.recover_if_missing(&unimplemented!(), &unimplemented!());
    |                   ^^^^^^^^^^^^^^^^^^ private method
    |
-  --> /kache/workspace/src/store/local/objects.rs:46:4
-  ::: /kache/workspace/src/store/local/objects.rs:50:19
+  --> /kache/workspace/src/store/local/objects.rs:45:4
+  ::: /kache/workspace/src/store/local/objects.rs:49:19
    |
    = note: private method defined here
 
@@ -137,7 +137,7 @@ error[E0624]: method `write_slot_observed` is private
 21 |     let _ = store.write_slot_observed(&unimplemented!(), &unimplemented!());
    |                   ^^^^^^^^^^^^^^^^^^^ private method
    |
-  --> /kache/workspace/src/store/local/observed.rs:76:4
+  --> /kache/workspace/src/store/local/observed.rs:75:4
    |
    = note: private method defined here
 
@@ -165,7 +165,7 @@ error[E0624]: method `write_server` is private
 22 |     let _ = store.write_server(&unimplemented!());
    |                   ^^^^^^^^^^^^ private method
    |
-  --> /kache/workspace/src/store/local/observed.rs:208:4
+  --> /kache/workspace/src/store/local/observed.rs:213:4
    |
    = note: private method defined here
 
@@ -184,8 +184,8 @@ error[E0624]: method `write_retention_debt` is private
 23 |     let _ = store.write_retention_debt(&unimplemented!(), &unimplemented!());
    |                   ^^^^^^^^^^^^^^^^^^^^ private method
    |
-  --> /kache/workspace/src/store/local/debt.rs:167:4
-  ::: /kache/workspace/src/store/local/debt.rs:171:19
+  --> /kache/workspace/src/store/local/debt.rs:168:4
+  ::: /kache/workspace/src/store/local/debt.rs:172:19
    |
    = note: private method defined here
 
@@ -213,7 +213,7 @@ error[E0624]: method `write_sweep_debt` is private
 24 |     let _ = store.write_sweep_debt(&unimplemented!());
    |                   ^^^^^^^^^^^^^^^^ private method
    |
-  --> /kache/workspace/src/store/local/debt.rs:256:4
+  --> /kache/workspace/src/store/local/debt.rs:257:4
    |
    = note: private method defined here
 

@@ -8,8 +8,7 @@ use crate::error::{Error, Result};
 use crate::identity::{TreeDigest, TreeMetadata};
 use crate::remote::layout;
 use crate::remote::transport::Remote;
-use crate::store::atomic::{path_state, read_json};
-use crate::store::local::{LocalStore, read_keyed_json};
+use crate::store::local::LocalStore;
 use std::path::{Path, PathBuf};
 
 #[cfg(test)]
@@ -111,7 +110,7 @@ impl LocalStore {
         // publish renames the COMPLETE object dir into place atomically), so
         // reuse only needs to verify the whole object — there is no partial
         // dir to refuse.
-        if path_state(&obj_dir)? {
+        if self.path_state_at(&obj_dir)? {
             if self.verify_object(digest, &obj_dir).is_ok() {
                 return Ok(()); // reuse
             }
@@ -134,7 +133,7 @@ impl LocalStore {
     /// object is reusable as-is.
     pub(crate) fn verify_object(&self, digest: &TreeDigest, obj_dir: &Path) -> Result<()> {
         let root = obj_dir.join("root");
-        let stored: TreeMetadata = read_json(&obj_dir.join("tree.json"))?;
+        let stored: TreeMetadata = self.read_json_at(&obj_dir.join("tree.json"))?;
         let canonical =
             crate::remote::canonical::verify_tree_metadata(&root, &stored).map_err(|e| {
                 Error::integrity(format!(
@@ -259,7 +258,7 @@ impl LocalStore {
         // — `objects/sha256/<digest>/tree.json`) — a metadata record swapped
         // into the wrong digest's directory is refused with an integrity
         // error naming both digests, never returned as if it were `digest`.
-        let stored: TreeMetadata = read_keyed_json(
+        let stored: TreeMetadata = self.read_keyed_json_at(
             &self.object_tree_json(digest),
             digest.as_str(),
             |m: &TreeMetadata| m.tree_sha256.as_str(),

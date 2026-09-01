@@ -52,6 +52,13 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+/// The path-based JSON reader — TEST-ONLY (the crash-consistency assertions
+/// read a REOPENED store's files directly to verify the on-disk state). The
+/// store's OWN record reads route through [`read_json_fd`]
+/// (descriptor-relative, symlink-refusing); no production caller uses the
+/// raw-path reader, so it is `#[cfg(test)]`-gated (no `#[allow(dead_code)]`
+/// band-aid).
+#[cfg(test)]
 pub(crate) fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     let bytes =
         std::fs::read(path).map_err(|e| Error::store(format!("read {}: {e}", path.display())))?;
@@ -1215,4 +1222,105 @@ pub(crate) fn write_file_fd(root: &OwnedFd, rel: &Path, bytes: &[u8]) -> Result<
     let mut f = std::fs::File::from(f);
     f.write_all(bytes)
         .map_err(|e| Error::store(format!("write {}: {e}", rel.display())))
+}
+
+// =====================================================================
+// DESCRIPTOR-RELATIVE READS (the owned-root confinement, read side)
+// ---------------------------------------------------------------------
+// The store's READS resolve paths relative to the owned root's open
+// directory descriptor, COMPONENT-WISE with `openat(O_NOFOLLOW)` — the
+// SAME refusal the mutations enforce: a symlink injected into ANY path
+// component is refused (ELOOP), never followed, so a read can never be
+// redirected outside the owned root. The path-based free functions above
+// (`read_json`, `path_state`) stay for the retention machinery (which
+// operates on paths under a store base it does not hold a descriptor
+// for); the store's OWN reads route through the `_fd` variants below.
+// =====================================================================
+
+/// Read the whole file at `rel` relative to `dir_fd`, resolved
+/// COMPONENT-WISE with `openat(O_NOFOLLOW)`: every intermediate component
+/// is opened as a directory (`O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+/// O_CLOEXEC`) and the final component is opened with
+/// `O_RDONLY | O_NOFOLLOW | O_CLOEXEC`. A symlink injected at ANY
+/// component is refused (ELOOP) — a read can never be redirected outside
+/// the root the descriptor pins.
+pub(crate) fn read_fd(dir_fd: &OwnedFd, rel: &Path) -> Result<Vec<u8>> {
+    let f = openat_no_follow(dir_fd, rel, libc::O_RDONLY, 0)?;
+    read_fd_to_end(&f)
+}
+
+/// [`read_fd`] + JSON deserialization (the descriptor-relative mirror of
+/// [`read_json`] for the store's own record reads).
+pub(crate) fn read_json_fd<T: serde::de::DeserializeOwned>(
+    dir_fd: &OwnedFd,
+    rel: &Path,
+) -> Result<T> {
+    let bytes = read_fd(dir_fd, rel)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|e| Error::store(format!("deserialize {}: {e}", rel.display())))
+}
+
+/// The descriptor-relative TRI-STATE existence check (the mirror of
+/// [`path_state`] for the store's own reads): resolve `rel` component-wise
+/// with `O_NOFOLLOW` and `fstat` the final component. A symlink at ANY
+/// component is REFUSED (ELOOP — never followed); a genuine NotFound of
+/// the final component is ABSENCE (`Ok(false)`); EVERY other filesystem
+/// error is a real failure → [`Error::store`], NEVER treated as absence.
+pub(crate) fn path_state_fd(dir_fd: &OwnedFd, rel: &Path) -> Result<bool> {
+    match openat_no_follow_io(dir_fd, rel, libc::O_RDONLY, 0) {
+        Ok(fd) => {
+            let f = std::fs::File::from(fd);
+            f.metadata()
+                .map_err(|e| Error::store(format!("fstat {}: {e}", rel.display())))?;
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(Error::store(format!("openat {}: {e}", rel.display()))),
+    }
+}
+
+/// One entry of a descriptor-relative directory read.
+pub(crate) struct DirEntry {
+    /// The entry's file name (never `.` or `..`).
+    pub name: std::ffi::OsString,
+    /// Whether the entry is a directory (classified with
+    /// `fstatat(AT_SYMLINK_NOFOLLOW)` — a symlink entry is reported as a
+    /// non-directory, never followed).
+    pub is_dir: bool,
+}
+
+/// Read the entries of the directory at `rel` relative to `dir_fd`,
+/// resolved COMPONENT-WISE with `openat(O_NOFOLLOW)` (a symlink injected
+/// at any component is refused — ELOOP — never followed). Each entry is
+/// classified with `fstatat(AT_SYMLINK_NOFOLLOW)` (a symlink entry is
+/// reported as a non-directory, never followed).
+pub(crate) fn read_dir_fd(dir_fd: &OwnedFd, rel: &Path) -> Result<Vec<DirEntry>> {
+    let dir_fd = openat_no_follow(dir_fd, rel, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+    let mut out = Vec::new();
+    for_each_dir_entry(&dir_fd, |name| {
+        let c = CString::new(name).map_err(|_| Error::store("path component with NUL"))?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let r = unsafe {
+            libc::fstatat(
+                dir_fd.as_raw_fd(),
+                c.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if r < 0 {
+            return Err(Error::store(format!(
+                "fstatat {}: {}",
+                rel.join(Path::new(std::ffi::OsStr::from_bytes(name)))
+                    .display(),
+                std::io::Error::last_os_error()
+            )));
+        }
+        out.push(DirEntry {
+            name: std::ffi::OsStr::from_bytes(name).to_os_string(),
+            is_dir: (st.st_mode & libc::S_IFMT) == libc::S_IFDIR,
+        });
+        Ok(())
+    })?;
+    Ok(out)
 }
