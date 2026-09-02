@@ -420,10 +420,7 @@ impl SshTransport {
     /// command deadline. `run_remote` and `run_remote_ok` differ only in the
     /// recorded operation kind and in whether they check the exit status.
     fn run_remote_op(&self, op: OpKind, command: &str) -> Result<std::process::Output> {
-        let mut argv = vec!["ssh".to_string()];
-        argv.extend(self.ssh_args()?);
-        argv.push("--".into());
-        argv.push(command.to_string());
+        let argv = self.ssh_command_argv(command)?;
         self.runner.run(op, &argv, None, None).map_err(|e| match e {
             RunError::Spawn(m) => Error::transport(format!("ssh {command}: {m}")),
             RunError::StdinWrite(m) => Error::transport(format!("ssh {command}: {m}")),
@@ -432,6 +429,23 @@ impl SshTransport {
                 Error::transport(format!("ssh command timed out after {after:?}: {command}"))
             }
         })
+    }
+
+    /// Build the `ssh <args> -- <command>` argv, forcing the remote command to
+    /// run under `bash` regardless of the deployment account's login shell.
+    /// The remote scripts (globs, `[ -e ] || continue`, `stat -c`, ...) are
+    /// written for POSIX sh/bash semantics; a login shell like zsh aborts on
+    /// an unmatched glob (`no matches found`) instead of passing the pattern
+    /// through, which breaks e.g. the first `list` of an empty object store.
+    /// Wrapping the command in `bash -c '<quoted>'` means the outer login
+    /// shell only parses the trivial `bash -c '...'` invocation (single-
+    /// quoted, no globs to expand), and the inner script runs under bash.
+    fn ssh_command_argv(&self, command: &str) -> Result<Vec<String>> {
+        let mut argv = vec!["ssh".to_string()];
+        argv.extend(self.ssh_args()?);
+        argv.push("--".into());
+        argv.push(format!("bash -c {}", shell_quote(command)));
+        Ok(argv)
     }
 
     /// Build a remote shell command string from an `argv`, quoting every
@@ -478,15 +492,17 @@ impl SshTransport {
             "mkdir -p $(dirname {p}) && cat > {p}",
             p = shell_quote(&remote_path_str)
         );
-        let mut argv = vec!["ssh".to_string()];
-        argv.extend(self.ssh_args()?);
-        argv.push("--".into());
-        argv.push(script);
+        let argv = self.ssh_command_argv(&script)?;
         // Size-aware deadline: a large upload over a slow link must not be
         // killed by the fixed command timeout mid-transfer (a truncated
         // object would fail its post-upload integrity re-hash). The bound
-        // scales with the payload at a conservative minimum rate.
-        let transfer_timeout = Duration::from_secs(upload_deadline_secs(data.len() as u64));
+        // scales with the payload at a conservative minimum rate (the
+        // snapshot's `DEPLOY_SSH_MIN_RATE_BYTES_PER_SEC` override, else the
+        // 64KB/s default).
+        let transfer_timeout = Duration::from_secs(upload_deadline_secs(
+            data.len() as u64,
+            upload_min_rate_bytes_per_sec(&self.env),
+        ));
         let out = self
             .runner
             .run(OpKind::Upload, &argv, Some(data), Some(transfer_timeout))
@@ -532,11 +548,24 @@ impl SshTransport {
 }
 
 /// The size-aware upload deadline: `max(SSH_COMMAND_TIMEOUT_SECS, bytes /
-/// MIN_RATE)` seconds — a large upload over a slow link is never killed
+/// min_rate)` seconds — a large upload over a slow link is never killed
 /// mid-transfer, while a hung upload (a remote that stops reading stdin) is
 /// still bounded.
-fn upload_deadline_secs(data_len: u64) -> u64 {
-    SSH_COMMAND_TIMEOUT_SECS.max(data_len / SSH_TRANSFER_MIN_RATE_BYTES_PER_SEC)
+fn upload_deadline_secs(data_len: u64, min_rate: u64) -> u64 {
+    SSH_COMMAND_TIMEOUT_SECS.max(data_len / min_rate)
+}
+
+/// Resolve the upload min-rate from the environment snapshot:
+/// `DEPLOY_SSH_MIN_RATE_BYTES_PER_SEC` (a positive integer) overrides the
+/// default [`SSH_TRANSFER_MIN_RATE_BYTES_PER_SEC`]; an unset, empty,
+/// non-numeric, or non-positive value falls back to the default. Resolved
+/// ONCE per upload from the snapshot — never from the live process env.
+fn upload_min_rate_bytes_per_sec(env: &SysEnv) -> u64 {
+    env.get("DEPLOY_SSH_MIN_RATE_BYTES_PER_SEC")
+        .and_then(|v| v.into_string().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|r| *r > 0)
+        .unwrap_or(SSH_TRANSFER_MIN_RATE_BYTES_PER_SEC)
 }
 
 /// Single-quote a string for safe inclusion in a remote shell token. A `'` is
@@ -1512,10 +1541,7 @@ impl Remote for SshTransport {
         // so the program receives exactly `argv` and the remote shell cannot
         // reinterpret spaces/metacharacters inside an argument.
         let command = format!("exec {}", Self::argv_cmd(argv));
-        let mut full = vec!["ssh".to_string()];
-        full.extend(self.ssh_args()?);
-        full.push("--".into());
-        full.push(command);
+        let full = self.ssh_command_argv(&command)?;
         // Runs through THE shared runner with the caller-supplied timeout: on
         // deadline the child is killed and reaped (deterministically) before the
         // Timeout outcome is returned, so `exec` can never hang the push either.
@@ -1582,10 +1608,7 @@ impl Remote for SshTransport {
         } else {
             Self::write_new_cmd(&self.root, rel.as_path(), IMMUTABLE_RECORD_MODE)
         };
-        let mut argv = vec!["ssh".to_string()];
-        argv.extend(self.ssh_args()?);
-        argv.push("--".into());
-        argv.push(cmd);
+        let argv = self.ssh_command_argv(&cmd)?;
         // The payload travels through the runner's STDIN — never through the
         // command string (see `write_new_cmd`): the raw `data` bytes are
         // piped to the remote `cat > "$tmp"` exactly, so arbitrary `Vec<u8>`
@@ -1846,23 +1869,35 @@ mod tests_ssh {
     #[test]
     fn upload_deadline_scales_with_payload_size() {
         // Small payloads (and empty ones) keep the fixed command deadline.
-        assert_eq!(upload_deadline_secs(0), SSH_COMMAND_TIMEOUT_SECS);
-        assert_eq!(upload_deadline_secs(64 * 1024), SSH_COMMAND_TIMEOUT_SECS);
+        assert_eq!(upload_deadline_secs(0, 64 * 1024), SSH_COMMAND_TIMEOUT_SECS);
+        assert_eq!(
+            upload_deadline_secs(64 * 1024, 64 * 1024),
+            SSH_COMMAND_TIMEOUT_SECS
+        );
         // A payload that needs more than the fixed window at the minimum
         // rate extends the deadline proportionally (24MB at 64KB/s).
         let mb24 = 24 * 1024 * 1024;
         assert_eq!(
-            upload_deadline_secs(mb24),
+            upload_deadline_secs(mb24, 64 * 1024),
             mb24 / SSH_TRANSFER_MIN_RATE_BYTES_PER_SEC
         );
         // The boundary: a payload needing more than the fixed window at the
         // minimum rate extends the deadline past the fixed command timeout
         // (integer division: the deadline grows only past a full rate-unit).
         let boundary = SSH_COMMAND_TIMEOUT_SECS * SSH_TRANSFER_MIN_RATE_BYTES_PER_SEC;
-        assert_eq!(upload_deadline_secs(boundary), SSH_COMMAND_TIMEOUT_SECS);
+        assert_eq!(
+            upload_deadline_secs(boundary, 64 * 1024),
+            SSH_COMMAND_TIMEOUT_SECS
+        );
         assert!(
-            upload_deadline_secs(boundary + SSH_TRANSFER_MIN_RATE_BYTES_PER_SEC)
+            upload_deadline_secs(boundary + SSH_TRANSFER_MIN_RATE_BYTES_PER_SEC, 64 * 1024)
                 > SSH_COMMAND_TIMEOUT_SECS
+        );
+        // A lower configured min-rate extends the deadline proportionally
+        // (the slow-link override: 24MB at 32KB/s is twice the 64KB/s bound).
+        assert_eq!(
+            upload_deadline_secs(mb24, 32 * 1024),
+            mb24 / (32 * 1024)
         );
     }
 
@@ -4450,10 +4485,16 @@ exec /bin/mv "$@"
             let mut expected = vec!["ssh".to_string()];
             expected.extend(t.ssh_args().expect("prepared identity"));
             expected.push("--".into());
-            expected.push(SshTransport::write_new_cmd(
-                t.root(),
-                rel.as_path(),
-                IMMUTABLE_RECORD_MODE,
+            // The command travels wrapped in `bash -c '...'` (the transport
+            // forces bash semantics regardless of the login shell), so the
+            // reference command is the wrapped form.
+            expected.push(format!(
+                "bash -c {}",
+                shell_quote(&SshTransport::write_new_cmd(
+                    t.root(),
+                    rel.as_path(),
+                    IMMUTABLE_RECORD_MODE,
+                ))
             ));
             let invocations = read_ssh_argv_log(&fake.argv_log);
             let write_inv = invocations

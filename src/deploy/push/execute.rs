@@ -194,6 +194,7 @@ pub(crate) fn run_execution(
     remotes: &HashMap<SlotId, Box<dyn Remote>>,
     helpers: &HashMap<SlotId, RemoteHelper>,
     bundles: &HashMap<ReleaseId, ValidatedReleaseBundle>,
+    trace: &mut crate::trace::Tracer,
 ) -> Result<ExecutionOutcome> {
     let config = ctx.config;
     let target = ctx.target;
@@ -239,6 +240,7 @@ pub(crate) fn run_execution(
         &servers_order,
         bundles,
         &batch_settings,
+        trace,
     )?;
 
     // 13 & 14. The FAILURE-POLICY PASS lives in [`crate::deploy::rollout`]:

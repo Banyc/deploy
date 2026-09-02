@@ -278,6 +278,7 @@ pub(crate) fn run_batches(
     servers_order: &[SlotId],
     bundles: &HashMap<ReleaseId, crate::verify::release::ValidatedReleaseBundle>,
     settings: &BatchRunSettings,
+    trace: &mut crate::trace::Tracer,
 ) -> Result<BatchRun> {
     // THE EXECUTION-REQUIREMENTS PROJECTION: every per-slot execution
     // request (artifact, minted generation, expected pre-push generation,
@@ -328,6 +329,21 @@ pub(crate) fn run_batches(
                 Some(deployment_id),
                 Some(&req.generation),
             )?;
+            // VERBOSE TRACING: announce the slot BEFORE its (potentially
+            // slow) per-server pipeline runs, so a stalled or timed-out
+            // operation can be attributed to the exact slot/server it was
+            // working on.
+            trace.step(
+                "mutation.slot",
+                format_args!(
+                    "slot={sid} server={} ({}@{}:{}) deploy_dir={}",
+                    servers[sid].id,
+                    servers[sid].user(),
+                    servers[sid].address(),
+                    servers[sid].port(),
+                    remotes[sid].root().display(),
+                ),
+            );
             let outcome = process_server(
                 remotes[sid].as_ref(),
                 &helpers[sid],

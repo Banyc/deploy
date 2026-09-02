@@ -754,6 +754,7 @@ pub(crate) fn push_inner<'a>(
         &remotes,
         &helpers,
         &preflight.bundles,
+        &mut trace,
     )?;
     trace.step(
         "mutation",

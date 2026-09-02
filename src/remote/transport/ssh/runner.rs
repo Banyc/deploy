@@ -39,6 +39,9 @@ pub(crate) const SSH_COMMAND_TIMEOUT_SECS: u64 = 60;
 /// fail its post-upload integrity re-hash). 64KB/s is deliberately far below
 /// any healthy link — it only extends the bound for genuinely slow hosts —
 /// while still bounding a hung upload (a remote that stops reading stdin).
+/// A link that sits AT or below the default (e.g. a Raspberry Pi on wifi,
+/// measured ~70-140KB/s) can be tolerated without recompiling by setting
+/// `DEPLOY_SSH_MIN_RATE_BYTES_PER_SEC` to a lower rate.
 pub(crate) const SSH_TRANSFER_MIN_RATE_BYTES_PER_SEC: u64 = 64 * 1024;
 
 /// The kind of ssh operation the runner is executing. The property test
