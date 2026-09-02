@@ -19,6 +19,7 @@ mod runner;
 
 use crate::env::SysEnv;
 use crate::error::{Error, Result};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -27,7 +28,7 @@ use super::{
     OpenedExisting, Remote, RemoteEntry, RemoteMeta, RemoveIfVerdict, RootedRelativePath,
     has_normal_component_below_root, verified_to_verdict, verify_existing,
 };
-use hostkey::pin_known_hosts;
+use hostkey::{pin_known_hosts, simple_hash};
 use runner::{OpKind, RunError, SSH_CONNECT_TIMEOUT_SECS, SshRunner};
 
 /// The framed ssh-lstat absence protocol (see [`SshTransport::metadata_opt`]):
@@ -151,6 +152,19 @@ pub struct SshTransport {
     /// `<temp_dir>/deploy-ssh-knownhosts`) — resolved ONCE at the
     /// construction boundary, never read from the process env.
     known_hosts_cache_dir: PathBuf,
+    /// The directory holding the SSH connection-multiplexing (ControlMaster)
+    /// sockets, one per `user@host:port` — a short path under the system
+    /// temp dir (`<temp_dir>/dmux`, created 0700 in
+    /// [`SshTransport::prepare_identity`] before any ssh op) because Unix
+    /// domain socket paths are length-limited (~104 bytes) and the
+    /// known-hosts cache path is too long to host them. Every ssh subprocess
+    /// this transport spawns reuses ONE persistent master connection per
+    /// remote, so the per-operation SSH handshake (banner, key exchange,
+    /// auth, session — several round trips at the link's RTT) is paid once
+    /// per push instead of once per operation; the master daemonizes into
+    /// its own process group, so the runner's foreground-only containment is
+    /// unaffected.
+    mux_socket_dir: PathBuf,
     /// The environment snapshot (owned): the pin path's `ssh-keygen`
     /// fingerprint-verification child receives its variables.
     env: SysEnv,
@@ -236,6 +250,7 @@ impl SshTransport {
             host_key_fingerprint: host_key_fingerprint.map(|s| s.to_string()),
             pinned_known_hosts: std::sync::Mutex::new(None),
             known_hosts_cache_dir: known_hosts_cache_dir.to_path_buf(),
+            mux_socket_dir: env.temp_dir().join("dmux"),
             env: env.clone(),
             runner: SshRunner::new(env),
             #[cfg(test)]
@@ -301,6 +316,25 @@ impl SshTransport {
             "PreferredAuthentications=publickey".into(),
             "-o".into(),
             format!("ConnectTimeout={SSH_CONNECT_TIMEOUT_SECS}"),
+            // SSH connection multiplexing: every operation of a push reuses
+            // ONE persistent master connection per user@host:port, so the
+            // multi-round-trip handshake (banner, key exchange, auth,
+            // session) is paid once per push instead of once per operation.
+            // The socket name is a short FNV hash of user@host:port (Unix
+            // domain socket paths are length-limited); the master daemonizes
+            // into its own process group, so the runner's foreground-only
+            // containment is unaffected; a stale socket (dead master) is
+            // detected and replaced by ssh itself.
+            "-o".into(),
+            "ControlMaster=auto".into(),
+            "-o".into(),
+            format!(
+                "ControlPath={}/mux-{}",
+                self.mux_socket_dir.display(),
+                simple_hash(&format!("{}:{}", self.target, self.port))
+            ),
+            "-o".into(),
+            "ControlPersist=120".into(),
             "-p".into(),
             self.port.to_string(),
         ];
@@ -1212,6 +1246,24 @@ impl Remote for SshTransport {
     }
 
     fn prepare_identity(&self) -> Result<()> {
+        // Create the local ControlMaster socket directory (0700) before any
+        // ssh op: the multiplexing sockets live here, keyed by
+        // `user@host:port`. Local-only, like the known-hosts pin below — a
+        // dry run's status inspection still connects over ssh and therefore
+        // needs the mux dir to exist.
+        std::fs::create_dir_all(&self.mux_socket_dir).map_err(|e| {
+            Error::transport(format!(
+                "create ssh mux dir {}: {e}",
+                self.mux_socket_dir.display()
+            ))
+        })?;
+        std::fs::set_permissions(&self.mux_socket_dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| {
+                Error::transport(format!(
+                    "chmod ssh mux dir {}: {e}",
+                    self.mux_socket_dir.display()
+                ))
+            })?;
         // If a fingerprint was supplied without an explicit known-hosts file,
         // verify the host key and pin it in a managed file BEFORE any remote
         // request — including a dry run's status inspection, which still

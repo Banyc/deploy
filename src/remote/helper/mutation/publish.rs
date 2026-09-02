@@ -38,9 +38,17 @@ use crate::remote::transport::{IMMUTABLE_RECORD_MODE, Remote, RootedRelativePath
 use crate::verify::release::ValidatedReleaseBundle;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::time::Duration;
 use walkdir::WalkDir;
 
 use super::super::RemoteHelper;
+
+/// Deadline for the remote tree-verification script ([`Remote::exec`]): the
+/// script runs ON the remote (reading the tree from its local disk and
+/// printing only per-file hashes), so the bound covers the ssh round trip
+/// plus a local disk read of the tree — generous, but a hung remote read
+/// still fails fast instead of blocking the push.
+pub(crate) const VERIFY_TREE_EXEC_TIMEOUT_SECS: u64 = 120;
 
 impl<'a> RemoteHelper<'a> {
     /// Whether the tree object exists on the remote — a typed probe: a
@@ -65,27 +73,52 @@ impl<'a> RemoteHelper<'a> {
     /// caller error: the caller checks existence first) or the transport
     /// itself failed.
     ///
-    /// The remote tree is materialized into a host temp directory and
-    /// canonicalized THERE: the canonical digest is computed from a directory
-    /// ([`crate::remote::canonical::canonicalize_tree`]), so the remote bytes
-    /// are downloaded and re-hashed with the SAME machinery every other
-    /// verifier uses.
-    fn verify_remote_tree(&self, rel: &RootedRelativePath, digest: &TreeDigest) -> Result<bool> {
+    /// The remote tree is verified WITHOUT downloading its content: a perl
+    /// script on the remote walks the tree and prints each entry's path,
+    /// type, mode, nlink, and content sha256 (the same per-file hashes the
+    /// local canonicalizer computes), and the digest is assembled from that
+    /// metadata with the SAME machinery ([`crate::remote::canonical::canonicalize_remote_entries`]).
+    /// Only the small entry metadata crosses the link — never the tree bytes
+    /// — so verification on a slow link costs a round trip instead of a
+    /// full tree download.
+    pub(crate) fn verify_remote_tree(
+        &self,
+        rel: &RootedRelativePath,
+        digest: &TreeDigest,
+    ) -> Result<bool> {
         if self.remote.metadata_opt(rel)?.is_none() {
             return Err(Error::integrity(format!(
                 "tree {} is missing; cannot verify",
                 rel.display()
             )));
         }
-        let tmp = tempfile::tempdir()
-            .map_err(|e| Error::remote(format!("tempdir for tree verification: {e}")))?;
-        // A download failure (unreadable content) means the content is
-        // INVALID — never trusted, never served. Only a missing tree (above)
-        // or a transport failure on the existence probe is an `Err`.
-        if crate::deploy::rollout::download_tree_to_host(self.remote, rel, tmp.path()).is_err() {
+        let root = self.remote.root().join(rel);
+        // A LocalTransport root is a LOCAL path (the tree lives on this
+        // host): canonicalize it directly — no exec, no subprocess. An
+        // SshTransport root is a REMOTE path (absent locally): run the
+        // remote verification script, which prints per-entry metadata and
+        // never transfers the tree content.
+        if root.exists() {
+            return match crate::remote::canonical::canonicalize_tree(&root) {
+                Ok(meta) => Ok(meta.tree_sha256 == digest.as_str()),
+                Err(_) => Ok(false),
+            };
+        }
+        let argv = vec![
+            "perl".to_string(),
+            "-e".to_string(),
+            crate::remote::canonical::remote_tree_verify_script().to_string(),
+            root.to_string_lossy().into_owned(),
+        ];
+        let out = self
+            .remote
+            .exec(&argv, Duration::from_secs(VERIFY_TREE_EXEC_TIMEOUT_SECS))?;
+        if out.exit_code != 0 {
+            // Unreadable content (a mode mutation that removed read
+            // permission) or a script failure: the tree does not verify.
             return Ok(false);
         }
-        match crate::remote::canonical::canonicalize_tree(tmp.path()) {
+        match crate::remote::canonical::canonicalize_remote_entries(&out.stdout, &root) {
             Ok(meta) => Ok(meta.tree_sha256 == digest.as_str()),
             Err(_) => Ok(false),
         }

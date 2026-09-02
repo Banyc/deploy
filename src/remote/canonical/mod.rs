@@ -179,6 +179,151 @@ pub fn canonicalize_tree(root: &Path) -> Result<TreeMetadata> {
     Ok(meta)
 }
 
+/// The remote tree-verification script: walks a tree on the remote and
+/// prints one tab-separated line per entry —
+/// `path\ttype\tmode_hex\tnlink\tcontent_sha256\tsymlink_target` — where
+/// `type` is `f`/`d`/`l`, `mode_hex` is the raw st_mode in hex, and
+/// `content_sha256` is the sha256 of the file bytes (or of the symlink
+/// target). The tool assembles the canonical metadata from this output and
+/// computes the digest ([`canonicalize_remote_entries`]), so verification
+/// never transfers the tree CONTENT — only the per-file hashes — which on
+/// a slow link costs a small round trip instead of a full tree download.
+/// Runs via `Remote::exec` as `perl -e <script> <root>`; `File::Find` and
+/// `Digest::SHA` are core perl modules on every supported host.
+pub(crate) fn remote_tree_verify_script() -> &'static str {
+    "use File::Find; use Digest::SHA qw(sha256_hex); my $root=$ARGV[0]; find(sub { my $p=$File::Find::name; my $rel=substr($p, length($root)+1); return if $rel eq q{}; my @st=lstat($p); my $t = -l $p ? q{l} : (-d $p ? q{d} : q{f}); my $m=sprintf(q{%x}, $st[2] & 07777); my $n=$st[3]; my ($h,$tg)=(q{},q{}); if ($t eq q{f}) { open my $fh, q{<}, $p or die qq{open $p: $!}; binmode $fh; local $/; my $d=<$fh>; $h=sha256_hex($d); close $fh; } elsif ($t eq q{l}) { $tg=readlink($p); $h=sha256_hex($tg); } print qq{$rel\t$t\t$m\t$n\t$h\t$tg\n}; }, $root);"
+}
+
+/// Assemble canonical tree metadata from the remote verification script's
+/// output ([`remote_tree_verify_script`]), applying the SAME validations the
+/// local canonicalizer applies ([`canonicalize_tree`]): NFC normalization,
+/// NUL/traversal/absolute/duplicate path rejection, hardlink rejection, and
+/// in-root symlink targets. The per-file content hashes come from the remote
+/// (sha256sum); the digest is computed from the assembled metadata, so a
+/// corrupted or divergent remote tree produces a digest mismatch without any
+/// content transfer. `root` is the remote tree root (absolute, on the
+/// remote host) used for the in-root symlink check.
+pub(crate) fn canonicalize_remote_entries(output: &str, root: &Path) -> Result<TreeMetadata> {
+    let mut entries: Vec<TreeEntry> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for line in output.lines() {
+        let mut it = line.split('\t');
+        let path = it.next().unwrap_or("");
+        if path.is_empty() {
+            continue;
+        }
+        let entry_type = it.next().unwrap_or("");
+        let mode_hex = it.next().unwrap_or("");
+        let nlink = it.next().unwrap_or("0");
+        let content_hash = it.next().unwrap_or("");
+        let symlink_target = it.next().unwrap_or("");
+
+        // Path validation — mirror canonicalize_tree exactly.
+        if path.contains('\0') {
+            return Err(Error::materialization(format!(
+                "path contains NUL bytes: {path}"
+            )));
+        }
+        let normalized: String = path.nfc().collect();
+        if normalized.split('/').any(|c| c == ".." || c == ".") {
+            return Err(Error::materialization(format!(
+                "path contains traversal components: {normalized}"
+            )));
+        }
+        if normalized.starts_with('/') {
+            return Err(Error::materialization(format!(
+                "absolute path not allowed: {normalized}"
+            )));
+        }
+        if !seen.insert(normalized.clone()) {
+            return Err(Error::materialization(format!(
+                "duplicate normalized path: {normalized}"
+            )));
+        }
+
+        let mode = u32::from_str_radix(mode_hex, 16).map_err(|_| {
+            Error::materialization(format!("invalid mode {mode_hex:?} for {normalized}"))
+        })?;
+
+        let entry = match entry_type {
+            "d" => TreeEntry {
+                path: normalized,
+                entry_type: "dir".to_string(),
+                mode: fmt_mode(mode),
+                content_sha256: None,
+                symlink_target: None,
+            },
+            "f" => {
+                let n: u64 = nlink.parse().map_err(|_| {
+                    Error::materialization(format!("invalid nlink {nlink:?} for {normalized}"))
+                })?;
+                if n > 1 {
+                    return Err(Error::materialization(format!(
+                        "hard links not allowed: {normalized}"
+                    )));
+                }
+                if content_hash.is_empty() {
+                    return Err(Error::materialization(format!(
+                        "missing content hash for {normalized}"
+                    )));
+                }
+                TreeEntry {
+                    path: normalized,
+                    entry_type: "file".to_string(),
+                    mode: fmt_mode(mode),
+                    content_sha256: Some(content_hash.to_string()),
+                    symlink_target: None,
+                }
+            }
+            "l" => {
+                if symlink_target.is_empty() {
+                    return Err(Error::materialization(format!(
+                        "missing symlink target for {normalized}"
+                    )));
+                }
+                let target = PathBuf::from(symlink_target);
+                if target.is_absolute() {
+                    return Err(Error::materialization(format!(
+                        "absolute symlink not allowed: {normalized}"
+                    )));
+                }
+                let resolved = normalize_lexical(root, &target);
+                match resolved {
+                    Some(r) if r.starts_with(root) => {}
+                    _ => {
+                        return Err(Error::materialization(format!(
+                            "escaping symlink not allowed: {normalized}"
+                        )));
+                    }
+                }
+                let target_bytes = symlink_target.as_bytes();
+                TreeEntry {
+                    path: normalized,
+                    entry_type: "symlink".to_string(),
+                    mode: "0777".to_string(),
+                    content_sha256: Some(sha256_bytes(target_bytes)),
+                    symlink_target: Some(symlink_target.to_string()),
+                }
+            }
+            other => {
+                return Err(Error::materialization(format!(
+                    "unsupported file type at {normalized}: {other:?}"
+                )));
+            }
+        };
+        entries.push(entry);
+    }
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut meta = TreeMetadata {
+        tree_schema_version: TREE_SCHEMA_VERSION,
+        hash_algorithm: "sha256".to_string(),
+        tree_sha256: String::new(),
+        entries,
+    };
+    meta.tree_sha256 = compute_tree_digest(&meta);
+    Ok(meta)
+}
+
 /// Verify that a stored [`TreeMetadata`] is EXACTLY the canonical metadata of
 /// the tree content at `root`: canonicalize the root and compare EVERY field
 /// (schema version, hash algorithm, tree digest, and each entry's
@@ -308,6 +453,39 @@ mod tests {
         std::fs::write(root.join("file.txt"), b"content").unwrap();
         std::fs::write(root.join("sub").join("nested.txt"), b"nested").unwrap();
         std::os::unix::fs::symlink("file.txt", root.join("sub").join("link")).unwrap();
+    }
+
+    /// The remote verification script ([`remote_tree_verify_script`]) must
+    /// produce the EXACT same canonical digest as the local canonicalizer
+    /// ([`canonicalize_tree`]): the script walks the tree and prints per-entry
+    /// metadata (path/type/mode/nlink/content sha256), and
+    /// [`canonicalize_remote_entries`] assembles the digest from it. This
+    /// pins the equivalence on a RICH tree (a file, a nested file, and a
+    /// symlink) — a divergence would falsely quarantine valid remote trees.
+    #[test]
+    fn remote_verify_script_digest_matches_local_canonicalization() {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let root = dir.path().join("tree");
+        build_tree(&root);
+        let local = canonicalize_tree(&root).unwrap();
+
+        let out = std::process::Command::new("perl")
+            .args(["-e", remote_tree_verify_script()])
+            .arg(&root)
+            .output()
+            .expect("perl must run");
+        assert!(
+            out.status.success(),
+            "script failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let remote =
+            canonicalize_remote_entries(&String::from_utf8_lossy(&out.stdout), &root).unwrap();
+        assert_eq!(
+            remote.tree_sha256, local.tree_sha256,
+            "remote-script digest must equal the local canonical digest"
+        );
+        assert_eq!(remote.entries, local.entries);
     }
 
     /// A legitimate filename containing `..` as a SUBSTRING (e.g. `a..b`,

@@ -30,7 +30,6 @@ use crate::identity::OperationId;
 use crate::identity::ReleaseId;
 use crate::ledger::Observation;
 use crate::ledger::ObservedGeneration;
-use crate::remote::canonical as tree;
 use crate::remote::helper::HeldSlotLock;
 use crate::remote::helper::RemoteHelper;
 use crate::remote::layout;
@@ -296,33 +295,27 @@ pub(crate) fn process_server(
         return Ok(ServerProc::failed_before(format!("publish failed: {e}")));
     }
 
-    // 2. Canonically hash the remote tree and compare with the requested digest.
-    //    Existing remote objects are re-verified here rather than trusted.
-    let verify_tmp = match tempfile::tempdir() {
-        Ok(t) => t,
-        Err(e) => {
-            return Ok(ServerProc::failed_before(format!("tempdir: {e}")));
-        }
-    };
+    // 2. Canonically hash the remote tree and compare with the requested
+    //    digest. Existing remote objects are re-verified here rather than
+    //    trusted. The verification runs ON the remote (a perl script prints
+    //    each entry's path/type/mode/nlink/content sha256; the digest is
+    //    assembled from that metadata) — the tree CONTENT is never
+    //    downloaded, so verification on a slow link costs a round trip
+    //    instead of a full tree transfer.
     let object_rel = layout::tree_root(&artifact.tree);
-    if let Err(e) = download_tree_to_host(remote, &object_rel, verify_tmp.path()) {
-        return Ok(ServerProc::failed_before(format!(
-            "download for verify failed: {e}"
-        )));
-    }
-    let meta = match tree::canonicalize_tree(verify_tmp.path()) {
-        Ok(m) => m,
-        Err(e) => {
+    match helper.verify_remote_tree(&object_rel, &artifact.tree) {
+        Ok(true) => {}
+        Ok(false) => {
             return Ok(ServerProc::failed_before(format!(
-                "canonicalize remote tree failed: {e}"
+                "integrity: remote tree digest does not match requested {}",
+                artifact.tree
             )));
         }
-    };
-    if meta.tree_sha256 != artifact.tree.as_str() {
-        return Ok(ServerProc::failed_before(format!(
-            "integrity: remote tree digest {} does not match requested {}",
-            meta.tree_sha256, artifact.tree
-        )));
+        Err(e) => {
+            return Ok(ServerProc::failed_before(format!(
+                "remote tree verification failed: {e}"
+            )));
+        }
     }
 
     // 3. Validate all declared artifact paths and types before changing current.
@@ -811,7 +804,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &staging,
             )
             .unwrap();
-            let meta = tree::canonicalize_tree(&staging).unwrap();
+            let meta = crate::remote::canonical::canonicalize_tree(&staging).unwrap();
             let tree = TreeDigest::parse(&meta.tree_sha256)
                 .expect("canonicalized tree sha256 is a valid digest");
             store
