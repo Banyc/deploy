@@ -3,8 +3,7 @@
 //! planned assignments and the observed pre-push statuses.
 
 use crate::deploy::plan::PlannedAssignment;
-use crate::identity::GenerationId;
-use crate::identity::SlotId;
+use crate::identity::{BehaviorContract, GenerationId, SlotId};
 use crate::remote::helper::RemoteStatus;
 use crate::store::local::LocalStore;
 use std::collections::HashMap;
@@ -27,6 +26,7 @@ pub(crate) fn render_dry_run_plan(
     assignments: &[PlannedAssignment],
     statuses: &HashMap<SlotId, RemoteStatus>,
     new_gen: &HashMap<SlotId, GenerationId>,
+    behaviors: &crate::ledger::records::BehaviorIndex,
 ) -> String {
     let mut msg = String::new();
     for a in assignments {
@@ -55,6 +55,32 @@ pub(crate) fn render_dry_run_plan(
                 a.artifact.tree
             ));
         }
+        // The behavior contract that will run on this slot (activation +
+        // verification) — so a dry run shows an agent what the push will
+        // DO, not just what it will write.
+        if let Some(by_variant) = behaviors.get(&a.artifact.release)
+            && let Some(behavior) = by_variant.get(a.artifact.variant.as_str())
+        {
+            msg.push_str(&format!("  {}\n", render_behavior(behavior)));
+        }
     }
     msg
+}
+
+/// Render a behavior contract (activation + verification) for the dry-run
+/// plan: the activation adapter (and its units) and the verification command
+/// that will run on the slot.
+fn render_behavior(behavior: &BehaviorContract) -> String {
+    use crate::config::{Activation, Verification};
+    let activation = match behavior.activation() {
+        Activation::None => "none".to_string(),
+        Activation::Systemd(sa) => format!(
+            "systemd (units: {})",
+            sa.units().map(|u| u.name()).collect::<Vec<_>>().join(", ")
+        ),
+    };
+    let verification = match behavior.verification() {
+        Verification::Command(vc) => format!("command: {}", vc.argv().join(" ")),
+    };
+    format!("activation={activation} verification={verification}")
 }

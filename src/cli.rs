@@ -598,12 +598,12 @@ fn render_status(observed: &ObservedTarget) -> Vec<String> {
                 artifact,
                 ..
             } => format!(
-                "{}  generation={:?} release={:?} variant={:?} tree={:?}",
+                "{}  generation={} release={} variant={} tree={}",
                 slot_id,
-                Some(generation.clone()),
-                Some(artifact.release.clone()),
-                Some(artifact.variant.clone()),
-                Some(artifact.tree.clone()),
+                generation.as_str(),
+                artifact.release.as_str(),
+                artifact.variant.as_str(),
+                artifact.tree.as_str(),
             ),
             // A slot with no observed state (`Absent`), a failed status read
             // (`Unknown`), or a generation whose ASSIGNMENT could not be read

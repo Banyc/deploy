@@ -484,7 +484,7 @@ impl ProjectConfig {
                 members += 1;
                 if !used_servers.insert(slot.server.as_str()) {
                     return Err(Error::config(format!(
-                        "target '{tname}' has multiple slots on server '{}'",
+                        "target '{tname}' has multiple slots on server '{}' — a target may own at most one slot per server (one server runs exactly one generation per target); give the extra slot its own target, or move it to a different server",
                         slot.server
                     )));
                 }

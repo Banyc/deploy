@@ -243,6 +243,7 @@ impl PreparedDeployment {
             &self.assignments(),
             statuses,
             &self.generations(),
+            &self.behaviors,
         )
     }
 
