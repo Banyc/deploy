@@ -292,7 +292,9 @@ pub(crate) fn run_preflight(
         if let Some(RecoveryOutcome::StillPending) =
             reconcile_pending_commits(txn, config, op_id, helpers, &receiver_uuids)?
         {
-            return Err(Error::conflict("a previous deployment is still pending"));
+            return Err(Error::conflict(
+                "a previous deployment is still pending — an earlier push was interrupted before its commit markers were finalized; if a slot mutation lock is stranded, recover it with `deploy unlock <target> <slot> --yes` (see the lock error for the exact acquisition id), then retry this push",
+            ));
         }
     }
 

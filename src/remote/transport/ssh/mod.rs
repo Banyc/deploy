@@ -29,7 +29,10 @@ use super::{
     has_normal_component_below_root, verified_to_verdict, verify_existing,
 };
 use hostkey::{pin_known_hosts, simple_hash};
-use runner::{OpKind, RunError, SSH_CONNECT_TIMEOUT_SECS, SshRunner};
+use runner::{
+    OpKind, RunError, SSH_COMMAND_TIMEOUT_SECS, SSH_CONNECT_TIMEOUT_SECS,
+    SSH_TRANSFER_MIN_RATE_BYTES_PER_SEC, SshRunner,
+};
 
 /// The framed ssh-lstat absence protocol (see [`SshTransport::metadata_opt`]):
 /// ONE remote exec runs a small perl `lstat` helper that prints a single
@@ -479,9 +482,16 @@ impl SshTransport {
         argv.extend(self.ssh_args()?);
         argv.push("--".into());
         argv.push(script);
+        // Size-aware deadline: a large upload over a slow link must not be
+        // killed by the fixed command timeout mid-transfer (a truncated
+        // object would fail its post-upload integrity re-hash). The bound
+        // scales with the payload at a conservative minimum rate.
+        let transfer_timeout = Duration::from_secs(
+            SSH_COMMAND_TIMEOUT_SECS.max(data.len() as u64 / SSH_TRANSFER_MIN_RATE_BYTES_PER_SEC),
+        );
         let out = self
             .runner
-            .run(OpKind::Upload, &argv, Some(data), None)
+            .run(OpKind::Upload, &argv, Some(data), Some(transfer_timeout))
             .map_err(|e| match e {
                 RunError::Spawn(m) => Error::transport(format!("ssh upload spawn: {m}")),
                 RunError::StdinWrite(m) => Error::transport(format!("ssh upload stdin write: {m}")),

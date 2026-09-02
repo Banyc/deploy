@@ -481,6 +481,13 @@ pub(crate) fn push_inner<'a>(
         target,
         opts,
     };
+    // VERBOSE PHASE TRACING: every push phase records a `[trace]` step with
+    // the time spent since the previous step, so `deploy push --verbose`
+    // shows an agent exactly what the push did, in what order, and where the
+    // time went (preflight, capacity/staging, mutation, commit) — the same
+    // surface the relative-ref operations already trace. A disabled tracer
+    // is a zero-cost no-op.
+    let mut trace = crate::trace::Tracer::new(opts.verbose);
     // Dry-run staging is disposable. The guard's Drop removes the whole
     // `dry-<deployment>` tree (on error, `?`, or unwind); the guard must
     // outlive the pre-mutation phases because the dry-run branch below
@@ -514,8 +521,20 @@ pub(crate) fn push_inner<'a>(
     // guards, the mutating remote prep (phase B), and the per-slot plan /
     // pre-push observation tables.
     open_remotes(&ctx, &mut remotes)?;
+    trace.step(
+        "preflight.remotes",
+        format_args!("opened {} remote(s)", remotes.len()),
+    );
     inspect_remotes(&ctx, &remotes, &mut helpers, &mut statuses)?;
+    trace.step(
+        "preflight.status",
+        format_args!("read {} slot status(es)", statuses.len()),
+    );
     let preflight = run_preflight(&ctx, txn, &remotes, &helpers, &statuses)?;
+    trace.step(
+        "preflight",
+        format_args!("{} assignment(s) planned", preflight.assignments.len()),
+    );
 
     // ---- Dry-run: read-only planning, no mutation of store/remote/locks -----
     if opts.dry_run {
@@ -613,7 +632,6 @@ pub(crate) fn push_inner<'a>(
     // advanced) even when every selected slot already runs the desired
     // artifact. The decision is traced (verbose) so a future agent can see
     // why a fresh generation was deployed over an up-to-date target.
-    let mut trace = crate::trace::Tracer::new(opts.verbose);
     if opts.force {
         trace.step(
             "push.force",
@@ -664,6 +682,7 @@ pub(crate) fn push_inner<'a>(
     // prepared deployment's PROJECTIONS (never the preflight outcome). See
     // [`persist_intent`].
     let prepared = persist_intent(&ctx, txn, &preflight, &project)?;
+    trace.step("intent", format_args!("persisted intent {deployment_id}"));
 
     // 8 & 9. Capacity + staging preflight — capacity is the caller's CURRENT
     // per-server policy; every failure ends the attempt `FailedPreflight`
@@ -716,6 +735,10 @@ pub(crate) fn push_inner<'a>(
         )?;
         return Err(failure.source);
     }
+    trace.step(
+        "capacity.staging",
+        format_args!("{} assignment(s) staged", preflight.assignments.len()),
+    );
 
     // MUTATION PHASES (steps 10-15) in [`crate::deploy::push`]: the
     // deployment-order batch loop, the failure-policy compensation + status
@@ -732,14 +755,23 @@ pub(crate) fn push_inner<'a>(
         &helpers,
         &preflight.bundles,
     )?;
+    trace.step(
+        "mutation",
+        format_args!("{} slot(s) executed", execution.executions.len()),
+    );
 
     // POST-MUTATION PHASES (steps 16-17) in [`crate::deploy::push`]: the
     // terminal event finalization (successful finalizer / plain terminal
     // append), the observed refresh + step-17 maintenance, and the report
     // assembly.
-    run_commit(
+    let report = run_commit(
         &ctx, txn, &prepared, &execution, &project, &servers, &helpers,
-    )
+    );
+    trace.step(
+        "commit",
+        format_args!("status {:?}", report.as_ref().map(|r| r.status)),
+    );
+    report
 }
 
 #[cfg(test)]

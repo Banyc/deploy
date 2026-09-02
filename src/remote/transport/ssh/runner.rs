@@ -31,6 +31,16 @@ pub(crate) const SSH_CONNECT_TIMEOUT_SECS: u64 = 10;
 // probe), and `Remote::exec` keeps its caller-supplied timeout.
 pub(crate) const SSH_COMMAND_TIMEOUT_SECS: u64 = 60;
 
+/// The assumed MINIMUM transfer rate (bytes/sec) used to scale the deadline
+/// of a size-known upload ([`SshTransport::upload_bytes`]): the deadline is
+/// `max(SSH_COMMAND_TIMEOUT_SECS, bytes / MIN_RATE)`, so a large upload over
+/// a slow link is never killed mid-transfer (the fixed 60s command deadline
+/// would truncate a 24MB binary at ~0.2MB/s and the truncated object would
+/// fail its post-upload integrity re-hash). 64KB/s is deliberately far below
+/// any healthy link — it only extends the bound for genuinely slow hosts —
+/// while still bounding a hung upload (a remote that stops reading stdin).
+pub(crate) const SSH_TRANSFER_MIN_RATE_BYTES_PER_SEC: u64 = 64 * 1024;
+
 /// The kind of ssh operation the runner is executing. The property test
 /// generates these × stall points through an injected fake seam (see the
 /// `runner_property_tests` module) and asserts the deadline/kill/reap contract
