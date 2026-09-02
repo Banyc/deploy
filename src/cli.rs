@@ -348,6 +348,10 @@ recovered and released; the slot ends free. The operation is idempotent\n\
         #[arg(long)]
         yes: bool,
     },
+    /// Print the deploy manual: the domain model, the features, the push flow,
+    /// and the commands — the terms and how the tool works, for an agent or a
+    /// new user. No project required.
+    Manual,
 }
 
 /// CLI entry point: snapshot the process environment ONCE at the process
@@ -412,6 +416,15 @@ where
             },
         )?;
         print_init_report(&report);
+        return Ok(());
+    }
+
+    // `manual` needs no config either: it prints the domain model, features,
+    // flow, and commands — usable from anywhere, before any project exists.
+    if matches!(&cli.command, Command::Manual) {
+        for line in render_manual() {
+            println!("{line}");
+        }
         return Ok(());
     }
 
@@ -557,6 +570,11 @@ where
             }
         }
         Command::Init { .. } => unreachable!("handled above"),
+        Command::Manual => {
+            for line in render_manual() {
+                println!("{line}");
+            }
+        }
     }
     Ok(())
 }
@@ -622,6 +640,51 @@ fn render_status(observed: &ObservedTarget) -> Vec<String> {
             ),
         })
         .collect()
+}
+
+/// Render `deploy manual`: the domain model, the features, the push flow, and
+/// the commands — the terms and how the tool works, for an agent or a new
+/// user. One line per concept, grouped by area, with cross-references; the
+/// CLI prints exactly these lines.
+fn render_manual() -> Vec<String> {
+    vec![
+        "deploy manual — how the deploy tool works".to_string(),
+        String::new(),
+        "MODEL".to_string(),
+        "  variant     a deployment flavor (stable, nightly); one .toml file per variant".to_string(),
+        "  slot        one server + one workload under an id; declares its deploy_dir, target, groups".to_string(),
+        "  target      a rollout group of slots; owns rollout policy (batch size, failure policy)".to_string(),
+        "  group       a per-slot tag selecting slots for `deploy push <target> --group <name>`".to_string(),
+        "  release     a named project snapshot (releases/<name>/); the active one is set in deploy.toml".to_string(),
+        "  generation  a deployed instance of a tree on a slot; `current` points at the live one".to_string(),
+        "  tree        the content-addressed artifact tree (sha256 of the canonicalized content)".to_string(),
+        "  receiver    the deploy_dir's immutable UUID; the physical identity of a slot".to_string(),
+        String::new(),
+        "FEATURES".to_string(),
+        "  push        deploy the current files to a target's slots, in rollout batches".to_string(),
+        "  rollback    restore a previous deployment by id or ref (@-, parent(@, N))".to_string(),
+        "  checkpoint  retain a target's history suffix at a deployment; sweep the rest".to_string(),
+        "  retention   per-slot cleanup policy (keep N artifacts, keep N days, protect previous)".to_string(),
+        "  activation  what runs after a deploy (none, or systemd: install/enable/restart units)".to_string(),
+        "  verification  how a deploy is confirmed (a command that must exit 0)".to_string(),
+        "  recovery    `deploy unlock` recovers a stranded mutation lock after a dead controller".to_string(),
+        String::new(),
+        "FLOW (what a push does)".to_string(),
+        "  preflight   read status, plan, stage trees, check capacity".to_string(),
+        "  mutation    per slot: publish the tree, verify it, install the generation, swap current".to_string(),
+        "  activation  run the slot's activation adapter".to_string(),
+        "  verification  run the slot's verification command".to_string(),
+        "  commit      record the attempt, refresh observed state, run retention".to_string(),
+        String::new(),
+        "COMMANDS".to_string(),
+        "  init        scaffold a fresh project".to_string(),
+        "  push        deploy to a target (--group, --force, --dry-run, refs)".to_string(),
+        "  log         show the target's deployment history".to_string(),
+        "  status      show what is actually running on every server".to_string(),
+        "  checkpoint  retain a history suffix and sweep the rest".to_string(),
+        "  unlock      recover a stranded mutation lock".to_string(),
+        "  manual      this manual".to_string(),
+    ]
 }
 
 fn print_init_report(report: &crate::init::InitReport) {
@@ -903,6 +966,43 @@ mod tests {
                 test_deployment_id("deploy-log-failed")
             )
         );
+    }
+
+    /// `deploy manual` renders the domain model, features, flow, and commands
+    /// — the terms and how the tool works — from anywhere (no project
+    /// required). The CLI prints exactly what [`render_manual`] returns.
+    #[test]
+    fn manual_renders_model_features_flow_and_commands() {
+        let lines = render_manual();
+        let joined = lines.join("\n");
+        for section in ["MODEL", "FEATURES", "FLOW (what a push does)", "COMMANDS"] {
+            assert!(
+                joined.contains(section),
+                "missing section {section}: {joined}"
+            );
+        }
+        for term in [
+            "variant",
+            "slot",
+            "target",
+            "group",
+            "release",
+            "generation",
+            "tree",
+        ] {
+            assert!(joined.contains(term), "missing term {term}: {joined}");
+        }
+        for cmd in [
+            "init",
+            "push",
+            "log",
+            "status",
+            "checkpoint",
+            "unlock",
+            "manual",
+        ] {
+            assert!(joined.contains(cmd), "missing command {cmd}: {joined}");
+        }
     }
 
     /// `deploy status <target>` renders each slot's OBSERVED state as it is
