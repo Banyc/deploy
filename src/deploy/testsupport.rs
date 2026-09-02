@@ -271,6 +271,8 @@ pub(crate) fn two_slot_push(
         config,
         target,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: group.map(str::to_string),
@@ -460,6 +462,8 @@ pub(crate) fn push_pending_attempt(h: &RecoveryHarness) -> LedgerIntentReport {
         "t1",
         &h.config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -810,6 +814,8 @@ pub(crate) fn push_clean(h: &RecoveryHarness) -> Result<PushReport> {
         "t1",
         &h.config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -940,6 +946,8 @@ pub(crate) fn push_main_with_id(
         &h.config,
         target,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -1148,6 +1156,8 @@ impl SysdHarness {
             &self.config,
             target,
             &PushOptions {
+                verbose: false,
+                force: false,
                 dry_run: false,
                 ref_token: None,
                 group: None,

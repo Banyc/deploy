@@ -369,6 +369,73 @@ mod noop_tests {
         );
     }
 
+    /// `--force` skips the "Everything up to date" no-op detection: a
+    /// forced push over an up-to-date target is a REAL push — a fresh
+    /// generation is minted, a new attempt + snapshot are recorded, and the
+    /// remote advances — instead of reporting "Everything up to date".
+    #[test]
+    fn force_push_skips_the_noop_check() {
+        let h = RecoveryHarness::new();
+        let id = test_deployment_id("deploy-force-baseline");
+        let r1 = push_main_with_id(&h, &id).unwrap();
+        assert_eq!(r1.status, Some(DeploymentStatus::Successful));
+        let first_gen =
+            known_generation(&r1.attempt.as_ref().unwrap().slots[&SlotId::new("p1")]).clone();
+
+        // Without --force the unchanged push is a no-op.
+        let r2 = push_clean(&h).unwrap();
+        assert_eq!(r2.status, None, "an unchanged push is a no-op");
+        assert_eq!(r2.message, "Everything up to date");
+        assert_eq!(h.store.read_attempts("t1").unwrap().len(), 1);
+
+        // With --force the same push is a REAL push: a fresh generation, a
+        // new attempt + snapshot, and the remote advanced.
+        let rf = h.remotes_base.clone();
+        let script = h.script.clone();
+        let clean_factory = move |s: &crate::config::ServerDef,
+                                  _slot: &crate::config::SlotConfig|
+              -> Result<Box<dyn Remote>> {
+            Ok(Box::new(LocalTransport::with_exec(
+                &crate::testutil::fixture_env(),
+                rf.join(s.id.as_str()),
+                script.clone(),
+            )?))
+        };
+        let r3 = push(
+            &h.cfg_path,
+            &h.store,
+            &clean_factory,
+            "t1",
+            &h.config,
+            &PushOptions {
+                verbose: false,
+                dry_run: false,
+                ref_token: None,
+                group: None,
+                force: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(r3.status, Some(DeploymentStatus::Successful));
+        assert_ne!(r3.message, "Everything up to date");
+        let second_gen =
+            known_generation(&r3.attempt.as_ref().unwrap().slots[&SlotId::new("p1")]).clone();
+        assert_ne!(
+            second_gen, first_gen,
+            "a forced push mints a NEW generation over the up-to-date target"
+        );
+        assert_eq!(
+            h.store.read_attempts("t1").unwrap().len(),
+            2,
+            "a forced push records a new attempt"
+        );
+        assert_eq!(
+            h.store.read_snapshots("t1").unwrap().len(),
+            2,
+            "a forced push appends a new snapshot"
+        );
+    }
+
     /// A variant whose verification argv renders the per-deployment identity
     /// templates (`{{ deployment_id }}` / `{{ generation }}` / `{{ tree }}`)
     /// so a no-op push's verification can be captured and asserted.
@@ -433,6 +500,8 @@ interval_seconds = 0
             "t1",
             &h.config,
             &PushOptions {
+                verbose: false,
+                force: false,
                 dry_run: false,
                 ref_token: None,
                 group: None,
@@ -486,6 +555,8 @@ interval_seconds = 0
             "t1",
             &h.config,
             &PushOptions {
+                verbose: false,
+                force: false,
                 dry_run: false,
                 ref_token: None,
                 group: None,
@@ -714,6 +785,8 @@ interval_seconds = 0
             "t1",
             &config,
             &PushOptions {
+                verbose: false,
+                force: false,
                 dry_run: false,
                 ref_token: None,
                 group: None,
@@ -760,6 +833,8 @@ interval_seconds = 0
             "t1",
             &config2,
             &PushOptions {
+                verbose: false,
+                force: false,
                 dry_run: false,
                 ref_token: None,
                 group: None,
@@ -842,6 +917,8 @@ interval_seconds = 0
             "t1",
             &config2,
             &PushOptions {
+                verbose: false,
+                force: false,
                 dry_run: false,
                 ref_token: None,
                 group: None,

@@ -15,6 +15,7 @@ pub mod ledger;
 pub mod remote;
 pub mod retention;
 pub mod store;
+pub(crate) mod trace;
 pub mod verify;
 
 #[cfg(test)]

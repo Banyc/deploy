@@ -110,6 +110,6 @@ pub use refs::{
 // NOT re-exported at the area root: their only in-crate consumers use the
 // module paths directly ([`crate::ledger::records`] /
 // [`crate::ledger::recovery`]).
-pub(crate) use refs::{RefExpr, parse_ref_expr, resolve_ref_expr};
+pub(crate) use refs::{RefExpr, ResolveRefSettings, parse_ref_expr, resolve_ref_expr};
 // The ledger/pins format-version constants (defined in [`crate::ledger::records`]).
 pub(crate) use records::{LEDGER_SCHEMA_VERSION, PINS_SCHEMA_VERSION};

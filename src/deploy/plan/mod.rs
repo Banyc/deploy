@@ -1815,6 +1815,7 @@ interval_seconds = 0
                         &crate::ledger::parse_ref_expr(token).expect("family tokens must parse"),
                         "t2",
                         &store,
+                        &crate::ledger::ResolveRefSettings::quiet(),
                     )
                     .expect_err(&format!("{token} on the no-history destination must fail"));
                 }
@@ -1823,6 +1824,7 @@ interval_seconds = 0
                         .expect("deployment id must parse"),
                     "t2",
                     &store,
+                    &crate::ledger::ResolveRefSettings::quiet(),
                 )
                 .expect_err("no snapshot for the deployment on t2; the deployment id must fail");
                 // The removed release-refid / sN forms are rejected at parse.

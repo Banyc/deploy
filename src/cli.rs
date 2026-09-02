@@ -52,6 +52,14 @@ struct Cli {
     /// Path to deploy.toml (defaults to ./deploy.toml).
     #[arg(long, global = true)]
     config: Option<PathBuf>,
+    /// Verbose step tracing for the RELATIVE reference operations
+    /// (`@-`, `@--`, `parent(...)`, `<deployment-id>-`, ...): each step of
+    /// the ref parse + resolution is described on stderr with the time
+    /// spent and the debug detail (parsed AST, ledger size, chain
+    /// position, resolved deployment id) — for debugging a push with an
+    /// agent. `grep '\[trace\]'` on the stderr of a verbose run.
+    #[arg(short, long, global = true)]
+    verbose: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -188,7 +196,8 @@ REMOVED: migrate `deploy push <target> sN` to the deployment id of that\n\
 snapshot's deployment (see `deploy log <target>`), or use `@-` /\n\
 parent(@, N)` for the deployment history.\n\
 --dry-run prints the plan and touches nothing (no store writes, no remote\n\
-state, no locks). Pushing identical content prints 'Everything up to date'.\n\
+state, no locks). Pushing identical content prints 'Everything up to date'\n\
+(unless --force: a forced push always deploys a fresh generation).\n\
 Rollout batches per rollout.batch_size; on a failed server, earlier batches\n\
 roll back by default (failure_policy: rollback_changed). The final status is\n\
 reported explicitly, including partial states like `degraded`.",
@@ -218,6 +227,12 @@ reported explicitly, including partial states like `degraded`.",
         group: Option<String>,
         #[arg(long)]
         dry_run: bool,
+        /// Force a real push even when every selected slot already runs the
+        /// desired artifact: the "Everything up to date" no-op detection is
+        /// skipped and a fresh generation is deployed and recorded (a new
+        /// attempt, a new snapshot, the remote advanced).
+        #[arg(long)]
+        force: bool,
     },
     /// Show the target's deployment history (successful and failed).
     #[command(
@@ -431,6 +446,7 @@ where
             reference,
             group,
             dry_run,
+            force,
         } => {
             let report = push(
                 &config_path,
@@ -442,6 +458,8 @@ where
                     dry_run,
                     ref_token: reference,
                     group,
+                    verbose: cli.verbose,
+                    force,
                 },
             )?;
             print_report(&report);
@@ -1139,6 +1157,66 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     fn init_defaults_to_current_directory() {
         let cli = Cli::try_parse_from(["deploy", "init"]).unwrap();
         assert!(matches!(cli.command, Command::Init { .. }));
+    }
+
+    /// The `--verbose` / `-v` flag is GLOBAL (usable anywhere on the
+    /// command line, like `--config`) and defaults to off. It is the CLI's
+    /// opt-in for the relative-reference step tracing (see
+    /// [`crate::trace::Tracer`]): the push spine reads it into
+    /// `PushOptions.verbose` and the ref resolution reads it into
+    /// `ResolveRefSettings.verbose`.
+    #[test]
+    fn verbose_flag_parses_globally() {
+        // Off by default.
+        let cli = Cli::try_parse_from(["deploy", "push", "production"]).unwrap();
+        assert!(!cli.verbose, "verbose defaults to off");
+        // The long form, before the subcommand (global flags are accepted
+        // anywhere).
+        let cli = Cli::try_parse_from(["deploy", "--verbose", "push", "production"]).unwrap();
+        assert!(cli.verbose, "--verbose before the subcommand sets the flag");
+        // The short form, after the subcommand.
+        let cli = Cli::try_parse_from(["deploy", "push", "production", "-v"]).unwrap();
+        assert!(cli.verbose, "-v after the subcommand sets the flag");
+        // The long form after the subcommand too.
+        let cli = Cli::try_parse_from(["deploy", "push", "production", "--verbose"]).unwrap();
+        assert!(cli.verbose, "--verbose after the subcommand sets the flag");
+    }
+
+    /// The `--force` flag is a PUSH flag (not global): it skips the
+    /// "Everything up to date" no-op detection so a forced push always
+    /// deploys a fresh generation. It defaults to off and parses on the
+    /// push subcommand.
+    #[test]
+    fn force_flag_parses_on_push() {
+        // Off by default.
+        let cli = Cli::try_parse_from(["deploy", "push", "production"]).unwrap();
+        let Command::Push { force, .. } = cli.command else {
+            panic!("expected Push command");
+        };
+        assert!(!force, "force defaults to off");
+        // The long form.
+        let cli = Cli::try_parse_from(["deploy", "push", "production", "--force"]).unwrap();
+        let Command::Push { force, .. } = cli.command else {
+            panic!("expected Push command");
+        };
+        assert!(force, "--force sets the flag");
+        // It combines with the other push flags.
+        let cli = Cli::try_parse_from([
+            "deploy",
+            "push",
+            "production",
+            "@-",
+            "--group",
+            "canary",
+            "--dry-run",
+            "--force",
+        ])
+        .unwrap();
+        let Command::Push { force, dry_run, .. } = cli.command else {
+            panic!("expected Push command");
+        };
+        assert!(force, "--force combines with the other push flags");
+        assert!(dry_run, "--dry-run still parses alongside --force");
     }
 
     /// `deploy checkpoint <target>` without a deployment id is a parse

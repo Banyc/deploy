@@ -256,6 +256,8 @@ fn end_to_end_push_rollback() -> Result<()> {
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -284,6 +286,8 @@ fn end_to_end_push_rollback() -> Result<()> {
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -309,6 +313,8 @@ fn end_to_end_push_rollback() -> Result<()> {
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -335,6 +341,8 @@ fn end_to_end_push_rollback() -> Result<()> {
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: Some("@-".to_string()),
             group: None,
@@ -405,6 +413,8 @@ fn snapshot_records_each_slots_physical_binding() -> Result<()> {
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -526,6 +536,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -581,6 +593,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         "production",
         &config2,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: Some(dep0.clone()),
             group: None,
@@ -617,6 +631,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         "production",
         &config2,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -708,6 +724,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -778,6 +796,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         "production",
         &config2,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: Some(dep0.clone()),
             group: None,
@@ -824,6 +844,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         "production",
         &config2,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -917,6 +939,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         "production",
         &config0,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -957,6 +981,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         "production",
         &config1,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -981,6 +1007,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         "production",
         &config1,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: Some("@-".to_string()),
             group: None,
@@ -1041,6 +1069,8 @@ fn dry_run_reports_plan() -> Result<()> {
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: true,
             ref_token: None,
             group: None,
@@ -1884,6 +1914,8 @@ interval_seconds = 0
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -1933,6 +1965,8 @@ fn dry_run_does_not_mutate() -> Result<()> {
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: true,
             ref_token: None,
             group: None,
@@ -2014,6 +2048,8 @@ fn historical_rollback_uses_historical_behavior() -> Result<()> {
         "production",
         &config_a,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -2032,6 +2068,8 @@ fn historical_rollback_uses_historical_behavior() -> Result<()> {
         "production",
         &config_b,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: Some(dep0),
             group: None,
@@ -2145,6 +2183,8 @@ fn historical_behavior_unavailable_fails_preflight() -> Result<()> {
         "production",
         &config_a,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -2189,6 +2229,8 @@ fn historical_behavior_unavailable_fails_preflight() -> Result<()> {
         "production",
         &config_b,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: Some(dep0),
             group: None,
@@ -2273,6 +2315,8 @@ fn incomplete_historical_behavior_fails_preflight_without_remote_mutation() -> R
         "production",
         &config_a,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -2321,6 +2365,8 @@ fn incomplete_historical_behavior_fails_preflight_without_remote_mutation() -> R
         "production",
         &config_b,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: Some(dep0),
             group: None,
@@ -2461,6 +2507,8 @@ interval_seconds = 0
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -2564,6 +2612,8 @@ fn post_lock_failure_releases_lock_and_records() -> Result<()> {
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -2670,6 +2720,8 @@ fn capacity_retention_compute_retained_failure_releases_lock() -> Result<()> {
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -2769,6 +2821,8 @@ fn step17_retention_failure_defers_maintenance_until_noop_retry() -> Result<()> 
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -2856,6 +2910,8 @@ fn step17_retention_failure_defers_maintenance_until_noop_retry() -> Result<()> 
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -2925,6 +2981,8 @@ fn noop_retry_keeps_marker_until_retention_succeeds() -> Result<()> {
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -2953,6 +3011,8 @@ fn noop_retry_keeps_marker_until_retention_succeeds() -> Result<()> {
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -2984,6 +3044,8 @@ fn noop_retry_keeps_marker_until_retention_succeeds() -> Result<()> {
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -3036,6 +3098,8 @@ fn committed_txn_write_failure_pends_commit() -> Result<()> {
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -3098,6 +3162,8 @@ fn commit_marker_write_failure_pends_commit() -> Result<()> {
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -3155,6 +3221,8 @@ fn pending_commit_attempt_reconciled_on_next_push() -> Result<()> {
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -3201,6 +3269,8 @@ fn pending_commit_attempt_reconciled_on_next_push() -> Result<()> {
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -3263,6 +3333,8 @@ fn pending_commit_attempt_reconciled_on_next_push() -> Result<()> {
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -3324,6 +3396,8 @@ fn pending_commit_diverged_generation_is_degraded_not_successful() -> Result<()>
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -3425,6 +3499,8 @@ fn pending_commit_diverged_generation_is_degraded_not_successful() -> Result<()>
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -3500,6 +3576,8 @@ fn conflicting_marker_on_main_push_is_degraded_not_pending() -> Result<()> {
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -3566,6 +3644,8 @@ fn pending_commit_conflicting_marker_is_degraded_not_pending_forever() -> Result
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -3612,6 +3692,8 @@ fn pending_commit_conflicting_marker_is_degraded_not_pending_forever() -> Result
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -3656,6 +3738,8 @@ fn pending_commit_conflicting_marker_is_degraded_not_pending_forever() -> Result
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -3732,6 +3816,8 @@ fn server_capacity_change_does_not_change_release_identity() -> Result<()> {
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -3763,6 +3849,8 @@ fn server_capacity_change_does_not_change_release_identity() -> Result<()> {
         "production",
         &config2,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -3807,6 +3895,8 @@ fn server_capacity_change_does_not_change_release_identity() -> Result<()> {
         "production",
         &config3,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -3929,6 +4019,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -3951,6 +4043,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         "production",
         &config2,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -4042,6 +4136,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         "production",
         &config0,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -4082,6 +4178,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         "production",
         &config1,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -4103,6 +4201,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         "production",
         &config1,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: Some(dep0),
             group: None,
@@ -4187,6 +4287,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         "production",
         &config0,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -4215,6 +4317,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         "production",
         &config1,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -4248,6 +4352,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         "production",
         &config_huge,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: Some("@-".to_string()),
             group: None,
@@ -4279,6 +4385,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         "production",
         &config_low,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: Some("@-".to_string()),
             group: None,
@@ -4333,6 +4441,8 @@ fn dry_run_leaves_no_trace_fingerprint() -> Result<()> {
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: true,
             ref_token: None,
             group: None,
@@ -4363,6 +4473,8 @@ fn dry_run_leaves_no_trace_fingerprint() -> Result<()> {
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: true,
             ref_token: None,
             group: None,
@@ -4416,6 +4528,8 @@ fn dry_run_factory_failure_mutates_nothing() -> Result<()> {
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: true,
             ref_token: None,
             group: None,
@@ -4466,6 +4580,8 @@ fn server_policy_change_does_not_change_release_identity() -> Result<()> {
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -4494,6 +4610,8 @@ fn server_policy_change_does_not_change_release_identity() -> Result<()> {
         "production",
         &config2,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -4587,6 +4705,8 @@ interval_seconds = 0
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -4716,6 +4836,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         dry_run: false,
         ref_token: None,
         group: None,
+        verbose: false,
+        force: false,
     };
 
     // Push `production` (content v1): deploys p1, records production's s0.
@@ -4841,6 +4963,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: Some(dep0_prod),
             group: None,
@@ -4887,6 +5011,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         "staging",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: Some(dep0_staging),
             group: None,
@@ -4956,6 +5082,8 @@ fn jj_style_refs_roll_back_along_snapshot_chain() -> Result<()> {
             "production",
             &config,
             &PushOptions {
+                verbose: false,
+                force: false,
                 dry_run: false,
                 ref_token: Some(bad.to_string()),
                 group: None,
@@ -4990,6 +5118,8 @@ fn jj_style_refs_roll_back_along_snapshot_chain() -> Result<()> {
             "production",
             &config,
             &PushOptions {
+                verbose: false,
+                force: false,
                 dry_run: false,
                 ref_token: None,
                 group: None,
@@ -5026,6 +5156,8 @@ fn jj_style_refs_roll_back_along_snapshot_chain() -> Result<()> {
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: Some("@".to_string()),
             group: None,
@@ -5042,6 +5174,8 @@ fn jj_style_refs_roll_back_along_snapshot_chain() -> Result<()> {
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: Some("parent(@, 2)".to_string()),
             group: None,
@@ -5062,6 +5196,8 @@ fn jj_style_refs_roll_back_along_snapshot_chain() -> Result<()> {
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: Some("@-".to_string()),
             group: None,
@@ -5092,6 +5228,8 @@ fn jj_style_refs_roll_back_along_snapshot_chain() -> Result<()> {
             "production",
             &config,
             &PushOptions {
+                verbose: false,
+                force: false,
                 dry_run: false,
                 ref_token: Some(token.clone()),
                 group: None,
@@ -5124,6 +5262,8 @@ fn jj_style_refs_roll_back_along_snapshot_chain() -> Result<()> {
             "production",
             &config,
             &PushOptions {
+                verbose: false,
+                force: false,
                 dry_run: false,
                 ref_token: Some(bad.to_string()),
                 group: None,

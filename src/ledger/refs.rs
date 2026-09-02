@@ -60,6 +60,29 @@ pub enum PushRef {
     Release { release: ReleaseId },
 }
 
+/// Settings for [`resolve_ref_expr`] — the trailing settings argument
+/// (data first, settings last): the caller's policy knobs for the
+/// resolution, bundled so the signature stays stable as knobs grow.
+#[derive(Debug)]
+pub(crate) struct ResolveRefSettings {
+    /// Verbose step tracing: when true, each resolution step is described
+    /// on stderr with the time spent and the debug detail (see
+    /// [`crate::trace::Tracer`]). The CLI's `--verbose` / `-v` flag sets
+    /// it; tests leave it false.
+    pub verbose: bool,
+}
+
+impl ResolveRefSettings {
+    /// The default settings: no verbose tracing (the CLI's `--verbose` /
+    /// `-v` flag opts in). TEST FIXTURES ONLY — production callers
+    /// construct the struct literal explicitly with their own `verbose`
+    /// (the CLI's flag), so this convenience is `#[cfg(test)]`.
+    #[cfg(test)]
+    pub fn quiet() -> Self {
+        Self { verbose: false }
+    }
+}
+
 /// Resolve a parsed [`RefExpr`] to a concrete [`PushRef`] against the
 /// separately-given `target` and the target's ledger in `store`.
 ///
@@ -72,26 +95,51 @@ pub enum PushRef {
 /// push argument); the relative forms never repeat it. Failures are ref
 /// errors: an empty chain, an unresolvable deployment id, and walking past
 /// the start of the chain all fail closed rather than guessing.
+///
+/// VERBOSE TRACING: when `settings.verbose` is true (the CLI's
+/// `--verbose` / `-v`), each resolution step is described on stderr with
+/// the time spent and the debug detail — the parsed expression, the ledger
+/// entry count, the successful-chain length, the base position, the
+/// ancestor walk, and the resolved ref — so a future agent can reconstruct
+/// exactly what a relative push did (see [`crate::trace::Tracer`]). The
+/// tracer is created here from the setting; the parse step is traced by the
+/// caller ([`crate::deploy::push::push`]).
 pub(crate) fn resolve_ref_expr(
     expr: &RefExpr,
     target: &str,
     store: &LocalStore,
+    settings: &ResolveRefSettings,
 ) -> Result<PushRef> {
+    let mut trace = crate::trace::Tracer::new(settings.verbose);
+    trace.step("ref.resolve", format_args!("target={target:?} expr={expr}"));
     match expr {
         // `@` / `HEAD` / the default push: the current local files.
-        RefExpr::Head => Ok(PushRef::Head),
+        RefExpr::Head => {
+            trace.step("ref.resolve.head", "HEAD push — no chain read");
+            Ok(PushRef::Head)
+        }
         // The DIRECT release form: `release:<id>` maps straight to a
         // `PushRef::Release` — no deployment-history stepping, no target
         // history required (cross-target capable by design; the release's own
         // stored slot snapshot and the CURRENT target's slots are what the
         // plan resolves against — the release-versioned vs current membership
         // equality check runs at plan time, before any remote access).
-        RefExpr::Release(release) => Ok(PushRef::Release {
-            release: release.clone(),
-        }),
+        RefExpr::Release(release) => {
+            trace.step(
+                "ref.resolve.release",
+                format_args!("release={release} — direct release form, no chain read"),
+            );
+            Ok(PushRef::Release {
+                release: release.clone(),
+            })
+        }
         RefExpr::Relative(rel) => {
             // `parent(@, 0)` is the same as `@` itself: the current state.
             if rel.base == RelBase::At && rel.steps == 0 {
+                trace.step(
+                    "ref.resolve.fold",
+                    "parent(@, 0) folds to HEAD — no chain read",
+                );
                 return Ok(PushRef::Head);
             }
             // The deployment history IS the ledger's successful entries,
@@ -99,12 +147,24 @@ pub(crate) fn resolve_ref_expr(
             // from that order — there is no stored index — so the chain is a
             // contiguous position space and any position < len is a member.
             let entries = store.read_ledger(target)?;
+            trace.step(
+                "ref.resolve.ledger",
+                format_args!("read {} ledger entries", entries.len()),
+            );
             let chain = successful_chain(&entries);
+            trace.step(
+                "ref.resolve.chain",
+                format_args!("{} successful deployments", chain.len()),
+            );
             let base_pos = resolve_base_pos(&rel.base, target, &chain, expr)?;
             let base_id = match &rel.base {
                 RelBase::At => chain[base_pos].deployment_id.as_str(),
                 RelBase::Refid(dep) => dep.as_str(),
             };
+            trace.step(
+                "ref.resolve.base",
+                format_args!("base {base_id} at position {base_pos}"),
+            );
             let pos = base_pos.checked_sub(rel.steps as usize).ok_or_else(|| {
                 Error::r#ref(format!(
                     "'{expr}' walks {} step(s) back from deployment '{base_id}' on target \
@@ -112,9 +172,20 @@ pub(crate) fn resolve_ref_expr(
                     rel.steps
                 ))
             })?;
+            trace.step(
+                "ref.resolve.step",
+                format_args!("{} step(s) back -> position {pos}", rel.steps),
+            );
+            let deployment_id = chain[pos].deployment_id.clone();
+            trace.step(
+                "ref.resolve.result",
+                format_args!(
+                    "PushRef::Deployment {{ target: {target}, deployment_id: {deployment_id} }}"
+                ),
+            );
             Ok(PushRef::Deployment {
                 target: TargetName::parse(target).expect("ledger target is a safe segment"),
-                deployment_id: chain[pos].deployment_id.clone(),
+                deployment_id,
             })
         }
     }
@@ -366,7 +437,12 @@ mod tests {
     /// Parse-then-resolve a token against the store, mirroring the engine's
     /// two-phase flow (parse first, resolve later).
     fn resolve(token: &str, store: &LocalStore) -> Result<PushRef> {
-        resolve_ref_expr(&parse_ref_expr(token)?, "production", store)
+        resolve_ref_expr(
+            &parse_ref_expr(token)?,
+            "production",
+            store,
+            &ResolveRefSettings::quiet(),
+        )
     }
 
     /// `@` / `HEAD` / `` / `parent(@, 0)` resolve to the default HEAD push.
@@ -494,7 +570,8 @@ mod tests {
             resolve_ref_expr(
                 &parse_ref_expr(&format!("release:{rid}")).expect("token must parse"),
                 "production",
-                &store
+                &store,
+                &ResolveRefSettings::quiet(),
             )
             .unwrap(),
             PushRef::Release {
@@ -505,7 +582,8 @@ mod tests {
             resolve_ref_expr(
                 &parse_ref_expr(&format!("release:{bare}")).expect("token must parse"),
                 "production",
-                &store
+                &store,
+                &ResolveRefSettings::quiet(),
             )
             .unwrap(),
             PushRef::Release {
@@ -521,7 +599,8 @@ mod tests {
             resolve_ref_expr(
                 &parse_ref_expr(&format!("release:{rid2}")).expect("must parse"),
                 "brand-new-target",
-                &empty
+                &empty,
+                &ResolveRefSettings::quiet(),
             )
             .unwrap(),
             PushRef::Release { release: rid2 }
@@ -671,7 +750,7 @@ mod tests {
             .collect();
         for (id, ok) in history {
             let expr = parse_ref_expr(id).expect("a seeded deployment id parses");
-            match resolve_ref_expr(&expr, "production", store) {
+            match resolve_ref_expr(&expr, "production", store, &ResolveRefSettings::quiet()) {
                 Ok(PushRef::Deployment {
                     deployment_id,
                     target: t,
@@ -777,8 +856,10 @@ mod tests {
             }
         };
 
-        let result = std::panic::catch_unwind(|| resolve_ref_expr(&expr, "production", &store))
-            .expect("resolve_ref_expr must never panic");
+        let result = std::panic::catch_unwind(|| {
+            resolve_ref_expr(&expr, "production", &store, &ResolveRefSettings::quiet())
+        })
+        .expect("resolve_ref_expr must never panic");
 
         // Fail-closed: every resolve failure is a ref error (the seeded
         // store is healthy, so only the ref contract can reject).

@@ -393,6 +393,8 @@ fn fingerprint_only_dry_run_leaves_remote_untouched() -> Result<()> {
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: true,
             ref_token: None,
             group: None,
@@ -454,6 +456,8 @@ fn fingerprint_only_first_push_succeeds() -> Result<()> {
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -536,6 +540,8 @@ fn fingerprint_only_repeat_push_is_idempotent() -> Result<()> {
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -555,6 +561,8 @@ fn fingerprint_only_repeat_push_is_idempotent() -> Result<()> {
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,

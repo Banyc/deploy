@@ -167,6 +167,8 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: true,
             ref_token: None,
             group: None,
@@ -193,6 +195,8 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,
@@ -311,6 +315,8 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             ref_token: None,
             group: None,

@@ -122,6 +122,8 @@ fn quickstart_fixture_parses_and_plans() -> Result<()> {
         "production",
         &config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: true,
             ref_token: None,
             group: None,

@@ -343,6 +343,8 @@ pub(crate) mod execute_tests {
             &h.config,
             target,
             &PushOptions {
+                verbose: false,
+                force: false,
                 dry_run: false,
                 ref_token: None,
                 group: None,
@@ -508,6 +510,8 @@ pub(crate) mod execute_tests {
             &config2,
             target,
             &PushOptions {
+                verbose: false,
+                force: false,
                 dry_run: false,
                 ref_token: None,
                 group: None,
@@ -829,6 +833,8 @@ interval_seconds = 0
             &config,
             target,
             &PushOptions {
+                verbose: false,
+                force: false,
                 dry_run: false,
                 ref_token: None,
                 group: None,
@@ -1123,6 +1129,8 @@ interval_seconds = 0
             &config,
             config.target("t1").expect("target t1"),
             &PushOptions {
+                verbose: false,
+                force: false,
                 dry_run: false,
                 ref_token: None,
                 group: None,
@@ -1853,6 +1861,8 @@ interval_seconds = 0
             &config,
             target,
             &PushOptions {
+                verbose: false,
+                force: false,
                 dry_run: false,
                 ref_token: None,
                 group: None,

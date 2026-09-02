@@ -85,6 +85,16 @@ pub struct PushOptions {
     /// selects a subset of the target's slots. `None` selects every slot
     /// owned by the target.
     pub group: Option<String>,
+    /// Verbose step tracing for the RELATIVE reference operations: when
+    /// true, the ref parse + resolution steps are described on stderr with
+    /// the time spent and the debug detail (see [`crate::trace::Tracer`]).
+    /// The CLI's `--verbose` / `-v` flag sets it; tests leave it false.
+    pub verbose: bool,
+    /// Force a real push even when every selected slot already runs the
+    /// desired artifact: the "Everything up to date" no-op detection is
+    /// skipped and a fresh generation is deployed and recorded. The CLI's
+    /// `--force` flag sets it; tests leave it false.
+    pub force: bool,
 }
 
 #[derive(Debug)]
@@ -247,8 +257,19 @@ pub fn push(
     // `push_inner`), so the target's snapshot chain is read at resolution
     // time — post-lock, post-reconcile — never here, before the push even
     // holds the target lock.
+    //
+    // VERBOSE TRACING: the tracer is created here (gated on `opts.verbose`,
+    // the CLI's `--verbose` / `-v`) and records the parse step; the
+    // resolution steps are traced inside [`ledger::resolve_ref_expr`] (which
+    // creates its own tracer from the same flag). Every `[trace]` line goes
+    // to stderr, so the report on stdout stays machine-parseable.
+    let mut trace = crate::trace::Tracer::new(opts.verbose);
     let ref_expr = match &opts.ref_token {
-        Some(t) => ledger::parse_ref_expr(t)?,
+        Some(t) => {
+            let expr = ledger::parse_ref_expr(t)?;
+            trace.step("ref.parse", format_args!("token={t:?} -> {expr}"));
+            expr
+        }
         None => RefExpr::Head,
     };
 
@@ -265,7 +286,14 @@ pub fn push(
     // resolve inside `push_inner` after reconciliation appended any
     // recovered snapshots: relative refs must see the reconciled append.
     let resolved = if opts.dry_run {
-        Some(ledger::resolve_ref_expr(&ref_expr, target_name, store)?)
+        Some(ledger::resolve_ref_expr(
+            &ref_expr,
+            target_name,
+            store,
+            &ledger::ResolveRefSettings {
+                verbose: opts.verbose,
+            },
+        )?)
     } else {
         None
     };
@@ -579,21 +607,36 @@ pub(crate) fn push_inner<'a>(
     // ArtifactRef equality + per-slot verification rendering the EXISTING
     // generation's identities) and the no-op path's hidden maintenance
     // wiring (A7) live in [`crate::deploy::push`].
-    if let Some(report) = check_up_to_date(
-        &preflight.pref,
-        store,
-        config,
-        target_name,
-        &project,
-        &servers,
-        &preflight.assignments,
-        &statuses,
-        &helpers,
-        &remotes,
-        &preflight.behavior_index,
-        op_id,
-        deployment_id,
-    )? {
+    //
+    // `--force` SKIPS the check entirely: a forced push always deploys a
+    // fresh generation (a new attempt, a new snapshot, the remote
+    // advanced) even when every selected slot already runs the desired
+    // artifact. The decision is traced (verbose) so a future agent can see
+    // why a fresh generation was deployed over an up-to-date target.
+    let mut trace = crate::trace::Tracer::new(opts.verbose);
+    if opts.force {
+        trace.step(
+            "push.force",
+            "skipping the 'Everything up to date' no-op check (--force)",
+        );
+    }
+    if !opts.force
+        && let Some(report) = check_up_to_date(
+            &preflight.pref,
+            store,
+            config,
+            target_name,
+            &project,
+            &servers,
+            &preflight.assignments,
+            &statuses,
+            &helpers,
+            &remotes,
+            &preflight.behavior_index,
+            op_id,
+            deployment_id,
+        )?
+    {
         return Ok(report);
     }
 

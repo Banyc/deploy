@@ -692,6 +692,8 @@ pub(crate) mod commit_tests {
             "t1",
             &h.config,
             &PushOptions {
+                verbose: false,
+                force: false,
                 dry_run: false,
                 ref_token: None,
                 group: None,

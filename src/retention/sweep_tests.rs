@@ -1033,6 +1033,8 @@ fn receiver_retention_failure_is_maintenance_not_correction() {
         "t1",
         &h.config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             group: None,
             ref_token: None,
@@ -1078,6 +1080,8 @@ fn receiver_retention_failure_is_maintenance_not_correction() {
         "t1",
         &h.config,
         &PushOptions {
+            verbose: false,
+            force: false,
             dry_run: false,
             group: None,
             ref_token: None,

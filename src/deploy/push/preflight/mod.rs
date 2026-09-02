@@ -309,7 +309,14 @@ pub(crate) fn run_preflight(
     // form.
     let pref = match resolved {
         Some(pref) => pref,
-        None => ledger::resolve_ref_expr(ref_expr, target_name, store)?,
+        None => ledger::resolve_ref_expr(
+            ref_expr,
+            target_name,
+            store,
+            &ledger::ResolveRefSettings {
+                verbose: opts.verbose,
+            },
+        )?,
     };
 
     // The COMPLETE release publication bundles built during preflight for
@@ -814,6 +821,8 @@ pub(crate) mod preflight_tests {
             "t1",
             &config,
             &PushOptions {
+                verbose: false,
+                force: false,
                 dry_run: true,
                 ref_token: None,
                 group: None,
@@ -892,6 +901,8 @@ pub(crate) mod preflight_tests {
             "t1",
             &config,
             &PushOptions {
+                verbose: false,
+                force: false,
                 dry_run: false,
                 ref_token: None,
                 group: None,
@@ -955,6 +966,8 @@ pub(crate) mod preflight_tests {
             "t1",
             &config,
             &PushOptions {
+                verbose: false,
+                force: false,
                 dry_run: false,
                 ref_token: Some(baseline_dep.as_str().to_string()),
                 group: None,
@@ -1202,6 +1215,8 @@ pub(crate) mod preflight_tests {
             "t1",
             &config2,
             &PushOptions {
+                verbose: false,
+                force: false,
                 dry_run: false,
                 ref_token: Some(
                     test_deployment_id("deploy-membership-baseline")
@@ -1294,6 +1309,8 @@ pub(crate) mod preflight_tests {
             "t1",
             &h.config,
             &PushOptions {
+                verbose: false,
+                force: false,
                 dry_run: true,
                 ref_token: Some(
                     test_deployment_id("deploy-hist-dry-s0")
@@ -1386,6 +1403,8 @@ pub(crate) mod preflight_tests {
             "t1",
             &h.config,
             &PushOptions {
+                verbose: false,
+                force: false,
                 dry_run: true,
                 ref_token: Some(id1.as_str().to_string()),
                 group: None,
@@ -1482,6 +1501,8 @@ pub(crate) mod preflight_tests {
             &config,
             target,
             &PushOptions {
+                verbose: false,
+                force: false,
                 dry_run: false,
                 ref_token: None,
                 group: None,
@@ -1601,6 +1622,8 @@ pub(crate) mod preflight_tests {
             &config,
             target,
             &PushOptions {
+                verbose: false,
+                force: false,
                 dry_run: false,
                 ref_token: None,
                 group: None,
@@ -1708,6 +1731,8 @@ pub(crate) mod preflight_tests {
             &h.config,
             target,
             &PushOptions {
+                verbose: false,
+                force: false,
                 dry_run: false,
                 ref_token: None,
                 group: None,
@@ -1891,6 +1916,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &config,
             target,
             &PushOptions {
+                verbose: false,
+                force: false,
                 dry_run: false,
                 ref_token: None,
                 group: None,
@@ -2075,6 +2102,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &h.config,
             target,
             &PushOptions {
+                verbose: false,
+                force: false,
                 dry_run: false,
                 ref_token: None,
                 group: None,
@@ -2134,6 +2163,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &h.config,
             target,
             &PushOptions {
+                verbose: false,
+                force: false,
                 dry_run: false,
                 ref_token: None,
                 group: None,
@@ -2193,6 +2224,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "t1",
             &h.config,
             &PushOptions {
+                verbose: false,
+                force: false,
                 dry_run: true,
                 ref_token: Some(id1.as_str().to_string()),
                 group: None,
@@ -2265,6 +2298,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "t1",
             &h.config,
             &PushOptions {
+                verbose: false,
+                force: false,
                 dry_run: true,
                 ref_token: None,
                 group: None,
@@ -2322,6 +2357,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                         "t1",
                         &config,
                         &PushOptions {
+                            verbose: false,
+                            force: false,
                             dry_run: dry,
                             ref_token: Some(token.clone()),
                         group: None},
@@ -2360,6 +2397,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     "t1",
                     &config,
                     &PushOptions {
+                        verbose: false,
+                        force: false,
                         dry_run: true,
                         ref_token: Some(token.clone()),
                     group: None},
@@ -2386,6 +2425,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     "t1",
                     &config,
                     &PushOptions {
+                        verbose: false,
+                        force: false,
                         dry_run: false,
                         ref_token: Some(token.clone()),
                     group: None},
@@ -2525,6 +2566,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 "t1",
                 &config2,
                 &PushOptions {
+                    verbose: false,
+                    force: false,
                     dry_run: false,
                     ref_token: None,
                     group: None,
@@ -2558,6 +2601,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &ledger::parse_ref_expr(&token).unwrap(),
                 "t1",
                 &h.store,
+                &ledger::ResolveRefSettings::quiet(),
             );
             // THE POST-RECONCILIATION chain: the pending attempt is the
             // NEWEST entry (the strictly-linear model — it was appended LAST,
@@ -2630,6 +2674,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 "t1",
                 &h.config,
                 &PushOptions {
+                    verbose: false,
+                    force: false,
                     dry_run: false,
                     ref_token: Some(token.clone()),
                     group: None,
@@ -2781,7 +2827,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             // Self-check: the token parses and genuinely fails to resolve.
             let expr = ledger::parse_ref_expr(&token).unwrap();
             assert!(
-                ledger::resolve_ref_expr(&expr, "t1", &h.store).is_err(),
+                ledger::resolve_ref_expr(
+                    &expr,
+                    "t1",
+                    &h.store,
+                    &ledger::ResolveRefSettings::quiet()
+                )
+                .is_err(),
                 "generated token must be semantically unresolvable: {token}"
             );
 
@@ -2797,6 +2849,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 "t1",
                 &h.config,
                 &PushOptions {
+                    verbose: false,
+                    force: false,
                     dry_run: true,
                     ref_token: Some(token.clone()),
                 group: None},
@@ -2894,6 +2948,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 "t1",
                 &config,
                 &PushOptions {
+                    verbose: false,
+                    force: false,
                     dry_run: true,
                     ref_token: Some(token.clone()),
                     group: Some(group.clone())},
@@ -2943,6 +2999,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     "t1",
                     &mut_config,
                     &PushOptions {
+                        verbose: false,
+                        force: false,
                         dry_run: dry,
                         ref_token: Some(token.clone()),
                         group: Some(group.clone())},

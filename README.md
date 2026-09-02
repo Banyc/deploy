@@ -101,8 +101,18 @@ marker needs neither.
 | `deploy status <target>` | What is actually running on each server right now (generation, release, variant, tree). |
 | `deploy checkpoint <target> <deployment-id>` | Atomically retain the target's history suffix at a successful deployment and sweep the unreachable content (irreversible — requires `--yes`; `--dry-run` previews the discard list). |
 
-Global flag: `--config <path>` selects a different `deploy.toml` than
-`./deploy.toml` (usable anywhere on the command line).
+Global flags: `--config <path>` selects a different `deploy.toml` than
+`./deploy.toml` (usable anywhere on the command line); `--verbose` / `-v`
+traces the RELATIVE reference operations (`@-`, `@--`, `parent(...)`,
+`<deployment-id>-`, ...) — each step of the ref parse + resolution is
+described on stderr with the time spent and the debug detail (parsed AST,
+ledger size, chain position, resolved deployment id), for debugging a push
+with an agent (`grep '\[trace\]'` on the stderr of a verbose run).
+
+`deploy push <target> --force` skips the "Everything up to date" no-op
+detection: a forced push always deploys a fresh generation (a new attempt,
+a new snapshot, the remote advanced) even when every selected slot already
+runs the desired artifact.
 
 ### Push and rollback references
 

@@ -1116,6 +1116,8 @@ impl Fixture {
             target_name,
             &self.config,
             &PushOptions {
+                verbose: false,
+                force: false,
                 dry_run: false,
                 ref_token: None,
                 group: None,
@@ -1133,6 +1135,8 @@ impl Fixture {
             target_name,
             &self.config,
             &PushOptions {
+                verbose: false,
+                force: false,
                 dry_run: false,
                 ref_token: None,
                 group: None,
@@ -1163,6 +1167,8 @@ impl Fixture {
             target_name,
             &self.config,
             &PushOptions {
+                verbose: false,
+                force: false,
                 dry_run: false,
                 ref_token: Some(ref_token.to_string()),
                 group: None,
@@ -1417,6 +1423,8 @@ impl Fixture {
                 t,
                 &self.config,
                 &PushOptions {
+                    verbose: false,
+                    force: false,
                     dry_run: false,
                     ref_token: Some(rt.to_string()),
                     group: None,
@@ -1508,6 +1516,8 @@ impl Fixture {
                     &t_owned,
                     &self.config,
                     &PushOptions {
+                        verbose: false,
+                        force: false,
                         dry_run: false,
                         ref_token: Some(rt.to_string()),
                         group: None,
@@ -1795,6 +1805,8 @@ impl Fixture {
             target_name,
             &self.config,
             &PushOptions {
+                verbose: false,
+                force: false,
                 dry_run: false,
                 ref_token: Some(ref_token.to_string()),
                 group: None,
@@ -6476,6 +6488,7 @@ fn assert_checkpoint_invariants(model: &Model, system: &Fixture) {
                 &ledger::parse_ref_expr(wid).expect("a deployment id parses"),
                 t,
                 &system.store,
+                &ledger::ResolveRefSettings::quiet(),
             )
             .unwrap_or_else(|e| panic!("{ctx}: deployment {wid} on {t} must resolve: {e}"));
             match resolved {
@@ -6502,9 +6515,13 @@ fn assert_checkpoint_invariants(model: &Model, system: &Fixture) {
         } else {
             format!("parent(@, {beyond})")
         };
-        let err =
-            ledger::resolve_ref_expr(&ledger::parse_ref_expr(&token).unwrap(), t, &system.store)
-                .unwrap_err();
+        let err = ledger::resolve_ref_expr(
+            &ledger::parse_ref_expr(&token).unwrap(),
+            t,
+            &system.store,
+            &ledger::ResolveRefSettings::quiet(),
+        )
+        .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("before the start of the deployment history")
@@ -7170,6 +7187,8 @@ fn run_slot_view_property(owners: Vec<usize>, pushes: Vec<usize>) {
             t,
             &config,
             &PushOptions {
+                verbose: false,
+                force: false,
                 dry_run: false,
                 ref_token: None,
                 group: None,
