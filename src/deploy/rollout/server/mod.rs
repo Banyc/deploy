@@ -1196,6 +1196,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let fake = bindir.join("systemctl");
         std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let fake_linger = bindir.join("loginctl");
+        std::fs::write(&fake_linger, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&fake_linger, std::fs::Permissions::from_mode(0o755)).unwrap();
         let config_home = tmp.path().join("xdg");
         // Hermetic env: fake systemctl first on PATH, temp config home. The
         // child processes (activation shell, transport commands) receive this
@@ -1450,6 +1453,12 @@ case "$1" in
   restart) if [ -f "$FAIL_RESTART" ]; then rm -f "$FAIL_RESTART"; echo "faulted" >&2; exit 1; fi; exit 0 ;;
   *) exit 0 ;;
 esac
+"#,
+                ),
+                (
+                    "loginctl",
+                    r#"#!/bin/sh
+exit 0
 "#,
                 ),
                 (

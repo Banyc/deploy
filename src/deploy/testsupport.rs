@@ -1058,6 +1058,12 @@ pub(crate) fn install_fake_systemctl(
         )
         .unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // The systemd adapter also enables lingering for the deployment account
+    // (user scope) — a fake `loginctl` that always succeeds keeps the
+    // activation hermetic.
+    let fake_linger = bindir.join("loginctl");
+    std::fs::write(&fake_linger, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&fake_linger, std::fs::Permissions::from_mode(0o755)).unwrap();
     let base_env = crate::testutil::fixture_env();
     let mut vars: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> =
         base_env.child_env().into_iter().collect();

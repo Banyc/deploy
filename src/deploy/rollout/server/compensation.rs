@@ -285,6 +285,9 @@ mod compensation_tests {
         let fake = bindir.join("systemctl");
         std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let fake_linger = bindir.join("loginctl");
+        std::fs::write(&fake_linger, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&fake_linger, std::fs::Permissions::from_mode(0o755)).unwrap();
         let config_home = tmp.path().join("xdg");
         // Hermetic env: fake systemctl on PATH, temp config home — children
         // receive this snapshot; the parent process env is never touched.

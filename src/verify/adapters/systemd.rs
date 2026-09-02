@@ -151,6 +151,20 @@ pub fn activation_commands(
     let mut cmds = Vec::new();
     let scope_user = matches!(sa.scope(), ActivationScope::User);
 
+    // 0. USER SCOPE ONLY: enable lingering for the deployment account BEFORE
+    //    installing any unit. Without it, the user manager (and therefore
+    //    every `--user` service) is terminated when the last session ends, so
+    //    a service deployed here would die on logout. `loginctl enable-linger`
+    //    with no argument enables it for the caller (the deployment account);
+    //    the default polkit policy allows a user to set lingering for
+    //    themselves without authentication, and the operation is idempotent
+    //    (an already-lingering user is a no-op). Linger is a one-time system
+    //    setting, not a per-deployment effect — the restore path never
+    //    disables it.
+    if scope_user {
+        cmds.push(vec!["loginctl".into(), "enable-linger".into()]);
+    }
+
     // 1. Parent directory + install each unit from its rendered staging file
     //    (user scope only).
     if scope_user {
@@ -1045,20 +1059,21 @@ pub(crate) mod tests {
         let c = cfg(ActivationScope::User, vec!["example.service"]);
         let cmds =
             activation_commands(Path::new("/srv/eng"), Path::new("/home/deploy/.config"), &c);
-        // First commands must mkdir + cp + chmod (install), then
-        // daemon-reload after the copy.
-        assert_eq!(cmds[0][0], "mkdir");
-        assert_eq!(cmds[1][0], "cp");
+        // Linger is enabled FIRST (user scope), then mkdir + cp + chmod
+        // (install), then daemon-reload after the copy.
+        assert_eq!(cmds[0], vec!["loginctl", "enable-linger"]);
+        assert_eq!(cmds[1][0], "mkdir");
+        assert_eq!(cmds[2][0], "cp");
         assert_eq!(
-            cmds[1][1], "/srv/eng/adapters/systemd/example.service",
+            cmds[2][1], "/srv/eng/adapters/systemd/example.service",
             "cp source is the staged rendered unit under the remote root"
         );
         assert_eq!(
-            cmds[1][2], "/home/deploy/.config/systemd/user/example.service",
+            cmds[2][2], "/home/deploy/.config/systemd/user/example.service",
             "cp destination is the user systemd dir"
         );
-        assert_eq!(cmds[2][0], "chmod");
-        assert_eq!(cmds[2][1], "0644");
+        assert_eq!(cmds[3][0], "chmod");
+        assert_eq!(cmds[3][1], "0644");
         let reload_idx = cmds
             .iter()
             .position(|c| {
@@ -1078,6 +1093,14 @@ pub(crate) mod tests {
                 |c| !(c[0] == "systemctl" && c[1] == "--user" && c[2] == "restart") || c.len() == 4
             )
         );
+    }
+
+    #[test]
+    fn system_scope_does_not_enable_linger() {
+        let c = cfg(ActivationScope::System, vec!["wrapper.service"]);
+        let cmds = activation_commands(Path::new("/srv/x"), Path::new("/home/deploy/.config"), &c);
+        // Linger is a user-scope concern: system services persist without it.
+        assert!(!cmds.iter().any(|c| c[0] == "loginctl"));
     }
 
     #[test]
@@ -1110,6 +1133,9 @@ pub(crate) mod tests {
         let fake = bindir.join("systemctl");
         std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let fake_linger = bindir.join("loginctl");
+        std::fs::write(&fake_linger, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&fake_linger, std::fs::Permissions::from_mode(0o755)).unwrap();
         let config_home = tmp.path().join("xdg");
         let base_env = crate::testutil::fixture_env();
         let mut vars: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> =
@@ -1196,6 +1222,9 @@ pub(crate) mod tests {
         let fake = bindir.join("systemctl");
         std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let fake_linger = bindir.join("loginctl");
+        std::fs::write(&fake_linger, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&fake_linger, std::fs::Permissions::from_mode(0o755)).unwrap();
         let config_home = tmp.path().join("xdg");
         let base_env = crate::testutil::fixture_env();
         let mut vars: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> =
@@ -1306,6 +1335,9 @@ pub(crate) mod tests {
         let fake = bindir.join("systemctl");
         std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let fake_linger = bindir.join("loginctl");
+        std::fs::write(&fake_linger, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&fake_linger, std::fs::Permissions::from_mode(0o755)).unwrap();
         let config_home = tmp.path().join("xdg");
         let base_env = crate::testutil::fixture_env();
         let mut vars: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> =
@@ -1362,6 +1394,9 @@ pub(crate) mod tests {
         let fake = bindir.join("systemctl");
         std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let fake_linger = bindir.join("loginctl");
+        std::fs::write(&fake_linger, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&fake_linger, std::fs::Permissions::from_mode(0o755)).unwrap();
         let config_home = tmp.path().join("xdg");
         let base_env = crate::testutil::fixture_env();
         let mut vars: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> =
@@ -1470,6 +1505,9 @@ pub(crate) mod tests {
         let fake = bindir.join("systemctl");
         std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let fake_linger = bindir.join("loginctl");
+        std::fs::write(&fake_linger, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&fake_linger, std::fs::Permissions::from_mode(0o755)).unwrap();
         let config_home = tmp.path().join("xdg");
         let base_env = crate::testutil::fixture_env();
         let mut vars: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> =
