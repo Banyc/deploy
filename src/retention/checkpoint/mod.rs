@@ -611,17 +611,17 @@ pub fn render_checkpoint_report(report: &CheckpointReport) -> Vec<String> {
     };
     lines.push(head);
     lines.push(format!(
-        "{} {} ledger entr{} below the checkpoint",
+        "{} {} ledger {} below the checkpoint",
         if report.dry_run {
             "would discard"
         } else {
             "discarded"
         },
         report.discards.discarded_entries.len(),
-        plural(report.discards.discarded_entries.len())
+        plural(report.discards.discarded_entries.len(), "entry")
     ));
     lines.push(sweep_line(
-        "deployment director",
+        "deployment directory",
         report.dry_run,
         report.discards.sweep_deployments.len(),
         report.discards.removed_deployments,
@@ -667,26 +667,35 @@ pub fn render_checkpoint_report(report: &CheckpointReport) -> Vec<String> {
 fn sweep_line(category: &str, dry_run: bool, planned: usize, removed: usize) -> String {
     if dry_run {
         format!(
-            "would remove {planned} {category}{} (unreachable)",
-            plural(planned)
+            "would remove {planned} {} (unreachable)",
+            plural(planned, category)
         )
     } else {
         let pending = planned - removed;
         match pending {
             0 => format!(
-                "removed {removed} {category}{} (unreachable)",
-                plural(removed)
+                "removed {removed} {} (unreachable)",
+                plural(removed, category)
             ),
             _ => format!(
-                "removed {removed} {category}{} (unreachable); {pending} pending",
-                plural(removed)
+                "removed {removed} {} (unreachable); {pending} pending",
+                plural(removed, category)
             ),
         }
     }
 }
 
-fn plural(n: usize) -> &'static str {
-    if n == 1 { "" } else { "s" }
+/// The plural form of `word` for a count of `n`: `1` keeps the singular,
+/// otherwise the regular `s` plural, with the `y` -> `ies` rule (entry ->
+/// entries, directory -> directories).
+fn plural(n: usize, word: &str) -> String {
+    if n == 1 {
+        word.to_string()
+    } else if let Some(stem) = word.strip_suffix('y') {
+        format!("{stem}ies")
+    } else {
+        format!("{word}s")
+    }
 }
 
 #[cfg(test)]

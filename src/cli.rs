@@ -626,11 +626,21 @@ fn render_status(observed: &ObservedTarget) -> Vec<String> {
 
 fn print_init_report(report: &crate::init::InitReport) {
     println!("created deploy project at {}", report.target.display());
+    println!(
+        "  server: {} (user: {})",
+        report.server_address, report.server_user
+    );
+    println!(
+        "  target: {} (deploy_dir: {})",
+        report.target_name,
+        report.deploy_dir.display()
+    );
+    println!("  files:");
     for f in &report.files {
-        println!("  {}", f.display());
+        println!("    {}", f.display());
     }
     for d in &report.dirs {
-        println!("  {}/  (local deployment root)", d.display());
+        println!("    {}/  (local deployment root)", d.display());
     }
     println!();
     println!("next steps (from inside the project):");
@@ -877,20 +887,19 @@ mod tests {
         let lines = render_log(&store, "production", &attempts).unwrap();
         assert_eq!(lines.len(), 2, "one line per attempt: {lines:?}");
         // A successful attempt renders its deployment id (the rollback key)
-        // as the prefix; an attempt without a snapshot renders `-`.
+        // once; an attempt without a snapshot renders the same shape (its
+        // status makes clear it is not a rollback target).
         assert_eq!(
             lines[0],
             format!(
-                "{}  {}  Successful  2026-01-01T00:00:00Z  (deployed)",
-                test_deployment_id("deploy-log-ok"),
+                "{}  Successful  2026-01-01T00:00:00Z  (deployed)",
                 test_deployment_id("deploy-log-ok")
             )
         );
-        // An entry without a rollback state keeps the columns aligned via `-`.
         assert_eq!(
             lines[1],
             format!(
-                "-  {}  FailedPreflight  2026-01-02T00:00:00Z  (preflight failed)",
+                "{}  FailedPreflight  2026-01-02T00:00:00Z  (preflight failed)",
                 test_deployment_id("deploy-log-failed")
             )
         );

@@ -77,6 +77,14 @@ pub struct InitReport {
     /// Directories created, relative to `target`, sorted (the local
     /// `.deploy-remote` deploy directory included).
     pub dirs: Vec<PathBuf>,
+    /// The scaffolded server address (the pathless `local` marker or a
+    /// hostname) and the deployment account, for the report.
+    pub server_address: String,
+    pub server_user: String,
+    /// The scaffolded owning target name (always `production`).
+    pub target_name: String,
+    /// The slot's deploy_dir (the sole physical root for a local server).
+    pub deploy_dir: PathBuf,
     /// The commands the user should run next, in order.
     pub next_steps: Vec<String>,
 }
@@ -182,6 +190,10 @@ pub fn init_project(target: &Path, opts: &InitOptions) -> Result<InitReport> {
         target,
         files,
         dirs,
+        server_address: address.clone(),
+        server_user: opts.user.clone(),
+        target_name: "production".to_string(),
+        deploy_dir,
         next_steps: vec![
             "deploy push production --dry-run".to_string(),
             "deploy push production".to_string(),
