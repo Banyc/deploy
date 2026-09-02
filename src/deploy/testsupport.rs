@@ -522,6 +522,10 @@ impl Remote for RecordingRemote {
     fn root(&self) -> &Path {
         self.inner.root()
     }
+
+    fn is_local(&self) -> bool {
+        true
+    }
     fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
         self.inner.read(rel)
     }
@@ -708,6 +712,10 @@ impl SwapInjectRemote {
 impl Remote for SwapInjectRemote {
     fn root(&self) -> &std::path::Path {
         self.inner.root()
+    }
+
+    fn is_local(&self) -> bool {
+        true
     }
     fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
         if self.stage_fire(rel) {
@@ -1191,6 +1199,10 @@ impl FakeCapacityRemote {
 impl Remote for FakeCapacityRemote {
     fn root(&self) -> &std::path::Path {
         self.inner.root()
+    }
+
+    fn is_local(&self) -> bool {
+        true
     }
     fn provision_layout(&self) -> Result<()> {
         self.inner.provision_layout()

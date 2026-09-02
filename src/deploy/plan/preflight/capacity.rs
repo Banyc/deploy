@@ -198,6 +198,10 @@ mod capacity_tests {
         fn root(&self) -> &Path {
             self.inner.root()
         }
+
+        fn is_local(&self) -> bool {
+            true
+        }
         fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
             self.inner.read(rel)
         }

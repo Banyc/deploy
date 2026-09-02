@@ -1463,6 +1463,10 @@ mod nested_guard_proptest {
         fn root(&self) -> &Path {
             &self.fake_root
         }
+
+        fn is_local(&self) -> bool {
+            true
+        }
         fn read(&self, rel: &RootedRelativePath) -> RemoteResult<Vec<u8>> {
             self.inner.read(rel)
         }
@@ -2465,6 +2469,10 @@ mod barrier_proptest {
         fn root(&self) -> &Path {
             self.inner.root()
         }
+
+        fn is_local(&self) -> bool {
+            true
+        }
         fn read(&self, rel: &RootedRelativePath) -> RemoteResult<Vec<u8>> {
             self.inner.read(rel)
         }
@@ -2753,6 +2761,10 @@ mod guard_release_retry {
     impl Remote for GuardFaultRemote {
         fn root(&self) -> &Path {
             self.inner.root()
+        }
+
+        fn is_local(&self) -> bool {
+            true
         }
         fn read(&self, rel: &RootedRelativePath) -> RemoteResult<Vec<u8>> {
             self.inner.read(rel)

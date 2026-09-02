@@ -144,6 +144,16 @@ pub struct FsBytes {
 /// by construction and a caller can never escape the deployment root.
 pub trait Remote {
     fn root(&self) -> &Path;
+    /// Whether `root()` names a path on THIS host (a [`LocalTransport`]) or
+    /// a path on a REMOTE host (an [`SshTransport`]). Callers that must
+    /// choose between direct local filesystem access and a remote exec (tree
+    /// verification) branch on this DECLARED nature — never on a local
+    /// filesystem probe of the root path, which is meaningless for a remote
+    /// root and would silently verify a same-named local directory in place
+    /// of the remote tree. Every transport MUST declare its nature (no
+    /// default): a new remote transport that forgets is a compile error, not
+    /// a silent local-verification bug.
+    fn is_local(&self) -> bool;
     fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>>;
     fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()>;
     /// Atomically create `rel` with `data` only if it does not already exist,
@@ -1422,6 +1432,10 @@ impl Remote for LocalTransport {
         &self.base
     }
 
+    fn is_local(&self) -> bool {
+        true
+    }
+
     fn provision_layout(&self) -> Result<()> {
         if !self.base.exists() {
             std::fs::create_dir_all(&self.base)
@@ -2478,6 +2492,11 @@ mod tests {
         fn root(&self) -> &Path {
             self.inner.root()
         }
+
+        fn is_local(&self) -> bool {
+            true
+        }
+
         fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
             self.inner.read(rel)
         }

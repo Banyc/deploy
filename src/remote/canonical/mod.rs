@@ -60,8 +60,11 @@ fn normalize_lexical(base: &Path, rel: &Path) -> Option<PathBuf> {
 
 /// Canonicalize a directory into a [`TreeMetadata`] and compute its digest.
 ///
-/// Rejects absolute paths, `..`, NUL bytes, duplicate normalized paths,
-/// escaping/absolute symbolic links, devices, sockets, FIFOs, and hard links.
+/// Rejects absolute paths, `..`, NUL bytes, newline/tab filenames (the
+/// remote verification wire format is line- and tab-separated, so the two
+/// verification paths must agree), duplicate normalized paths,
+/// escaping/absolute symbolic links, devices, sockets, FIFOs, and hard
+/// links.
 pub fn canonicalize_tree(root: &Path) -> Result<TreeMetadata> {
     let mut entries: Vec<TreeEntry> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -82,6 +85,18 @@ pub fn canonicalize_tree(root: &Path) -> Result<TreeMetadata> {
         if rel_str.contains('\0') {
             return Err(Error::materialization(format!(
                 "path contains NUL bytes: {}",
+                path.display()
+            )));
+        }
+        // Newline/tab filenames are refused here (at staging) so the local
+        // and remote verification paths agree: the remote script's output is
+        // line- and tab-separated, so such a filename would mangle the wire
+        // format and make the tree unverifiable on a remote. Rejecting it
+        // early turns that into a clear staging error instead of a confusing
+        // remote digest mismatch.
+        if rel_str.contains('\n') || rel_str.contains('\t') {
+            return Err(Error::materialization(format!(
+                "path contains newline or tab: {}",
                 path.display()
             )));
         }
@@ -182,16 +197,20 @@ pub fn canonicalize_tree(root: &Path) -> Result<TreeMetadata> {
 /// The remote tree-verification script: walks a tree on the remote and
 /// prints one tab-separated line per entry —
 /// `path\ttype\tmode_hex\tnlink\tcontent_sha256\tsymlink_target` — where
-/// `type` is `f`/`d`/`l`, `mode_hex` is the raw st_mode in hex, and
-/// `content_sha256` is the sha256 of the file bytes (or of the symlink
-/// target). The tool assembles the canonical metadata from this output and
-/// computes the digest ([`canonicalize_remote_entries`]), so verification
-/// never transfers the tree CONTENT — only the per-file hashes — which on
-/// a slow link costs a small round trip instead of a full tree download.
-/// Runs via `Remote::exec` as `perl -e <script> <root>`; `File::Find` and
-/// `Digest::SHA` are core perl modules on every supported host.
+/// `type` is `f`/`d`/`l`/`o` (`o` = a non-regular file: FIFO, socket, or
+/// device — classified separately so the assembler REJECTS it, mirroring
+/// the local canonicalizer's rejection of special files, and so the script
+/// never `open`s a FIFO, which would block), `mode_hex` is the raw st_mode
+/// in hex, and `content_sha256` is the sha256 of the file bytes (or of the
+/// symlink target). The tool assembles the canonical metadata from this
+/// output and computes the digest ([`canonicalize_remote_entries`]), so
+/// verification never transfers the tree CONTENT — only the per-file hashes
+/// — which on a slow link costs a small round trip instead of a full tree
+/// download. Runs via `Remote::exec` as `perl -e <script> <root>`;
+/// `File::Find` and `Digest::SHA` are core perl modules on every supported
+/// host.
 pub(crate) fn remote_tree_verify_script() -> &'static str {
-    "use File::Find; use Digest::SHA qw(sha256_hex); my $root=$ARGV[0]; find(sub { my $p=$File::Find::name; my $rel=substr($p, length($root)+1); return if $rel eq q{}; my @st=lstat($p); my $t = -l $p ? q{l} : (-d $p ? q{d} : q{f}); my $m=sprintf(q{%x}, $st[2] & 07777); my $n=$st[3]; my ($h,$tg)=(q{},q{}); if ($t eq q{f}) { open my $fh, q{<}, $p or die qq{open $p: $!}; binmode $fh; local $/; my $d=<$fh>; $h=sha256_hex($d); close $fh; } elsif ($t eq q{l}) { $tg=readlink($p); $h=sha256_hex($tg); } print qq{$rel\t$t\t$m\t$n\t$h\t$tg\n}; }, $root);"
+    "use File::Find; use Digest::SHA qw(sha256_hex); my $root=$ARGV[0]; find(sub { my $p=$File::Find::name; my $rel=substr($p, length($root)+1); return if $rel eq q{}; my @st=lstat($p); my $t = -l $p ? q{l} : (-d $p ? q{d} : (-f $p ? q{f} : q{o})); my $m=sprintf(q{%x}, $st[2] & 07777); my $n=$st[3]; my ($h,$tg)=(q{},q{}); if ($t eq q{f}) { open my $fh, q{<}, $p or die qq{open $p: $!}; binmode $fh; local $/; my $d=<$fh>; $h=sha256_hex($d); close $fh; } elsif ($t eq q{l}) { $tg=readlink($p); $h=sha256_hex($tg); } print qq{$rel\t$t\t$m\t$n\t$h\t$tg\n}; }, $root);"
 }
 
 /// Assemble canonical tree metadata from the remote verification script's
@@ -222,6 +241,16 @@ pub(crate) fn canonicalize_remote_entries(output: &str, root: &Path) -> Result<T
         if path.contains('\0') {
             return Err(Error::materialization(format!(
                 "path contains NUL bytes: {path}"
+            )));
+        }
+        // Newline/tab are the wire-format breakers: the script's output is
+        // line- and tab-separated, so a filename containing either would
+        // mangle the fields. The local canonicalizer rejects them too, so
+        // the two verification paths agree (a tree with such a filename is
+        // refused at staging, never silently unverifiable on a remote).
+        if path.contains('\n') || path.contains('\t') {
+            return Err(Error::materialization(format!(
+                "path contains newline or tab: {path}"
             )));
         }
         let normalized: String = path.nfc().collect();
@@ -265,6 +294,21 @@ pub(crate) fn canonicalize_remote_entries(output: &str, root: &Path) -> Result<T
                 if content_hash.is_empty() {
                     return Err(Error::materialization(format!(
                         "missing content hash for {normalized}"
+                    )));
+                }
+                // The remote script emits lowercase hex (Digest::SHA's
+                // sha256_hex), exactly like the local canonicalizer
+                // ([`crate::digest::sha256_bytes`]). A malformed hash (wrong
+                // length, non-hex, or uppercase) is rejected with a clear
+                // error instead of silently producing a confusing digest
+                // mismatch.
+                if content_hash.len() != 64
+                    || !content_hash
+                        .bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+                {
+                    return Err(Error::materialization(format!(
+                        "invalid content hash {content_hash:?} for {normalized}"
                     )));
                 }
                 TreeEntry {
@@ -511,6 +555,183 @@ mod tests {
             paths.contains(&"..hidden"),
             "a filename starting with '..' is valid, got {paths:?}"
         );
+    }
+
+    /// Run the remote verification script on `root` and return its stdout
+    /// (the caller asserts on the parse outcome).
+    fn run_remote_script(root: &Path) -> String {
+        let out = std::process::Command::new("perl")
+            .args(["-e", remote_tree_verify_script()])
+            .arg(root)
+            .output()
+            .expect("perl must run");
+        assert!(
+            out.status.success(),
+            "script failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// A FIFO (or socket/device) must be rejected by BOTH verification
+    /// paths: the local canonicalizer refuses non-regular files, and the
+    /// remote script classifies it as `o` (other) — never `f` — so the
+    /// assembler rejects it too, and the script never `open`s the FIFO
+    /// (which would block until the exec timeout). This pins the
+    /// convergence of the two paths on special files.
+    #[test]
+    fn special_files_rejected_by_both_canonicalizers() {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let root = dir.path().join("tree");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("file.txt"), b"content").unwrap();
+        let fifo = root.join("pipe");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o644) };
+        assert_eq!(
+            rc,
+            0,
+            "mkfifo must succeed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        // Local path: rejected.
+        let local_err = canonicalize_tree(&root).unwrap_err();
+        assert!(
+            local_err.to_string().contains("unsupported file type"),
+            "local canonicalizer must reject the FIFO, got: {local_err}"
+        );
+
+        // Remote path: the script classifies the FIFO as `o` and the
+        // assembler rejects it (and the script COMPLETES — it never blocks
+        // opening the FIFO).
+        let out = run_remote_script(&root);
+        let remote_err = canonicalize_remote_entries(&out, &root).unwrap_err();
+        assert!(
+            remote_err.to_string().contains("unsupported file type"),
+            "remote assembler must reject the FIFO, got: {remote_err}"
+        );
+    }
+
+    /// A hard link (nlink > 1) must be rejected by the remote verification
+    /// path exactly as the local canonicalizer rejects it: the script prints
+    /// the raw nlink and the assembler refuses nlink > 1.
+    #[test]
+    fn hard_links_rejected_by_remote_path() {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let root = dir.path().join("tree");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"content").unwrap();
+        std::fs::hard_link(root.join("a.txt"), root.join("b.txt")).unwrap();
+
+        // Local path: rejected.
+        let local_err = canonicalize_tree(&root).unwrap_err();
+        assert!(
+            local_err.to_string().contains("hard links not allowed"),
+            "local canonicalizer must reject the hard link, got: {local_err}"
+        );
+
+        // Remote path: the script prints nlink=2 and the assembler rejects it.
+        let out = run_remote_script(&root);
+        let remote_err = canonicalize_remote_entries(&out, &root).unwrap_err();
+        assert!(
+            remote_err.to_string().contains("hard links not allowed"),
+            "remote assembler must reject the hard link, got: {remote_err}"
+        );
+    }
+
+    /// The digest-equivalence pin extended to the entry classes the original
+    /// test missed: an EMPTY file (zero-length content hash) and a UNICODE
+    /// filename (NFC normalization must agree between the two paths).
+    #[test]
+    fn remote_script_digest_matches_for_empty_and_unicode_files() {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let root = dir.path().join("tree");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("empty.txt"), b"").unwrap();
+        // "café" written as e + combining acute (NFC-normalizes to é).
+        std::fs::write(root.join("caf\u{301}.txt"), b"unicode").unwrap();
+        let local = canonicalize_tree(&root).unwrap();
+
+        let out = run_remote_script(&root);
+        let remote = canonicalize_remote_entries(&out, &root).unwrap();
+        assert_eq!(
+            remote.tree_sha256, local.tree_sha256,
+            "remote-script digest must equal the local canonical digest"
+        );
+        assert_eq!(remote.entries, local.entries);
+    }
+
+    /// A filename containing a newline or tab is refused by BOTH
+    /// canonicalizers: the remote script's output is line- and
+    /// tab-separated, so such a filename would mangle the wire format and
+    /// make the tree unverifiable on a remote. Rejecting it in the local
+    /// canonicalizer too keeps the two verification paths in agreement —
+    /// the tree is refused at staging with a clear error, never silently
+    /// unverifiable on a remote.
+    #[test]
+    fn newline_and_tab_filenames_rejected_by_both_canonicalizers() {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let root = dir.path().join("tree");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a\nb"), b"content").unwrap();
+        let local_err = canonicalize_tree(&root).unwrap_err();
+        assert!(
+            local_err.to_string().contains("newline or tab"),
+            "local canonicalizer must reject the newline filename, got: {local_err}"
+        );
+
+        let root2 = dir.path().join("tree2");
+        std::fs::create_dir_all(&root2).unwrap();
+        std::fs::write(root2.join("a\tb"), b"content").unwrap();
+        let local_err2 = canonicalize_tree(&root2).unwrap_err();
+        assert!(
+            local_err2.to_string().contains("newline or tab"),
+            "local canonicalizer must reject the tab filename, got: {local_err2}"
+        );
+
+        // Remote path: the newline filename mangles the line split and the
+        // tab filename mangles the field split — both must fail closed.
+        let out = run_remote_script(&root);
+        assert!(
+            canonicalize_remote_entries(&out, &root).is_err(),
+            "remote assembler must reject the newline filename"
+        );
+        let out2 = run_remote_script(&root2);
+        assert!(
+            canonicalize_remote_entries(&out2, &root2).is_err(),
+            "remote assembler must reject the tab filename"
+        );
+    }
+
+    /// The remote assembler must reject a malformed content hash (wrong
+    /// length, non-hex, or uppercase) with a clear error instead of
+    /// silently folding it into the digest — a corrupted or divergent
+    /// script output must fail closed loudly.
+    #[test]
+    fn remote_entries_reject_malformed_content_hash() {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let root = dir.path().join("tree");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("file.txt"), b"content").unwrap();
+        let good = run_remote_script(&root);
+
+        for bad in [
+            // Too short.
+            "file.txt\tf\t1a4\t1\tdeadbeef\t",
+            // Non-hex.
+            "file.txt\tf\t1a4\t1\tzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\t",
+            // Uppercase hex.
+            "file.txt\tf\t1a4\t1\tABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEF\t",
+        ] {
+            let err = canonicalize_remote_entries(bad, &root).unwrap_err();
+            assert!(
+                err.to_string().contains("invalid content hash"),
+                "malformed hash must be rejected with a clear error, got: {err}"
+            );
+        }
+        // The well-formed output still parses.
+        canonicalize_remote_entries(&good, &root).unwrap();
     }
 
     /// One systematically-mutated metadata field the verifier must reject

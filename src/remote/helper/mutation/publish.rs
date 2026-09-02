@@ -93,12 +93,16 @@ impl<'a> RemoteHelper<'a> {
             )));
         }
         let root = self.remote.root().join(rel);
-        // A LocalTransport root is a LOCAL path (the tree lives on this
-        // host): canonicalize it directly — no exec, no subprocess. An
-        // SshTransport root is a REMOTE path (absent locally): run the
-        // remote verification script, which prints per-entry metadata and
-        // never transfers the tree content.
-        if root.exists() {
+        // The verification strategy is decided by the transport's DECLARED
+        // nature ([`Remote::is_local`]), never by a local filesystem probe
+        // of the root path: a LocalTransport root is a LOCAL path (the tree
+        // lives on this host) — canonicalize it directly, no exec, no
+        // subprocess. An SshTransport root is a REMOTE path — run the remote
+        // verification script, which prints per-entry metadata and never
+        // transfers the tree content. Probing `root.exists()` would silently
+        // verify a same-named LOCAL directory in place of the remote tree
+        // (false accept) or reject a valid remote tree (false reject).
+        if self.remote.is_local() {
             return match crate::remote::canonical::canonicalize_tree(&root) {
                 Ok(meta) => Ok(meta.tree_sha256 == digest.as_str()),
                 Err(_) => Ok(false),
@@ -1318,6 +1322,10 @@ pub(crate) mod tests_publish {
         fn root(&self) -> &std::path::Path {
             self.inner.root()
         }
+
+        fn is_local(&self) -> bool {
+            true
+        }
         fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
             if Self::is_staging(rel) && self.consume(|f| f == ReleasePublishFault::VerifyRead) {
                 return Err(Error::remote(
@@ -1405,6 +1413,79 @@ pub(crate) mod tests_publish {
                 ));
             }
             self.inner.fsync_tree(rel)
+        }
+    }
+
+    /// A transport that DECLARES itself remote (`is_local() = false`) while
+    /// its root is a LOCAL path — the exact shape of an SshTransport whose
+    /// remote tree path happens to exist locally. `verify_remote_tree` must
+    /// branch on the DECLARED nature ([`Remote::is_local`]), never on a
+    /// local filesystem probe of the root: a same-named local directory
+    /// must never be verified in place of the remote tree. `exec` returns
+    /// the scripted outcome exactly once (a second call is an error, so a
+    /// test can prove exec was never consulted).
+    struct DeclaredRemote {
+        inner: LocalTransport,
+        is_local: bool,
+        exec_outcome: std::sync::Mutex<Option<ExecOutcome>>,
+    }
+
+    impl Remote for DeclaredRemote {
+        fn root(&self) -> &Path {
+            self.inner.root()
+        }
+        fn is_local(&self) -> bool {
+            self.is_local
+        }
+        fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
+            self.inner.read(rel)
+        }
+        fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
+            self.inner.write(rel, data, mode)
+        }
+        fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict> {
+            self.inner.try_write_new(rel, data)
+        }
+        fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
+            self.inner.create_dir(rel)
+        }
+        fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+            self.inner.create_dir_all(rel)
+        }
+        fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
+            self.inner.set_mode(rel, mode)
+        }
+        fn list(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>> {
+            self.inner.list(rel)
+        }
+        fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
+            self.inner.rename(from, to)
+        }
+        fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
+            self.inner.symlink(target, link)
+        }
+        fn read_link(&self, rel: &RootedRelativePath) -> Result<std::path::PathBuf> {
+            self.inner.read_link(rel)
+        }
+        fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
+            self.inner.remove_file(rel)
+        }
+        fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+            self.inner.remove_dir_all(rel)
+        }
+        fn exists(&self, rel: &RootedRelativePath) -> bool {
+            self.inner.exists(rel)
+        }
+        fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta> {
+            self.inner.metadata(rel)
+        }
+        fn exec(&self, _argv: &[String], _timeout: std::time::Duration) -> Result<ExecOutcome> {
+            self.exec_outcome.lock().unwrap().take().ok_or_else(|| {
+                Error::remote("DeclaredRemote: exec called with no scripted outcome")
+            })
+        }
+        fn filesystem_bytes(&self) -> Result<FsBytes> {
+            self.inner.filesystem_bytes()
         }
     }
 
@@ -1816,5 +1897,79 @@ pub(crate) mod tests_publish {
                 }
             }
         }
+    }
+
+    /// `verify_remote_tree` must branch on the transport's DECLARED nature
+    /// ([`Remote::is_local`]), never on a local filesystem probe of the root
+    /// path. The regression: an SshTransport whose remote tree path happens
+    /// to exist as a LOCAL directory would have its LOCAL content verified
+    /// in place of the remote tree (false accept — remote corruption
+    /// undetected — or false reject). A transport declaring `is_local() =
+    /// false` must take the exec path even when the root exists locally; a
+    /// transport declaring `is_local() = true` must canonicalize locally and
+    /// never consult `exec`.
+    #[test]
+    fn verify_remote_tree_branches_on_declared_transport_nature() {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        // The REMOTE tree (content "remote") whose scripted output the
+        // fake's exec returns.
+        let remote_tree = dir.path().join("remote");
+        std::fs::create_dir_all(&remote_tree).unwrap();
+        std::fs::write(remote_tree.join("file.txt"), b"remote content").unwrap();
+        let remote_digest = crate::remote::canonical::canonicalize_tree(&remote_tree)
+            .unwrap()
+            .tree_sha256;
+        let digest = TreeDigest::parse(&remote_digest).unwrap();
+
+        // The DECOY: a local directory at the fake's root that EXISTS with
+        // DIFFERENT content — the exact shape of an SshTransport whose
+        // remote tree path happens to exist locally.
+        let base = dir.path().join("base");
+        std::fs::create_dir_all(base.join("tree")).unwrap();
+        std::fs::write(base.join("tree").join("file.txt"), b"decoy content").unwrap();
+
+        // Scripted exec output: the remote script run on the REMOTE tree.
+        let out = std::process::Command::new("perl")
+            .args(["-e", crate::remote::canonical::remote_tree_verify_script()])
+            .arg(&remote_tree)
+            .output()
+            .expect("perl must run");
+        assert!(out.status.success());
+        let scripted = ExecOutcome {
+            exit_code: 0,
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::new(),
+        };
+
+        let rel = RootedRelativePath::parse(std::path::Path::new("tree")).unwrap();
+
+        // Declared REMOTE: verification must use the scripted exec output
+        // (the remote tree) and IGNORE the local decoy — the regression the
+        // `root.exists()` probe caused (it would have verified the decoy
+        // and reported a false mismatch).
+        let remote = DeclaredRemote {
+            inner: LocalTransport::new(&crate::testutil::fixture_env(), base.clone()).unwrap(),
+            is_local: false,
+            exec_outcome: std::sync::Mutex::new(Some(scripted.clone())),
+        };
+        let helper = RemoteHelper::new(&remote);
+        assert!(
+            helper.verify_remote_tree(&rel, &digest).unwrap(),
+            "a declared-remote transport must verify via exec, ignoring the local decoy"
+        );
+
+        // Declared LOCAL: verification must canonicalize the local decoy
+        // (digest mismatch → false) and NEVER consult exec (the scripted
+        // outcome is absent — an exec call would error, not return false).
+        let local = DeclaredRemote {
+            inner: LocalTransport::new(&crate::testutil::fixture_env(), base).unwrap(),
+            is_local: true,
+            exec_outcome: std::sync::Mutex::new(None),
+        };
+        let helper = RemoteHelper::new(&local);
+        assert!(
+            !helper.verify_remote_tree(&rel, &digest).unwrap(),
+            "a declared-local transport must canonicalize the local tree, never exec"
+        );
     }
 }

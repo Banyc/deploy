@@ -1245,6 +1245,10 @@ impl Remote for SshTransport {
         &self.root
     }
 
+    fn is_local(&self) -> bool {
+        false
+    }
+
     fn prepare_identity(&self) -> Result<()> {
         // Create the local ControlMaster socket directory (0700) before any
         // ssh op: the multiplexing sockets live here, keyed by

@@ -1122,6 +1122,10 @@ impl Remote for SpyRemote {
     fn root(&self) -> &Path {
         self.inner.root()
     }
+
+    fn is_local(&self) -> bool {
+        true
+    }
     fn read(&self, rel: &RootedRelativePath) -> deploy::error::Result<Vec<u8>> {
         self.inner.read(rel)
     }
@@ -1284,6 +1288,10 @@ impl Remote for FaultRemote {
     fn root(&self) -> &Path {
         self.inner.root()
     }
+
+    fn is_local(&self) -> bool {
+        true
+    }
     fn read(&self, rel: &RootedRelativePath) -> deploy::error::Result<Vec<u8>> {
         self.inner.read(rel)
     }
@@ -1425,6 +1433,10 @@ impl Remote for FailOnceMarkerRemote {
     fn root(&self) -> &Path {
         self.inner.root()
     }
+
+    fn is_local(&self) -> bool {
+        true
+    }
     fn provision_layout(&self) -> Result<()> {
         self.inner.provision_layout()
     }
@@ -1555,6 +1567,10 @@ impl Remote for FailOnceRetentionRemote {
     fn root(&self) -> &Path {
         self.inner.root()
     }
+
+    fn is_local(&self) -> bool {
+        true
+    }
     fn provision_layout(&self) -> Result<()> {
         self.inner.provision_layout()
     }
@@ -1666,6 +1682,10 @@ impl ConflictingMarkerRemote {
 impl Remote for ConflictingMarkerRemote {
     fn root(&self) -> &Path {
         self.inner.root()
+    }
+
+    fn is_local(&self) -> bool {
+        true
     }
     fn provision_layout(&self) -> Result<()> {
         self.inner.provision_layout()

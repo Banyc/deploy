@@ -1039,6 +1039,10 @@ pub(crate) mod test_remotes {
         fn root(&self) -> &std::path::Path {
             self.inner.root()
         }
+
+        fn is_local(&self) -> bool {
+            true
+        }
         fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
             self.inner.read(rel)
         }
@@ -1141,6 +1145,10 @@ pub(crate) mod test_remotes {
         fn root(&self) -> &std::path::Path {
             self.inner.root()
         }
+
+        fn is_local(&self) -> bool {
+            true
+        }
         fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
             self.inner.read(rel)
         }
@@ -1241,6 +1249,10 @@ pub(crate) mod test_remotes {
     impl Remote for FailOnceStagingRemote {
         fn root(&self) -> &std::path::Path {
             self.inner.root()
+        }
+
+        fn is_local(&self) -> bool {
+            true
         }
         fn provision_layout(&self) -> Result<()> {
             self.inner.provision_layout()
@@ -1351,6 +1363,10 @@ pub(crate) mod test_remotes {
         fn root(&self) -> &std::path::Path {
             self.inner.root()
         }
+
+        fn is_local(&self) -> bool {
+            true
+        }
         fn provision_layout(&self) -> Result<()> {
             self.inner.provision_layout()
         }
@@ -1447,6 +1463,10 @@ pub(crate) mod test_remotes {
     impl Remote for CountingRemote {
         fn root(&self) -> &std::path::Path {
             self.inner.root()
+        }
+
+        fn is_local(&self) -> bool {
+            true
         }
         fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
             self.tick();

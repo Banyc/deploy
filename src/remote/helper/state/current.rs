@@ -1608,6 +1608,9 @@ mod tests_current {
         fn root(&self) -> &std::path::Path {
             self.inner.root()
         }
+        fn is_local(&self) -> bool {
+            true
+        }
         fn exists(&self, rel: &RootedRelativePath) -> bool {
             if rel == crate::remote::layout::current() {
                 return true;
@@ -1830,6 +1833,9 @@ mod tests_current {
     impl crate::remote::transport::Remote for HintedCurrentRemote {
         fn root(&self) -> &std::path::Path {
             self.inner.root()
+        }
+        fn is_local(&self) -> bool {
+            true
         }
         fn exists(&self, rel: &RootedRelativePath) -> bool {
             if rel == crate::remote::layout::current() {

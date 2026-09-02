@@ -84,6 +84,10 @@ mod tests {
         fn root(&self) -> &Path {
             &self.base
         }
+
+        fn is_local(&self) -> bool {
+            true
+        }
         fn read(&self, _rel: &RootedRelativePath) -> Result<Vec<u8>> {
             unreachable!("not used by run_verification")
         }
