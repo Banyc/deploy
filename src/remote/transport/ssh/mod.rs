@@ -486,9 +486,7 @@ impl SshTransport {
         // killed by the fixed command timeout mid-transfer (a truncated
         // object would fail its post-upload integrity re-hash). The bound
         // scales with the payload at a conservative minimum rate.
-        let transfer_timeout = Duration::from_secs(
-            SSH_COMMAND_TIMEOUT_SECS.max(data.len() as u64 / SSH_TRANSFER_MIN_RATE_BYTES_PER_SEC),
-        );
+        let transfer_timeout = Duration::from_secs(upload_deadline_secs(data.len() as u64));
         let out = self
             .runner
             .run(OpKind::Upload, &argv, Some(data), Some(transfer_timeout))
@@ -531,6 +529,14 @@ impl SshTransport {
         }
         Ok(out.stdout)
     }
+}
+
+/// The size-aware upload deadline: `max(SSH_COMMAND_TIMEOUT_SECS, bytes /
+/// MIN_RATE)` seconds — a large upload over a slow link is never killed
+/// mid-transfer, while a hung upload (a remote that stops reading stdin) is
+/// still bounded.
+fn upload_deadline_secs(data_len: u64) -> u64 {
+    SSH_COMMAND_TIMEOUT_SECS.max(data_len / SSH_TRANSFER_MIN_RATE_BYTES_PER_SEC)
 }
 
 /// Single-quote a string for safe inclusion in a remote shell token. A `'` is
@@ -1829,6 +1835,34 @@ mod tests_ssh {
             }),
             "ssh args must carry -o ConnectTimeout={}, got: {args:?}",
             SSH_CONNECT_TIMEOUT_SECS
+        );
+    }
+
+    /// The size-aware upload deadline must scale with the payload at the
+    /// minimum transfer rate: a small payload keeps the fixed command
+    /// deadline, a large payload extends it proportionally (a slow-but-
+    /// healthy link is never killed mid-transfer), and the bound still grows
+    /// past the fixed window the moment the payload needs more than it.
+    #[test]
+    fn upload_deadline_scales_with_payload_size() {
+        // Small payloads (and empty ones) keep the fixed command deadline.
+        assert_eq!(upload_deadline_secs(0), SSH_COMMAND_TIMEOUT_SECS);
+        assert_eq!(upload_deadline_secs(64 * 1024), SSH_COMMAND_TIMEOUT_SECS);
+        // A payload that needs more than the fixed window at the minimum
+        // rate extends the deadline proportionally (24MB at 64KB/s).
+        let mb24 = 24 * 1024 * 1024;
+        assert_eq!(
+            upload_deadline_secs(mb24),
+            mb24 / SSH_TRANSFER_MIN_RATE_BYTES_PER_SEC
+        );
+        // The boundary: a payload needing more than the fixed window at the
+        // minimum rate extends the deadline past the fixed command timeout
+        // (integer division: the deadline grows only past a full rate-unit).
+        let boundary = SSH_COMMAND_TIMEOUT_SECS * SSH_TRANSFER_MIN_RATE_BYTES_PER_SEC;
+        assert_eq!(upload_deadline_secs(boundary), SSH_COMMAND_TIMEOUT_SECS);
+        assert!(
+            upload_deadline_secs(boundary + SSH_TRANSFER_MIN_RATE_BYTES_PER_SEC)
+                > SSH_COMMAND_TIMEOUT_SECS
         );
     }
 

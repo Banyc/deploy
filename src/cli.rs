@@ -570,11 +570,7 @@ where
             }
         }
         Command::Init { .. } => unreachable!("handled above"),
-        Command::Manual => {
-            for line in render_manual() {
-                println!("{line}");
-            }
-        }
+        Command::Manual => unreachable!("handled above"),
     }
     Ok(())
 }
