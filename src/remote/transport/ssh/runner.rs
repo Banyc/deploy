@@ -392,6 +392,15 @@ pub(crate) struct SshRunner {
 }
 
 impl SshRunner {
+    /// The bound the runner applies to post-connect commands AND uploads
+    /// (the upload scales it up for large payloads via
+    /// [`crate::remote::transport::ssh::upload_deadline`]) — exposed so the
+    /// size-aware upload deadline is computed from THIS (the injected test
+    /// bound or the production 60s), never a hardcoded constant.
+    pub(crate) fn command_deadline(&self) -> Duration {
+        self.command_deadline
+    }
+
     /// Build the runner for the environment snapshot `env`: every real child
     /// this runner spawns receives the snapshot as its ENTIRE environment
     /// (see [`SysEnv::apply_to_command`]).
@@ -668,6 +677,16 @@ mod runner_property_tests {
                 })
                 .collect()
         }
+        fn log_snapshot(&self) -> Vec<(String, u32)> {
+            let log = self.log.lock().unwrap();
+            log.iter()
+                .map(|e| match e {
+                    LogEntry::Spawn { pid, .. } => ("spawn".to_string(), *pid),
+                    LogEntry::Kill { pid } => ("kill".to_string(), *pid),
+                    LogEntry::Reap { pid } => ("reap".to_string(), *pid),
+                })
+                .collect()
+        }
         /// True when the first Kill precedes the first Reap (kill-then-reap).
         fn kill_precedes_reap(&self) -> bool {
             let log = self.log.lock().unwrap();
@@ -772,15 +791,24 @@ mod runner_property_tests {
                 Stall::Hang => {
                     // Block until the runner kills us at the deadline. A bounded
                     // backstop turns a broken runner (one that never kills) into
-                    // a loud assertion failure instead of a suite-wide hang.
-                    let budget = Instant::now() + Duration::from_secs(5);
+                    // a loud assertion failure instead of a suite-wide hang. The
+                    // budget must be FAR above the deadline: under the FULL gate's
+                    // heavy parallel load the caller thread that invokes the kill
+                    // can itself be descheduled for seconds (the kill is a property
+                    // of the runner, not of when the child happens to be scheduled)
+                    // — a tight backstop would panic a HEALTHY runner's child
+                    // before the (delayed) kill lands.
+                    let budget = Instant::now() + Duration::from_secs(60);
                     while !self.killed.load(Ordering::SeqCst) && Instant::now() < budget {
                         std::thread::sleep(Duration::from_millis(1));
                     }
                     assert!(
                         self.killed.load(Ordering::SeqCst),
-                        "stalled child {} was never killed: the runner must kill then reap on deadline",
-                        self.pid
+                        "stalled child {} was never killed: ctl={:?} killed={} reaped={} — runner must kill then reap on deadline",
+                        self.pid,
+                        (self as *const ChildCtl as usize),
+                        self.killed.load(Ordering::SeqCst),
+                        self.reaped.load(Ordering::SeqCst),
                     );
                     Ok(output(0))
                 }
@@ -1147,7 +1175,9 @@ mod runner_property_tests {
                 assert_eq!(
                     state.reap_pids(),
                     vec![spawn_pid],
-                    "stalled child must be reaped exactly once"
+                    "stalled child must be reaped exactly once — full log: {:?}, live_waiters={}",
+                    state.log_snapshot(),
+                    state.live_waiters.load(Ordering::SeqCst)
                 );
                 assert!(
                     state.kill_precedes_reap(),
@@ -1690,6 +1720,9 @@ mod runner_property_tests {
         // The wait thread reaps the child, then parks on the barrier (reaped
         // but not yet completed).
         let waiter = std::thread::spawn(wait);
+        // Same generous backstop as the fake Hang loop: under the FULL gate's
+        // parallel load the wait thread can be descheduled for seconds after
+        // the kill — the budget only needs to catch a genuinely stuck wait.
         let budget = Instant::now() + Duration::from_secs(5);
         while !state.reap_pids().contains(&pid) && Instant::now() < budget {
             std::thread::sleep(Duration::from_millis(1));

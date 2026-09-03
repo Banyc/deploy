@@ -30,8 +30,7 @@ use super::{
 };
 use hostkey::{pin_known_hosts, simple_hash};
 use runner::{
-    OpKind, RunError, SSH_COMMAND_TIMEOUT_SECS, SSH_CONNECT_TIMEOUT_SECS,
-    SSH_TRANSFER_MIN_RATE_BYTES_PER_SEC, SshRunner,
+    OpKind, RunError, SSH_CONNECT_TIMEOUT_SECS, SSH_TRANSFER_MIN_RATE_BYTES_PER_SEC, SshRunner,
 };
 
 /// The framed ssh-lstat absence protocol (see [`SshTransport::metadata_opt`]):
@@ -499,10 +498,11 @@ impl SshTransport {
         // scales with the payload at a conservative minimum rate (the
         // snapshot's `DEPLOY_SSH_MIN_RATE_BYTES_PER_SEC` override, else the
         // 64KB/s default).
-        let transfer_timeout = Duration::from_secs(upload_deadline_secs(
+        let transfer_timeout = upload_deadline(
             data.len() as u64,
             upload_min_rate_bytes_per_sec(&self.env),
-        ));
+            self.runner.command_deadline(),
+        );
         let out = self
             .runner
             .run(OpKind::Upload, &argv, Some(data), Some(transfer_timeout))
@@ -547,12 +547,15 @@ impl SshTransport {
     }
 }
 
-/// The size-aware upload deadline: `max(SSH_COMMAND_TIMEOUT_SECS, bytes /
-/// min_rate)` seconds — a large upload over a slow link is never killed
-/// mid-transfer, while a hung upload (a remote that stops reading stdin) is
-/// still bounded.
-fn upload_deadline_secs(data_len: u64, min_rate: u64) -> u64 {
-    SSH_COMMAND_TIMEOUT_SECS.max(data_len / min_rate)
+/// The size-aware upload deadline: `max(runner command deadline, bytes /
+/// min_rate)` — a large upload over a slow link is never killed mid-transfer,
+/// while a hung upload (a remote that stops reading stdin) is still bounded.
+/// The BASE deadline is the runner's [`SshRunner::command_deadline`], never
+/// a hardcoded constant: the test seam injects a tiny command deadline and
+/// MUST see it applied to uploads too (the fake Hang child waits for THIS
+/// bound, not a production constant).
+fn upload_deadline(data_len: u64, min_rate: u64, command_deadline: Duration) -> Duration {
+    command_deadline.max(Duration::from_secs(data_len / min_rate))
 }
 
 /// Resolve the upload min-rate from the environment snapshot:
@@ -1733,6 +1736,7 @@ impl Remote for SshTransport {
 #[cfg(test)]
 mod tests_ssh {
     use super::*;
+    use crate::remote::transport::ssh::runner::SSH_COMMAND_TIMEOUT_SECS;
     #[cfg(test)]
     use proptest::prelude::*;
     #[cfg(test)]
@@ -1862,40 +1866,55 @@ mod tests_ssh {
     }
 
     /// The size-aware upload deadline must scale with the payload at the
-    /// minimum transfer rate: a small payload keeps the fixed command
-    /// deadline, a large payload extends it proportionally (a slow-but-
-    /// healthy link is never killed mid-transfer), and the bound still grows
-    /// past the fixed window the moment the payload needs more than it.
+    /// minimum transfer rate: a small payload keeps the command deadline, a
+    /// large payload extends it proportionally (a slow-but-healthy link is
+    /// never killed mid-transfer), and the bound still grows past the base
+    /// window the moment the payload needs more than it. The RUNNER's command
+    /// deadline is the floor — a test seam's tiny injected deadline applies to
+    /// uploads too.
     #[test]
     fn upload_deadline_scales_with_payload_size() {
-        // Small payloads (and empty ones) keep the fixed command deadline.
-        assert_eq!(upload_deadline_secs(0, 64 * 1024), SSH_COMMAND_TIMEOUT_SECS);
-        assert_eq!(
-            upload_deadline_secs(64 * 1024, 64 * 1024),
-            SSH_COMMAND_TIMEOUT_SECS
-        );
-        // A payload that needs more than the fixed window at the minimum
-        // rate extends the deadline proportionally (24MB at 64KB/s).
+        let base = Duration::from_secs(SSH_COMMAND_TIMEOUT_SECS);
+        // Small payloads (and empty ones) keep the command deadline.
+        assert_eq!(upload_deadline(0, 64 * 1024, base), base);
+        assert_eq!(upload_deadline(64 * 1024, 64 * 1024, base), base);
+        // A payload that needs more than the base window at the minimum rate
+        // extends the deadline proportionally (24MB at 64KB/s).
         let mb24 = 24 * 1024 * 1024;
         assert_eq!(
-            upload_deadline_secs(mb24, 64 * 1024),
-            mb24 / SSH_TRANSFER_MIN_RATE_BYTES_PER_SEC
+            upload_deadline(mb24, 64 * 1024, base),
+            Duration::from_secs(mb24 / SSH_TRANSFER_MIN_RATE_BYTES_PER_SEC)
         );
-        // The boundary: a payload needing more than the fixed window at the
-        // minimum rate extends the deadline past the fixed command timeout
+        // The boundary: a payload needing more than the base window at the
+        // minimum rate extends the deadline past the command deadline
         // (integer division: the deadline grows only past a full rate-unit).
         let boundary = SSH_COMMAND_TIMEOUT_SECS * SSH_TRANSFER_MIN_RATE_BYTES_PER_SEC;
-        assert_eq!(
-            upload_deadline_secs(boundary, 64 * 1024),
-            SSH_COMMAND_TIMEOUT_SECS
-        );
+        assert_eq!(upload_deadline(boundary, 64 * 1024, base), base);
         assert!(
-            upload_deadline_secs(boundary + SSH_TRANSFER_MIN_RATE_BYTES_PER_SEC, 64 * 1024)
-                > SSH_COMMAND_TIMEOUT_SECS
+            upload_deadline(
+                boundary + SSH_TRANSFER_MIN_RATE_BYTES_PER_SEC,
+                64 * 1024,
+                base
+            ) > base
         );
         // A lower configured min-rate extends the deadline proportionally
         // (the slow-link override: 24MB at 32KB/s is twice the 64KB/s bound).
-        assert_eq!(upload_deadline_secs(mb24, 32 * 1024), mb24 / (32 * 1024));
+        assert_eq!(
+            upload_deadline(mb24, 32 * 1024, base),
+            Duration::from_secs(mb24 / (32 * 1024))
+        );
+        // The RUNNER's command deadline is the floor for an upload whose
+        // payload needs less than it (the seam's tiny injected deadline
+        // applies to uploads — the fake Hang child waits for THIS bound,
+        // never a production constant); a payload that needs MORE than the
+        // floor still scales past it.
+        let tiny = Duration::from_millis(25);
+        assert_eq!(upload_deadline(0, 64 * 1024, tiny), tiny);
+        assert_eq!(upload_deadline(7, 64 * 1024, tiny), tiny);
+        assert!(
+            upload_deadline(mb24, 64 * 1024, tiny) > tiny,
+            "a payload needing more than the floor scales past it"
+        );
     }
 
     // Finding 3: `.` and `..` are excluded, and real modes are preserved.

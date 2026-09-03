@@ -1962,13 +1962,17 @@ mod cross_remote_guard_mutation {
                     gen_id: crate::identity::test_generation_id(&gen_tag)
                         .as_str()
                         .to_string(),
-                    op_id: format!("op-{op_tag}")
+                    op_id: crate::identity::test_operation_id(&op_tag)
+                        .as_str()
+                        .to_string(),
                 }
             ),
             arb_expected().prop_map(|expected| GuardOp::RemoveCurrentIf { expected }),
             ("[a-z0-9]{1,8}", "[a-z0-9]{1,8}").prop_map(|(dep_tag, tree_tag)| {
                 GuardOp::PublishFromIncoming {
-                    deployment_id: format!("deploy-{dep_tag}"),
+                    deployment_id: crate::identity::test_deployment_id(&dep_tag)
+                        .as_str()
+                        .to_string(),
                     digest: crate::identity::test_tree_digest(&tree_tag)
                         .as_str()
                         .to_string(),
@@ -1983,12 +1987,16 @@ mod cross_remote_guard_mutation {
                 ]
             )
                 .prop_map(|(op_tag, state)| GuardOp::TransactionRecord {
-                    op_id: format!("op-{op_tag}"),
+                    op_id: crate::identity::test_operation_id(&op_tag)
+                        .as_str()
+                        .to_string(),
                     state
                 }),
             ("[a-z0-9]{1,8}", "[a-z0-9]{1,8}").prop_map(|(dep_tag, gen_tag)| {
                 GuardOp::WriteCommitMarker {
-                    deployment_id: format!("deploy-{dep_tag}"),
+                    deployment_id: crate::identity::test_deployment_id(&dep_tag)
+                        .as_str()
+                        .to_string(),
                     generation: crate::identity::test_generation_id(&gen_tag)
                         .as_str()
                         .to_string(),
