@@ -1895,10 +1895,7 @@ mod tests_ssh {
         );
         // A lower configured min-rate extends the deadline proportionally
         // (the slow-link override: 24MB at 32KB/s is twice the 64KB/s bound).
-        assert_eq!(
-            upload_deadline_secs(mb24, 32 * 1024),
-            mb24 / (32 * 1024)
-        );
+        assert_eq!(upload_deadline_secs(mb24, 32 * 1024), mb24 / (32 * 1024));
     }
 
     // Finding 3: `.` and `..` are excluded, and real modes are preserved.
