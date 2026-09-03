@@ -5643,12 +5643,15 @@ impl Model {
                 // failure branch returned earlier): with no `current` link
                 // there is nothing to read inside `process_server`'s pre-swap
                 // status, so the deployment advances BOTH slots normally and
-                // the one-shot arm fires at the COMMIT STEP's status read
-                // instead — the marker write is demoted to `PendingCommit`
-                // (recoverable), the attempt is recorded, and the observed
-                // refresh re-projects the NEW live state (truthful: this
-                // push DID advance the slots). Identical to CommitMarker.
-                self.pending.insert(t, (id.clone(), v, gen_val, false));
+                // the one-shot arm fires at the COMMIT STEP's observed-
+                // refresh status read instead. THAT read failure records the
+                // slot's observed state as `Unknown` (maintenance — the
+                // refresh is best-effort), but the deployment itself is
+                // DURABLY COMMITTED: the committed-transaction record write
+                // succeeds, so the attempt finalizes Successful — a later
+                // push can re-observe the live state. NOT PendingCommit: the
+                // marker write did not fail (contrast `CommitMarker`).
+                self.append_snapshot(t, &id, v);
                 self.debt.insert(t, false);
             }
             Some(FailureClass::CommitMarker) => {
@@ -5823,13 +5826,15 @@ impl Model {
         // report statuses to the EXACT disposition — `Ok` + `FailedPreflight`
         // is a DIFFERENT class from `Err` + `NoAttempt` (see
         // `classifier_distinguishes_err_noattempt_from_ok_failed_preflight`).
-        let class = if matches!(
-            fault,
-            Some(FailureClass::CommitMarker) | Some(FailureClass::RemoteStatusPreSwap)
-        ) {
-            // `RemoteStatusPreSwap` here is the INERT case only (the pre-swap
-            // failure branch returned earlier): the deployment advanced and
-            // the commit step demoted the marker to PendingCommit.
+        let class = if matches!(fault, Some(FailureClass::CommitMarker)) {
+            // `CommitMarker`: the commit marker WRITE fails — the deployment
+            // advanced but the bookkeeping did not commit, so the attempt is
+            // PendingCommit. `RemoteStatusPreSwap` is deliberately NOT here:
+            // the INERT case's fault fires at the observed-refresh READ, which
+            // only records the slot's observed state as Unknown — the
+            // committed-transaction record write succeeds, so the deployment
+            // finalizes Successful (a refresh read failure is maintenance,
+            // not a failed commit).
             OutcomeClass::Push {
                 boundary: ReturnBoundary::Ok,
                 disposition: Disposition::Pending,
