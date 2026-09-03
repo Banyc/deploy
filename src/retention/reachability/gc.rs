@@ -194,6 +194,20 @@ impl EnumeratedEntry {
             EnumeratedEntry::Other(_) => None,
         }
     }
+
+    /// The raw directory name, for DETERMINISTIC ordering only: a recognized
+    /// entry's name is its validated identity string; an unrecognized entry's
+    /// name is the raw filesystem name. Sorting by this (never by
+    /// [`EnumeratedEntry::identity`], which is `None` for every unrecognized
+    /// entry and would leave them in readdir order) makes the deletion order
+    /// the sorted enumeration on every filesystem.
+    pub(crate) fn name(&self) -> &str {
+        match self {
+            EnumeratedEntry::Release(id) => id.as_str(),
+            EnumeratedEntry::Tree(digest) => digest.as_str(),
+            EnumeratedEntry::Other(name) => name,
+        }
+    }
 }
 
 /// Enumerate the store's targets (every directory under `targets/`), sorted
@@ -233,8 +247,9 @@ fn enumerate_dirs(root: &Path, kind: EntryKind) -> Result<Vec<EnumeratedEntry>> 
         Err(e) => return Err(Error::store(format!("read_dir {}: {e}", root.display()))),
     }
     // Sort by the raw name for determinism (the deletion order is the sorted
-    // enumeration).
-    out.sort_by(|a, b| a.identity().cmp(&b.identity()));
+    // enumeration) — never by `identity()`, which is `None` for every
+    // unrecognized entry and would leave them in filesystem readdir order.
+    out.sort_by(|a, b| a.name().cmp(b.name()));
     Ok(out)
 }
 

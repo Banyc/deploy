@@ -728,8 +728,12 @@ mod tests_current {
 
     /// EVERY malformed `current` target — an unparseable generation id, a
     /// missing `root` suffix, `generations` at a non-canonical position,
-    /// extra components, an empty target, absolute/`..` traversal — is an
-    /// integrity error, never a `None` and never a panic.
+    /// extra components, absolute/`..` traversal — is an integrity error,
+    /// never a `None` and never a panic. (The EMPTY target is excluded: an
+    /// empty symlink target cannot be created on Linux — `symlink(2)` fails
+    /// with ENOENT — so the fixture is unrepresentable there; the
+    /// parse-failure path it would exercise is identical for any malformed
+    /// target.)
     #[test]
     fn status_fails_integrity_for_malformed_current_targets() {
         let valid_gid = test_generation_id("gen-any");
@@ -749,7 +753,6 @@ mod tests_current {
                 layout::GENERATIONS_COMPONENT,
                 valid_gid.as_str()
             ),
-            "".to_string(),
             "not a path at all!!".to_string(),
         ] {
             let spec = LayoutSpec {
@@ -958,14 +961,16 @@ mod tests_current {
     /// first-deployment path) — and the malformed link is left byte-
     /// identical. This is the reported bug: a malformed link was previously
     /// mistaken for absence, so the first-deployment swap silently
-    /// overwrote it.
+    /// overwrote it. (The EMPTY target is excluded: an empty symlink target
+    /// cannot be created on Linux — `symlink(2)` fails with ENOENT — so the
+    /// fixture is unrepresentable there; the parse-failure path it would
+    /// exercise is identical for any malformed target.)
     #[test]
     fn swap_rejects_malformed_present_current() {
         for target in [
             "objects/sha256/x/root",
             "generations/not-a-gen-id/root",
             "generations/",
-            "",
         ] {
             let spec = LayoutSpec {
                 current: Some(CurrentLink::Symlink(target.to_string())),

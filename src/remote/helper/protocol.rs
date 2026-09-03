@@ -72,6 +72,7 @@ mod tests_protocol {
     use crate::remote::transport::LocalTransport;
     use crate::remote::transport::PROTOCOL_VERSION;
     use crate::remote::transport::Remote;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
     fn setup() -> (tempfile::TempDir, LocalTransport, PathBuf) {
@@ -133,6 +134,12 @@ mod tests_protocol {
             format!("{{\"protocol_version\": {}}}", PROTOCOL_VERSION + 1),
         )
         .unwrap();
+        // Pin the marker mode to the handshake's required 0o644: `std::fs::write`
+        // creates with `0o666 & ~umask` (0o644 under macOS's 0o022, 0o664 under
+        // Linux's 0o002) — an unpinned mode would fail the handshake with a
+        // ModeMismatch BEFORE the version check, masking the case under test.
+        std::fs::set_permissions(root.join(&marker), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
 
         let err = RemoteHelper::new(&remote)
             .handshake()

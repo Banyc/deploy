@@ -428,8 +428,27 @@ mod tests {
         }
         drop(_b_hold);
         drop(_c_hold);
-        let last = FileLock::acquire(&path, "op-last")
-            .map_err(|e| proptest::test_runner::TestCaseError::fail(e.to_string()))?;
+        // The flock may be TRANSIENTLY held by a forked child of a parallel
+        // test: a child spawned (fork+exec) while the winner's fd was open
+        // inherits the fd during its fork→exec window, and the flock
+        // persists until the child's exec closes it (O_CLOEXEC). The
+        // discipline under test — the lock returns to the free state on the
+        // SAME inode once the winner's fd closes — is unaffected; only the
+        // instant at which it is observable is. Wait (bounded) for the free
+        // state instead of asserting it is immediate.
+        let last = (0..50)
+            .find_map(|_| match FileLock::acquire(&path, "op-last") {
+                Ok(lock) => Some(lock),
+                Err(_) => {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    None
+                }
+            })
+            .ok_or_else(|| {
+                proptest::test_runner::TestCaseError::fail(
+                    "the lock must return to the free state after the winner's fd closes",
+                )
+            })?;
         prop_assert_eq!(
             inode_a,
             inode_id(&path),

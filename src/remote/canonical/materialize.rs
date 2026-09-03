@@ -827,6 +827,12 @@ mod tests_materialize {
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o750)).unwrap();
         std::fs::write(sub.join("inside"), b"y").unwrap();
+        // Pin the source mode explicitly: `std::fs::write` creates with
+        // `0o666 & ~umask`, which is 0o644 under macOS's 0o022 but 0o664
+        // under Linux's 0o002 — the materializer preserves the SOURCE mode,
+        // so the fixture must make it deterministic.
+        std::fs::set_permissions(sub.join("inside"), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
 
         let mappings = vec![mapping("app/", "out/")];
         let dest = dir.path().join("dest");
