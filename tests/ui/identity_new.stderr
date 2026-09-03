@@ -5,11 +5,20 @@ error[E0599]: no associated function or constant named `new` found for struct `S
    |                        ^^^ associated function or constant not found in `SlotId`
    |
 note: if you're trying to build a new `SlotId`, consider using `SlotId::parse` which returns `Result<SlotId, deploy::error::Error>`
-  --> /kache/workspace/src/identity/mod.rs:91:12
-  --> /kache/workspace/src/identity/identity/id/segments.rs:30:0
-  ::: /kache/workspace/src/identity/identity/id/segments.rs:35:1
+  --> src/identity/mod.rs
    |
-   = note: in this macro invocation
+   |               pub fn parse(s: &str) -> Result<$name> {
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+  ::: src/identity/identity/id/segments.rs
+   |
+   | / id_newtype!(
+   | |     SlotId,
+   | |     valid_name,
+   | |     "A slot identity: a single safe path segment (the shared \
+   | |      segment rule from [`crate::identity`])."
+   | | );
+   | |_- in this macro invocation
    = note: this error originates in the macro `id_newtype` (in Nightly builds, run with -Z macro-backtrace for more info)
 help: there is a method `ne` with a similar name
    |

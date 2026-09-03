@@ -11,13 +11,16 @@ warning: unreachable statement
 error[E0624]: method `create_generation` is private
   --> tests/ui/guard_primitives_are_crate_private.rs:18:11
    |
-18 |     guard.create_generation(&unimplemented!());
-   |           ^^^^^^^^^^^^^^^^^ private method
+18 |       guard.create_generation(&unimplemented!());
+   |             ^^^^^^^^^^^^^^^^^ private method
    |
-  --> /kache/workspace/src/remote/helper/state/assignment.rs:381:4
-  ::: /kache/workspace/src/remote/helper/state/assignment.rs:384:57
+  ::: src/remote/helper/state/assignment.rs
    |
-   = note: private method defined here
+   | /     pub(crate) fn create_generation(
+   | |         &self,
+   | |         spec: &GenerationSpec,
+   | |     ) -> Result<crate::remote::helper::DurableGeneration> {
+   | |_________________________________________________________- private method defined here
 
 warning: unreachable expression
   --> tests/ui/guard_primitives_are_crate_private.rs:18:29
@@ -31,13 +34,18 @@ warning: unreachable expression
 error[E0624]: method `swap_current` is private
   --> tests/ui/guard_primitives_are_crate_private.rs:19:11
    |
-19 |     guard.swap_current(&unimplemented!(), &unimplemented!(), "op");
-   |           ^^^^^^^^^^^^ private method
+19 |       guard.swap_current(&unimplemented!(), &unimplemented!(), "op");
+   |             ^^^^^^^^^^^^ private method
    |
-  --> /kache/workspace/src/remote/helper/state/current.rs:399:4
-  ::: /kache/workspace/src/remote/helper/state/current.rs:404:54
+  ::: src/remote/helper/state/current.rs
    |
-   = note: private method defined here
+   | /     pub(crate) fn swap_current(
+   | |         &self,
+   | |         expected: &ExpectedCurrent,
+   | |         gen_id: &GenerationId,
+   | |         op_id: &str,
+   | |     ) -> Result<crate::remote::helper::DurableCurrent> {
+   | |______________________________________________________- private method defined here
 
 warning: unreachable expression
   --> tests/ui/guard_primitives_are_crate_private.rs:19:24

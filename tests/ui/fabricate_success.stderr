@@ -7,4 +7,7 @@ error[E0308]: mismatched types
    |         arguments to this function are incorrect
    |
 note: associated function defined here
-  --> /kache/workspace/src/kernel/terminal.rs:470:11
+  --> src/kernel/terminal.rs
+   |
+   |     pub fn new(
+   |            ^^^
