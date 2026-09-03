@@ -1183,7 +1183,11 @@ mod tests_current {
     /// `generations/<id>/root`, canonical-with-malformed-id, `generations/
     /// <id>` without the `root` suffix, extra components
     /// (`foo/generations/<id>/root`), no-`generations` paths, and arbitrary
-    /// garbage (including empty).
+    /// printable garbage. The EMPTY target is deliberately EXCLUDED: an
+    /// empty symlink target cannot be created on Linux (`symlink(2)` fails
+    /// with ENOENT), while macOS accepts it — the install would diverge by
+    /// platform, and the garbage-parse arm needs no empty string to be
+    /// exercised.
     fn arbitrary_current_target() -> impl Strategy<Value = String> {
         prop_oneof![
             // Canonical shape with an ARBITRARY id (valid or malformed).
@@ -1210,8 +1214,9 @@ mod tests_current {
             // No generations component: arbitrary path-ish garbage.
             "[a-zA-Z0-9/._-]{1,60}",
             // Arbitrary printable garbage (may or may not contain
-            // `generations` as a component; may be empty).
-            "[ -~]{0,60}",
+            // `generations` as a component); non-empty — an empty symlink
+            // target is uncreatable on Linux (ENOENT).
+            "[ -~]{1,60}",
         ]
     }
 
