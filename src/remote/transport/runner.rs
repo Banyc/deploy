@@ -144,7 +144,22 @@ fn child_exited_unreaped(pid: u32) -> std::io::Result<bool> {
         }
         return Err(e);
     }
-    Ok(si.si_pid != 0)
+    Ok(siginfo_pid(&si) != 0)
+}
+
+/// The `si_pid` of a `siginfo_t` after a successful `waitid`: a FIELD on
+/// macOS, a METHOD on Linux (libc 0.2.155+ exposes the union members as
+/// methods there) — the accessor hides the platform difference so the
+/// caller is portable.
+#[cfg(target_os = "linux")]
+fn siginfo_pid(si: &libc::siginfo_t) -> libc::pid_t {
+    // SAFETY: the union field is valid after a successful `waitid` wrote
+    // the siginfo.
+    unsafe { si.si_pid() }
+}
+#[cfg(not(target_os = "linux"))]
+fn siginfo_pid(si: &libc::siginfo_t) -> libc::pid_t {
+    si.si_pid
 }
 
 /// The LIVE (non-zombie) members of the process group `pgid`, excluding the
@@ -162,7 +177,11 @@ fn live_group_members(pgid: i32, exclude_pid: u32) -> Vec<i32> {
         return members;
     };
     for entry in entries.flatten() {
-        let Some(name) = entry.file_name().to_str() else {
+        // Bind the OsString first: `file_name().to_str()` borrows from a
+        // temporary that dies at the end of the let-else, so the `&str`
+        // would dangle (E0716).
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
             continue;
         };
         let Ok(pid) = name.parse::<i32>() else {
