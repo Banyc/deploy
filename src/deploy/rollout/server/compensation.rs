@@ -288,9 +288,12 @@ mod compensation_tests {
         let fake_linger = bindir.join("loginctl");
         std::fs::write(&fake_linger, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&fake_linger, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let config_home = tmp.path().join("xdg");
-        // Hermetic env: fake systemctl on PATH, temp config home — children
-        // receive this snapshot; the parent process env is never touched.
+        // Hermetic env: fake systemctl on PATH — children receive this
+        // snapshot; the parent process env is never touched. The config home
+        // is OWNED by the harness (a per-harness temp `XDG_CONFIG_HOME`
+        // injected into the transport env — see [`Harness::new`]), so the
+        // installed unit lands under the harness's own temp dir, never the
+        // real host's `$HOME/.config`.
         let base = crate::testutil::fixture_env();
         let mut vars: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> =
             base.child_env().into_iter().collect();
@@ -305,7 +308,6 @@ mod compensation_tests {
             )
             .into(),
         );
-        vars.insert("XDG_CONFIG_HOME".into(), config_home.as_os_str().to_owned());
         let env = crate::env::SysEnv::from_map(vars);
 
         let outcome = (|| {
@@ -396,9 +398,12 @@ mod compensation_tests {
             // its own immutable release id, variant, tree, AND the prior
             // deployment identity (`deployment_id`/`generation`) — never the
             // desired release/tree or the failed generation's identities the
-            // failed push would have rendered.
+            // failed push would have rendered. The unit link is under the
+            // HARNESS-OWNED config home (a per-harness temp dir) — never the
+            // real host's `$HOME/.config`.
             let installed =
-                std::fs::read_to_string(config_home.join("systemd/user/example.service")).unwrap();
+                std::fs::read_to_string(h.config_home().join("systemd/user/example.service"))
+                    .unwrap();
             assert!(
                 installed.contains(&format!(
                     "--release={}",

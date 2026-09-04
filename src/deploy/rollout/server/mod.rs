@@ -761,6 +761,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         pub(crate) _project: PathBuf,
         pub(crate) tree: TreeDigest,
         pub(crate) remote: LocalTransport,
+        /// The simulated remote host's config home (a per-harness temp dir):
+        /// the systemd adapter's unit link lives under
+        /// `<config_home>/systemd/user/<unit>`. OWNED by the harness —
+        /// injected into the transport env, never taken from the caller — so
+        /// a systemd test can never resolve the REAL host's `$HOME/.config`
+        /// (parallel tests would race each other's unit link).
+        config_home: PathBuf,
     }
 
     impl Harness {
@@ -815,7 +822,21 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 )
                 .unwrap();
 
-            let remote = LocalTransport::new(env, dir.path().join("remote")).unwrap();
+            // THE REMOTE-HOST ENV: the transport's children resolve the
+            // systemd adapter's config home from THIS env (the `sh -c` probe
+            // reads `${XDG_CONFIG_HOME:-$HOME/.config}`). The harness OWNS the
+            // config home — a per-harness temp dir is injected, so a systemd
+            // test can never resolve the REAL host's `$HOME/.config` (parallel
+            // tests would race each other's unit link: a concurrent restore's
+            // `rm` could remove another test's baseline-installed unit,
+            // flipping its prior capture to absent and letting the restore's
+            // rm branch succeed → `Restored` instead of `FailedAfterAdvance`).
+            let config_home = dir.path().join("xdg");
+            let mut vars: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> =
+                env.child_env().into_iter().collect();
+            vars.insert("XDG_CONFIG_HOME".into(), config_home.as_os_str().to_owned());
+            let remote_env = crate::env::SysEnv::from_map(vars);
+            let remote = LocalTransport::new(&remote_env, dir.path().join("remote")).unwrap();
             Harness {
                 _dir: dir,
                 config,
@@ -823,7 +844,16 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 _project: project,
                 tree,
                 remote,
+                config_home,
             }
+        }
+
+        /// The simulated remote host's config home — the base of the systemd
+        /// unit link (`<config_home>/systemd/user/<unit>`). The harness OWNS
+        /// it (a per-harness temp dir injected into the transport env), so
+        /// tests assert on the installed unit here, never on a host path.
+        pub(crate) fn config_home(&self) -> &Path {
+            &self.config_home
         }
 
         pub(crate) fn behave(&self) -> BehaviorContract {
@@ -1183,14 +1213,15 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     /// construction at both `run_activation` call sites; staging reads the
     /// unit from `generations/<gid>/root/<artifact>`, so a `root/root`
     /// double-join would ENOENT and the push would never reach Activated.
-    /// Fake `systemctl` in PATH and a temp `XDG_CONFIG_HOME` keep the
-    /// activation hermetic (same pattern as the adapter end-to-end test; the
-    /// shared `ENV_LOCK` serializes env-mutating tests).
+    /// Fake `systemctl` in PATH keeps the activation hermetic; the config
+    /// home is OWNED by the harness (a per-harness temp `XDG_CONFIG_HOME`
+    /// injected into the transport env — see [`Harness::new`]), so the
+    /// installed unit lands under the harness's own temp dir, never the real
+    /// host's `$HOME/.config`.
     #[test]
     fn systemd_push_activation_uses_generation_root_not_nested() {
         let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
-        // Fake systemctl (daemon-reload/enable/restart all succeed) and a temp
-        // config home so the installed unit lands somewhere hermetic.
+        // Fake systemctl (daemon-reload/enable/restart all succeed) on PATH.
         let bindir = tmp.path().join("bin");
         std::fs::create_dir_all(&bindir).unwrap();
         let fake = bindir.join("systemctl");
@@ -1199,10 +1230,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let fake_linger = bindir.join("loginctl");
         std::fs::write(&fake_linger, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&fake_linger, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let config_home = tmp.path().join("xdg");
-        // Hermetic env: fake systemctl first on PATH, temp config home. The
-        // child processes (activation shell, transport commands) receive this
-        // snapshot; the parent process env is never touched.
+        // Hermetic env: fake systemctl first on PATH. The child processes
+        // (activation shell, transport commands) receive this snapshot; the
+        // parent process env is never touched. The config home is the
+        // harness's own (injected by [`Harness::new`]).
         let base = crate::testutil::fixture_env();
         let mut vars: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> =
             base.child_env().into_iter().collect();
@@ -1217,7 +1248,6 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             )
             .into(),
         );
-        vars.insert("XDG_CONFIG_HOME".into(), config_home.as_os_str().to_owned());
         let env = crate::env::SysEnv::from_map(vars);
 
         let outcome = {
@@ -1280,8 +1310,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             // through `generations/<gid>/root` and rendered it with the slot
             // context — the deploy_dir of the OPEN REMOTE (the slot's real
             // deployment location, which in production is the config-declared
-            // deploy_dir itself).
-            let installed = config_home.join("systemd/user/example.service");
+            // deploy_dir itself). The unit link is under the HARNESS-OWNED
+            // config home (a per-harness temp dir) — never the real host's
+            // `$HOME/.config`.
+            let installed = h.config_home().join("systemd/user/example.service");
             assert_eq!(
                 std::fs::read_to_string(&installed).unwrap(),
                 format!(
@@ -1292,6 +1324,79 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             Ok::<(), String>(())
         };
         outcome.unwrap();
+    }
+
+    /// THE HARNESS-OWNED CONFIG HOME (the structural fix for the
+    /// shared-host-path flake): the systemd adapter's unit link must ALWAYS
+    /// resolve under the harness's own temp dir — never the real host's
+    /// `$HOME/.config` — no matter what env the caller passes. A plain
+    /// process snapshot (no `XDG_CONFIG_HOME`) would resolve to the real
+    /// host, and parallel tests would race each other's unit link: a
+    /// concurrent restore's `rm` (the first-deploy absence branch) could
+    /// remove another test's baseline-installed unit, flipping its prior
+    /// capture to absent and letting the restore's rm branch succeed →
+    /// `Restored` instead of `FailedAfterAdvance`.
+    #[test]
+    fn harness_config_home_is_hermetic() {
+        // Fake systemctl/loginctl on PATH (macOS has neither) so the
+        // activation commands succeed; the config home is the harness's own.
+        let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let bindir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        for name in ["systemctl", "loginctl"] {
+            let shim = bindir.join(name);
+            std::fs::write(&shim, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let base = crate::testutil::fixture_env();
+        let mut vars: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> =
+            base.child_env().into_iter().collect();
+        vars.insert(
+            "PATH".into(),
+            format!(
+                "{}:{}",
+                bindir.display(),
+                base.path()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            )
+            .into(),
+        );
+        let env = crate::env::SysEnv::from_map(vars);
+        let h = Harness::new(
+            &env,
+            SYSTEMD_TOML,
+            SYSTEMD_VARIANT,
+            &[
+                ("build/output/app/server", "v1"),
+                ("deployment/common/README", "common"),
+                (
+                    "units/example.service",
+                    "[Service]\nExecStart={{ deploy_dir }}/current/app/server\n",
+                ),
+            ],
+        );
+        // The config home is under the harness's own temp dir — the caller's
+        // env (a plain process snapshot, no XDG_CONFIG_HOME) cannot leak the
+        // real host's `$HOME/.config` into the simulated remote host.
+        assert!(
+            h.config_home().starts_with(h._dir.path()),
+            "the harness config home must be under the harness's own temp dir, got {}",
+            h.config_home().display()
+        );
+        // And a push installs the unit there (the link the adapter writes).
+        let proc = h.run(None);
+        assert!(
+            matches!(proc.state, SlotExecution::Advanced { .. }),
+            "the systemd push must activate: {:?}",
+            proc.state
+        );
+        assert!(
+            h.config_home()
+                .join("systemd/user/example.service")
+                .is_file(),
+            "the installed unit must land under the harness-owned config home"
+        );
     }
 
     // ---- THE ADAPTER-TRANSACTION FAULT MATRIX (the review's P1 acceptance) --
@@ -1731,6 +1836,11 @@ exec /usr/bin/test "$@"
     /// driven through the REAL `process_server`, classified by the kernel.
     fn run_fault_case(fault: TxnFault, state: SlotState) -> (TerminalDisposition, SlotExecution) {
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        // The harness OWNS the config home (a per-harness temp `XDG_CONFIG_HOME`
+        // injected into the transport env), so the unit link is isolated per
+        // fault case by construction — a plain process snapshot would resolve
+        // to the REAL `$HOME/.config`, and parallel tests would race each
+        // other's `example.service` link (see [`Harness::new`]).
         let (env, shims) = FaultShims::install(dir.path(), &crate::testutil::fixture_env());
         let h = Harness::new(
             &env,
