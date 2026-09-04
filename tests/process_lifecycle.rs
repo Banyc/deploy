@@ -279,7 +279,18 @@ fn script_for(kind: ChildKind, dir: &Path) -> Vec<String> {
         ChildKind::LateMarker => vec![
             "sh".into(),
             "-c".into(),
-            format!("sleep 1.2; touch {}", dir.join("marker").display()),
+            // The marker write stays at 1.2s — past the 1s deadline, so a
+            // leaked (returned-while-still-alive) child is caught writing
+            // AFTER the outcome by the no-post-return-fs probe — but the
+            // child then KEEPS RUNNING for 10 more seconds: the
+            // honest-failure survivor assertion (`assert_pid_alive` under
+            // the injected Inert kill) must find the child still alive, and
+            // under parallel load the outcome processing can exceed the old
+            // 0.2s margin between the deadline and the child's self-exit.
+            format!(
+                "sleep 1.2; touch {}; sleep 10",
+                dir.join("marker").display()
+            ),
         ],
     }
 }
