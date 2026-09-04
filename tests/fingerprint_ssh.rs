@@ -383,6 +383,7 @@ fn fingerprint_only_dry_run_leaves_remote_untouched() -> Result<()> {
             Some(fp.as_str()),
             &cache,
             &env,
+            false,
         )?))
     };
 
@@ -446,6 +447,7 @@ fn fingerprint_only_first_push_succeeds() -> Result<()> {
             Some(fp.as_str()),
             &cache,
             &env,
+            false,
         )?))
     };
 
@@ -530,6 +532,7 @@ fn fingerprint_only_repeat_push_is_idempotent() -> Result<()> {
             Some(fp.as_str()),
             &cache,
             &env,
+            false,
         )?))
     };
 

@@ -157,7 +157,12 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
     let factory = move |s: &deploy::config::ServerDef,
                         slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
-        create_remote(&deploy::env::SysEnv::from_process(), s, slot.deploy_dir())
+        create_remote(
+            &deploy::env::SysEnv::from_process(),
+            s,
+            slot.deploy_dir(),
+            false,
+        )
     };
 
     let r_dry = push(

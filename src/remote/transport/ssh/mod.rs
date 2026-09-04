@@ -174,6 +174,11 @@ pub struct SshTransport {
     /// ([`SshRunner`]): hard deadline, kill, and deterministic reap, so no
     /// operation can run unbounded after connection establishment.
     runner: SshRunner,
+    /// Per-file upload tracing (`--verbose`): when set, each `upload_bytes`
+    /// emits `[trace] upload.start` / `[trace] upload.done` lines to stderr
+    /// naming the remote path, the payload size, and the elapsed time, so a
+    /// stalled push can be attributed to the exact file being transferred.
+    verbose: bool,
     /// Test-only swap injection for the descriptor-bound verification helper:
     /// a `VerifySwap` stored as a Rust VALUE (never via env) that
     /// `verify_open_script` embeds as literals. `#[cfg(test)]`-gated so
@@ -211,6 +216,7 @@ impl SshTransport {
         host_key_fingerprint: Option<&str>,
         known_hosts_cache_dir: &Path,
         env: &SysEnv,
+        verbose: bool,
     ) -> Result<Self> {
         if user.is_empty() || address.is_empty() {
             return Err(Error::transport(
@@ -255,6 +261,7 @@ impl SshTransport {
             mux_socket_dir: env.temp_dir().join("dmux"),
             env: env.clone(),
             runner: SshRunner::new(env),
+            verbose,
             #[cfg(test)]
             test_verify_swap: std::sync::Mutex::new(None),
         };
@@ -291,6 +298,7 @@ impl SshTransport {
             host_key_fingerprint,
             known_hosts_cache_dir,
             env,
+            false,
         )?;
         t.runner = runner;
         Ok(t)
@@ -318,6 +326,8 @@ impl SshTransport {
             "PreferredAuthentications=publickey".into(),
             "-o".into(),
             format!("ConnectTimeout={SSH_CONNECT_TIMEOUT_SECS}"),
+            "-o".into(),
+            "Compression=yes".into(),
             // SSH connection multiplexing: every operation of a push reuses
             // ONE persistent master connection per user@host:port, so the
             // multi-round-trip handshake (banner, key exchange, auth,
@@ -484,6 +494,12 @@ impl SshTransport {
     /// bounded wait, so an upload to a remote that stops reading (hung remote
     /// mid-`cat`) times out after `SSH_COMMAND_TIMEOUT_SECS` instead of
     /// blocking the push indefinitely.
+    ///
+    /// When the transport was built with `verbose` (the CLI's `--verbose`),
+    /// each upload emits `[trace] upload.start` / `[trace] upload.done` lines
+    /// to stderr naming the remote path, the payload size, and the elapsed
+    /// time — so a stalled or slow push can be attributed to the exact file
+    /// being transferred.
     pub(crate) fn upload_bytes(&self, rel: &Path, data: &[u8], mode: u32) -> Result<()> {
         let remote_path = self.root.join(rel);
         let remote_path_str = remote_path.to_string_lossy().into_owned();
@@ -498,11 +514,14 @@ impl SshTransport {
         // scales with the payload at a conservative minimum rate (the
         // snapshot's `DEPLOY_SSH_MIN_RATE_BYTES_PER_SEC` override, else the
         // 64KB/s default).
-        let transfer_timeout = upload_deadline(
-            data.len() as u64,
-            upload_min_rate_bytes_per_sec(&self.env),
-            self.runner.command_deadline(),
-        );
+        let bytes = data.len() as u64;
+        let min_rate = upload_min_rate_bytes_per_sec(&self.env);
+        let command_deadline = self.runner.command_deadline();
+        let transfer_timeout = upload_deadline(bytes, min_rate, command_deadline);
+        if self.verbose {
+            eprintln!("[trace] upload.start: {remote_path_str} ({bytes} bytes)");
+        }
+        let started = std::time::Instant::now();
         let out = self
             .runner
             .run(OpKind::Upload, &argv, Some(data), Some(transfer_timeout))
@@ -511,9 +530,24 @@ impl SshTransport {
                 RunError::StdinWrite(m) => Error::transport(format!("ssh upload stdin write: {m}")),
                 RunError::Wait(m) => Error::transport(format!("ssh upload wait: {m}")),
                 RunError::Timeout { after } => {
-                    Error::transport(format!("ssh upload timed out after {after:?}"))
+                    // DIAGNOSIS, not a dead end: name the file and size, and
+                    // point at the fix (slow link vs hung remote).
+                    upload_timeout_error(
+                        after,
+                        bytes,
+                        &remote_path_str,
+                        transfer_timeout,
+                        command_deadline,
+                        min_rate,
+                    )
                 }
             })?;
+        if self.verbose {
+            eprintln!(
+                "[trace] upload.done: {remote_path_str} +{:.1}s",
+                started.elapsed().as_secs_f32()
+            );
+        }
         if !out.status.success() {
             return Err(Error::transport(format!(
                 "ssh upload failed: {}",
@@ -556,6 +590,42 @@ impl SshTransport {
 /// bound, not a production constant).
 fn upload_deadline(data_len: u64, min_rate: u64, command_deadline: Duration) -> Duration {
     command_deadline.max(Duration::from_secs(data_len / min_rate))
+}
+
+/// Build the DIAGNOSTIC error for an upload that hit its deadline. A size-
+/// scaled deadline (`deadline > command_deadline`) means the link is slower
+/// than the assumed minimum rate — the message says so and points at the
+/// `DEPLOY_SSH_MIN_RATE_BYTES_PER_SEC` override with a concrete suggested
+/// value (half the current rate), so a slow link is recoverable without
+/// reading the source. A bare command deadline means the remote stopped
+/// reading stdin (a hung remote or wedged filesystem) — a different failure
+/// that a rate override cannot fix. Both branches name the remote file and
+/// its byte size so a stalling file is attributable.
+fn upload_timeout_error(
+    after: Duration,
+    bytes: u64,
+    remote_path: &str,
+    deadline: Duration,
+    command_deadline: Duration,
+    min_rate: u64,
+) -> Error {
+    if deadline > command_deadline {
+        let suggested = (min_rate / 2).max(1024);
+        Error::transport(format!(
+            "ssh upload timed out after {after:?}: {bytes} bytes to '{remote_path}' did not finish \
+             within the size-scaled deadline (bytes / min_rate = {bytes} / {min_rate} B/s; the \
+             default minimum is {SSH_TRANSFER_MIN_RATE_BYTES_PER_SEC} B/s, overridable via \
+             DEPLOY_SSH_MIN_RATE_BYTES_PER_SEC). The link is slower than the assumed minimum — \
+             retry with DEPLOY_SSH_MIN_RATE_BYTES_PER_SEC={suggested} (half the current rate) or \
+             lower so the deadline scales to the real link speed"
+        ))
+    } else {
+        Error::transport(format!(
+            "ssh upload timed out after {after:?}: {bytes} bytes to '{remote_path}' did not finish \
+             within the base command deadline ({command_deadline:?}) — the remote likely stopped \
+             reading stdin (a hung remote or wedged filesystem)"
+        ))
+    }
 }
 
 /// Resolve the upload min-rate from the environment snapshot:
@@ -1764,6 +1834,7 @@ mod tests_ssh {
             None,
             Path::new("/tmp/deploy-ssh-knownhosts-unit"),
             &test_env(),
+            false,
         )
         .unwrap()
     }
@@ -1785,6 +1856,7 @@ mod tests_ssh {
             None,
             Path::new("/tmp/deploy-ssh-knownhosts-unit"),
             &test_env(),
+            false,
         )
         .err()
         .expect("the filesystem root must be refused as a deploy_dir");
@@ -1806,6 +1878,7 @@ mod tests_ssh {
             Some("SHA256:abc"),
             Path::new("/tmp/deploy-ssh-knownhosts-unit"),
             &test_env(),
+            false,
         )
         .err()
         .expect("both identity sources must be rejected");
@@ -1828,6 +1901,7 @@ mod tests_ssh {
             None,
             Path::new("/tmp/deploy-ssh-knownhosts-unit"),
             &test_env(),
+            false,
         )
         .err()
         .expect("missing identity must be rejected");
@@ -1915,6 +1989,47 @@ mod tests_ssh {
             upload_deadline(mb24, 64 * 1024, tiny) > tiny,
             "a payload needing more than the floor scales past it"
         );
+    }
+
+    /// A size-scaled upload timeout names the file, the size, the deadline
+    /// math, and the `DEPLOY_SSH_MIN_RATE_BYTES_PER_SEC` fix with a concrete
+    /// suggestion — an agent hitting a slow link can recover without reading
+    /// the source.
+    #[test]
+    fn upload_timeout_error_names_file_and_rate_fix() {
+        let base = Duration::from_secs(SSH_COMMAND_TIMEOUT_SECS);
+        let err = upload_timeout_error(
+            Duration::from_secs(372),
+            24 * 1024 * 1024,
+            "/srv/app/app/bin/linux/armv7/proxy",
+            Duration::from_secs(372),
+            base,
+            64 * 1024,
+        );
+        let msg = err.to_string();
+        // The file and byte size are attributable.
+        assert!(msg.contains("/srv/app/app/bin/linux/armv7/proxy"));
+        assert!(msg.contains("25165824 bytes"));
+        // The deadline math and the override are named.
+        assert!(msg.contains("DEPLOY_SSH_MIN_RATE_BYTES_PER_SEC"));
+        assert!(msg.contains("DEPLOY_SSH_MIN_RATE_BYTES_PER_SEC=32768"));
+        // It is identified as a size-scaled (slow-link) timeout, not a hang.
+        assert!(msg.contains("size-scaled"));
+    }
+
+    /// A bare command-deadline timeout is diagnosed as a hung remote (the
+    /// remote stopped reading stdin), NOT as a slow link — a rate override
+    /// cannot fix a hang, so the message must not send the user there.
+    #[test]
+    fn upload_timeout_error_distinguishes_hung_remote() {
+        let base = Duration::from_secs(SSH_COMMAND_TIMEOUT_SECS);
+        let err =
+            upload_timeout_error(base, 512, "/srv/app/app/config.toml", base, base, 64 * 1024);
+        let msg = err.to_string();
+        assert!(msg.contains("base command deadline"));
+        assert!(msg.contains("stopped reading stdin"));
+        // The slow-link fix must NOT be suggested for a hang.
+        assert!(!msg.contains("DEPLOY_SSH_MIN_RATE_BYTES_PER_SEC="));
     }
 
     // Finding 3: `.` and `..` are excluded, and real modes are preserved.
@@ -3362,6 +3477,7 @@ exec /bin/mv "$@"
                 Some(self.fingerprint.as_str()),
                 cache,
                 env,
+                false,
             )
             .unwrap()
         }

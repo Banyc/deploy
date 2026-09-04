@@ -71,6 +71,7 @@ pub fn create_remote(
     env: &SysEnv,
     server: &ServerDef,
     deploy_dir: &std::path::Path,
+    verbose: bool,
 ) -> Result<Box<dyn Remote>> {
     match server.connection() {
         ServerConnection::Local { .. } => {
@@ -130,6 +131,7 @@ pub fn create_remote(
                 host_key_fingerprint,
                 &known_hosts_cache_dir,
                 env,
+                verbose,
             )?))
         }
     }
@@ -169,11 +171,14 @@ mod tests {
             "/..",
             "rel/relative",
         ] {
-            let err = create_remote(&SysEnv::from_process(), &local_server(), Path::new(dir))
-                .err()
-                .unwrap_or_else(|| {
-                    panic!("a traversal-carrying deploy_dir must be rejected: {dir}")
-                });
+            let err = create_remote(
+                &SysEnv::from_process(),
+                &local_server(),
+                Path::new(dir),
+                false,
+            )
+            .err()
+            .unwrap_or_else(|| panic!("a traversal-carrying deploy_dir must be rejected: {dir}"));
             assert!(
                 err.to_string().contains("traversal-free"),
                 "error must name the traversal rule, got: {err}"
@@ -185,9 +190,14 @@ mod tests {
     /// `AbsoluteDeployDir`, never a raw `PathBuf`).
     #[test]
     fn create_remote_local_rejects_relative_deploy_dir() {
-        let err = create_remote(&SysEnv::from_process(), &local_server(), Path::new("rel/x"))
-            .err()
-            .unwrap_or_else(|| panic!("a relative deploy_dir must be rejected"));
+        let err = create_remote(
+            &SysEnv::from_process(),
+            &local_server(),
+            Path::new("rel/x"),
+            false,
+        )
+        .err()
+        .unwrap_or_else(|| panic!("a relative deploy_dir must be rejected"));
         assert!(
             err.to_string().contains("traversal-free"),
             "error must name the absoluteness/traversal rule, got: {err}"
@@ -206,6 +216,7 @@ mod tests {
                 &SysEnv::from_process(),
                 &local_server(),
                 Path::new(deploy_dir),
+                false,
             )
             .unwrap_or_else(|e| panic!("{deploy_dir} must be accepted: {e}"));
             assert_eq!(
@@ -227,9 +238,14 @@ mod tests {
     #[test]
     fn create_remote_local_rejects_root_deploy_dir() {
         for dir in ["/", "//", "//./"] {
-            let err = create_remote(&SysEnv::from_process(), &local_server(), Path::new(dir))
-                .err()
-                .unwrap_or_else(|| panic!("the filesystem root is not a valid local root: {dir}"));
+            let err = create_remote(
+                &SysEnv::from_process(),
+                &local_server(),
+                Path::new(dir),
+                false,
+            )
+            .err()
+            .unwrap_or_else(|| panic!("the filesystem root is not a valid local root: {dir}"));
             assert!(
                 err.to_string().contains("traversal-free"),
                 "error must name the rule, got: {err}"

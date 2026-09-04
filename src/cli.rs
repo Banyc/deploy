@@ -448,10 +448,11 @@ where
     // `'static`): each remote is built from the same boundary snapshot, so
     // every spawned child env is deterministic.
     let env = env.clone();
-    let factory =
-        move |s: &crate::config::ServerDef,
-              slot: &crate::config::SlotConfig|
-              -> Result<Box<dyn Remote>> { create_remote(&env, s, slot.deploy_dir()) };
+    let factory = move |s: &crate::config::ServerDef,
+                        slot: &crate::config::SlotConfig|
+          -> Result<Box<dyn Remote>> {
+        create_remote(&env, s, slot.deploy_dir(), cli.verbose)
+    };
 
     match cli.command {
         Command::Push {
@@ -664,6 +665,21 @@ fn render_manual() -> Vec<String> {
         "  activation  what runs after a deploy (none, or systemd: install/enable/restart units)".to_string(),
         "  verification  how a deploy is confirmed (a command that must exit 0)".to_string(),
         "  recovery    `deploy unlock` recovers a stranded mutation lock after a dead controller".to_string(),
+        "  slow links  ssh upload deadlines scale with DEPLOY_SSH_MIN_RATE_BYTES_PER_SEC (default 64KiB/s); an upload timeout names the file and the fix".to_string(),
+        String::new(),
+        "RULES (learned the hard way)".to_string(),
+        "  one slot per server per target — two variants on the SAME server need different targets".to_string(),
+        "  groups are per-slot tags, not targets; a group push still produces a complete target".to_string(),
+        "    snapshot (first deployment: the group must cover every slot; after membership changes,".to_string(),
+        "    every unselected slot must have a prior assignment matching its physical binding)".to_string(),
+        "  a push is refused while a previous deployment is pending; an interrupted push leaves a".to_string(),
+        "    pending deployment and possibly a stranded lock — recover with `deploy unlock <target>".to_string(),
+        "    <slot> --acquisition <id> --yes` (the error names the id), then retry".to_string(),
+        "  `--force` skips the up-to-date no-op check and always deploys a fresh generation;".to_string(),
+        "    `--dry-run` touches nothing (no locks, no remote writes)".to_string(),
+        "  verification must pass or the push rolls back; a service that retries (e.g. a port".to_string(),
+        "    conflict during startup) reports is-active rc=3 — verify with `is-active || is-enabled`".to_string(),
+        "  user-scope services survive logout automatically (the systemd adapter enables linger)".to_string(),
         String::new(),
         "FLOW (what a push does)".to_string(),
         "  preflight   read status, plan, stage trees, check capacity".to_string(),
@@ -971,7 +987,13 @@ mod tests {
     fn manual_renders_model_features_flow_and_commands() {
         let lines = render_manual();
         let joined = lines.join("\n");
-        for section in ["MODEL", "FEATURES", "FLOW (what a push does)", "COMMANDS"] {
+        for section in [
+            "MODEL",
+            "FEATURES",
+            "FLOW (what a push does)",
+            "COMMANDS",
+            "RULES",
+        ] {
             assert!(
                 joined.contains(section),
                 "missing section {section}: {joined}"
@@ -2256,7 +2278,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             move |s: &crate::config::ServerDef,
                   slot: &crate::config::SlotConfig|
                   -> crate::error::Result<Box<dyn crate::remote::transport::Remote>> {
-                crate::remote::create_remote(&env, s, slot.deploy_dir())
+                crate::remote::create_remote(&env, s, slot.deploy_dir(), false)
             };
         let report = crate::deploy::unlock::run_unlock(
             &store,

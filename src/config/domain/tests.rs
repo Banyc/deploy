@@ -3760,7 +3760,7 @@ proptest! {
                     // so transport creation must succeed for this slot —
                     // there is no static relationship left that could fail
                     // at transport creation.
-                    let remote = create_remote(&env, server, slot.deploy_dir())
+                    let remote = create_remote(&env, server, slot.deploy_dir(), false)
                         .unwrap_or_else(|e| {
                             panic!("accepted graph must create slot '{}' transport: {e}", slot.id)
                         });
