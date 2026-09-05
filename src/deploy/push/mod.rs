@@ -687,20 +687,23 @@ pub(crate) fn push_inner<'a>(
     // 8 & 9. Capacity + staging preflight — capacity is the caller's CURRENT
     // per-server policy; every failure ends the attempt `FailedPreflight`
     // (see [`run_capacity_and_staging`]).
-    if let Err(failure) = run_capacity_and_staging(
+    let deduped = match run_capacity_and_staging(
         store,
         &preflight.assignments,
         &helpers,
+        &statuses,
         op_id,
         deployment_id,
         config,
     ) {
-        // FailedPreflight terminal (empty outcomes — no slot was touched) +
-        // best-effort incoming cleanup, then the ORIGINAL error. The engine
-        // NEVER constructs terminal variants itself — [`decide_terminal`]
-        // owns the truth table, so the preflight-failure path routes through
-        // it with the intent, exactly like every other disposition.
-        let disposition = crate::kernel::transition::decide_terminal(
+        Ok(deduped) => deduped,
+        Err(failure) => {
+            // FailedPreflight terminal (empty outcomes — no slot was touched) +
+            // best-effort incoming cleanup, then the ORIGINAL error. The engine
+            // NEVER constructs terminal variants itself — [`decide_terminal`]
+            // owns the truth table, so the preflight-failure path routes through
+            // it with the intent, exactly like every other disposition.
+            let disposition = crate::kernel::transition::decide_terminal(
             prepared.intent(),
             crate::kernel::transition::ExecutionReport::PreflightFailed,
         )
@@ -709,35 +712,40 @@ pub(crate) fn push_inner<'a>(
                 "push {deployment_id}: the kernel refused the preflight-failure disposition: {e}"
             ))
         })?;
-        // Best-effort incoming cleanup runs FIRST (the partial staging upload
-        // is disposable — the review keeps it best-effort), then THE
-        // TERMINAL-APPEND FAILURE IS PROPAGATED (the review's P1 fix — a
-        // swallowed preflight-append failure can no longer exist): when the
-        // FailedPreflight terminal append fails, the attempt stays
-        // intent-only (recoverable-pending — a later push's recovery settles
-        // it through [`crate::ledger::recovery`]) and THIS push surfaces the
-        // append failure instead of silently continuing and returning the
-        // original preflight error as if the attempt had settled. The caller
-        // must see the persistence boundary failed.
-        for a in &preflight.assignments {
-            helpers[&a.placement_slot]
-                .remove_incoming(deployment_id)
-                .ok();
+            // Best-effort incoming cleanup runs FIRST (the partial staging upload
+            // is disposable — the review keeps it best-effort), then THE
+            // TERMINAL-APPEND FAILURE IS PROPAGATED (the review's P1 fix — a
+            // swallowed preflight-append failure can no longer exist): when the
+            // FailedPreflight terminal append fails, the attempt stays
+            // intent-only (recoverable-pending — a later push's recovery settles
+            // it through [`crate::ledger::recovery`]) and THIS push surfaces the
+            // append failure instead of silently continuing and returning the
+            // original preflight error as if the attempt had settled. The caller
+            // must see the persistence boundary failed.
+            for a in &preflight.assignments {
+                helpers[&a.placement_slot]
+                    .remove_incoming(deployment_id)
+                    .ok();
+            }
+            txn.append_terminal(
+                deployment_id,
+                &LedgerTerminal::new(
+                    crate::remote::helper::now_rfc3339_ts(),
+                    crate::kernel::terminal::intent_digest(prepared.intent()),
+                    NonSuccessfulDisposition::from_decision(disposition),
+                    Some(failure.reason.to_string()),
+                ),
+            )?;
+            return Err(failure.source);
         }
-        txn.append_terminal(
-            deployment_id,
-            &LedgerTerminal::new(
-                crate::remote::helper::now_rfc3339_ts(),
-                crate::kernel::terminal::intent_digest(prepared.intent()),
-                NonSuccessfulDisposition::from_decision(disposition),
-                Some(failure.reason.to_string()),
-            ),
-        )?;
-        return Err(failure.source);
-    }
+    };
     trace.step(
         "capacity.staging",
-        format_args!("{} assignment(s) staged", preflight.assignments.len()),
+        format_args!(
+            "{} assignment(s) staged ({} with per-file dedup)",
+            preflight.assignments.len(),
+            deduped
+        ),
     );
 
     // MUTATION PHASES (steps 10-15) in [`crate::deploy::push`]: the

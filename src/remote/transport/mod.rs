@@ -247,6 +247,30 @@ pub trait Remote {
     fn read_link(&self, rel: &RootedRelativePath) -> Result<PathBuf>;
     fn remove_file(&self, rel: &RootedRelativePath) -> Result<()>;
     fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()>;
+    /// Recursively copy the tree at `src` to `dest` — the per-file dedup's
+    /// staging base (the previous tree is copied into the staging dir, then
+    /// only the changed files are uploaded). `dest` must not already exist
+    /// (the caller removes a stale staging dir first); its parent is
+    /// created. The DEFAULT is a naive list/read/write walk — correct for
+    /// every transport, and for a [`LocalTransport`] it is a real local-disk
+    /// copy (the "download" is a local read); the [`SshTransport`] overrides
+    /// it with a same-filesystem `cp -a` on the remote so no bytes cross the
+    /// link. The walk is TWO-PHASE (directories are created owner-writable
+    /// and chmodded to their final mode deepest-first after every child is
+    /// copied), so a read-only source tree copies cleanly.
+    fn copy_tree(&self, src: &RootedRelativePath, dest: &RootedRelativePath) -> Result<()> {
+        if let Some(parent) = dest.parent() {
+            self.create_dir_all(&parent)?;
+        }
+        // (dest, final_mode, depth) collected during the walk for phase 2.
+        let mut dirs: Vec<(RootedRelativePath, u32, usize)> = Vec::new();
+        copy_tree_recursive(self, src, dest, 0, &mut dirs)?;
+        dirs.sort_by_key(|d| std::cmp::Reverse(d.2));
+        for (d, mode, _depth) in dirs {
+            self.set_mode(&d, mode)?;
+        }
+        Ok(())
+    }
     /// Recursively fsync every file and directory under `rel` (the staged
     /// release bundle), making the WHOLE tree durable before the atomic
     /// install rename — a crash after the fsync but before the rename loses
@@ -368,6 +392,37 @@ pub trait Remote {
 
 fn join(root: &Path, rel: &RootedRelativePath) -> PathBuf {
     root.join(rel.as_path())
+}
+
+/// The naive recursive half of [`Remote::copy_tree`]'s default: walk `src`
+/// with [`Remote::list`], recreating every entry at `dest` (directories
+/// owner-writable during the walk, files/symlinks with their final modes),
+/// collecting `(dest, final_mode, depth)` for the caller's phase-2 finalize.
+fn copy_tree_recursive<R: Remote + ?Sized>(
+    remote: &R,
+    src: &RootedRelativePath,
+    dest: &RootedRelativePath,
+    depth: usize,
+    dirs: &mut Vec<(RootedRelativePath, u32, usize)>,
+) -> Result<()> {
+    remote.create_dir_all(dest)?;
+    for e in remote.list(src)? {
+        let s = src.join(&e.name)?;
+        let d = dest.join(&e.name)?;
+        if e.is_dir {
+            remote.create_dir_all(&d)?;
+            remote.set_mode(&d, (e.mode | 0o200) & 0o7777)?;
+            dirs.push((d.clone(), e.mode & 0o7777, depth));
+            copy_tree_recursive(remote, &s, &d, depth + 1, dirs)?;
+        } else if e.is_symlink {
+            let target = remote.read_link(&s)?;
+            remote.symlink(&target, &d)?;
+        } else {
+            let data = remote.read(&s)?;
+            remote.write(&d, &data, e.mode & 0o7777)?;
+        }
+    }
+    Ok(())
 }
 
 /// Read the deploy_dir's IMMUTABLE receiver-UUID marker

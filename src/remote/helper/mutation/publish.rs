@@ -32,13 +32,15 @@
 //! sibling).
 
 use crate::error::{Error, Result};
-use crate::identity::{DeploymentId, ReleaseRecord, TreeDigest};
+use crate::identity::{DeploymentId, ReleaseRecord, TreeDigest, TreeEntry, TreeMetadata};
 use crate::remote::layout;
 use crate::remote::transport::{IMMUTABLE_RECORD_MODE, Remote, RootedRelativePath};
 use crate::verify::release::ValidatedReleaseBundle;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::time::Duration;
+use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
 
 use super::super::RemoteHelper;
@@ -92,7 +94,6 @@ impl<'a> RemoteHelper<'a> {
                 rel.display()
             )));
         }
-        let root = self.remote.root().join(rel);
         // The verification strategy is decided by the transport's DECLARED
         // nature ([`Remote::is_local`]), never by a local filesystem probe
         // of the root path: a LocalTransport root is a LOCAL path (the tree
@@ -102,28 +103,11 @@ impl<'a> RemoteHelper<'a> {
         // transfers the tree content. Probing `root.exists()` would silently
         // verify a same-named LOCAL directory in place of the remote tree
         // (false accept) or reject a valid remote tree (false reject).
-        if self.remote.is_local() {
-            return match crate::remote::canonical::canonicalize_tree(&root) {
-                Ok(meta) => Ok(meta.tree_sha256 == digest.as_str()),
-                Err(_) => Ok(false),
-            };
-        }
-        let argv = vec![
-            "perl".to_string(),
-            "-e".to_string(),
-            crate::remote::canonical::remote_tree_verify_script().to_string(),
-            root.to_string_lossy().into_owned(),
-        ];
-        let out = self
-            .remote
-            .exec(&argv, Duration::from_secs(VERIFY_TREE_EXEC_TIMEOUT_SECS))?;
-        if out.exit_code != 0 {
-            // Unreadable content (a mode mutation that removed read
-            // permission) or a script failure: the tree does not verify.
-            return Ok(false);
-        }
-        match crate::remote::canonical::canonicalize_remote_entries(&out.stdout, &root) {
+        match self.remote_tree_metadata(rel) {
             Ok(meta) => Ok(meta.tree_sha256 == digest.as_str()),
+            // Unreadable content (a mode mutation that removed read
+            // permission), a script failure, or uncanonicalizable content:
+            // the tree does not verify.
             Err(_) => Ok(false),
         }
     }
@@ -165,17 +149,129 @@ impl<'a> RemoteHelper<'a> {
     /// surface — the ONLY public mutation path is
     /// [`crate::deploy::rollout::commit`] with a
     /// [`crate::deploy::rollout::PreparedSlotMutation`].
+    /// Stage a tree into the operation-unique incoming path. Returns
+    /// `Ok(true)` when the PER-FILE DEDUP was used (the tree was staged as a
+    /// copy of the previous tree plus only the changed files), `Ok(false)`
+    /// for a full upload. The dedup is an OPTIMIZATION: any failure falls
+    /// back to the full upload (the staged tree is still verified against
+    /// the digest before publish, so a dedup bug can never install a wrong
+    /// tree — it fails the push closed).
     pub(crate) fn stage_incoming(
         &self,
         deployment_id: &DeploymentId,
         digest: &TreeDigest,
         host_src: &Path,
-    ) -> Result<()> {
+        prev_digest: Option<&TreeDigest>,
+    ) -> Result<bool> {
         let dest = layout::staged_tree(deployment_id, digest);
         if self.remote.metadata_opt(&dest)?.is_some() {
             self.remove_remote_tree_restoring_write(&dest)?;
         }
-        copy_host_tree_to_remote(host_src, &dest, self.remote)
+        if let Some(prev) = prev_digest
+            && prev != digest
+            && self.tree_exists(prev)?
+        {
+            match self.stage_incoming_dedup(host_src, prev, &dest) {
+                Ok(()) => return Ok(true),
+                Err(e) => {
+                    // The dedup staging is partial/unknown: remove it and
+                    // re-stage from scratch below.
+                    self.remove_remote_tree_restoring_write(&dest)?;
+                    eprintln!(
+                        "deploy: per-file dedup skipped for tree {} (full upload): {e}",
+                        digest
+                    );
+                }
+            }
+        }
+        copy_host_tree_to_remote(host_src, &dest, self.remote)?;
+        Ok(false)
+    }
+
+    /// Stage a new tree with PER-FILE DEDUP against the previous tree: copy
+    /// the previous tree into the staging dir (remote-side `cp -a`, no bytes
+    /// cross the link), then upload ONLY the entries that differ from the
+    /// previous tree (by type, mode, or content hash), and remove entries the
+    /// previous tree had but the new tree dropped. The staged tree is still
+    /// verified against the digest before publish ([`Self::publish_from_incoming`]),
+    /// so a missed change fails the push closed rather than installing a
+    /// wrong tree.
+    fn stage_incoming_dedup(
+        &self,
+        host_src: &Path,
+        prev: &TreeDigest,
+        dest: &RootedRelativePath,
+    ) -> Result<()> {
+        // The host tree's canonical metadata (per-file content hashes + modes)
+        // lives in the local object store's `tree.json`, a sibling of the
+        // object root — read it instead of re-hashing the tree.
+        let host_meta: TreeMetadata = {
+            let tree_json = host_src
+                .parent()
+                .ok_or_else(|| {
+                    Error::materialization(format!(
+                        "tree object root {} has no parent; cannot locate tree.json",
+                        host_src.display()
+                    ))
+                })?
+                .join("tree.json");
+            let data = std::fs::read(&tree_json).map_err(|e| {
+                Error::materialization(format!("read tree metadata {}: {e}", tree_json.display()))
+            })?;
+            serde_json::from_slice(&data).map_err(|e| {
+                Error::materialization(format!("parse tree metadata {}: {e}", tree_json.display()))
+            })?
+        };
+        // The previous tree's canonical metadata (per-file hashes) comes from
+        // the remote verification script — only the small entry metadata
+        // crosses the link, never the tree bytes.
+        let prev_meta = self.remote_tree_metadata(&layout::tree_root(prev))?;
+        // Copy the previous tree into the staging dir (remote-side, same
+        // filesystem).
+        self.copy_remote_tree(&layout::tree_root(prev), dest)?;
+        // Upload only the entries that differ from the previous tree.
+        let skip = build_skip_set(&host_meta, &prev_meta);
+        copy_host_tree_to_remote_impl(host_src, dest, self.remote, &skip)?;
+        // Remove entries the previous tree had but the new tree dropped.
+        remove_stale_entries(&prev_meta, &host_meta, dest, self.remote)?;
+        Ok(())
+    }
+
+    /// The canonical metadata of a remote tree (per-file type/mode/content
+    /// hash), WITHOUT transferring the tree content: a local transport
+    /// canonicalizes the tree directly; a remote transport runs the
+    /// verification script, which prints per-entry metadata. Used by the
+    /// per-file dedup to compare the previous tree against the new one.
+    fn remote_tree_metadata(&self, rel: &RootedRelativePath) -> Result<TreeMetadata> {
+        let root = self.remote.root().join(rel);
+        if self.remote.is_local() {
+            return crate::remote::canonical::canonicalize_tree(&root);
+        }
+        let argv = vec![
+            "perl".to_string(),
+            "-e".to_string(),
+            crate::remote::canonical::remote_tree_verify_script().to_string(),
+            root.to_string_lossy().into_owned(),
+        ];
+        let out = self
+            .remote
+            .exec(&argv, Duration::from_secs(VERIFY_TREE_EXEC_TIMEOUT_SECS))?;
+        if out.exit_code != 0 {
+            return Err(Error::remote(format!(
+                "remote tree verification script failed (exit {}): {}",
+                out.exit_code, out.stderr
+            )));
+        }
+        crate::remote::canonical::canonicalize_remote_entries(&out.stdout, &root)
+    }
+
+    /// Copy a remote tree into a staging path — the per-file dedup's staging
+    /// base. Delegates to [`Remote::copy_tree`]: a same-filesystem copy on
+    /// the remote (no bytes cross the link) for the SSH transport, a local
+    /// disk copy for the local transport. The destination must not already
+    /// exist (the caller removes a stale staging dir before calling).
+    fn copy_remote_tree(&self, src: &RootedRelativePath, dest: &RootedRelativePath) -> Result<()> {
+        self.remote.copy_tree(src, dest)
     }
 }
 
@@ -666,6 +762,22 @@ pub(crate) fn copy_host_tree_to_remote(
     rel_dest: &RootedRelativePath,
     remote: &dyn Remote,
 ) -> Result<()> {
+    copy_host_tree_to_remote_impl(host, rel_dest, remote, &HashSet::new())
+}
+
+/// The two-phase host-tree upload ([`copy_host_tree_to_remote`]) with an
+/// optional per-file SKIP SET: entries whose NFC-normalized relative path is
+/// in `skip` are NOT uploaded (the caller has already placed identical
+/// content at the destination — the per-file dedup copies the previous tree
+/// into the staging dir first). Skipped entries are assumed byte-identical
+/// with the same mode; the staged tree is still verified against the digest
+/// before publish, so a wrong skip fails the push closed.
+fn copy_host_tree_to_remote_impl(
+    host: &Path,
+    rel_dest: &RootedRelativePath,
+    remote: &dyn Remote,
+    skip: &HashSet<String>,
+) -> Result<()> {
     remote.create_dir_all(rel_dest)?;
     // (dest, final_mode, depth) collected during the walk for phase 2.
     let mut dirs: Vec<(RootedRelativePath, u32, usize)> = Vec::new();
@@ -679,8 +791,20 @@ pub(crate) fn copy_host_tree_to_remote(
         let dest = rel_dest.join(rel)?;
         let meta = std::fs::symlink_metadata(path)
             .map_err(|e| Error::remote(format!("stat {}: {e}", path.display())))?;
+        // The skip lookup uses the NFC-normalized path (the canonical
+        // metadata's path form).
+        let rel_norm: String = rel.to_string_lossy().nfc().collect();
+        let skipped = skip.contains(&rel_norm);
         if meta.is_dir() {
-            remote.create_dir(&dest)?;
+            // The dir may already exist (dedup: copied from the previous
+            // tree) — create_dir_all is idempotent; a type transition
+            // (file -> dir) removes the stale entry first.
+            if let Some(m) = remote.metadata_opt(&dest)?
+                && !m.is_dir
+            {
+                remote.remove_file(&dest)?;
+            }
+            remote.create_dir_all(&dest)?;
             // Phase 1: force owner-write so the directory's contents can be
             // uploaded regardless of the final (possibly read-only) mode. A
             // bare `mkdir` would also inherit the remote umask (e.g. 0775 on
@@ -690,12 +814,33 @@ pub(crate) fn copy_host_tree_to_remote(
             remote.set_mode(&dest, (meta.mode() | 0o200) & 0o7777)?;
             dirs.push((dest, meta.mode() & 0o7777, entry.depth()));
         } else if meta.file_type().is_symlink() {
+            if skipped {
+                continue;
+            }
             let target = std::fs::read_link(path)
                 .map_err(|e| Error::remote(format!("readlink {}: {e}", path.display())))?;
+            // A stale entry of a different type (or a stale symlink) is
+            // removed before the symlink is created.
+            if remote.metadata_opt(&dest)?.is_some() {
+                remote.remove_file(&dest)?;
+            }
             remote.symlink(&target, &dest)?;
         } else {
+            if skipped {
+                continue;
+            }
             let data = std::fs::read(path)
                 .map_err(|e| Error::remote(format!("read {}: {e}", path.display())))?;
+            // A stale entry of a different type (dir/symlink) is removed
+            // before the file is written; an existing regular file is
+            // overwritten in place.
+            if let Some(m) = remote.metadata_opt(&dest)? {
+                if m.is_dir {
+                    remote.remove_dir_all(&dest)?;
+                } else if m.is_symlink {
+                    remote.remove_file(&dest)?;
+                }
+            }
             remote.write(&dest, &data, meta.mode() & 0o7777)?;
         }
     }
@@ -704,6 +849,68 @@ pub(crate) fn copy_host_tree_to_remote(
     dirs.sort_by_key(|d| std::cmp::Reverse(d.2));
     for (dest, mode, _depth) in dirs {
         remote.set_mode(&dest, mode)?;
+    }
+    Ok(())
+}
+
+/// Build the per-file dedup SKIP SET: the paths of the new tree's entries
+/// that are IDENTICAL to the previous tree's entry at the same path (same
+/// type, mode, and content hash). These entries are already present in the
+/// staging dir (copied from the previous tree) and must not be re-uploaded.
+fn build_skip_set(host_meta: &TreeMetadata, prev_meta: &TreeMetadata) -> HashSet<String> {
+    let prev: HashMap<&str, (&str, &str, Option<&str>)> = prev_meta
+        .entries
+        .iter()
+        .map(|e| {
+            (
+                e.path.as_str(),
+                (
+                    e.entry_type.as_str(),
+                    e.mode.as_str(),
+                    e.content_sha256.as_deref(),
+                ),
+            )
+        })
+        .collect();
+    host_meta
+        .entries
+        .iter()
+        .filter(|he| {
+            prev.get(he.path.as_str()).is_some_and(|(t, m, c)| {
+                *t == he.entry_type && *m == he.mode && *c == he.content_sha256.as_deref()
+            })
+        })
+        .map(|he| he.path.clone())
+        .collect()
+}
+
+/// Remove from the staging dir the entries the PREVIOUS tree had but the NEW
+/// tree dropped (the dedup staged the previous tree as the base). Files and
+/// symlinks are removed first, then directories deepest-first (a parent-dir
+/// removal would orphan the children's paths).
+fn remove_stale_entries(
+    prev_meta: &TreeMetadata,
+    host_meta: &TreeMetadata,
+    dest: &RootedRelativePath,
+    remote: &dyn Remote,
+) -> Result<()> {
+    let host_paths: HashSet<&str> = host_meta.entries.iter().map(|e| e.path.as_str()).collect();
+    let mut stale_dirs: Vec<&TreeEntry> = Vec::new();
+    for pe in &prev_meta.entries {
+        if host_paths.contains(pe.path.as_str()) {
+            continue;
+        }
+        let p = dest.join(pe.path.as_str())?;
+        if pe.entry_type == "dir" {
+            stale_dirs.push(pe);
+        } else {
+            remote.remove_file(&p)?;
+        }
+    }
+    stale_dirs.sort_by_key(|e| std::cmp::Reverse(e.path.len()));
+    for pe in stale_dirs {
+        let p = dest.join(pe.path.as_str())?;
+        remote.remove_dir_all(&p)?;
     }
     Ok(())
 }
@@ -1832,7 +2039,7 @@ pub(crate) mod tests_publish {
             match scenario {
                 PublishScenario::Staged => {
                     // Stage, then mutate the STAGED tree before publishing.
-                    helper.stage_incoming(&dep, &digest, &host).unwrap();
+                    helper.stage_incoming(&dep, &digest, &host, None).unwrap();
                     let staged_path = remote.root().join(layout::staged_tree(&dep, &digest));
                     apply_mutation(&staged_path, &mutation);
                     let held = crate::remote::helper::SlotRemote::new(&helper, crate::remote::helper::test_owner("test-app", "s1"))
@@ -1864,7 +2071,7 @@ pub(crate) mod tests_publish {
                     // the rename), mutate the EXISTING object, re-stage, and
                     // re-publish from incoming: the repair re-publishes the
                     // verified staged tree.
-                    helper.stage_incoming(&dep, &digest, &host).unwrap();
+                    helper.stage_incoming(&dep, &digest, &host, None).unwrap();
                     let held = crate::remote::helper::SlotRemote::new(&helper, crate::remote::helper::test_owner("test-app", "s1"))
                         .acquire_lock_guard(&crate::identity::test_operation_id("op-1"))
                         .unwrap();
@@ -1872,7 +2079,7 @@ pub(crate) mod tests_publish {
                     drop(held);
                     let final_path = remote.root().join(layout::tree_root(&digest));
                     apply_mutation(&final_path, &mutation);
-                    helper.stage_incoming(&dep, &digest, &host).unwrap();
+                    helper.stage_incoming(&dep, &digest, &host, None).unwrap();
                     let held = crate::remote::helper::SlotRemote::new(&helper, crate::remote::helper::test_owner("test-app", "s1"))
                         .acquire_lock_guard(&crate::identity::test_operation_id("op-2"))
                         .unwrap();
@@ -1971,5 +2178,367 @@ pub(crate) mod tests_publish {
             !helper.verify_remote_tree(&rel, &digest).unwrap(),
             "a declared-local transport must canonicalize the local tree, never exec"
         );
+    }
+
+    // ---- PER-FILE DEDUP STAGING ----
+    //
+    // `stage_incoming` with a previous tree digest stages the new tree as a
+    // copy of the previous tree plus ONLY the changed files: unchanged files
+    // are never re-uploaded. The staged tree is still verified against the
+    // digest before publish, so a dedup bug fails the push closed.
+
+    /// A transport wrapper that records every WRITE path (delegating the
+    /// operation to the wrapped `LocalTransport`), so a test can assert
+    /// which files were uploaded. `copy_tree` is forwarded to the inner
+    /// transport (the dedup's previous-tree copy runs on the inner directly
+    /// and is NOT counted as an upload).
+    struct WriteCountingRemote {
+        inner: LocalTransport,
+        written: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl WriteCountingRemote {
+        fn new(env: &crate::env::SysEnv, base: std::path::PathBuf) -> Result<Self> {
+            Ok(WriteCountingRemote {
+                inner: LocalTransport::new(env, base)?,
+                written: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+        fn written_paths(&self) -> Vec<String> {
+            self.written.lock().unwrap().clone()
+        }
+    }
+
+    impl Remote for WriteCountingRemote {
+        fn root(&self) -> &std::path::Path {
+            self.inner.root()
+        }
+        fn is_local(&self) -> bool {
+            true
+        }
+        fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
+            self.inner.read(rel)
+        }
+        fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
+            self.written
+                .lock()
+                .unwrap()
+                .push(rel.as_path().to_string_lossy().into_owned());
+            self.inner.write(rel, data, mode)
+        }
+        fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict> {
+            self.inner.try_write_new(rel, data)
+        }
+        fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
+            self.inner.create_dir(rel)
+        }
+        fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+            self.inner.create_dir_all(rel)
+        }
+        fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
+            self.inner.set_mode(rel, mode)
+        }
+        fn list(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>> {
+            self.inner.list(rel)
+        }
+        fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
+            self.inner.rename(from, to)
+        }
+        fn symlink(&self, target: &std::path::Path, link: &RootedRelativePath) -> Result<()> {
+            self.inner.symlink(target, link)
+        }
+        fn read_link(&self, rel: &RootedRelativePath) -> Result<std::path::PathBuf> {
+            self.inner.read_link(rel)
+        }
+        fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
+            self.inner.remove_file(rel)
+        }
+        fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+            self.inner.remove_dir_all(rel)
+        }
+        fn exists(&self, rel: &RootedRelativePath) -> bool {
+            self.inner.exists(rel)
+        }
+        fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta> {
+            self.inner.metadata(rel)
+        }
+        fn copy_tree(&self, src: &RootedRelativePath, dest: &RootedRelativePath) -> Result<()> {
+            self.inner.copy_tree(src, dest)
+        }
+        fn exec(&self, argv: &[String], timeout: Duration) -> Result<ExecOutcome> {
+            self.inner.exec(argv, timeout)
+        }
+        fn filesystem_bytes(&self) -> Result<FsBytes> {
+            self.inner.filesystem_bytes()
+        }
+    }
+
+    /// Build a host tree and write its canonical `tree.json` beside it (the
+    /// local object store's layout: `root/` + sibling `tree.json`), returning
+    /// the canonical digest.
+    fn build_host_tree(root: &Path, specs: &[EntrySpec]) -> TreeDigest {
+        build_tree(root, specs);
+        let meta = crate::remote::canonical::canonicalize_tree(root).unwrap();
+        let tree_json = root.parent().unwrap().join("tree.json");
+        std::fs::write(&tree_json, serde_json::to_vec(&meta).unwrap()).unwrap();
+        TreeDigest::parse(&meta.tree_sha256).expect("canonical digest")
+    }
+
+    /// Stage `host` (with its sibling tree.json) into the remote and publish
+    /// it, so the tree exists in the remote object store (the dedup's
+    /// previous-tree base).
+    fn stage_and_publish(
+        helper: &RemoteHelper,
+        dep: &DeploymentId,
+        digest: &TreeDigest,
+        host: &Path,
+    ) {
+        helper.stage_incoming(dep, digest, host, None).unwrap();
+        let held = crate::remote::helper::SlotRemote::new(
+            helper,
+            crate::remote::helper::test_owner("test-app", "s1"),
+        )
+        .acquire_lock_guard(&crate::identity::test_operation_id("op-1"))
+        .unwrap();
+        held.publish_from_incoming(dep, digest).unwrap();
+        drop(held);
+    }
+
+    /// The staged tree at `incoming/<dep>/<digest>.partial` canonicalizes to
+    /// `digest` (the publish-time verification's precondition).
+    fn assert_staged_tree_matches(remote: &dyn Remote, dep: &DeploymentId, digest: &TreeDigest) {
+        let staged = remote.root().join(layout::staged_tree(dep, digest));
+        let meta = crate::remote::canonical::canonicalize_tree(&staged).unwrap();
+        assert_eq!(
+            meta.tree_sha256,
+            digest.as_str(),
+            "the dedup-staged tree must canonicalize to the required digest"
+        );
+    }
+
+    /// The core dedup property: a release-to-release change (config edited,
+    /// binary untouched) stages the new tree as a copy of the previous tree
+    /// plus ONLY the changed file — the unchanged binary is never re-uploaded.
+    #[test]
+    fn stage_incoming_dedup_reuses_unchanged_files() {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let remote =
+            WriteCountingRemote::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
+                .unwrap();
+        let helper = RemoteHelper::new(&remote);
+
+        // v1: a "binary" and a config.
+        let host1 = dir.path().join("host1");
+        let digest1 = build_host_tree(
+            &host1,
+            &[
+                EntrySpec::File {
+                    path: "bin/app",
+                    data: vec![0x42; 4096],
+                    mode: 0o755,
+                },
+                EntrySpec::File {
+                    path: "config.toml",
+                    data: b"version = 1\n".to_vec(),
+                    mode: 0o644,
+                },
+            ],
+        );
+        let dep1 = crate::identity::test_deployment_id("dep1");
+        stage_and_publish(&helper, &dep1, &digest1, &host1);
+
+        // v2: the config changes, the binary is byte-identical.
+        let host2 = dir.path().join("host2");
+        let digest2 = build_host_tree(
+            &host2,
+            &[
+                EntrySpec::File {
+                    path: "bin/app",
+                    data: vec![0x42; 4096],
+                    mode: 0o755,
+                },
+                EntrySpec::File {
+                    path: "config.toml",
+                    data: b"version = 2\n".to_vec(),
+                    mode: 0o644,
+                },
+            ],
+        );
+        let dep2 = crate::identity::test_deployment_id("dep2");
+        helper
+            .stage_incoming(&dep2, &digest2, &host2, Some(&digest1))
+            .unwrap();
+
+        // The staged tree is complete and canonical.
+        assert_staged_tree_matches(&remote, &dep2, &digest2);
+
+        // The unchanged binary was NOT re-uploaded; only the config was.
+        // (Filter to the v2 staging dir — the v1 full upload legitimately
+        // wrote the binary.)
+        let dep2_prefix = format!("incoming/{}/", dep2.as_str());
+        let written = remote.written_paths();
+        let written_v2: Vec<&String> = written
+            .iter()
+            .filter(|p| p.starts_with(&dep2_prefix))
+            .collect();
+        assert!(
+            written_v2.iter().any(|p| p.ends_with("config.toml")),
+            "the changed config must be uploaded, got: {written_v2:?}"
+        );
+        assert!(
+            !written_v2.iter().any(|p| p.ends_with("bin/app")),
+            "the unchanged binary must NOT be re-uploaded, got: {written_v2:?}"
+        );
+    }
+
+    /// The dedup handles ADDED and REMOVED files: a new file is uploaded, a
+    /// dropped file is removed from the copied staging base, and the staged
+    /// tree still canonicalizes to the new digest.
+    #[test]
+    fn stage_incoming_dedup_handles_added_and_removed_files() {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let remote =
+            WriteCountingRemote::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
+                .unwrap();
+        let helper = RemoteHelper::new(&remote);
+
+        // v1: files A and B.
+        let host1 = dir.path().join("host1");
+        let digest1 = build_host_tree(
+            &host1,
+            &[
+                EntrySpec::File {
+                    path: "a.txt",
+                    data: b"aaa".to_vec(),
+                    mode: 0o644,
+                },
+                EntrySpec::File {
+                    path: "b.txt",
+                    data: b"bbb".to_vec(),
+                    mode: 0o644,
+                },
+            ],
+        );
+        let dep1 = crate::identity::test_deployment_id("dep1");
+        stage_and_publish(&helper, &dep1, &digest1, &host1);
+
+        // v2: A changes, B is dropped, C is added.
+        let host2 = dir.path().join("host2");
+        let digest2 = build_host_tree(
+            &host2,
+            &[
+                EntrySpec::File {
+                    path: "a.txt",
+                    data: b"aaa-changed".to_vec(),
+                    mode: 0o644,
+                },
+                EntrySpec::File {
+                    path: "c.txt",
+                    data: b"ccc".to_vec(),
+                    mode: 0o644,
+                },
+            ],
+        );
+        let dep2 = crate::identity::test_deployment_id("dep2");
+        helper
+            .stage_incoming(&dep2, &digest2, &host2, Some(&digest1))
+            .unwrap();
+
+        assert_staged_tree_matches(&remote, &dep2, &digest2);
+
+        // The dropped file is gone from the staged tree; the added file is
+        // present; the changed file carries the new content.
+        let staged = remote.root().join(layout::staged_tree(&dep2, &digest2));
+        assert!(
+            !staged.join("b.txt").exists(),
+            "a file dropped from the new tree must be removed from the staged base"
+        );
+        assert_eq!(
+            std::fs::read(staged.join("c.txt")).unwrap(),
+            b"ccc",
+            "an added file must be present in the staged tree"
+        );
+        assert_eq!(
+            std::fs::read(staged.join("a.txt")).unwrap(),
+            b"aaa-changed",
+            "a changed file must carry the new content"
+        );
+    }
+
+    /// The dedup handles a TYPE TRANSITION (a file becomes a directory): the
+    /// stale entry is removed from the copied staging base before the new
+    /// entry is created, and the staged tree canonicalizes to the new digest.
+    #[test]
+    fn stage_incoming_dedup_handles_type_transitions() {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let remote =
+            WriteCountingRemote::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
+                .unwrap();
+        let helper = RemoteHelper::new(&remote);
+
+        // v1: `thing` is a file.
+        let host1 = dir.path().join("host1");
+        let digest1 = build_host_tree(
+            &host1,
+            &[EntrySpec::File {
+                path: "thing",
+                data: b"file".to_vec(),
+                mode: 0o644,
+            }],
+        );
+        let dep1 = crate::identity::test_deployment_id("dep1");
+        stage_and_publish(&helper, &dep1, &digest1, &host1);
+
+        // v2: `thing` is a directory containing a file.
+        let host2 = dir.path().join("host2");
+        let digest2 = build_host_tree(
+            &host2,
+            &[
+                EntrySpec::Dir {
+                    path: "thing",
+                    mode: 0o755,
+                },
+                EntrySpec::File {
+                    path: "thing/inner.txt",
+                    data: b"inner".to_vec(),
+                    mode: 0o644,
+                },
+            ],
+        );
+        let dep2 = crate::identity::test_deployment_id("dep2");
+        helper
+            .stage_incoming(&dep2, &digest2, &host2, Some(&digest1))
+            .unwrap();
+
+        assert_staged_tree_matches(&remote, &dep2, &digest2);
+    }
+
+    /// When the previous tree is MISSING from the remote, the dedup falls
+    /// back to the full upload — the staged tree still canonicalizes to the
+    /// digest.
+    #[test]
+    fn stage_incoming_dedup_falls_back_when_prev_missing() {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let remote =
+            WriteCountingRemote::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
+                .unwrap();
+        let helper = RemoteHelper::new(&remote);
+
+        let host = dir.path().join("host");
+        let digest = build_host_tree(
+            &host,
+            &[EntrySpec::File {
+                path: "a.txt",
+                data: b"aaa".to_vec(),
+                mode: 0o644,
+            }],
+        );
+        let dep = crate::identity::test_deployment_id("dep");
+        let missing = TreeDigest::parse(&"0".repeat(64)).expect("a valid digest");
+        helper
+            .stage_incoming(&dep, &digest, &host, Some(&missing))
+            .unwrap();
+
+        assert_staged_tree_matches(&remote, &dep, &digest);
     }
 }

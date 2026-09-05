@@ -1569,6 +1569,20 @@ impl Remote for SshTransport {
         self.run_remote_ok(&Self::argv_cmd(&["rm".into(), "-rf".into(), p]))
     }
 
+    fn copy_tree(&self, src: &RootedRelativePath, dest: &RootedRelativePath) -> Result<()> {
+        if let Some(parent) = dest.parent() {
+            self.create_dir_all(&parent)?;
+        }
+        let s = self.root.join(src).to_string_lossy().into_owned();
+        let d = self.root.join(dest).to_string_lossy().into_owned();
+        // Same-filesystem `cp -a` on the remote: no bytes cross the link, and
+        // `-a` preserves modes, ownership, timestamps, and symlinks (GNU and
+        // BSD cp both handle read-only source dirs by creating the dest dirs
+        // writable and chmodding them at the end). The destination must not
+        // already exist (the caller removes a stale staging dir first).
+        self.run_remote_ok(&Self::argv_cmd(&["cp".into(), "-a".into(), s, d]))
+    }
+
     fn exists(&self, rel: &RootedRelativePath) -> bool {
         let p = self.root.join(rel).to_string_lossy().into_owned();
         let out = self.run_remote(&Self::argv_cmd(&["test".into(), "-e".into(), p]));

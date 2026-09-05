@@ -932,6 +932,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     &deployment_id,
                     &self.tree,
                     &self.store.object_root(&self.tree),
+                    None,
                 )
                 .unwrap();
             let behavior = self.behave();
