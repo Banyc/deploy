@@ -24,7 +24,6 @@ use crate::digest::sha256_bytes;
 use crate::error::{Error, Result};
 use crate::identity::{TreeEntry, TreeMetadata};
 use std::collections::BTreeSet;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
@@ -125,7 +124,15 @@ pub fn canonicalize_tree(root: &Path) -> Result<TreeMetadata> {
             .map_err(|e| Error::materialization(format!("stat {}: {e}", path.display())))?;
 
         let entry_type;
-        let mut mode = fmt_mode(meta.mode());
+        // Symlink entries carry a fixed canonical mode (0777) — the mode is
+        // never read through the (symlink-following) platform helper, which
+        // would fail on a dangling link. Dirs/files read their mode via the
+        // platform helper (a documented 0o644 constant on Windows).
+        let mut mode = if meta.is_symlink() {
+            "0777".to_string()
+        } else {
+            fmt_mode(crate::platform::file_mode(path)?)
+        };
         let mut content_sha256 = None;
         let mut symlink_target = None;
 
@@ -158,11 +165,15 @@ pub fn canonicalize_tree(root: &Path) -> Result<TreeMetadata> {
             mode = "0777".to_string();
         } else if meta.is_file() {
             entry_type = "file";
-            if meta.nlink() > 1 {
-                return Err(Error::materialization(format!(
-                    "hard links not allowed: {}",
-                    path.display()
-                )));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if meta.nlink() > 1 {
+                    return Err(Error::materialization(format!(
+                        "hard links not allowed: {}",
+                        path.display()
+                    )));
+                }
             }
             let data = std::fs::read(path)
                 .map_err(|e| Error::materialization(format!("read {}: {e}", path.display())))?;

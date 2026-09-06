@@ -22,12 +22,9 @@ use crate::ledger::{
     CheckpointWire, DeploymentIntent, DeploymentStatus, LEDGER_SCHEMA_VERSION, LedgerEntry,
     LedgerEventWire, LedgerIntentWire, LedgerTerminal, LedgerTerminalWire,
 };
-use crate::store::atomic::{ReplaceOutcome, openat_no_follow, temp_file_name};
+use crate::store::atomic::ReplaceOutcome;
 use crate::store::local::LocalStore;
-use std::io::Write;
-use std::os::fd::OwnedFd;
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[cfg(test)]
 use crate::testutil::test_faults::FaultKind;
@@ -502,106 +499,44 @@ impl LocalStore {
             buf.push_str(line);
             buf.push('\n');
         }
-        // The ledger write is DESCRIPTOR-RELATIVE: the parent directory is
-        // resolved component-wise relative to the owned root with
-        // `openat(O_NOFOLLOW)`, so a symlink injected into a path component
-        // can never redirect the append outside the owned root.
+        // The ledger write is DESCRIPTOR-RELATIVE on Unix (component-wise
+        // `openat(O_NOFOLLOW)` — a symlink injected into a path component
+        // can never redirect the append outside the owned root) and
+        // PATH-BASED on Windows — the platform split lives in
+        // [`crate::store::atomic`]'s `write_atomic_replace_fd`. The
+        // per-stage fault registry maps onto the replace's stage hook.
         let rel = self.rel(&p)?;
-        let parent_rel = rel.parent().unwrap_or(Path::new(""));
-        let parent_fd: OwnedFd = if parent_rel.as_os_str().is_empty() {
-            self.root_fd
-                .try_clone()
-                .map_err(|e| Error::store(format!("dup root dir: {e}")))?
-        } else {
-            openat_no_follow(
-                &self.root_fd,
-                parent_rel,
-                libc::O_RDONLY | libc::O_DIRECTORY,
-                0,
-            )?
+        #[cfg(test)]
+        let fault = &mut |stage: crate::store::atomic::ReplaceStage| -> Option<Error> {
+            let kind = match stage {
+                crate::store::atomic::ReplaceStage::Write => FaultKind::AppendWrite,
+                crate::store::atomic::ReplaceStage::Sync => FaultKind::AppendSync,
+                crate::store::atomic::ReplaceStage::Rename => FaultKind::AppendRename,
+                crate::store::atomic::ReplaceStage::DirSync => FaultKind::AppendDirSync,
+            };
+            if self.fault_registry.consume(kind, _deployment_id) {
+                Some(Error::store(format!(
+                    "test fault: ledger append ({stage:?}) forced to fail once"
+                )))
+            } else {
+                None
+            }
         };
-        let file_name = rel
-            .file_name()
-            .ok_or_else(|| Error::store(format!("{} has no file name", p.display())))?;
-        let tmp_name = temp_file_name(file_name);
-
-        // Stage 1: the temp write.
-        #[cfg(test)]
-        if self
-            .fault_registry
-            .consume(FaultKind::AppendWrite, _deployment_id)
-        {
-            return Err(Error::store(
-                "test fault: ledger append (temp write) forced to fail once",
-            ));
+        #[cfg(not(test))]
+        let fault = &mut |_stage: crate::store::atomic::ReplaceStage| -> Option<Error> { None };
+        let outcome = crate::store::atomic::write_atomic_replace_fd(
+            &self.root_fd,
+            rel,
+            buf.as_bytes(),
+            fault,
+        )?;
+        // FAIL-CLOSED: a post-rename durability-unknown outcome is an `Err`
+        // (the same post-commit window the checkpoint's
+        // [`FaultKind::LedgerReplaceDirSync`] models).
+        match outcome {
+            crate::store::atomic::ReplaceOutcome::ReplacedDurable => Ok(()),
+            crate::store::atomic::ReplaceOutcome::ReplacedDurabilityUnknown { error } => Err(error),
         }
-        {
-            let tmp_fd = openat_no_follow(
-                &parent_fd,
-                Path::new(&tmp_name),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
-                0o600,
-            )?;
-            let mut f = std::fs::File::from(tmp_fd);
-            f.write_all(buf.as_bytes())
-                .map_err(|e| Error::store(format!("write {}: {e}", p.display())))?;
-        }
-        // Stage 2: the temp fsync.
-        #[cfg(test)]
-        if self
-            .fault_registry
-            .consume(FaultKind::AppendSync, _deployment_id)
-        {
-            return Err(Error::store(
-                "test fault: ledger append (temp sync) forced to fail once",
-            ));
-        }
-        {
-            let f = std::fs::File::from(openat_no_follow(
-                &parent_fd,
-                Path::new(&tmp_name),
-                libc::O_RDONLY,
-                0,
-            )?);
-            f.sync_all()
-                .map_err(|e| Error::store(format!("fsync {}: {e}", p.display())))?;
-        }
-        // Private BEFORE visible: the temp carries 0o600 before the rename.
-        {
-            let f = std::fs::File::from(openat_no_follow(
-                &parent_fd,
-                Path::new(&tmp_name),
-                libc::O_RDONLY,
-                0,
-            )?);
-            f.set_permissions(std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| Error::store(format!("chmod {}: {e}", p.display())))?;
-        }
-        // Stage 3: the atomic rename (the commit point).
-        #[cfg(test)]
-        if self
-            .fault_registry
-            .consume(FaultKind::AppendRename, _deployment_id)
-        {
-            return Err(Error::store(
-                "test fault: ledger append (rename) forced to fail once",
-            ));
-        }
-        crate::store::atomic::renameat_fd(&parent_fd, &tmp_name, &parent_fd, file_name)?;
-        // Stage 4: the FAIL-CLOSED parent-directory fsync, AFTER the rename:
-        // the new ledger is already visible, but not durable across power
-        // loss until its directory entry is synced.
-        #[cfg(test)]
-        if self
-            .fault_registry
-            .consume(FaultKind::AppendDirSync, _deployment_id)
-        {
-            return Err(Error::store(
-                "test fault: ledger append (parent-dir sync) forced to fail once",
-            ));
-        }
-        crate::store::atomic::fsync_dir_fd(&parent_fd)?;
-        Ok(())
     }
 }
 

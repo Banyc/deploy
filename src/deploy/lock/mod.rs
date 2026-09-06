@@ -1,6 +1,9 @@
 //! Advisory locking for push transactions.
 //!
-//! `FileLock` is an advisory (flock) lock held by an open file descriptor.
+//! `FileLock` is an advisory lock held by an open file descriptor — `flock`
+//! on Unix, `LockFileEx` on Windows (the platform split lives in the
+//! [`unix`] / [`windows`] submodules behind ONE cfg switch at the module
+//! boundary).
 //! While the guard is alive the kernel prevents any other process from
 //! acquiring the same lock, and the lock is released automatically if the
 //! owning process dies — so a stale lock from a crashed controller can never
@@ -25,8 +28,27 @@
 //! flock.
 
 use crate::error::{Error, Result};
-use std::os::unix::io::AsRawFd;
 use std::path::Path;
+
+#[cfg(unix)]
+mod unix;
+#[cfg(windows)]
+mod windows;
+
+#[cfg(unix)]
+use unix as platform;
+#[cfg(windows)]
+use windows as platform;
+
+pub(crate) use platform::{contended_errno, try_lock, unlock};
+
+/// The outcome of a platform lock attempt: acquired, contended (another
+/// holder — the caller reports the "held by" message), or a real failure.
+pub(crate) enum LockAttempt {
+    Acquired,
+    Contended,
+    Failed(std::io::Error),
+}
 
 /// An advisory (flock) lock held by an open file descriptor. While the guard
 /// is alive the kernel prevents any other process from acquiring the same lock,
@@ -88,23 +110,21 @@ impl FileLock {
             .truncate(false)
             .open(path)
             .map_err(|e| Error::preflight(format!("open lock {}: {e}", path.display())))?;
-        let fd = file.as_raw_fd();
-        // Exclusive, non-blocking advisory lock. Only one holder at a time.
-        let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-        if ret != 0 {
-            let err = std::io::Error::last_os_error();
-            match err.raw_os_error() {
-                Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => {
-                    let held = std::fs::read_to_string(path).unwrap_or_default();
-                    return Err(Error::preflight(format!(
-                        "local lock {} held by '{}'",
-                        path.display(),
-                        held.trim()
-                    )));
-                }
-                _ => {
-                    return Err(Error::preflight(format!("flock {}: {err}", path.display())));
-                }
+        // Exclusive, non-blocking advisory lock (flock on Unix, LockFileEx
+        // on Windows — the platform split lives in the [`platform`]
+        // submodule). Only one holder at a time.
+        match platform::try_lock(&file) {
+            platform::LockAttempt::Acquired => {}
+            platform::LockAttempt::Contended => {
+                let held = std::fs::read_to_string(path).unwrap_or_default();
+                return Err(Error::preflight(format!(
+                    "local lock {} held by '{}'",
+                    path.display(),
+                    held.trim()
+                )));
+            }
+            platform::LockAttempt::Failed(err) => {
+                return Err(Error::preflight(format!("lock {}: {err}", path.display())));
             }
         }
         // We hold the lock: record our operation id for diagnostics.
@@ -130,9 +150,7 @@ impl std::ops::Drop for FileLock {
         // fd drops even if the explicit unlock below never ran. The file is
         // left in place as a stable diagnostic record (the last holder's
         // operation id); exclusion comes from the flock on the single inode.
-        unsafe {
-            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
-        }
+        platform::unlock(&self.file);
     }
 }
 
@@ -171,10 +189,12 @@ impl AdministrativeRecoveryGuard {
     }
 }
 
+#[cfg(unix)]
 #[cfg(test)]
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use std::os::unix::io::AsRawFd;
     use std::sync::{Arc, Barrier};
     use std::thread;
 

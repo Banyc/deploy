@@ -4,7 +4,6 @@
 
 use crate::env::SysEnv;
 use crate::error::{Error, Result};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -66,7 +65,7 @@ pub(crate) fn pin_known_hosts(
             cache_dir.display()
         ))
     })?;
-    std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+    crate::platform::chmod(&cache_dir, 0o700).map_err(|e| {
         Error::transport(format!(
             "chmod known_hosts cache {}: {e}",
             cache_dir.display()
@@ -153,7 +152,7 @@ pub(crate) fn pin_known_hosts(
         .and_then(|_| f.write_all(b"\n"))
         .map_err(|e| Error::transport(format!("write known_hosts {}: {e}", path.display())))?;
     drop(f);
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+    crate::platform::chmod(&path, 0o600)
         .map_err(|e| Error::transport(format!("chmod known_hosts {}: {e}", path.display())))?;
     Ok(path)
 }

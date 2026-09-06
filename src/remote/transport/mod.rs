@@ -31,14 +31,13 @@ pub(crate) mod scripted;
 mod ssh;
 
 pub use rooted::RootedRelativePath;
-pub use runner::{
-    ChildRunner, KillSeam, RealKill, RunError, RunOutcome, RunnerConfig, kill_process_group,
-};
+#[cfg(unix)]
+pub use runner::kill_process_group;
+pub use runner::{ChildRunner, KillSeam, RealKill, RunError, RunOutcome, RunnerConfig};
 pub use ssh::SshTransport;
 
 use crate::env::SysEnv;
 use crate::error::{Error, Result};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
@@ -514,7 +513,7 @@ fn meta_to_remote(m: &std::fs::Metadata) -> RemoteMeta {
         is_symlink: m.file_type().is_symlink(),
         is_file: m.is_file(),
         size: m.len(),
-        mode: m.mode(),
+        mode: crate::platform::metadata_mode(m),
     }
 }
 
@@ -566,8 +565,7 @@ pub(crate) fn ensure_operation_lock_sidecar_durable(base: &Path) -> Result<()> {
         .open(&p)
     {
         Ok(f) => {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644));
+            let _ = crate::platform::chmod(&p, 0o644);
             f.sync_all()
                 .map_err(|e| Error::transport(format!("fsync {}: {e}", p.display())))?;
             drop(f);
@@ -607,16 +605,18 @@ pub(crate) fn with_operation_lock_sidecar<R>(
         .read(true)
         .open(&p)
         .map_err(|e| Error::transport(format!("open sidecar {}: {e}", p.display())))?;
-    use std::os::unix::io::AsRawFd;
-    let fd = file.as_raw_fd();
+    // The platform lock (flock on Unix, LockFileEx on Windows — the split
+    // lives in [`crate::deploy::lock`]): the closure returns the
+    // 0/-1 convention `wait_for_sidecar_flock` expects.
+    let try_lock = || match crate::deploy::lock::try_lock(&file) {
+        crate::deploy::lock::LockAttempt::Acquired => 0,
+        _ => -1,
+    };
     wait_for_sidecar_flock(
         &p,
         SIDECAR_WAIT_TIMEOUT,
         SIDECAR_RETRY_INTERVAL,
-        || {
-            let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-            if ret == 0 { 0 } else { -1 }
-        },
+        try_lock,
         || std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
         Instant::now,
         std::thread::sleep,
@@ -624,7 +624,7 @@ pub(crate) fn with_operation_lock_sidecar<R>(
     SIDECAR_DEPTH.with(|c| c.set(depth + 1));
     let res = f();
     SIDECAR_DEPTH.with(|c| c.set(depth));
-    unsafe { libc::flock(fd, libc::LOCK_UN) };
+    crate::deploy::lock::unlock(&file);
     res
 }
 
@@ -652,7 +652,7 @@ pub(crate) fn wait_for_sidecar_flock(
         }
         let errno = last_errno();
         match errno {
-            x if x == libc::EWOULDBLOCK => {
+            x if x == crate::deploy::lock::contended_errno() => {
                 let cur = now();
                 if cur >= deadline {
                     return Err(Error::transport(format!(
@@ -663,6 +663,9 @@ pub(crate) fn wait_for_sidecar_flock(
                 }
                 sleep(interval.min(deadline - cur));
             }
+            // EINTR (Unix only — Windows has no equivalent): retry
+            // immediately.
+            #[cfg(unix)]
             x if x == libc::EINTR => continue,
             _ => {
                 return Err(Error::transport(format!(
@@ -965,7 +968,7 @@ pub(crate) fn durable_create_new(
             step = CreateNewStep::Chmod
         )));
     }
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(options.mode & 0o7777))
+    crate::platform::chmod(&tmp, options.mode & 0o7777)
         .map_err(|e| Error::transport(format!("chmod {}: {e}", tmp.display())))?;
     // 4. file fsync — the temp file is durable.
     if fail(CreateNewStep::FileFsync) {
@@ -1328,10 +1331,13 @@ impl VerifySwap {
 /// open is irrelevant — the descriptor pins the inode.
 fn open_verify_local(p: &Path, #[cfg(test)] swap: Option<&VerifySwap>) -> Result<OpenedExisting> {
     use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
-    opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
     #[cfg(test)]
     if swap.is_some_and(|s| s.fire(VerifySwapBoundary::BeforeOpen, p)) {
         // The swap consumed: the destination was replaced BEFORE the open,
@@ -1525,7 +1531,7 @@ impl Remote for LocalTransport {
         std::fs::write(&p, data)
             .map_err(|e| Error::transport(format!("write {}: {e}", p.display())))?;
         if mode != 0 {
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode))
+            crate::platform::chmod(&p, mode)
                 .map_err(|e| Error::transport(format!("chmod {}: {e}", p.display())))?;
         }
         Ok(())
@@ -1542,11 +1548,8 @@ impl Remote for LocalTransport {
     }
 
     fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
-        std::fs::set_permissions(
-            join(&self.base, rel),
-            std::fs::Permissions::from_mode(mode & 0o7777),
-        )
-        .map_err(|e| Error::transport(format!("chmod {}: {e}", rel.display())))
+        crate::platform::chmod(&join(&self.base, rel), mode & 0o7777)
+            .map_err(|e| Error::transport(format!("chmod {}: {e}", rel.display())))
     }
 
     fn list(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>> {
@@ -1572,7 +1575,7 @@ impl Remote for LocalTransport {
                 is_dir: m.is_dir(),
                 is_symlink: m.file_type().is_symlink(),
                 size: m.len(),
-                mode: m.mode(),
+                mode: crate::platform::metadata_mode(&m),
             });
         }
         Ok(out)
@@ -1595,7 +1598,7 @@ impl Remote for LocalTransport {
             std::fs::create_dir_all(parent).ok();
         }
         let _ = std::fs::remove_file(&l);
-        let res = std::os::unix::fs::symlink(target, &l);
+        let res = crate::platform::symlink(target, &l);
         res.map_err(|e| {
             Error::transport(format!(
                 "symlink {} -> {}: {e}",
@@ -1910,6 +1913,7 @@ impl LocalTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::Path;
 
     /// The deploy_dir's IMMUTABLE receiver-UUID marker: `provision_layout`

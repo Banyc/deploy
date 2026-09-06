@@ -37,7 +37,6 @@ use crate::remote::layout;
 use crate::remote::transport::{IMMUTABLE_RECORD_MODE, Remote, RootedRelativePath};
 use crate::verify::release::ValidatedReleaseBundle;
 use std::collections::{HashMap, HashSet};
-use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::time::Duration;
 use unicode_normalization::UnicodeNormalization;
@@ -811,8 +810,12 @@ fn copy_host_tree_to_remote_impl(
             // umask-0002 hosts), changing the tree digest; the explicit mode
             // keeps the create deterministic. The FINAL mode is applied in
             // phase 2, after every child has been uploaded.
-            remote.set_mode(&dest, (meta.mode() | 0o200) & 0o7777)?;
-            dirs.push((dest, meta.mode() & 0o7777, entry.depth()));
+            remote.set_mode(&dest, (crate::platform::file_mode(path)? | 0o200) & 0o7777)?;
+            dirs.push((
+                dest,
+                crate::platform::file_mode(path)? & 0o7777,
+                entry.depth(),
+            ));
         } else if meta.file_type().is_symlink() {
             if skipped {
                 continue;
@@ -841,7 +844,7 @@ fn copy_host_tree_to_remote_impl(
                     remote.remove_file(&dest)?;
                 }
             }
-            remote.write(&dest, &data, meta.mode() & 0o7777)?;
+            remote.write(&dest, &data, crate::platform::file_mode(path)? & 0o7777)?;
         }
     }
     // Phase 2: finalize directory modes deepest-first, so a read-only parent
@@ -923,6 +926,8 @@ pub(crate) mod tests_publish {
     };
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
 
     /// A named (label, mutator) pair driving the publish-rejection mutation

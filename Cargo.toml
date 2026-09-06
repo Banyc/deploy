@@ -32,6 +32,11 @@ libc = "0.2"
 winnow = "1.0.4"
 jiff = "0.2.35"
 
+[target.'cfg(windows)'.dependencies]
+# The Windows advisory lock (LockFileEx/UnlockFileEx) for [`crate::deploy::lock`]
+# and the transport sidecar lock — the Windows counterpart of POSIX `flock`.
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_System_IO"] }
+
 [dev-dependencies]
 assert_fs = "1"
 # The crate as its OWN dev-dependency with the `test-support` feature: the

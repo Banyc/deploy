@@ -45,7 +45,6 @@ use crate::verify::command::run_verification;
 use crate::verify::systemd::validate_artifact_paths;
 use crate::verify::systemd::{SystemdActivation, SystemdApplied};
 use std::collections::HashMap;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 // Per-server mutation pipeline.
@@ -561,7 +560,7 @@ pub(crate) fn download_tree_to_host(
             // producing a wrong tree.
             let target = remote.read_link(&child_rel)?;
             let _ = std::fs::remove_file(&dest);
-            std::os::unix::fs::symlink(&target, &dest)
+            crate::platform::symlink(&target, &dest)
                 .map_err(|e| Error::transport(format!("symlink {}: {e}", dest.display())))?;
         } else if entry.is_dir {
             download_tree_to_host(remote, &child_rel, &dest)?;
@@ -578,7 +577,7 @@ pub(crate) fn download_tree_to_host(
 
 /// Apply a mode to a local file/directory, preserving only the permission bits.
 fn set_mode(path: &Path, mode: u32) -> Result<()> {
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o7777))
+    crate::platform::chmod(path, mode & 0o7777)
         .map_err(|e| Error::transport(format!("chmod {}: {e}", path.display())))
 }
 
@@ -592,6 +591,8 @@ pub(crate) mod server_tests {
     use crate::ledger::SlotOutcome;
     use crate::remote::transport::LocalTransport;
     use crate::verify::release::RELEASE_RECORD_SCHEMA_VERSION;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
     pub(crate) const NONE_VARIANT: &str = r#"

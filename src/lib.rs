@@ -12,6 +12,7 @@ pub mod identity;
 pub mod init;
 pub mod kernel;
 pub mod ledger;
+pub(crate) mod platform;
 pub mod remote;
 pub mod retention;
 pub mod store;

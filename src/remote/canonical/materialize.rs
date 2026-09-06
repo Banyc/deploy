@@ -6,7 +6,6 @@
 use crate::config::{Mapping, destinations_overlap, resolved_mode};
 use crate::error::{Error, Result};
 use std::io::ErrorKind;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
@@ -49,8 +48,7 @@ fn dest_for(staging: &Path, to: &str, src_is_dir: bool, rel: &Path) -> PathBuf {
 
 fn set_mode(path: &Path, mode: Option<u32>) -> Result<()> {
     let m = mode.unwrap_or(0o755);
-    let perms = std::fs::Permissions::from_mode(m);
-    std::fs::set_permissions(path, perms)
+    crate::platform::chmod(path, m)
         .map_err(|e| Error::materialization(format!("set_permissions {}: {e}", path.display())))?;
     Ok(())
 }
@@ -90,9 +88,13 @@ fn create_parent_dirs(src: &Path, dst: &Path, src_root: Option<&Path>) -> Result
         let mode = if depth <= mirror_depth {
             src.ancestors()
                 .nth(depth)
-                .and_then(|counterpart| std::fs::symlink_metadata(counterpart).ok())
-                .filter(|m| m.is_dir())
-                .map(|m| m.mode() & 0o7777)
+                .and_then(|counterpart| {
+                    std::fs::symlink_metadata(counterpart)
+                        .ok()
+                        .filter(|m| m.is_dir())
+                        .and_then(|_| crate::platform::file_mode(counterpart).ok())
+                })
+                .map(|m| m & 0o7777)
                 .unwrap_or(0o755)
         } else {
             0o755
@@ -165,12 +167,12 @@ fn copy_entry(src: &Path, dst: &Path, opts: &CopyEntryOptions<'_>) -> Result<()>
         // override is a FILE-mode policy, and applying a non-traversable
         // override (e.g. 0644) to a directory would break every later
         // no-follow destination walk through it.
-        let final_mode = ft.mode() & 0o7777;
+        let final_mode = crate::platform::file_mode(src)? & 0o7777;
         set_mode(dst, Some(final_mode))?;
         return Ok(());
     }
     // Regular file: preserve the source mode unless an override is given.
-    let source_mode = ft.mode() & 0o7777;
+    let source_mode = crate::platform::file_mode(src)? & 0o7777;
     let final_mode = opts.mode_override.unwrap_or(source_mode);
     create_parent_dirs(src, dst, opts.src_root)?;
     let _ = std::fs::remove_file(dst);
@@ -448,7 +450,7 @@ pub fn materialize_variant(
             // symlink-free; every nested entry re-checks through `copy_entry`.
             ensure_no_symlink_ancestor(dest, &base)?;
             // Preserve the source directory's mode on the merge base.
-            let base_mode = src_meta.mode() & 0o7777;
+            let base_mode = crate::platform::file_mode(&src)? & 0o7777;
             for entry in WalkDir::new(&src).min_depth(1).into_iter() {
                 let entry = entry.map_err(|e| Error::mapping(format!("walk {e}")))?;
                 let rel = entry
@@ -799,6 +801,8 @@ mod tests_materialize {
     use proptest::prelude::*;
     #[cfg(test)]
     use proptest::test_runner::{FileFailurePersistence, RngSeed};
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
 
     fn mapping(from: &str, to: &str) -> Mapping {

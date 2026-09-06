@@ -36,7 +36,6 @@ use crate::identity::ApplicationStoreKey;
 use crate::remote::layout as remote_layout;
 use crate::store::atomic::{ReplaceOutcome, ensure_private_dir, read_json_fd};
 use serde::Serialize;
-use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 
 #[cfg(test)]
@@ -75,7 +74,7 @@ pub mod releases;
 /// DESCRIPTOR-RELATIVE to `dir_fd` (component-wise `openat(O_NOFOLLOW)` — a
 /// symlink injected into any path component is refused, never followed).
 pub(crate) fn read_keyed_json_fd<T>(
-    dir_fd: &OwnedFd,
+    root: &crate::store::atomic::RootDir,
     rel: &Path,
     key: &str,
     extract: impl Fn(&T) -> &str,
@@ -83,7 +82,7 @@ pub(crate) fn read_keyed_json_fd<T>(
 where
     T: serde::de::DeserializeOwned,
 {
-    let rec: T = read_json_fd(dir_fd, rel)?;
+    let rec: T = read_json_fd(root, rel)?;
     let embedded = extract(&rec);
     if embedded != key {
         return Err(Error::integrity(format!(
@@ -208,13 +207,12 @@ pub struct LocalStore {
     /// [`OwnedRoot`] alive so its `Drop` releases the registration.
     #[allow(dead_code)]
     root: Option<OwnedRoot>,
-    /// The open directory descriptor on the owned root, opened with
-    /// `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`. Every store mutation resolves
-    /// paths relative to this descriptor (component-wise `openat(O_NOFOLLOW)`,
-    /// see [`crate::store::atomic`]'s `_fd` primitives), so a symlink
-    /// injected into a path component can never redirect a mutation outside
-    /// the owned root.
-    root_fd: OwnedFd,
+    /// The owned root anchor: an open directory descriptor on Unix (the
+    /// symlink-refusing confinement — every store mutation resolves
+    /// component-wise with `openat(O_NOFOLLOW)`, see
+    /// [`crate::store::atomic`]'s `_fd` primitives), the root PATH on
+    /// Windows (path-based with documented weaker guarantees).
+    root_fd: crate::store::atomic::RootDir,
     /// Per-fixture one-shot fault registry (test-only). Created EMPTY by
     /// [`LocalStore::with_base`]; tests that want an injected store fault arm
     /// it via [`LocalStore::fault_registry`]. There are no process-global
@@ -282,7 +280,7 @@ impl LocalStore {
     /// path component can never redirect a mutation outside the owned root.
     pub fn from_owned_root(root: OwnedRoot) -> Result<LocalStore> {
         let base = root.canonical().to_path_buf();
-        let root_fd = open_root_fd(&base)?;
+        let root_fd = crate::store::atomic::RootDir::open(&base)?;
         ensure_private_dir(&base.join(remote_layout::objects()))?;
         ensure_private_dir(&base.join(remote_layout::RELEASES))?;
         ensure_private_dir(&base.join("targets"))?;
@@ -344,7 +342,7 @@ impl LocalStore {
         ensure_private_dir(&base.join("servers"))?;
         ensure_private_dir(&base.join("deployments"))?;
         ensure_private_dir(&base.join("staging"))?;
-        let root_fd = open_root_fd(&base)?;
+        let root_fd = crate::store::atomic::RootDir::open(&base)?;
         Ok(LocalStore {
             base,
             root: None,
@@ -572,25 +570,6 @@ impl LocalStore {
     pub fn staging_dir(&self) -> PathBuf {
         self.base.join("staging")
     }
-}
-
-/// Open a directory descriptor on `base` with `O_DIRECTORY | O_NOFOLLOW |
-/// O_CLOEXEC`: the descriptor pins the owned root, and every store mutation
-/// resolves paths relative to it (component-wise `openat(O_NOFOLLOW)`), so a
-/// symlink injected into a path component can never redirect a mutation
-/// outside the owned root. `O_NOFOLLOW` refuses a symlink at the FINAL
-/// component (the root itself must be a real directory); intermediate
-/// components are resolved normally (the root is canonical by construction
-/// in production, and test bases are real directories).
-fn open_root_fd(base: &Path) -> Result<OwnedFd> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.read(true);
-    opts.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    let f = opts
-        .open(base)
-        .map_err(|e| Error::store(format!("open root {}: {e}", base.display())))?;
-    Ok(f.into())
 }
 
 /// Sanitize a name for use as a directory/file component — retained ONLY

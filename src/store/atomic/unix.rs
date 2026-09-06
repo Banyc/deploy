@@ -1,105 +1,16 @@
-//! Durable atomic filesystem I/O for the store.
-//!
-//! The atomic-replace protocol this module implements is the store's
-//! durability machinery: write a UNIQUE temp file in the same directory,
-//! chmod it private (0o600) BEFORE it can become visible under its final
-//! name, fsync it, rename it into place (atomic on POSIX — a reader never
-//! sees a torn record), then fsync the parent directory. The replace has
-//! TWO DISTINCT COMMIT POINTS and `write_atomic_replace` reports them
-//! EXPLICITLY ([`ReplaceOutcome`]): the RENAME is commit point 1 (the new
-//! content becomes VISIBLE under its final name), and the PARENT-DIRECTORY
-//! FSYNC is commit point 2 (the rename becomes DURABLE across power loss).
-//! A failure before the rename is an `Err` — the OLD content is still
-//! visible. A failure of the parent-directory open/fsync AFTER the rename
-//! is [`ReplaceOutcome::ReplacedDurabilityUnknown`] — the NEW content IS
-//! visible but its durability is UNCONFIRMED — never a bare `Err` (a bare
-//! `Err` would conflate "the rename never happened" with "the rename
-//! happened but the durability commit could not be verified"). The
-//! durability of these writes is the checkpoint's ordering guarantee — the
-//! floor marker must be durable BEFORE the compaction deletes anything, so
-//! an interrupted compaction can never expose history below the floor; the
-//! checkpoint's per-stage sequence (the transactional ADVANCE and its
-//! restore) lives in [`crate::retention::history_floor`] on top of these
-//! primitives.
-//!
-//! The helpers here are the shared plumbing — `pub(crate)` free functions
-//! imported by [`crate::store::local`] and [`crate::retention::history_floor`]:
-//! the tri-state existence check (`path_state`), the fail-closed
-//! parent-dir fsync (`sync_parent_dir`), unique temp naming
-//! (`temp_name_for`), the atomic marker/JSONL rewrites
-//! (`write_atomic_replace`, `write_jsonl_atomic`), private permissions
-//! (`set_private`, `ensure_private_dir`), the tree-object directory
-//! copy (`copy_dir_recursive`), and the JSON readers.
-//!
-//! Parse-sensitive marker reads: a PRESENT-but-malformed marker CONTENT is
-//! semantic CORRUPTION and maps to [`Error::integrity`] via
-//! `read_json_marker` (the file exists, it is just not a valid marker),
-//! while a mechanical filesystem I/O failure (open/read/rename/fsync)
-//! stays [`Error::store`] — the class split a caller can always
-//! distinguish "this marker is corrupt" from "disk read failed".
-//! `read_json` folds both into [`Error::store`], which is correct for
-//! its non-marker callers (observed.json, retention-debt.json, tree
-//! metadata, ...); callers of `read_json_marker` must still perform
-//! their own schema-version check after a successful parse (also
-//! [`Error::integrity`]): an unsupported `schema_version` is a
-//! marker-format violation, not an I/O failure.
+//! The Unix implementation of the store atomic I/O: the descriptor-relative
+//! owned-root confinement (`openat`/`renameat`/`linkat`/`unlinkat`/`mkdirat`
+//! with `O_NOFOLLOW` — a symlink injected into any path component is refused,
+//! never followed) plus the POSIX durability protocol (temp fsync, atomic
+//! rename, parent-directory fsync). Selected by the single `#[cfg(unix)]`
+//! `mod` declaration in [`super`].
 
-use crate::error::{Error, Result};
-use std::ffi::{CStr, CString, OsStr};
+use super::*;
+use std::ffi::{CStr, CString};
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
-
-/// The path-based JSON reader — TEST-ONLY (the crash-consistency assertions
-/// read a REOPENED store's files directly to verify the on-disk state). The
-/// store's OWN record reads route through [`read_json_fd`]
-/// (descriptor-relative, symlink-refusing); no production caller uses the
-/// raw-path reader, so it is `#[cfg(test)]`-gated (no `#[allow(dead_code)]`
-/// band-aid).
-#[cfg(test)]
-pub(crate) fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
-    let bytes =
-        std::fs::read(path).map_err(|e| Error::store(format!("read {}: {e}", path.display())))?;
-    serde_json::from_slice(&bytes)
-        .map_err(|e| Error::store(format!("deserialize {}: {e}", path.display())))
-}
-/// TRI-STATE existence check for marker/backup/log DISCOVERY: is `path`
-/// present? A genuine [`std::io::ErrorKind::NotFound`] from
-/// [`std::fs::symlink_metadata`] is the ONE outcome that reads as ABSENCE
-/// (`Ok(false)`); EVERY other filesystem error (EACCES, EIO, ENOTDIR, ...)
-/// is a real failure → [`Error::store`], NEVER treated as absence. This is
-/// the fail-closed replacement for the boolean `.exists()` checks that
-/// silently read a permission/I/O error on the marker directory as "no
-/// floor" / "no pending cleanup" / "no backups".
-///
-/// The store's WRITE-path open-or-create checks (`append_attempt`,
-/// `append_snapshot`, `write_atomic_cas`) are deliberately NOT converted:
-/// there a swallowed `exists()` error lands in the subsequent open/create
-/// call, which fails and propagates anyway — no silent absence is possible.
-///
-/// Under `#[cfg(test)]` the check routes through the injectable
-/// [`MarkerIoOps`] seam when a test installed one, so the tri-state
-/// property can force each outcome on the marker path.
-pub(crate) fn path_state(path: &Path) -> Result<bool> {
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => Ok(true),
-        Err(e) => absent_or_store(e, path),
-    }
-}
-
-/// Classify a metadata error tri-state: ONLY a genuine
-/// [`std::io::ErrorKind::NotFound`] is absence (`Ok(false)`); any other io
-/// error is [`Error::store`] (a permission/read failure is never "no
-/// marker").
-fn absent_or_store(e: std::io::Error, path: &Path) -> Result<bool> {
-    if e.kind() == std::io::ErrorKind::NotFound {
-        Ok(false)
-    } else {
-        Err(Error::store(format!("stat {}: {e}", path.display())))
-    }
-}
 
 pub(crate) fn set_private(path: &Path) -> Result<()> {
     let perms = std::fs::Permissions::from_mode(0o600);
@@ -108,104 +19,6 @@ pub(crate) fn set_private(path: &Path) -> Result<()> {
 }
 /// Unique temp-file name for an atomic replace of `path`: same directory,
 /// hidden dot-prefixed name carrying the process id and a process-scoped
-/// counter, so concurrent atomic writes on one store stay collision-free.
-pub(crate) fn temp_name_for(path: &Path) -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-    path.with_file_name(format!(
-        ".{}.tmp.{}.{}",
-        path.file_name()
-            .map(|n| n.to_string_lossy())
-            .unwrap_or_default(),
-        std::process::id(),
-        TMP_COUNTER.fetch_add(1, Ordering::Relaxed),
-    ))
-}
-/// The explicit outcome of an atomic replace: the two commit points
-/// (the rename — new content VISIBLE — and the parent-directory fsync —
-/// new content DURABLE) are reported distinctly, so a caller can always
-/// tell "the rename never happened" from "the rename happened but
-/// durability is unconfirmed" (see `write_atomic_replace`).
-#[derive(Debug)]
-pub enum ReplaceOutcome {
-    /// BOTH commit points confirmed: the new content is visible under its
-    /// final name AND the parent-directory fsync succeeded — the replace
-    /// is durable across power loss.
-    ReplacedDurable,
-    /// ONLY the rename (commit point 1) is confirmed: the new content IS
-    /// visible under its final name, but the parent-directory open/fsync
-    /// (commit point 2) failed AFTER the rename — durability is
-    /// UNCONFIRMED and the failure is carried. NEVER a bare `Err`: `Err`
-    /// means the rename never happened (the old content is still visible).
-    ReplacedDurabilityUnknown { error: Error },
-}
-
-/// The [`write_atomic_replace`] stage a test-injected fault fires at. The
-/// hook is [`write_atomic_replace`]'s own `fault` parameter, so a
-/// per-fixture registry can fault each atomic-replacement stage exactly as
-/// the append path's [`crate::testutil::test_faults::FaultKind::AppendWrite`]
-/// family does; production passes a no-op hook.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ReplaceStage {
-    /// The temp-file CREATE/WRITE stage (before any I/O on the temp): the
-    /// visible target is wholly OLD; a fault here is an `Err`.
-    Write,
-    /// The temp-file FSYNC stage (after the write, before the chmod): an
-    /// invisible dot-prefixed temp exists; the visible target is wholly
-    /// OLD; a fault here is an `Err`.
-    Sync,
-    /// The RENAME stage (after the chmod, before the atomic rename): the
-    /// visible target is wholly OLD; a fault here is an `Err`.
-    Rename,
-    /// The PARENT-DIRECTORY open/fsync stage, AFTER the rename: the new
-    /// content IS visible under its final name but its durability is
-    /// unconfirmed — reported as
-    /// [`ReplaceOutcome::ReplacedDurabilityUnknown`], never an `Err`.
-    DirSync,
-}
-
-/// Durably replace a mutable marker file (the history floor): write a
-/// UNIQUE temp file in the same directory, chmod it private, fsync it,
-/// rename over the target (atomic on POSIX — a reader never sees a torn
-/// record), then fsync the parent directory. The durability of this write
-/// is the checkpoint's ordering guarantee — the floor marker must be
-/// durable BEFORE the compaction deletes anything, so an interrupted
-/// compaction can never expose history below the floor.
-///
-/// # The TWO COMMIT POINTS — the tri-state contract
-///
-/// * `Err` — the rename NEVER succeeded: a failure at any PRE-RENAME
-///   stage (temp create/write, temp fsync, chmod, rename) propagates as
-///   `Err` and the OLD content remains visible.
-/// * [`ReplaceOutcome::ReplacedDurable`] — the new content is visible AND
-///   the parent-directory fsync was confirmed: the replace is durable
-///   across power loss.
-/// * [`ReplaceOutcome::ReplacedDurabilityUnknown`] — the new content IS
-///   visible under its final name (the rename — commit point 1 —
-///   happened), but durability is UNCONFIRMED: the parent-directory
-///   `File::open` or `sync_all` (commit point 2) failed after the rename
-///   and the failure is carried. The fail-closed behaviour is preserved —
-///   the unconfirmed durability is never reported as success — but it
-///   surfaces as the EXPLICIT unknown-durability outcome, never an
-///   ambiguous `Err`.
-///
-/// Ordering: the temp file is chmodded 0o600 BEFORE the rename, so the
-/// marker never becomes visible under its final name with default
-/// permissions.
-///
-/// # The per-stage fault hook
-///
-/// `fault` is invoked at each stage's entry and may inject a failure at
-/// EVERY atomic-replacement stage ([`ReplaceStage`]): the hook returns the
-/// faulted error for the stage it wants to fail (`None` passes the stage
-/// through). The pre-rename stages (write / sync / rename) propagate a hook
-/// error as `Err` — the old content is still visible; the post-rename
-/// parent-directory stage converts a hook error (or a real open/fsync
-/// failure) into [`ReplaceOutcome::ReplacedDurabilityUnknown`] with the
-/// error carried. The hook is the caller's closure over ITS OWN fixture
-/// registry, so fault isolation stays per-fixture (never process-global
-/// state); a no-op hook (`|_| None`) is the plain production path — the
-/// SAME function is exercised in test builds with the registry-backed hook.
 pub(crate) fn write_atomic_replace(
     path: &Path,
     bytes: &[u8],
@@ -429,8 +242,26 @@ pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 // operates on paths under a store base it does not hold a descriptor
 // for); the store's OWN mutations route through the `_fd` variants below.
 // =====================================================================
+// DESCRIPTOR-RELATIVE I/O (the owned-root confinement)
+// ---------------------------------------------------------------------
+// The store's mutations resolve paths relative to the owned root's open
+// directory descriptor, COMPONENT-WISE with `openat(O_NOFOLLOW)`: every
+// intermediate component is opened as a directory with `O_DIRECTORY |
+// O_NOFOLLOW` (a symlink at ANY component → ELOOP → refused), and the
+// final component is opened with `O_NOFOLLOW`. A symlink injected into a
+// path component can never redirect a mutation outside the owned root —
+// the descriptor pins the root, and no component is ever followed.
+// =====================================================================
 
 /// Open `rel` relative to `dir_fd` COMPONENT-WISE with `O_NOFOLLOW`: every
+/// intermediate component is opened as a directory (`O_RDONLY | O_DIRECTORY
+/// | O_NOFOLLOW | O_CLOEXEC`), and the final component is opened with
+/// `flags` plus `O_NOFOLLOW | O_CLOEXEC`. A symlink injected at ANY
+/// component is refused (ELOOP) — a mutation can never be redirected
+/// outside the root the descriptor pins. `mode` is used only when `flags`
+/// includes `O_CREAT`. The raw `_io` variant returns the underlying io
+/// error (so a caller can distinguish a genuine NotFound from a symlink
+/// refusal); [`openat_no_follow`] wraps it with the path context.
 /// intermediate component is opened as a directory (`O_RDONLY | O_DIRECTORY
 /// | O_NOFOLLOW | O_CLOEXEC`), and the final component is opened with
 /// `flags` plus `O_NOFOLLOW | O_CLOEXEC`. A symlink injected at ANY
@@ -476,21 +307,6 @@ pub(crate) fn openat_no_follow(
 ) -> Result<OwnedFd> {
     openat_no_follow_io(dir_fd, rel, flags, mode)
         .map_err(|e| Error::store(format!("openat {}: {e}", rel.display())))
-}
-
-/// The unique temp FILE NAME for an atomic replace of a file named
-/// `file_name`: hidden dot-prefixed, carrying the process id and a
-/// process-scoped counter (the same naming as [`temp_name_for`], but for
-/// the descriptor-relative writers that need just the name).
-pub(crate) fn temp_file_name(file_name: &OsStr) -> std::ffi::OsString {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-    std::ffi::OsString::from(format!(
-        ".{}.tmp.{}.{}",
-        file_name.to_string_lossy(),
-        std::process::id(),
-        TMP_COUNTER.fetch_add(1, Ordering::Relaxed),
-    ))
 }
 
 /// Open the parent directory of `rel` relative to `root` (component-wise
@@ -683,7 +499,7 @@ fn for_each_dir_entry(dir_fd: &OwnedFd, mut f: impl FnMut(&[u8]) -> Result<()>) 
 /// directory must already exist (the store creates it via
 /// [`ensure_private_dir_fd`] before the write).
 pub(crate) fn write_atomic_replace_fd(
-    root: &OwnedFd,
+    root: &RootDir,
     rel: &Path,
     bytes: &[u8],
     fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
@@ -696,7 +512,7 @@ pub(crate) fn write_atomic_replace_fd(
     if !parent_rel.as_os_str().is_empty() {
         ensure_private_dir_fd(root, parent_rel)?;
     }
-    let (parent_fd, file_name) = parent_fd_of(root, rel)?;
+    let (parent_fd, file_name) = parent_fd_of(root.as_fd(), rel)?;
     let tmp_name = temp_file_name(file_name);
     // Stage 1: the temp create/write. A failure (or an injected
     // [`ReplaceStage::Write`] fault) is a PRE-RENAME `Err`: the visible
@@ -766,8 +582,8 @@ pub(crate) fn write_atomic_replace_fd(
 /// `root` with `openat(O_NOFOLLOW)`. A symlink injected at the final
 /// component is REFUSED (ELOOP) — never followed, never compared against
 /// its target.
-pub(crate) fn write_atomic_cas_fd(root: &OwnedFd, rel: &Path, bytes: &[u8]) -> Result<()> {
-    let (parent_fd, file_name) = parent_fd_of(root, rel)?;
+pub(crate) fn write_atomic_cas_fd(root: &RootDir, rel: &Path, bytes: &[u8]) -> Result<()> {
+    let (parent_fd, file_name) = parent_fd_of(root.as_fd(), rel)?;
     // If the file exists, its content must be byte-identical (an identical
     // rewrite is an idempotent success; a symlink at the final component is
     // refused by the O_NOFOLLOW open — never followed).
@@ -848,8 +664,9 @@ pub(crate) fn write_atomic_cas_fd(root: &OwnedFd, rel: &Path, bytes: &[u8]) -> R
 /// `mkdirat`/`openat(O_NOFOLLOW)`, chmodding the FINAL directory to 0o700
 /// (the same contract as [`ensure_private_dir`]). A symlink at any
 /// component is refused (ELOOP) — never followed.
-pub(crate) fn ensure_private_dir_fd(root: &OwnedFd, rel: &Path) -> Result<()> {
+pub(crate) fn ensure_private_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
     let mut cur: OwnedFd = root
+        .as_fd()
         .try_clone()
         .map_err(|e| Error::store(format!("dup root dir: {e}")))?;
     let comps: Vec<&[u8]> = rel.components().map(|c| c.as_os_str().as_bytes()).collect();
@@ -875,10 +692,11 @@ pub(crate) fn ensure_private_dir_fd(root: &OwnedFd, rel: &Path) -> Result<()> {
 /// parent of each created component (deepest first), then the parent of the
 /// new path's own parent — all through directory fds. Returns `true` when
 /// this call created at least one directory.
-pub(crate) fn ensure_private_dir_durable_fd(root: &OwnedFd, rel: &Path) -> Result<bool> {
+pub(crate) fn ensure_private_dir_durable_fd(root: &RootDir, rel: &Path) -> Result<bool> {
     let comps: Vec<&[u8]> = rel.components().map(|c| c.as_os_str().as_bytes()).collect();
     let mut dirs: Vec<OwnedFd> = Vec::with_capacity(comps.len());
     let mut cur: OwnedFd = root
+        .as_fd()
         .try_clone()
         .map_err(|e| Error::store(format!("dup root dir: {e}")))?;
     let mut created: Vec<usize> = Vec::new();
@@ -939,36 +757,44 @@ pub(crate) fn ensure_private_dir_durable_fd(root: &OwnedFd, rel: &Path) -> Resul
     // created component (deepest first), then the parent of the new path's
     // own parent (the entry that names the directory HOLDING the new path).
     for &i in created.iter().rev() {
-        let parent = if i == 0 { root } else { &dirs[i - 1] };
-        fsync_dir_fd(parent)?;
+        if i == 0 {
+            fsync_dir_fd(root.as_fd())?;
+        } else {
+            fsync_dir_fd(&dirs[i - 1])?;
+        }
     }
     if comps.len() >= 2 {
-        let parent_of_parent = if comps.len() >= 3 {
-            &dirs[comps.len() - 3]
+        if comps.len() >= 3 {
+            fsync_dir_fd(&dirs[comps.len() - 3])?;
         } else {
-            root
-        };
-        fsync_dir_fd(parent_of_parent)?;
+            fsync_dir_fd(root.as_fd())?;
+        }
     }
     Ok(true)
 }
 
 /// The descriptor-relative parent-directory fsync: fsync the directory
 /// holding `rel` (the durability commit of a rename/removal inside it).
-pub(crate) fn sync_parent_dir_fd(root: &OwnedFd, rel: &Path) -> Result<()> {
+pub(crate) fn sync_parent_dir_fd(root: &RootDir, rel: &Path) -> Result<()> {
     let parent_rel = rel.parent().unwrap_or(Path::new(""));
     let parent_fd = if parent_rel.as_os_str().is_empty() {
-        root.try_clone()
+        root.as_fd()
+            .try_clone()
             .map_err(|e| Error::store(format!("dup root dir: {e}")))?
     } else {
-        openat_no_follow(root, parent_rel, libc::O_RDONLY | libc::O_DIRECTORY, 0)?
+        openat_no_follow(
+            root.as_fd(),
+            parent_rel,
+            libc::O_RDONLY | libc::O_DIRECTORY,
+            0,
+        )?
     };
     fsync_dir_fd(&parent_fd)
 }
 
 /// The descriptor-relative private chmod (0o600) of a file under the root.
-pub(crate) fn set_private_fd(root: &OwnedFd, rel: &Path) -> Result<()> {
-    let (parent_fd, name) = parent_fd_of(root, rel)?;
+pub(crate) fn set_private_fd(root: &RootDir, rel: &Path) -> Result<()> {
+    let (parent_fd, name) = parent_fd_of(root.as_fd(), rel)?;
     let f = std::fs::File::from(openat_no_follow(
         &parent_fd,
         Path::new(name),
@@ -981,16 +807,16 @@ pub(crate) fn set_private_fd(root: &OwnedFd, rel: &Path) -> Result<()> {
 
 /// The descriptor-relative remove of a single file (or symlink — the
 /// symlink itself is removed, never its target).
-pub(crate) fn remove_file_fd(root: &OwnedFd, rel: &Path) -> Result<()> {
-    let (parent_fd, name) = parent_fd_of(root, rel)?;
+pub(crate) fn remove_file_fd(root: &RootDir, rel: &Path) -> Result<()> {
+    let (parent_fd, name) = parent_fd_of(root.as_fd(), rel)?;
     unlinkat_fd(&parent_fd, name)
 }
 
 /// The descriptor-relative rename of a path under the root to another path
 /// under the root (both parents resolved component-wise with O_NOFOLLOW).
-pub(crate) fn renameat_paths(root: &OwnedFd, from: &Path, to: &Path) -> Result<()> {
-    let (from_fd, from_name) = parent_fd_of(root, from)?;
-    let (to_fd, to_name) = parent_fd_of(root, to)?;
+pub(crate) fn renameat_paths(root: &RootDir, from: &Path, to: &Path) -> Result<()> {
+    let (from_fd, from_name) = parent_fd_of(root.as_fd(), from)?;
+    let (to_fd, to_name) = parent_fd_of(root.as_fd(), to)?;
     renameat_fd(&from_fd, from_name, &to_fd, to_name)
 }
 
@@ -999,8 +825,8 @@ pub(crate) fn renameat_paths(root: &OwnedFd, from: &Path, to: &Path) -> Result<(
 /// removed as the entry itself, never followed), subdirectories are
 /// recursed into, and the tree root is removed last. A symlink injected at
 /// any component is refused (ELOOP) — never followed.
-pub(crate) fn remove_dir_all_fd(root: &OwnedFd, rel: &Path) -> Result<()> {
-    let (parent_fd, name) = parent_fd_of(root, rel)?;
+pub(crate) fn remove_dir_all_fd(root: &RootDir, rel: &Path) -> Result<()> {
+    let (parent_fd, name) = parent_fd_of(root.as_fd(), rel)?;
     let dir_fd = openat_no_follow(
         &parent_fd,
         Path::new(name),
@@ -1073,15 +899,15 @@ fn remove_dir_contents_fd(dir_fd: &OwnedFd, rel: &Path) -> Result<()> {
 /// absolute path (a read, never a mutation). Directory and file modes are
 /// copied EXACTLY from the source (the tree digest includes modes — a
 /// mode-shifted copy would fail the staged-object verification).
-pub(crate) fn copy_dir_recursive_fd(root: &OwnedFd, src: &Path, dst_rel: &Path) -> Result<()> {
+pub(crate) fn copy_dir_recursive_fd(root: &RootDir, src: &Path, dst_rel: &Path) -> Result<()> {
     // Create the destination directory with the SOURCE directory's mode
     // (the digest includes modes; the copy must preserve them exactly).
     let src_mode = std::fs::metadata(src)
         .map_err(|e| Error::store(format!("stat {}: {e}", src.display())))?
         .permissions()
         .mode();
-    create_dir_chain_fd(root, dst_rel, src_mode)?;
-    let dst_fd = openat_no_follow(root, dst_rel, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+    create_dir_chain_fd(root.as_fd(), dst_rel, src_mode)?;
+    let dst_fd = openat_no_follow(root.as_fd(), dst_rel, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
     for entry in std::fs::read_dir(src)
         .map_err(|e| Error::store(format!("read_dir {}: {e}", src.display())))?
     {
@@ -1168,8 +994,8 @@ fn create_dir_chain_fd(root: &OwnedFd, rel: &Path, mode: u32) -> Result<()> {
 /// descriptor — a symlink injected into any component is refused (ELOOP),
 /// never followed. Symlinks are SKIPPED (their durability is their
 /// directory entry, covered by the parent-dir fsync).
-pub(crate) fn fsync_tree_recursive_fd(root: &OwnedFd, rel: &Path) -> Result<()> {
-    let dir_fd = openat_no_follow(root, rel, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+pub(crate) fn fsync_tree_recursive_fd(root: &RootDir, rel: &Path) -> Result<()> {
+    let dir_fd = openat_no_follow(root.as_fd(), rel, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
     for_each_dir_entry(&dir_fd, |name| {
         let child_rel = rel.join(Path::new(std::ffi::OsStr::from_bytes(name)));
         let c = CString::new(name).map_err(|_| Error::store("path component with NUL"))?;
@@ -1211,8 +1037,8 @@ pub(crate) fn fsync_tree_recursive_fd(root: &OwnedFd, rel: &Path) -> Result<()> 
 /// The descriptor-relative plain file write (create-or-truncate, 0o600):
 /// used for the staged object's `tree.json` metadata (the staged tree is
 /// fsynced as a whole by [`fsync_tree_recursive_fd`] before the publish).
-pub(crate) fn write_file_fd(root: &OwnedFd, rel: &Path, bytes: &[u8]) -> Result<()> {
-    let (parent_fd, name) = parent_fd_of(root, rel)?;
+pub(crate) fn write_file_fd(root: &RootDir, rel: &Path, bytes: &[u8]) -> Result<()> {
+    let (parent_fd, name) = parent_fd_of(root.as_fd(), rel)?;
     let f = openat_no_follow(
         &parent_fd,
         Path::new(name),
@@ -1244,18 +1070,18 @@ pub(crate) fn write_file_fd(root: &OwnedFd, rel: &Path, bytes: &[u8]) -> Result<
 /// `O_RDONLY | O_NOFOLLOW | O_CLOEXEC`. A symlink injected at ANY
 /// component is refused (ELOOP) — a read can never be redirected outside
 /// the root the descriptor pins.
-pub(crate) fn read_fd(dir_fd: &OwnedFd, rel: &Path) -> Result<Vec<u8>> {
-    let f = openat_no_follow(dir_fd, rel, libc::O_RDONLY, 0)?;
+pub(crate) fn read_fd(root: &RootDir, rel: &Path) -> Result<Vec<u8>> {
+    let f = openat_no_follow(root.as_fd(), rel, libc::O_RDONLY, 0)?;
     read_fd_to_end(&f)
 }
 
 /// [`read_fd`] + JSON deserialization (the descriptor-relative mirror of
 /// [`read_json`] for the store's own record reads).
 pub(crate) fn read_json_fd<T: serde::de::DeserializeOwned>(
-    dir_fd: &OwnedFd,
+    root: &RootDir,
     rel: &Path,
 ) -> Result<T> {
-    let bytes = read_fd(dir_fd, rel)?;
+    let bytes = read_fd(root, rel)?;
     serde_json::from_slice(&bytes)
         .map_err(|e| Error::store(format!("deserialize {}: {e}", rel.display())))
 }
@@ -1266,8 +1092,8 @@ pub(crate) fn read_json_fd<T: serde::de::DeserializeOwned>(
 /// component is REFUSED (ELOOP — never followed); a genuine NotFound of
 /// the final component is ABSENCE (`Ok(false)`); EVERY other filesystem
 /// error is a real failure → [`Error::store`], NEVER treated as absence.
-pub(crate) fn path_state_fd(dir_fd: &OwnedFd, rel: &Path) -> Result<bool> {
-    match openat_no_follow_io(dir_fd, rel, libc::O_RDONLY, 0) {
+pub(crate) fn path_state_fd(root: &RootDir, rel: &Path) -> Result<bool> {
+    match openat_no_follow_io(root.as_fd(), rel, libc::O_RDONLY, 0) {
         Ok(fd) => {
             let f = std::fs::File::from(fd);
             f.metadata()
@@ -1279,23 +1105,13 @@ pub(crate) fn path_state_fd(dir_fd: &OwnedFd, rel: &Path) -> Result<bool> {
     }
 }
 
-/// One entry of a descriptor-relative directory read.
-pub(crate) struct DirEntry {
-    /// The entry's file name (never `.` or `..`).
-    pub name: std::ffi::OsString,
-    /// Whether the entry is a directory (classified with
-    /// `fstatat(AT_SYMLINK_NOFOLLOW)` — a symlink entry is reported as a
-    /// non-directory, never followed).
-    pub is_dir: bool,
-}
-
 /// Read the entries of the directory at `rel` relative to `dir_fd`,
 /// resolved COMPONENT-WISE with `openat(O_NOFOLLOW)` (a symlink injected
 /// at any component is refused — ELOOP — never followed). Each entry is
 /// classified with `fstatat(AT_SYMLINK_NOFOLLOW)` (a symlink entry is
 /// reported as a non-directory, never followed).
-pub(crate) fn read_dir_fd(dir_fd: &OwnedFd, rel: &Path) -> Result<Vec<DirEntry>> {
-    let dir_fd = openat_no_follow(dir_fd, rel, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+pub(crate) fn read_dir_fd(root: &RootDir, rel: &Path) -> Result<Vec<DirEntry>> {
+    let dir_fd = openat_no_follow(root.as_fd(), rel, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
     let mut out = Vec::new();
     for_each_dir_entry(&dir_fd, |name| {
         let c = CString::new(name).map_err(|_| Error::store("path component with NUL"))?;

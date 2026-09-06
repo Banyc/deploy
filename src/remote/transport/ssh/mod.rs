@@ -19,7 +19,6 @@ mod runner;
 
 use crate::env::SysEnv;
 use crate::error::{Error, Result};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -1379,13 +1378,12 @@ impl Remote for SshTransport {
                 self.mux_socket_dir.display()
             ))
         })?;
-        std::fs::set_permissions(&self.mux_socket_dir, std::fs::Permissions::from_mode(0o700))
-            .map_err(|e| {
-                Error::transport(format!(
-                    "chmod ssh mux dir {}: {e}",
-                    self.mux_socket_dir.display()
-                ))
-            })?;
+        crate::platform::chmod(&self.mux_socket_dir, 0o700).map_err(|e| {
+            Error::transport(format!(
+                "chmod ssh mux dir {}: {e}",
+                self.mux_socket_dir.display()
+            ))
+        })?;
         // If a fingerprint was supplied without an explicit known-hosts file,
         // verify the host key and pin it in a managed file BEFORE any remote
         // request — including a dry run's status inspection, which still

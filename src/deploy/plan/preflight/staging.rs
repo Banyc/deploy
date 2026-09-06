@@ -6,7 +6,6 @@ use crate::error::Error;
 use crate::error::Result;
 use crate::identity::DeploymentId;
 use crate::remote::helper::RemoteHelper;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 // Disposable staging lifecycle and cleanup.
@@ -38,17 +37,17 @@ fn restore_owner_write_recursive(root: &Path) -> std::io::Result<()> {
             } else if ft.is_symlink() {
                 continue;
             }
-            let mode = entry.metadata()?.permissions().mode();
+            let mode = crate::platform::file_mode(&path)?;
             if mode & 0o200 == 0 {
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode | 0o200))?;
+                crate::platform::chmod(&path, mode | 0o200)?;
             }
         }
         Ok(())
     }
     walk(root)?;
-    let mode = std::fs::metadata(root)?.permissions().mode();
+    let mode = crate::platform::file_mode(root)?;
     if mode & 0o200 == 0 {
-        std::fs::set_permissions(root, std::fs::Permissions::from_mode(mode | 0o200))?;
+        crate::platform::chmod(root, mode | 0o200)?;
     }
     Ok(())
 }
@@ -133,6 +132,8 @@ impl Drop for StagingCleanup {
 mod staging_tests {
     use super::*;
     use crate::deploy::plan::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn staging_cleanup_drop_removes_tree_take_prevents_removal() {

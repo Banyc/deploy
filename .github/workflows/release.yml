@@ -19,9 +19,13 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
   upload-assets:
-    # The deploy crate is Linux/macOS only (the process-group runner's live
-    # member enumeration is implemented for Linux and macOS — a hard
-    # compile_error on any other platform), so there is no Windows target.
+    # The deploy crate runs on Linux, macOS, AND Windows (the controller
+    # side — it deploys to remote Unix hosts via SSH; the Windows port's
+    # documented weaker guarantees: no process-group termination, no
+    # parent-directory fsync durability, no Unix mode bits). The REMOTE
+    # targets are Unix-only (the process-group runner's live member
+    # enumeration is Linux/macOS — a hard compile_error on other platforms
+    # — but that code is the LOCAL runner, not the remote contract).
     strategy:
       matrix:
         include:
@@ -35,6 +39,8 @@ jobs:
             os: macos-latest
           - target: x86_64-apple-darwin
             os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

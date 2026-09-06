@@ -30,7 +30,6 @@ pub(crate) use crate::store::local::LocalStore;
 pub(crate) use crate::testutil::test_remotes::FailOnceMarkerRemote;
 pub(crate) use crate::verify::release::RELEASE_RECORD_SCHEMA_VERSION;
 pub(crate) use std::collections::{BTreeMap, BTreeSet};
-pub(crate) use std::os::unix::fs::PermissionsExt;
 pub(crate) use std::path::{Path, PathBuf};
 pub(crate) use std::sync::atomic::{AtomicBool, Ordering};
 pub(crate) use std::sync::{Arc, Mutex};
@@ -1057,13 +1056,13 @@ pub(crate) fn install_fake_systemctl(
             "#!/bin/sh\nif [ \"$1\" = \"--user\" ]; then shift; fi\ncase \"$1\" in\nrestart)\n  if [ -n \"$FAKE_SYSTEMCTL_FAIL\" ] && [ -f \"$FAKE_SYSTEMCTL_FAIL\" ]; then\n    if [ \"$FAKE_SYSTEMCTL_ONCE\" = \"1\" ]; then rm -f \"$FAKE_SYSTEMCTL_FAIL\"; fi\n    echo \"fake systemctl: forced restart failure\" >&2\n    exit 1\n  fi\n  exit 0\n  ;;\n*)\n  exit 0\n  ;;\nesac\n",
         )
         .unwrap();
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::platform::chmod(&fake, 0o755).unwrap();
     // The systemd adapter also enables lingering for the deployment account
     // (user scope) — a fake `loginctl` that always succeeds keeps the
     // activation hermetic.
     let fake_linger = bindir.join("loginctl");
     std::fs::write(&fake_linger, "#!/bin/sh\nexit 0\n").unwrap();
-    std::fs::set_permissions(&fake_linger, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::platform::chmod(&fake_linger, 0o755).unwrap();
     let base_env = crate::testutil::fixture_env();
     let mut vars: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> =
         base_env.child_env().into_iter().collect();
