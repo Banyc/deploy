@@ -268,6 +268,20 @@ pub fn receiver_uuid() -> RootedRelativePath {
     RootedRelativePath::from_validated(Path::new("receiver-uuid").to_path_buf())
 }
 
+/// The CRATE-FORMAT receiver-id marker file at the deploy_dir root, BESIDE
+/// the legacy [`receiver_uuid`] marker: exactly 40 lowercase hex characters
+/// followed by a newline — the form `storekit`'s `Layout::receiver_marker`
+/// reads and validates. It is written ONCE by the legacy-marker ADOPTION
+/// ([`crate::remote::transport::adopt_receiver_marker`]), which derives it
+/// from the legacy receiver UUID; the legacy file is never modified, so the
+/// deploy_dir's old identity survives and the adoption is reversible.
+///
+/// The eventual crate migration points `Layout::receiver_marker` at THIS
+/// path; nothing else in `deploy` reads it yet.
+pub fn receiver_id() -> RootedRelativePath {
+    RootedRelativePath::from_validated(Path::new("receiver-id").to_path_buf())
+}
+
 /// Relative link target (from inside a generation directory) to that
 /// generation's tree object. `tree` is the TYPED tree identity. The target
 /// is relative to the LINK's directory (it legitimately traverses up to the

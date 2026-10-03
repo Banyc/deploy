@@ -260,10 +260,15 @@ pub(crate) fn run_preflight(
     for (slot, _s) in &all_members {
         let slot_id = SlotId::parse(slot.id.as_str()).expect("validated slot id is a safe segment");
         let r = remotes.get(&slot_id).unwrap();
-        receiver_uuids.insert(
-            slot_id,
-            crate::remote::transport::read_receiver_uuid_opt(r.as_ref())?,
-        );
+        // A REAL push adopts a legacy-only deploy_dir here (writing the
+        // crate-format receiver-id marker beside the legacy one); a DRY RUN
+        // touches nothing and uses the read-only peek.
+        let receiver = if opts.dry_run {
+            crate::remote::transport::peek_receiver_uuid_opt(r.as_ref())?
+        } else {
+            crate::remote::transport::read_receiver_uuid_opt(r.as_ref())?
+        };
+        receiver_uuids.insert(slot_id, receiver);
     }
 
     // Reconcile `PendingCommit` attempts left by earlier pushes BEFORE the
