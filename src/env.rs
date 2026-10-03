@@ -14,116 +14,28 @@
 //! its ENTIRE environment (`env_clear` + the snapshot's variables), so a child's
 //! `PATH` (and any fake-bin/test variable) is the deterministic snapshot, never
 //! whatever `PATH` won the race in the parent — and nothing else leaks in.
+//!
+//! # The substrate swap (`storekit::env`)
+//!
+//! This module was `deploy`'s own environment snapshot, the source
+//! `storekit::env` was extracted from; the two are code-identical (only doc
+//! comments differ), so this is a `pub use` of the crate's module and every
+//! `crate::env::…` call site keeps resolving. It is a PREREQUISITE of the
+//! transport swap: the crate's `LocalTransport::new` takes a
+//! [`storekit::env::SysEnv`], so `deploy`'s [`SysEnv`] must BE that type (a
+//! distinct `deploy` copy could not be passed). `pub` (never `pub(crate)`) is
+//! required: this module is `pub mod env` and [`SysEnv`] appears in `deploy`'s
+//! public `LocalTransport` API, so narrowing it would break the public
+//! surface.
 
-use std::collections::BTreeMap;
-use std::ffi::{OsStr, OsString};
-use std::path::PathBuf;
-
-/// A snapshot of the process environment: pure data, no `std::env` reads.
-///
-/// Constructed at the process boundary via [`SysEnv::from_process`], or by
-/// tests via [`SysEnv::from_map`] to build a hermetic environment that is
-/// passed to the fixture instead of mutating the process-global env.
-#[derive(Clone, Debug)]
-pub struct SysEnv {
-    vars: BTreeMap<OsString, OsString>,
-}
-
-impl SysEnv {
-    /// Snapshot the current process environment (`std::env::vars_os`).
-    /// This is THE process-boundary entry point: call it exactly once per
-    /// command invocation (in `cli::run_with`) and pass the snapshot down.
-    /// Every other subsystem reads env state through this value or a
-    /// resolved accessor — never from the live process env.
-    pub fn from_process() -> SysEnv {
-        SysEnv {
-            vars: std::env::vars_os().collect(),
-        }
-    }
-
-    /// Build a snapshot from an explicit map (test constructor): a hermetic
-    /// environment that replaces the process env entirely — no `set_var`/
-    /// `remove_var`, no lock, no cross-test interference.
-    pub fn from_map(vars: BTreeMap<OsString, OsString>) -> SysEnv {
-        SysEnv { vars }
-    }
-
-    /// Look up a single variable (raw `OsString` form).
-    pub fn get(&self, k: &str) -> Option<OsString> {
-        self.vars.get(OsStr::new(k)).cloned()
-    }
-
-    /// The `PATH` variable, if set.
-    pub fn path(&self) -> Option<OsString> {
-        self.get("PATH")
-    }
-
-    /// The temp directory: `TMPDIR` when set and non-empty, else the
-    /// platform temp dir (`/tmp` on Unix — this crate is Unix-only). Pure:
-    /// no process reads.
-    pub fn temp_dir(&self) -> PathBuf {
-        self.get("TMPDIR")
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
-    }
-
-    /// The user data home: `XDG_DATA_HOME` when set and non-empty, else
-    /// `$HOME`, else `.` (the current directory).
-    pub fn data_home(&self) -> PathBuf {
-        self.get("XDG_DATA_HOME")
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| {
-                self.get("HOME")
-                    .filter(|s| !s.is_empty())
-                    .map(PathBuf::from)
-            })
-            .unwrap_or_else(|| PathBuf::from("."))
-    }
-
-    /// The user config home: `XDG_CONFIG_HOME` when set and non-empty, else
-    /// `$HOME/.config`, else `.config`.
-    pub fn config_home(&self) -> PathBuf {
-        match self
-            .get("XDG_CONFIG_HOME")
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-        {
-            Some(xdg) => xdg,
-            None => match self.get("HOME").filter(|s| !s.is_empty()) {
-                Some(home) => PathBuf::from(home).join(".config"),
-                None => PathBuf::from(".config"),
-            },
-        }
-    }
-
-    /// The full variable list as `(key, value)` pairs. Used by tests to build
-    /// snapshot-based fixtures and by [`SysEnv::apply_to_command`] internally.
-    /// Production child-process boundaries MUST call [`SysEnv::apply_to_command`]
-    /// instead: a bare `envs` overlay would let the parent env leak into a
-    /// supposedly-hermetic snapshot.
-    pub fn child_env(&self) -> Vec<(OsString, OsString)> {
-        self.vars
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
-    }
-
-    /// Apply this snapshot to a child `Command` as the child's ENTIRE
-    /// environment: `env_clear()` first (the child inherits NOTHING from the
-    /// parent — an overlay would leak the parent env into a supposedly-hermetic
-    /// snapshot), then set exactly this snapshot's variables. Call this at EVERY
-    /// child-process boundary.
-    pub fn apply_to_command(&self, cmd: &mut std::process::Command) {
-        cmd.env_clear();
-        cmd.envs(self.vars.iter().map(|(k, v)| (k.clone(), v.clone())));
-    }
-}
+pub use storekit::env::*;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+    use std::ffi::{OsStr, OsString};
+    use std::path::PathBuf;
 
     fn map(pairs: &[(&str, &str)]) -> BTreeMap<OsString, OsString> {
         pairs
