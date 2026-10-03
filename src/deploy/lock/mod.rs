@@ -1,34 +1,60 @@
 //! Advisory locking for push transactions.
 //!
-//! `FileLock` is an advisory lock held by an open file descriptor — `flock`
-//! on Unix, `LockFileEx` on Windows (the platform split lives in the
-//! [`unix`] / [`windows`] submodules behind ONE cfg switch at the module
-//! boundary).
-//! While the guard is alive the kernel prevents any other process from
-//! acquiring the same lock, and the lock is released automatically if the
-//! owning process dies — so a stale lock from a crashed controller can never
-//! be double-owned, and two live contenders can never both win the
-//! acquisition. Locks are taken in a fixed local-then-target order — the
-//! application-store `operation.lock` first, then the target lock — so the
-//! whole push pipeline, including [`crate::retention::checkpoint`], runs under the
-//! same discipline as [`crate::deploy::push::push`].
+//! [`FileLock`] is the `storekit::lock` advisory lock held by an open file
+//! descriptor — `flock` on Unix, `LockFileEx` on Windows. While the guard is
+//! alive the kernel prevents any other process from acquiring the same lock,
+//! and the lock is released automatically if the owning process dies — so a
+//! stale lock from a crashed controller can never be double-owned, and two
+//! live contenders can never both win the acquisition. Locks are taken in a
+//! fixed local-then-target order — the application-store `operation.lock`
+//! first, then the target lock — so the whole push pipeline, including
+//! [`crate::retention::checkpoint`], runs under the same discipline as
+//! [`crate::deploy::push::push`].
 //!
-//! # The STABLE-INODE discipline (why the lock file is never deleted)
+//! # The substrate swap (`storekit::lock`)
 //!
-//! POSIX `flock` locks are attached to an INODE, not a path. The lock file is
-//! created ONCE (on the first acquisition) and is NEVER removed, so every
-//! acquisition in the store/session lifetime flocks the SAME inode. Releasing
-//! closes the descriptor only (`flock LOCK_UN` + close) — the file itself
-//! persists. This is deliberate: an unlock-then-unlink release would open an
-//! inode-SPLIT window in which a second process flocks the OLD inode between
-//! the unlock and the unlink while a third process creates a NEW inode and
-//! flocks that — two processes simultaneously holding "the lock". With a
-//! single never-removed inode no such window can exist: a fresh open of the
-//! path always finds the same inode, so at most one holder can ever win the
-//! flock.
-
-use crate::error::{Error, Result};
-use std::path::Path;
+//! This module was `deploy`'s own advisory lock (`mod.rs`/`unix.rs`/
+//! `windows.rs`, the source `storekit` was extracted from). [`FileLock`] and
+//! [`AdministrativeRecoveryGuard`] are now the crate's, re-exported
+//! `pub(crate)` (every item `deploy` exposed was `pub(crate)`; the crate
+//! exports them `pub` for its own consumers, so a `pub use` would WIDEN
+//! `deploy`'s surface — the same form as the `digest`/`platform`/`trace` and
+//! `store::atomic` swaps). The crate's `acquire` is STRICTER than the one
+//! this module used to carry:
+//!
+//! * **A symlink at the record path is refused** (`O_NOFOLLOW` on Unix, the
+//!   Windows analogue), and a symlinked PARENT directory is refused too, so a
+//!   record path that is a symlink can no longer redirect the `set_len(0)` +
+//!   op-id write into an arbitrary victim file. `deploy`'s own `acquire`
+//!   followed the link and TRUNCATED the victim (see
+//!   `deploy::lock::tests::symlink_at_record_path_cannot_truncate_a_victim`,
+//!   which failed against the pre-swap lock and passes against the crate's).
+//! * **The op-id record is PRIVATE (`0o600`)** — requested at creation AND
+//!   re-applied on every acquisition.
+//! * **Contention is the TYPED [`storekit::Error::LockContended`]** (mapped
+//!   to [`crate::error::Error::LockContended`] by the facade bridge) rather
+//!   than the `Preflight` string class.
+//!
+//! The durability helper and the whole stable-inode discipline moved with it:
+//! the crate's `acquire` durably creates the record's parent
+//! (`atomic::ensure_private_dir_durable`) and never unlinks the record on
+//! release. The slice-B adaptation `ensure_private_dir_durable_confined` is
+//! gone — resolving the anchor directory and parsing the relative chain is
+//! now the crate's business.
+//!
+//! # What did NOT move: the operation-lock sidecar's platform flock triple
+//!
+//! `try_lock`, `unlock`, `contended_errno` and `LockAttempt` stay here, and are
+//! NOT a re-export: the crate confines them to `pub(crate)`. Their ONLY
+//! consumer is [`crate::remote::transport`]'s operation-lock sidecar
+//! (`with_operation_lock_sidecar` / `wait_for_sidecar_flock`), which needs a
+//! blocking-with-deadline retry over an already-open, read-only fd — the
+//! crate's non-blocking, path-creating `FileLock::acquire` is not that
+//! mechanism. This is a reported crate gap for the `transport` slice, not a
+//! workaround: the sidecar's own primitive is kept until the crate exposes a
+//! wait/retry form (or until the sidecar is retired in favour of
+//! `DestinationOwnership::lock_with_in_root_lock`, see `storekit/MIGRATION.md`
+//! ownership conflict (a)).
 
 #[cfg(unix)]
 mod unix;
@@ -43,185 +69,35 @@ use windows as platform;
 pub(crate) use platform::{contended_errno, try_lock, unlock};
 
 /// The outcome of a platform lock attempt: acquired, contended (another
-/// holder — the caller reports the "held by" message), or a real failure.
+/// holder), or a real failure. The `io::Error` payload the original carried
+/// on `Failed` was READ only by this module's own `FileLock::acquire` — now
+/// the crate's — so it is dropped: the only remaining consumer is the
+/// transport's sidecar waiter
+/// ([`crate::remote::transport::with_operation_lock_sidecar`]), which
+/// classifies contention by [`contended_errno`] and reads the errno itself
+/// (`last_os_error` immediately after the failed `flock`, with no syscall in
+/// between). The crate's own `LockAttempt` still carries the payload for its
+/// `acquire`; this one no longer has a reader.
 pub(crate) enum LockAttempt {
     Acquired,
     Contended,
-    Failed(std::io::Error),
+    Failed,
 }
 
-/// An advisory (flock) lock held by an open file descriptor. While the guard
-/// is alive the kernel prevents any other process from acquiring the same lock,
-/// and the lock is released automatically if the owning process dies. This
-/// makes the stale-lock double-ownership race impossible: a dead controller's
-/// lock is released by the kernel rather than lingering, and two live
-/// contenders can never both win the acquisition.
+/// The crate's advisory `FileLock`, re-exported `pub(crate)`.
 ///
-/// The lock file is created once on the first acquisition and is NEVER
-/// removed by a release or drop (the STABLE-INODE discipline above): every
-/// acquisition flocks the same inode, so the old delete-on-release design's
-/// unlock→unlink inode-split window cannot exist.
-///
-/// `pub(crate)` so the checkpoint command ([`crate::retention::checkpoint`]) runs
-/// under the SAME lock discipline as pushes: the application-store lock then
-/// the target lock, exactly like [`crate::deploy::push`].
-pub(crate) struct FileLock {
-    file: std::fs::File,
-}
+/// The crate's `acquire` durably creates the record's parent, refuses a
+/// symlink at the record path (`O_NOFOLLOW`) and a symlinked parent, makes the
+/// record private (`0o600`), and reports contention as the typed
+/// [`storekit::Error::LockContended`]. Its `Drop` releases the advisory lock
+/// (unlock + close, never unlink — the same stable-inode discipline).
+pub(crate) use storekit::lock::FileLock;
 
-/// The confined replacement for the crate-deleted path-based
-/// `ensure_private_dir_durable`: resolve the deepest EXISTING ancestor of
-/// `dir` as the [`RootDir`](crate::store::atomic::RootDir) and hand the
-/// missing chain (a validated [`RootedRelativePath`](storekit::RootedRelativePath))
-/// to the crate's confined
-/// [`ensure_private_dir_durable_fd`](crate::store::atomic::ensure_private_dir_durable_fd),
-/// which creates each component at `0o700` and fsyncs every NEW directory
-/// entry. The durable creation itself is the crate's; this helper only
-/// resolves WHICH existing directory anchors it — the lock path may sit under
-/// a not-yet-created `targets/<target>/`, so the anchor is the deepest
-/// existing ancestor, never the base the caller does not pass.
-fn ensure_private_dir_durable_confined(dir: &Path) -> Result<()> {
-    let Some(anchor) = dir.ancestors().find(|a| a.exists()) else {
-        return Err(Error::preflight(format!(
-            "cannot create {} durably: no existing ancestor",
-            dir.display()
-        )));
-    };
-    if anchor == dir {
-        return Ok(());
-    }
-    let rel_path = dir.strip_prefix(anchor).map_err(|_| {
-        Error::preflight(format!(
-            "{} is not under {}",
-            dir.display(),
-            anchor.display()
-        ))
-    })?;
-    let root = crate::store::atomic::RootDir::open(anchor).map_err(Error::from)?;
-    let rel = storekit::RootedRelativePath::parse(rel_path)?;
-    crate::store::atomic::ensure_private_dir_durable_fd(&root, &rel).map_err(Error::from)?;
-    Ok(())
-}
-
-impl FileLock {
-    /// Acquire the advisory lock at `path`: open (creating the file on the
-    /// FIRST acquisition only — after that the persistent inode is reused),
-    /// then `flock LOCK_EX|LOCK_NB`. The parent directory is durably created
-    /// by [`ensure_private_dir_durable_confined`] before the lock
-    /// is taken (see the durable-first-append machinery the lock path must
-    /// never bypass).
-    ///
-    /// The file is created with `create(true).truncate(false)`: when it
-    /// already exists (always, after the first acquisition of this path) the
-    /// SAME inode is opened, never a fresh one — the lock never swaps inodes.
-    /// The persistent file does not disturb the durable-first-append
-    /// machinery: directory creation is detected by the directory-entry
-    /// fsyncs in [`ensure_private_dir_durable_confined`] (which
-    /// reports what it CREATED), never by files inside the directory, so a
-    /// surviving `operation.lock` changes nothing for a first append.
-    pub(crate) fn acquire(path: &Path, op_id: &str) -> Result<Self> {
-        // DURABLE parent creation: the lock file's parent directory is
-        // created with EVERY newly created directory entry fsynced (see
-        // [`ensure_private_dir_durable_confined`]) BEFORE the
-        // lock is taken. A lock acquisition that creates a directory must
-        // never do so with a plain unsynced mkdir — the engine's first
-        // push used to let the lock path create `targets/<target>/` that
-        // way, bypassing the durable first-append helper (the target dir
-        // already existed when the append's creation detection ran, so no
-        // parent sync happened) and a reported-successful first push could
-        // recover with the target directory missing after power loss. The
-        // engine also durably pre-creates the target directory before
-        // locking (see [`crate::deploy::push`]); this helper makes
-        // the lock path itself durable for every caller.
-        if let Some(parent) = path.parent() {
-            ensure_private_dir_durable_confined(parent)
-                .map_err(|e| Error::preflight(format!("mkdir {}: {e}", parent.display())))?;
-        }
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)
-            .map_err(|e| Error::preflight(format!("open lock {}: {e}", path.display())))?;
-        // Exclusive, non-blocking advisory lock (flock on Unix, LockFileEx
-        // on Windows — the platform split lives in the [`platform`]
-        // submodule). Only one holder at a time.
-        match platform::try_lock(&file) {
-            platform::LockAttempt::Acquired => {}
-            platform::LockAttempt::Contended => {
-                let held = std::fs::read_to_string(path).unwrap_or_default();
-                return Err(Error::preflight(format!(
-                    "local lock {} held by '{}'",
-                    path.display(),
-                    held.trim()
-                )));
-            }
-            platform::LockAttempt::Failed(err) => {
-                return Err(Error::preflight(format!("lock {}: {err}", path.display())));
-            }
-        }
-        // We hold the lock: record our operation id for diagnostics.
-        use std::io::Write;
-        file.set_len(0)
-            .and_then(|_| file.write_all(op_id.as_bytes()))
-            .map_err(|e| Error::preflight(format!("write lock {}: {e}", path.display())))?;
-        Ok(FileLock { file })
-    }
-}
-
-impl std::ops::Drop for FileLock {
-    fn drop(&mut self) {
-        // Release the advisory lock; then the descriptor's drop closes it.
-        // THE LOCK FILE IS NEVER REMOVED (the STABLE-INODE discipline): a
-        // release is unlock + close ONLY, so the next acquisition re-opens
-        // the SAME inode and the unlock→unlink inode-split window (a second
-        // process flocking the old inode while a third creates and flocks a
-        // new one — two simultaneous holders) is structurally impossible.
-        // Best-effort by design, like the other Drop fallbacks: this runs on
-        // every return path (including panic/unwind), so a failure must not
-        // surface, and the flock itself is released by the kernel when the
-        // fd drops even if the explicit unlock below never ran. The file is
-        // left in place as a stable diagnostic record (the last holder's
-        // operation id); exclusion comes from the flock on the single inode.
-        platform::unlock(&self.file);
-    }
-}
-
-/// A typed ADMINISTRATIVE capability: owns the local application-store lock
-/// (`FileLock` on the store's `operation.lock`) for the duration of an
-/// explicit remote-lock recovery
-/// ([`crate::remote::helper::RemoteHelper::recover_lock`]).
-///
-/// Recovery is an administrative operation that is legal ONLY while the local
-/// application lock is held: every live controller holds that lock while it
-/// operates, so a recovery performed under it cannot race a live controller
-/// on the same store. The TYPE enforces the precondition — `recover_lock`
-/// accepts only `&AdministrativeRecoveryGuard` — and the guard can be
-/// constructed only by actually acquiring the local `FileLock`
-/// ([`Self::acquire`]); there is no free constructor, so a library caller
-/// cannot recover a remote lock without first holding the local lock.
-///
-/// The local lock is held for exactly the guard's lifetime. Its release is
-/// the `FileLock` release above: unlock + close, never unlink (the stable
-/// inode survives, exactly as for every other lock file).
-pub(crate) struct AdministrativeRecoveryGuard {
-    _local_lock: FileLock,
-}
-
-impl AdministrativeRecoveryGuard {
-    /// Construct the recovery capability by ACQUIRING the local
-    /// application-store lock at `lock_path` (the store's `operation.lock`).
-    /// The caller must be an administrative path (the CLI's recovery
-    /// invocation) that has confirmed the remote holder is dead; holding this
-    /// guard for the whole recovery is what serializes a recovery against any
-    /// LIVE controller on the same store.
-    pub(crate) fn acquire(lock_path: &Path, op_id: &str) -> Result<Self> {
-        Ok(Self {
-            _local_lock: FileLock::acquire(lock_path, op_id)?,
-        })
-    }
-}
+/// The crate's typed ADMINISTRATIVE capability (see its module docs): owns the
+/// local application-store lock for the duration of an explicit remote-lock
+/// recovery. `recover_lock` accepts only `&AdministrativeRecoveryGuard`, and
+/// the guard is constructible only by actually acquiring the local `FileLock`.
+pub(crate) use storekit::lock::AdministrativeRecoveryGuard;
 
 #[cfg(unix)]
 #[cfg(test)]
@@ -288,9 +164,95 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("B must be refused while A holds the lock"),
         };
+        // TIGHTENING (the crate's lock): contention is now the TYPED
+        // `storekit::Error::LockContended` (mapped to
+        // `crate::error::Error::LockContended` by the facade bridge), not the
+        // `Preflight` string class `deploy`'s own lock returned.
+        assert!(
+            matches!(err, storekit::Error::LockContended(_)),
+            "contention must be the TYPED signal, not a string-matching target: {err:?}"
+        );
         assert!(
             err.to_string().contains("held by 'op-A'"),
             "the refusal must name the holder: {err}"
+        );
+    }
+
+    /// THE SYMLINK-AT-RECORD HARDENING (the arbitrary-file truncation): a
+    /// symlink planted at the lock record's spelling must NOT be followed —
+    /// the acquisition refuses BEFORE any `set_len(0)`/write can be
+    /// redirected through the link, so a victim file the link names is
+    /// neither truncated nor overwritten. The victim's bytes after the
+    /// attempt are quoted so a regression (a follow-through that truncates
+    /// the victim) is legible in the failure.
+    #[test]
+    fn symlink_at_record_path_cannot_truncate_a_victim() {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let victim = dir.path().join("victim.txt");
+        let original = "VICTIM-MUST-SURVIVE\n";
+        std::fs::write(&victim, original).unwrap();
+        let record = dir.path().join("operation.lock");
+        std::os::unix::fs::symlink(&victim, &record).unwrap();
+
+        let res = FileLock::acquire(&record, "op-symlink");
+        let after =
+            std::fs::read_to_string(&victim).unwrap_or_else(|e| format!("<unreadable: {e}>"));
+
+        assert!(
+            res.is_err(),
+            "a symlink at the lock record must be REFUSED, never followed; \
+             victim content after the attempt = {after:?}"
+        );
+        assert_eq!(
+            after, original,
+            "the victim file must be untouched (no truncation, no op-id overwrite)"
+        );
+        assert!(
+            std::fs::symlink_metadata(&record)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the record path must still be the symlink — never replaced"
+        );
+    }
+
+    /// THE SYMLINKED-PARENT HARDENING: a symlink at the record's PARENT
+    /// directory would redirect the whole record (and every subsequent open)
+    /// elsewhere, so it is refused BEFORE the record is opened — the redirect
+    /// target gains no record and a file there is untouched. The record
+    /// itself is a plain (missing) spelling, so this test isolates the PARENT
+    /// check: the record-path `O_NOFOLLOW` refusal is not in play.
+    #[test]
+    fn symlinked_parent_dir_cannot_redirect_the_record() {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let victim = outside.join("keep.txt");
+        let original = "PARENT-VICTIM-MUST-SURVIVE\n";
+        std::fs::write(&victim, original).unwrap();
+        // The record is spelled through a symlinked parent; the redirect
+        // target holds no `operation.lock` of its own.
+        let link = dir.path().join("link-parent");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let record = link.join("operation.lock");
+        let redirected = outside.join("operation.lock");
+
+        let res = FileLock::acquire(&record, "op-parent-symlink");
+        let after =
+            std::fs::read_to_string(&victim).unwrap_or_else(|e| format!("<unreadable: {e}>"));
+
+        assert!(
+            res.is_err(),
+            "a symlinked parent directory must be REFUSED before any record is opened"
+        );
+        assert!(
+            !redirected.exists(),
+            "the redirect target must gain no record; it holds {:?}",
+            std::fs::read_to_string(&redirected).ok()
+        );
+        assert_eq!(
+            after, original,
+            "the file through the symlinked parent must be untouched"
         );
     }
 

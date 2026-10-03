@@ -37,7 +37,7 @@ pub(crate) fn try_lock(file: &std::fs::File) -> LockAttempt {
         if err.raw_os_error() == Some(33) {
             LockAttempt::Contended
         } else {
-            LockAttempt::Failed(err)
+            LockAttempt::Failed
         }
     }
 }

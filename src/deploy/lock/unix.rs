@@ -16,7 +16,7 @@ pub(crate) fn try_lock(file: &std::fs::File) -> LockAttempt {
             Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => {
                 LockAttempt::Contended
             }
-            _ => LockAttempt::Failed(err),
+            _ => LockAttempt::Failed,
         }
     }
 }

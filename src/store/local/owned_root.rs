@@ -1,178 +1,62 @@
-//! The SEALED filesystem-ownership root ([`OwnedRoot`]): the canonical,
-//! non-root, non-symlink directory a [`LocalStore`] owns, registered per
-//! resolved endpoint so two owners can never overlap.
+//! The SEALED filesystem-ownership root ([`OwnedRoot`]) — now the
+//! `storekit::root` substrate.
 //!
-//! Filesystem ownership is LEXICAL today: two stores (or two deployment
-//! roots) can be created on the same directory, or on ancestor/descendant
-//! directories of each other, and nothing rejects it — two owners over
-//! overlapping state. The [`OwnedRoot`] closes that class:
+//! This module was `deploy`'s own ownership root (439 lines: the sealed type,
+//! the process-global per-endpoint registry, and the overlap refusal, the
+//! source `storekit` was extracted from). It is now a `pub use` of
+//! [`storekit::root::OwnedRoot`], so the implementation lives in exactly one
+//! place and every `crate::store::local::OwnedRoot` call site keeps resolving.
+//! The re-export is `pub` (not `pub(crate)` like the `lock`/`atomic` swaps):
+//! `deploy` itself re-exported `OwnedRoot` publicly from
+//! [`crate::store::local`], and the crate exports it publicly too, so the
+//! surface is neither narrowed nor widened.
 //!
-//! * **Sealed** — the fields are private and there is NO unchecked
-//!   constructor; the ONLY construction path is [`OwnedRoot::parse`], which
-//!   canonicalizes the path, rejects the filesystem root, and rejects a
-//!   symlink root (the root must be a REAL directory, not a symlink).
-//! * **Overlap refusal** — two [`OwnedRoot`]s on the same resolved endpoint
-//!   (the physical host identity; for the local store the `local` marker)
-//!   with EQUAL canonical roots, or with one an ANCESTOR/DESCENDANT of the
-//!   other, are refused at construction — before any filesystem mutation.
-//!   The refusal happens against the process-global ownership registry, and
-//!   the registration is released when the owning [`OwnedRoot`] (and the
-//!   store holding it) is dropped: two SIMULTANEOUS owners over overlapping
-//!   state are refused, while a released root can be re-owned.
+//! # Behaviour (unchanged from `deploy`'s copy)
 //!
-//! The store's mutations are additionally descriptor-relative (see
-//! [`crate::store::atomic`]'s `_fd` primitives): every mutation resolves
-//! paths component-wise relative to the owned root's open directory
-//! descriptor with `openat(O_NOFOLLOW)`, so a symlink injected into a path
-//! component can never redirect a mutation outside the owned root.
+//! Filesystem ownership is LEXICAL: two stores (or two deployment roots) can
+//! be created on the same directory, or on ancestor/descendant directories of
+//! each other, and nothing rejects it — two owners over overlapping state.
+//! [`OwnedRoot`] closes that class: the only construction path is
+//! [`OwnedRoot::parse`], which canonicalizes the path, rejects the filesystem
+//! root and a symlink root, and refuses a root that equals — or is an ancestor
+//! or descendant of — an already-owned root on the SAME resolved endpoint. The
+//! refusal happens against the process-global ownership registry BEFORE any
+//! filesystem mutation, and the registration is REFCOUNTED (released when the
+//! last clone drops). The crate adds ONE shared authority for the overlap
+//! predicate (`root::roots_overlap`), which the sync's source/destination
+//! check also uses; `deploy` inlined the same comparison.
+//!
+//! The store's mutations remain descriptor-relative (`crate::store::atomic`'s
+//! `_fd` primitives, now the crate's): every mutation resolves paths
+//! component-wise relative to the owned root's open directory descriptor with
+//! `openat(O_NOFOLLOW)`, so a symlink injected into a path component can never
+//! redirect a mutation outside the owned root.
+//!
+//! # The `EndpointKey` domain cut
+//!
+//! [`OwnedRoot::parse`] now takes `storekit::root::EndpointKey` and
+//! [`OwnedRoot::local_endpoint`] returns it, while `deploy` keeps its own
+//! [`crate::identity::EndpointKey`]. The two are the SAME domain type cut at
+//! two levels: the crate's is the minimal non-empty, separator/whitespace/
+//! control-free token the ownership registry needs; `deploy`'s is the
+//! PHYSICAL deployment-identity component of [`crate::identity::PhysicalSlotKey`]
+//! (`{application, slot, endpoint, deploy_dir}`, where the endpoint is the
+//! ServerDef's `user@address`), with the `Config`-class error its domain
+//! expects. **Decision: keep `deploy`'s type where its domain needs it, and
+//! let the crate's type own the root boundary.** The only endpoint `deploy`
+//! ever feeds to a root is the constant `local` marker
+//! ([`OwnedRoot::local_endpoint`], which now parses the crate's own
+//! [`storekit::root::LOCAL_ENDPOINT_MARKER`]); no `deploy` endpoint is mapped
+//! into the registry, so there is no conversion to write. Nothing is lost:
+//! both validators accept exactly the same token set, and the only
+//! observable difference is the error CLASS an INVALID endpoint would take
+//! (`Ref` from the crate vs `Config` from `deploy`) — a class `deploy` never
+//! routes through the root constructor. A future caller that DOES thread a
+//! non-local `deploy` endpoint into an `OwnedRoot` converts with
+//! `storekit::root::EndpointKey::parse(endpoint.as_str())` (infallible for an
+//! already-validated `deploy` endpoint).
 
-use crate::error::{Error, Result};
-use crate::identity::{EndpointKey, LOCAL_ENDPOINT_MARKER};
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-
-/// The process-global ownership registry: for each resolved endpoint, the
-/// set of canonical roots currently owned by a LIVE [`OwnedRoot`]. A root
-/// is registered at [`OwnedRoot::parse`] and released when the LAST live
-/// [`OwnedRoot`] clone is dropped (the registration is REFCOUNTED — clones
-/// share one registration token, so the registration is released exactly
-/// once, when the last clone drops) — two SIMULTANEOUS owners over equal or
-/// ancestor/descendant roots on the same endpoint are refused, while a
-/// released root can be re-owned.
-static OWNED_ROOTS: Mutex<BTreeMap<EndpointKey, BTreeSet<PathBuf>>> = Mutex::new(BTreeMap::new());
-
-/// THE SEALED filesystem-ownership root: a canonical, non-root, non-symlink
-/// directory, owned on one resolved endpoint. Private fields; the ONLY
-/// construction path is [`OwnedRoot::parse`], which canonicalizes the path,
-/// rejects the filesystem root and symlink roots, and refuses to register a
-/// root that equals — or is an ancestor or descendant of — an already-owned
-/// root on the same endpoint. The registration is REFCOUNTED: clones share
-/// one registration token, and the registration is released when the LAST
-/// clone is dropped (a root can be shared — e.g. every provisioned slot of
-/// a validated project is bound to the project's store root — without
-/// releasing the ownership while any clone is alive).
-#[derive(Clone, Debug)]
-pub struct OwnedRoot {
-    /// The canonical, non-root, non-symlink directory.
-    canonical: PathBuf,
-    /// The resolved endpoint this root is owned on.
-    endpoint: EndpointKey,
-    /// The REFCOUNTED registration token: the registration is released when
-    /// the LAST clone of this root drops (clones share the token). This
-    /// field is a KEEP-ALIVE token — clones share the [`Arc`], and the
-    /// release happens in the token's own `Drop` (never by reading this
-    /// field), so the field is intentionally never read directly.
-    #[allow(dead_code)] // keep-alive token: its Drop releases the ownership registration
-    registration: Arc<OwnedRootRegistration>,
-}
-
-/// The refcounted registration token: holds the (endpoint, canonical)
-/// pair whose registration it releases on the LAST drop.
-#[derive(Debug)]
-struct OwnedRootRegistration {
-    endpoint: EndpointKey,
-    canonical: PathBuf,
-}
-
-impl Drop for OwnedRootRegistration {
-    fn drop(&mut self) {
-        let mut registry = OWNED_ROOTS.lock().unwrap();
-        if let Some(owned) = registry.get_mut(&self.endpoint) {
-            owned.remove(&self.canonical);
-            if owned.is_empty() {
-                registry.remove(&self.endpoint);
-            }
-        }
-    }
-}
-
-impl OwnedRoot {
-    /// The local store's resolved endpoint: the `local` marker (the
-    /// pathless local connection kind's physical host identity — see
-    /// [`crate::identity::physical`]).
-    pub(crate) fn local_endpoint() -> Result<EndpointKey> {
-        EndpointKey::parse(LOCAL_ENDPOINT_MARKER)
-    }
-
-    /// Construct the owned root from a canonical, non-root, non-symlink
-    /// directory on `endpoint`. The path must EXIST (canonicalization
-    /// requires it); the directory must not be the filesystem root and must
-    /// not be a symlink; and the canonical root must not equal — nor be an
-    /// ancestor or descendant of — any already-owned root on the same
-    /// endpoint. The refusal happens HERE, before any filesystem mutation
-    /// (this constructor only reads and updates the in-memory registry).
-    pub fn parse(endpoint: &EndpointKey, path: &Path) -> Result<OwnedRoot> {
-        // The root must be a REAL directory, not a symlink: the final
-        // component of the given path must not be a symlink (a symlink
-        // root would let a later swap redirect the whole store).
-        let meta = std::fs::symlink_metadata(path)
-            .map_err(|e| Error::store(format!("stat {}: {e}", path.display())))?;
-        if meta.file_type().is_symlink() {
-            return Err(Error::store(format!(
-                "refusing to own {}: the root must be a real directory, not a symlink",
-                path.display()
-            )));
-        }
-        if !meta.is_dir() {
-            return Err(Error::store(format!(
-                "refusing to own {}: the root must be a directory",
-                path.display()
-            )));
-        }
-        // Canonicalize: resolve every symlink in the path (intermediate
-        // components included) to the real directory.
-        let canonical = std::fs::canonicalize(path)
-            .map_err(|e| Error::store(format!("canonicalize {}: {e}", path.display())))?;
-        // Reject the filesystem root: a store can never own `/`.
-        if canonical.parent().is_none() {
-            return Err(Error::store(format!(
-                "refusing to own {}: the filesystem root is not an ownable directory",
-                canonical.display()
-            )));
-        }
-        // Reject overlap on the same endpoint: equal, ancestor, or
-        // descendant roots are refused (two owners over overlapping state).
-        let mut registry = OWNED_ROOTS.lock().unwrap();
-        if let Some(owned) = registry.get(endpoint) {
-            for existing in owned {
-                if canonical == *existing
-                    || canonical.starts_with(existing)
-                    || existing.starts_with(&canonical)
-                {
-                    return Err(Error::store(format!(
-                        "refusing to own {}: it overlaps the already-owned root {} on endpoint {}",
-                        canonical.display(),
-                        existing.display(),
-                        endpoint.as_str()
-                    )));
-                }
-            }
-        }
-        registry
-            .entry(endpoint.clone())
-            .or_default()
-            .insert(canonical.clone());
-        Ok(OwnedRoot {
-            canonical: canonical.clone(),
-            endpoint: endpoint.clone(),
-            registration: Arc::new(OwnedRootRegistration {
-                endpoint: endpoint.clone(),
-                canonical,
-            }),
-        })
-    }
-
-    /// The canonical owned directory.
-    pub fn canonical(&self) -> &Path {
-        &self.canonical
-    }
-
-    /// The resolved endpoint this root is owned on.
-    pub fn endpoint(&self) -> &EndpointKey {
-        &self.endpoint
-    }
-}
+pub use storekit::root::OwnedRoot;
 
 #[cfg(test)]
 mod tests {
@@ -181,7 +65,8 @@ mod tests {
     use crate::store::local::LocalStore;
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    use storekit::root::EndpointKey;
 
     /// A unique endpoint per proptest case: derived from the generated tag,
     /// so the process-global registry never accumulates across cases and

@@ -356,7 +356,7 @@ impl LocalStore {
     pub(crate) fn owned_root_for_project(&self) -> Result<OwnedRoot> {
         match self.owned_root() {
             Some(root) => Ok(root.clone()),
-            None => OwnedRoot::parse(&OwnedRoot::local_endpoint()?, &self.base),
+            None => Ok(OwnedRoot::parse(&OwnedRoot::local_endpoint()?, &self.base)?),
         }
     }
 
