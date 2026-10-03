@@ -68,23 +68,17 @@ use walkdir::WalkDir;
 /// legacy/transplanted record is never read as a valid deployment).
 pub const PROTOCOL_VERSION: u32 = 2;
 
-#[derive(Clone, Debug)]
-pub struct RemoteEntry {
-    pub name: String,
-    pub is_dir: bool,
-    pub is_symlink: bool,
-    pub size: u64,
-    pub mode: u32,
-}
-
-#[derive(Clone, Debug)]
-pub struct RemoteMeta {
-    pub is_dir: bool,
-    pub is_symlink: bool,
-    pub is_file: bool,
-    pub size: u64,
-    pub mode: u32,
-}
+// The shared transport vocabulary is now the crate's. Each type below is
+// byte-for-byte identical to `deploy`'s former definition (same derives, same
+// fields/variants), so re-exporting it is behaviour-identical and gives the
+// verdict/wire vocabulary ONE authority — the crate that the transport trait
+// comes from. `ExecOutcome` deliberately stays `deploy`'s here: the crate's
+// carries an extra `timeout_cause` dimension that the runner/transport swap (a
+// later stage) adopts together with the `Exec` trait.
+pub use storekit::transport::{
+    ContentEquivalence, CreateNewVerdict, FsBytes, NotRegularFileKind, RemoteEntry, RemoteMeta,
+    RemoveIfVerdict, VerifiedExisting,
+};
 
 #[derive(Clone, Debug)]
 pub struct ExecOutcome {
@@ -138,15 +132,6 @@ impl Exec for ChildRunner {
             Err(e) => Err(Error::transport(e.to_string())),
         }
     }
-}
-
-/// Total and available bytes on the filesystem backing a remote root, as
-/// reported by `df`. `total` is the filesystem's full size; `available` is
-/// the free space a new upload can consume. Both are in bytes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FsBytes {
-    pub total: u64,
-    pub available: u64,
 }
 
 /// Filesystem + execution surface for one server's remote root.
@@ -733,52 +718,6 @@ pub(crate) fn wait_for_sidecar_flock(
     Ok(())
 }
 
-/// The verdict of one atomic compare-and-delete attempt
-/// ([`Remote::remove_file_if`]): the entry was removed because it carried
-/// EXACTLY the expected bytes ([`RemoveIfVerdict::Removed`]), the entry
-/// existed but did NOT match ([`RemoveIfVerdict::Mismatch`] — it is never
-/// removed, and a no-replace restore put it back), or the entry was
-/// GENUINELY absent ([`RemoveIfVerdict::Absent`]). `pub` because it crosses
-/// the [`Remote`] trait boundary: every transport's `remove_file_if` returns
-/// it, and every caller (and external test crate) branches on it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RemoveIfVerdict {
-    /// The entry existed with content byte-identical to `expected` and was
-    /// removed: the slot is now free.
-    Removed,
-    /// The entry existed but its content differed from `expected`: it was
-    /// restored (or left as the winner's), NEVER removed. A stale release or
-    /// a stale break lands here — the successor's lock survives.
-    Mismatch,
-    /// The entry was genuinely absent: nothing to remove (an idempotent
-    /// success for a release, a free slot for an acquire).
-    Absent,
-}
-
-/// The verdict of one canonical create-new attempt (`durable_create_new`).
-/// `pub` because it crosses the [`Remote`] trait boundary: every transport's
-/// `try_write_new` returns it, and every caller (and external test crate)
-/// branches on it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CreateNewVerdict {
-    /// The record was durably installed: exact bytes, the final mode, and a
-    /// parent-directory-fsync'd directory entry all hold.
-    Created,
-    /// The destination already existed and VERIFIED as an identical entry:
-    /// the `lstat` succeeded, the entry is a REGULAR FILE, its mode matched
-    /// EXACTLY, and its content matched per the caller's requested
-    /// equivalence — the identical retry converges, no error, no replace.
-    AlreadyPresent,
-    /// The destination already existed but did NOT verify as an identical
-    /// entry: the TYPED [`VerifiedExisting`] reason says why (not a regular
-    /// file — directory/symlink/other, never followed; a MODE MISMATCH; a
-    /// CONTENT MISMATCH per the caller's equivalence; unreadable; or
-    /// vanished). The winner is NEVER replaced or modified, and the caller
-    /// receives the typed reason — it can never reinterpret an
-    /// undifferentiated conflict as "already present, fine".
-    Conflict(VerifiedExisting),
-}
-
 /// The seven stages of the canonical create-new sequence — the crash/failure
 /// model's injection points. Test-only in practice (the proptest arms exactly
 /// one stage), but plain `pub(crate)` so the primitive can consult it in both
@@ -823,91 +762,6 @@ impl CreateNewFault {
         use std::sync::atomic::Ordering;
         self.step == step && self.armed.swap(false, Ordering::SeqCst)
     }
-}
-
-/// The caller-chosen content-equivalence relation applied to an EXISTING
-/// entry during create-new verification: the create-new EEXIST path verifies
-/// the existing entry and the CALLER decides whether byte-exact equality is
-/// required or whether a semantic (JSON parse-equal) relation is accepted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ContentEquivalence {
-    /// Byte-exact: the existing entry's bytes must equal the intended bytes.
-    /// Every immutable record's identical retry (markers, locks, the protocol
-    /// marker, assignment records) converges under this relation.
-    Exact,
-    /// Semantic: JSON parse-equal (object key order and whitespace are not
-    /// part of the contract), falling back to byte-exact when either side is
-    /// not JSON. Used by the release-file publisher whose idempotent
-    /// re-publication legitimately re-serializes the same contract with
-    /// different key order/whitespace.
-    Semantic,
-}
-
-/// WHY an existing create-new destination is not a clean identical retry —
-/// the typed companion of [`CreateNewVerdict::Conflict`]. Every reason is a
-/// distinct variant: a caller can never reinterpret an undifferentiated
-/// conflict (a directory, a symlink, a mode mismatch, or unreadable entry
-/// can never be silently accepted as "already present, fine").
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NotRegularFileKind {
-    /// A directory occupies the destination path.
-    Directory,
-    /// A symlink occupies the destination path — reported from the
-    /// `O_NOFOLLOW` open's ELOOP (never followed — a symlink pointing at a
-    /// matching regular file is still a conflict, never an accepted retry).
-    Symlink,
-    /// Any other non-regular kind: a fifo, socket, device, ...
-    Other,
-}
-
-/// The TYPED result of verifying an EXISTING create-new destination against
-/// the intended content — the single DESCRIPTOR-BOUND verification shared by
-/// BOTH transports (the local `durable_create_new` verify-on-retry and the
-/// SSH transport's EEXIST verification): the entry is opened with `O_NOFOLLOW`
-/// and the type/mode AND the content all come from the ONE opened inode
-/// (fstat + read through the SAME descriptor — never an lstat followed by a
-/// separate, symlink-following path re-open). `Ok` is reached ONLY when the
-/// open succeeded AND the OPENED inode is a REGULAR FILE AND its content was
-/// read through the same descriptor; every other outcome is one of the
-/// explicit reasons below. The verdict [`CreateNewVerdict::AlreadyPresent`]
-/// is produced ONLY when this is [`VerifiedExisting::Ok`] with `mode_ok` true
-/// (the mode matched EXACTLY) and the content matched per the caller's
-/// requested equivalence; EVERY other variant is
-/// [`CreateNewVerdict::Conflict`] carrying this reason.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum VerifiedExisting {
-    /// The descriptor-bound open succeeded, the OPENED inode is a REGULAR
-    /// FILE, and its content was read THROUGH THE SAME opened descriptor.
-    /// `mode_ok` records whether the entry's mode matched the
-    /// required mode EXACTLY (a mismatch is reported as
-    /// [`VerifiedExisting::ModeMismatch`]; `mode_ok` stays a first-class
-    /// dimension so the verdict constructor must consult it — an entry is
-    /// only ever [`CreateNewVerdict::AlreadyPresent`] when it is true) and
-    /// `content` records the caller's requested content equivalence, which
-    /// HELD (a failed comparison is [`VerifiedExisting::ContentMismatch`]).
-    Ok {
-        mode_ok: bool,
-        content: ContentEquivalence,
-    },
-    /// The `O_NOFOLLOW` open reported the destination absent (ENOENT/ENOTDIR).
-    /// Should not happen on the
-    /// EEXIST-confirmed path (the no-clobber publish observed the
-    /// destination), but typed rather than assumed.
-    NotFound,
-    /// The opened (fstat'd) inode is NOT a regular file: a
-    /// directory, a symlink (never followed), or another kind.
-    NotRegularFile { kind: NotRegularFileKind },
-    /// The entry is a regular file whose mode does NOT match the required
-    /// mode EXACTLY — the mode is part of the immutable record, so a mode
-    /// mismatch is a real conflict, never an accepted retry.
-    ModeMismatch { actual: u32, required: u32 },
-    /// The entry is a regular file with the EXACT required mode, but its
-    /// content did NOT match per the caller's requested equivalence.
-    ContentMismatch,
-    /// The entry exists (and is a regular file) but its content could not be
-    /// read during verification (permission, I/O fault): a real failure, never
-    /// a fabricated verdict. The payload carries the errno-bearing error text.
-    Unreadable(String),
 }
 
 /// Settings for one [`durable_create_new`] attempt: the FINAL MODE the
