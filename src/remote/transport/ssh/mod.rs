@@ -80,15 +80,15 @@ pub const SSH_TWRITE_CONFLICT_EXIT: i32 = 17;
 pub const SSH_TWRITE_PREINSTALL_EXIT: i32 = 1;
 
 /// How long the SSH sidecar flock waits before giving up — mirrors
-/// `crate::remote::transport::SIDECAR_WAIT_TIMEOUT` (2s) with a 5ms retry interval
-/// (`crate::remote::transport::SIDECAR_RETRY_INTERVAL`). The Perl sidecars use a
+/// `storekit::transport::SIDECAR_WAIT_TIMEOUT` (2s) with a 5ms retry interval
+/// (`storekit::transport::SIDECAR_RETRY_INTERVAL`). The Perl sidecars use a
 /// monotonic deadline (`clock_gettime(CLOCK_MONOTONIC)`) so the wait is bounded
 /// even if the system clock jumps.
 const SIDECAR_FLOCK_DEADLINE_SECS: f64 = 2.0;
 const SIDECAR_FLOCK_INTERVAL_SECS: f64 = 0.005;
 
-/// ONE shared Perl prelude for the sidecar `flock` — the SSH mirror of
-/// `crate::remote::transport::wait_for_sidecar_flock`'s policy: `EWOULDBLOCK`/`EAGAIN`
+/// ONE shared Perl prelude for the sidecar `flock` — the SSH mirror of the
+/// crate's sidecar policy (`storekit::transport::with_operation_lock_sidecar`): `EWOULDBLOCK`/`EAGAIN`
 /// → wait `interval.min(remaining)`; `EINTR` → retry immediately; any other
 /// errno → `die "sidecar flock failed: $!"`; contended past the deadline →
 /// `die "sidecar contended"`. The prelude reads `$fh` already opened by the
@@ -885,8 +885,8 @@ impl SshTransport {
     /// process that owns the sidecar `flock`. The sidecar is created durably
     /// (`mkdir -p`, `touch`, `chmod 644`) and never removed; the perl helper
     /// acquires an exclusive `LOCK_EX|LOCK_NB` with a 2-second monotonic deadline
-    /// and 5ms retry interval (mirroring `SIDECAR_WAIT_TIMEOUT` /
-    /// `SIDECAR_RETRY_INTERVAL`): `EWOULDBLOCK`/`EAGAIN` waits
+    /// and 5ms retry interval (mirroring `storekit::transport::SIDECAR_WAIT_TIMEOUT` /
+    /// `storekit::transport::SIDECAR_RETRY_INTERVAL`): `EWOULDBLOCK`/`EAGAIN` waits
     /// `interval.min(remaining)`, `EINTR` retries immediately, any other errno
     /// fails with `sidecar flock failed`, contended past the deadline dies with
     /// `sidecar contended`. The lock is held via the open file description until

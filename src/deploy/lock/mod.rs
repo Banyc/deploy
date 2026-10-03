@@ -42,47 +42,16 @@
 //! gone — resolving the anchor directory and parsing the relative chain is
 //! now the crate's business.
 //!
-//! # What did NOT move: the operation-lock sidecar's platform flock triple
+//! # The sidecar platform flock triple was RETIRED with the sidecar
 //!
-//! `try_lock`, `unlock`, `contended_errno` and `LockAttempt` stay here, and are
-//! NOT a re-export: the crate confines them to `pub(crate)`. Their ONLY
-//! consumer is [`crate::remote::transport`]'s operation-lock sidecar
-//! (`with_operation_lock_sidecar` / `wait_for_sidecar_flock`), which needs a
-//! blocking-with-deadline retry over an already-open, read-only fd — the
-//! crate's non-blocking, path-creating `FileLock::acquire` is not that
-//! mechanism. This is a reported crate gap for the `transport` slice, not a
-//! workaround: the sidecar's own primitive is kept until the crate exposes a
-//! wait/retry form (or until the sidecar is retired in favour of
-//! `DestinationOwnership::lock_with_in_root_lock`, see `storekit/MIGRATION.md`
-//! ownership conflict (a)).
-
-#[cfg(unix)]
-mod unix;
-#[cfg(windows)]
-mod windows;
-
-#[cfg(unix)]
-use unix as platform;
-#[cfg(windows)]
-use windows as platform;
-
-pub(crate) use platform::{contended_errno, try_lock, unlock};
-
-/// The outcome of a platform lock attempt: acquired, contended (another
-/// holder), or a real failure. The `io::Error` payload the original carried
-/// on `Failed` was READ only by this module's own `FileLock::acquire` — now
-/// the crate's — so it is dropped: the only remaining consumer is the
-/// transport's sidecar waiter
-/// ([`crate::remote::transport::with_operation_lock_sidecar`]), which
-/// classifies contention by [`contended_errno`] and reads the errno itself
-/// (`last_os_error` immediately after the failed `flock`, with no syscall in
-/// between). The crate's own `LockAttempt` still carries the payload for its
-/// `acquire`; this one no longer has a reader.
-pub(crate) enum LockAttempt {
-    Acquired,
-    Contended,
-    Failed,
-}
+//! `try_lock`, `unlock`, `contended_errno` and `LockAttempt` used to live
+//! here for [`crate::remote::transport`]'s operation-lock sidecar. The crate
+//! now exposes
+//! [`storekit::transport::with_operation_lock_sidecar`] publicly (the SAME
+//! record, the SAME 2 s/5 ms blocking-with-deadline policy, an RAII hold),
+//! so the transport takes its sidecar from the crate and the deploy-local
+//! triple and its two platform modules (`unix.rs`/`windows.rs`) are deleted.
+//! The crate owns that mechanism; `deploy` no longer has a second copy.
 
 /// The crate's advisory `FileLock`, re-exported `pub(crate)`.
 ///

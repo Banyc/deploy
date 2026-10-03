@@ -53,7 +53,7 @@ pub use storekit::relpath::RootedRelativePath;
 use crate::env::SysEnv;
 use crate::error::{Error, Result};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use walkdir::WalkDir;
 
 /// The remote-state protocol version. Bumped 1 -> 2 when the remote
@@ -564,158 +564,57 @@ fn meta_to_remote(m: &std::fs::Metadata) -> RemoteMeta {
 /// permissions would silently depend on the caller's umask.
 pub(crate) const IMMUTABLE_RECORD_MODE: u32 = 0o644;
 
-/// How long a contender waits for the sidecar mutex before failing: a
-/// MONOTONIC deadline (not an attempt count). Ordinary critical sections
-/// (file syncs inside the flock) finish well within it; a holder that is
-/// still alive after the deadline is a genuinely stuck/unbounded operation.
-pub(crate) const SIDECAR_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
-/// The sleep between non-blocking flock retries (bounded by the remaining
-/// time to the deadline, so no retry ever extends past it).
-pub(crate) const SIDECAR_RETRY_INTERVAL: Duration = Duration::from_millis(5);
-
-// Thread-local re-entrancy depth for the sidecar critical section. When
-// `>0`, the current thread already holds the sidecar flock, so nested
-// transport calls for the lock path skip re-acquiring it. Depth is
-// incremented on entry and decremented on exit, even on error.
+// The operation-lock sidecar critical section is the CRATE's
+// ([`storekit::transport::with_operation_lock_sidecar`]): the SAME record
+// (`layout::operation_lock_sidecar()`), the SAME `create_new` + fsync
+// durability, the SAME 2 s deadline / 5 ms retry policy, and an RAII hold
+// that releases the flock and the re-entrancy depth on every exit path
+// including a panic unwind. `deploy` no longer carries the flock triple
+// (`try_lock`/`unlock`/`contended_errno`), the wait loop, or the constants.
+//
+// What `deploy` still observes locally is RE-ENTRANCY, for its own
+// `remove_file_if_inner`: while this thread is inside the sidecar, a
+// serialized compare-and-delete keeps the lock record CONTINUOUSLY VISIBLE
+// (no claim-aside rename window) instead of taking the atomic claim path.
+// The crate owns its own depth for locking; this counter is only that
+// observer, and it is raised for the duration of the crate's critical
+// section.
 thread_local! {
     static SIDECAR_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Ensure the sidecar mutex file exists durably: create the parent
-/// directory, create the file with `create_new` (so a concurrent creator
-/// is not truncated), `fsync` the file and `fsync` the parent directory.
-/// The file is created once and never removed/renamed, so every
-/// participant flocks the same inode. Mode 0o644, durable.
-pub(crate) fn ensure_operation_lock_sidecar_durable(base: &Path) -> Result<()> {
-    let rel = crate::remote::layout::operation_lock_sidecar();
-    let p = join(base, &rel);
-    if let Some(parent) = p.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| Error::transport(format!("mkdir {}: {e}", parent.display())))?;
-    }
-    // Fast path: already exists.
-    if p.exists() {
-        return Ok(());
-    }
-    // Create with create_new to avoid truncating a concurrent winner.
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&p)
-    {
-        Ok(f) => {
-            let _ = crate::platform::chmod(&p, 0o644);
-            f.sync_all()
-                .map_err(|e| Error::transport(format!("fsync {}: {e}", p.display())))?;
-            drop(f);
-            if let Some(parent) = p.parent() {
-                let dir = std::fs::File::open(parent)
-                    .map_err(|e| Error::transport(format!("open dir {}: {e}", parent.display())))?;
-                dir.sync_all().map_err(|e| {
-                    Error::transport(format!("fsync dir {}: {e}", parent.display()))
-                })?;
-            }
-            Ok(())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(e) => Err(Error::transport(format!("create {}: {e}", p.display()))),
+/// Run `f` inside the crate's operation-lock sidecar, recording on this
+/// thread that the sidecar is held. The lock itself — acquisition, wait
+/// policy, re-entrancy and RAII release — is entirely the crate's.
+fn with_observed_operation_lock<R>(base: &Path, f: impl FnOnce() -> Result<R>) -> Result<R> {
+    let prev_depth = SIDECAR_DEPTH.with(|c| c.get());
+    let _hold = SidecarObservation::new(prev_depth);
+    storekit::transport::with_operation_lock_sidecar(
+        base,
+        &crate::remote::layout::operation_lock_sidecar(),
+        || Ok(f()),
+    )
+    .map_err(Error::from)?
+}
+
+/// The RAII observer for [`with_observed_operation_lock`]: raises the
+/// thread-local depth on construction and restores it on drop, so a panic
+/// unwinding through the critical section cannot leak the observation.
+struct SidecarObservation {
+    prev_depth: usize,
+}
+
+impl SidecarObservation {
+    fn new(prev_depth: usize) -> Self {
+        SIDECAR_DEPTH.with(|c| c.set(prev_depth + 1));
+        SidecarObservation { prev_depth }
     }
 }
 
-/// Run `f` while holding an exclusive `flock` on the sidecar mutex file.
-/// The sidecar is ensured durably before locking. Uses non-blocking
-/// `LOCK_EX|LOCK_NB` with a monotonic deadline (`SIDECAR_WAIT_TIMEOUT`)
-/// and a 5ms sleep between attempts (bounded by the remaining time to the
-/// deadline); a contended sidecar after the deadline fails with an explicit
-/// transport error, never hangs. Re-entrant: if the current thread already
-/// holds the sidecar (depth>0), `f` runs directly.
-pub(crate) fn with_operation_lock_sidecar<R>(
-    base: &Path,
-    f: impl FnOnce() -> Result<R>,
-) -> Result<R> {
-    let depth = SIDECAR_DEPTH.with(|c| c.get());
-    if depth > 0 {
-        return f();
+impl Drop for SidecarObservation {
+    fn drop(&mut self) {
+        SIDECAR_DEPTH.with(|c| c.set(self.prev_depth));
     }
-    ensure_operation_lock_sidecar_durable(base)?;
-    let rel = crate::remote::layout::operation_lock_sidecar();
-    let p = join(base, &rel);
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .open(&p)
-        .map_err(|e| Error::transport(format!("open sidecar {}: {e}", p.display())))?;
-    // The platform lock (flock on Unix, LockFileEx on Windows — the split
-    // lives in [`crate::deploy::lock`]): the closure returns the
-    // 0/-1 convention `wait_for_sidecar_flock` expects.
-    let try_lock = || match crate::deploy::lock::try_lock(&file) {
-        crate::deploy::lock::LockAttempt::Acquired => 0,
-        _ => -1,
-    };
-    wait_for_sidecar_flock(
-        &p,
-        SIDECAR_WAIT_TIMEOUT,
-        SIDECAR_RETRY_INTERVAL,
-        try_lock,
-        || std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
-        Instant::now,
-        std::thread::sleep,
-    )?;
-    SIDECAR_DEPTH.with(|c| c.set(depth + 1));
-    let res = f();
-    SIDECAR_DEPTH.with(|c| c.set(depth));
-    crate::deploy::lock::unlock(&file);
-    res
-}
-
-/// The flock-contention wait, with the OS interactions injected so the
-/// timeout/retry policy can be property-tested deterministically. `try_flock`
-/// returns the flock(2) result convention (0 = acquired, -1 = error with
-/// errno consultable via `last_errno`), `now` the monotonic clock, `sleep`
-/// the wait primitive. The policy: keep acquiring until the deadline —
-/// `EWOULDBLOCK` sleeps `interval.min(deadline - now)`, `EINTR` retries
-/// immediately, any other errno fails immediately; a holder that is still
-/// contended when the deadline passes fails with the timeout error.
-pub(crate) fn wait_for_sidecar_flock(
-    path: &std::path::Path,
-    timeout: Duration,
-    interval: Duration,
-    mut try_flock: impl FnMut() -> i32,
-    mut last_errno: impl FnMut() -> i32,
-    mut now: impl FnMut() -> Instant,
-    mut sleep: impl FnMut(Duration),
-) -> Result<()> {
-    let deadline = now() + timeout;
-    loop {
-        if try_flock() == 0 {
-            break;
-        }
-        let errno = last_errno();
-        match errno {
-            x if x == crate::deploy::lock::contended_errno() => {
-                let cur = now();
-                if cur >= deadline {
-                    return Err(Error::transport(format!(
-                        "sidecar mutex remained contended for {:?}: {}",
-                        timeout,
-                        path.display()
-                    )));
-                }
-                sleep(interval.min(deadline - cur));
-            }
-            // EINTR (Unix only — Windows has no equivalent): retry
-            // immediately.
-            #[cfg(unix)]
-            x if x == libc::EINTR => continue,
-            _ => {
-                return Err(Error::transport(format!(
-                    "flock sidecar {}: {}",
-                    path.display(),
-                    std::io::Error::from_raw_os_error(errno)
-                )));
-            }
-        }
-    }
-    Ok(())
 }
 
 /// The seven stages of the canonical create-new sequence — the crash/failure
@@ -1540,7 +1439,7 @@ impl Remote for LocalTransport {
         // the compare-then-delete becomes operation-atomic: a contender's
         // create-if-absent cannot win the freed path mid-operation.
         if rel.as_path() == crate::remote::layout::operation_lock().as_path() {
-            return with_operation_lock_sidecar(&self.base, || {
+            return with_observed_operation_lock(&self.base, || {
                 self.remove_file_if_inner(rel, expected)
             });
         }
@@ -1549,7 +1448,9 @@ impl Remote for LocalTransport {
 
     fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict> {
         if rel.as_path() == crate::remote::layout::operation_lock().as_path() {
-            return with_operation_lock_sidecar(&self.base, || self.try_write_new_inner(rel, data));
+            return with_observed_operation_lock(&self.base, || {
+                self.try_write_new_inner(rel, data)
+            });
         }
         self.try_write_new_inner(rel, data)
     }
@@ -1561,7 +1462,7 @@ impl Remote for LocalTransport {
         equivalence: ContentEquivalence,
     ) -> Result<CreateNewVerdict> {
         if rel.as_path() == crate::remote::layout::operation_lock().as_path() {
-            return with_operation_lock_sidecar(&self.base, || {
+            return with_observed_operation_lock(&self.base, || {
                 self.try_write_new_with_inner(rel, data, equivalence)
             });
         }
@@ -1696,8 +1597,8 @@ impl LocalTransport {
         expected: &[u8],
     ) -> Result<RemoveIfVerdict> {
         let p = join(&self.base, rel);
-        // When already holding the sidecar (we are inside with_operation_lock_sidecar),
-        // the mutation is already serialized, so a simple read-compare-unlink
+        // When already holding the sidecar (we are inside the crate's
+        // with_operation_lock_sidecar), the mutation is already serialized, so a simple read-compare-unlink
         // keeps the record continuously visible for a mismatched remove (no
         // transient absence) and is safe from TOCTOU.
         if SIDECAR_DEPTH.with(|c| c.get() > 0) {
@@ -2890,147 +2791,167 @@ mod tests {
         }
     }
 
-    proptest! {
-        #![proptest_config(ProptestConfig {
-            cases: crate::testutil::proptest_cases(64),
-            rng_seed: RngSeed::Fixed(0x5EED_5EED),
-            failure_persistence: None,
-            ..ProptestConfig::default()
-        })]
-
-        #[test]
-        fn wait_for_sidecar_flock_simulated_contention(
-            hold_ms in prop_oneof![
-                Just(0u64),
-                Just(1u64),
-                Just(1999u64),
-                Just(2000u64),
-                Just(2500u64),
-                Just(3000u64),
-                0u64..=3000u64,
-            ],
-        ) {
-            let timeout = SIDECAR_WAIT_TIMEOUT;
-            let interval = SIDECAR_RETRY_INTERVAL;
-            let hold = Duration::from_millis(hold_ms);
-            let start = Instant::now();
-            let release_at = start + hold;
-            let deadline = start + timeout;
-            let simulated = std::cell::Cell::new(start);
-            let sleeps = std::cell::RefCell::new(Vec::<Duration>::new());
-            let try_count = std::cell::Cell::new(0usize);
-            let last_now = std::cell::Cell::new(None::<Instant>);
-            let path = Path::new("/tmp/sidecar.test");
-            let res = wait_for_sidecar_flock(
-                path,
-                timeout,
-                interval,
-                || {
-                    try_count.set(try_count.get() + 1);
-                    last_now.set(Some(simulated.get()));
-                    if simulated.get() > release_at { 0 } else { -1 }
-                },
-                || libc::EWOULDBLOCK,
-                || simulated.get(),
-                |d| {
-                    sleeps.borrow_mut().push(d);
-                    simulated.set(simulated.get() + d);
-                },
-            );
-            if hold < timeout {
-                prop_assert!(res.is_ok(), "hold {hold:?} < timeout {timeout:?} must succeed, got {res:?} sleeps={:?} try_count={}", sleeps.borrow(), try_count.get());
-                // Success must have observed the release.
-                prop_assert!(simulated.get() >= release_at, "simulated time must have reached release_at");
-            } else {
-                prop_assert!(res.is_err(), "hold {hold:?} >= timeout {timeout:?} must fail");
-                let msg = res.unwrap_err().to_string();
-                prop_assert!(msg.contains("remained contended for"), "timeout error must contain 'remained contended for', got: {msg}");
-                // Failure happens only after deadline.
-                let last = last_now.get().expect("at least one try");
-                prop_assert!(last >= deadline, "failure must happen only after deadline: last_now={last:?} deadline={deadline:?}");
-                // No sleep extends beyond deadline.
-                for s in sleeps.borrow().iter() {
-                    prop_assert!(*s <= interval, "every sleep <= interval, got {s:?}");
-                }
-                let elapsed = simulated.get().duration_since(start);
-                prop_assert!(elapsed <= timeout + interval, "total elapsed {elapsed:?} must be <= timeout+interval {:?}", timeout + interval);
-                // Also no sleep took us beyond deadline+interval: simulated never beyond deadline+epsilon.
-                prop_assert!(simulated.get() <= deadline + interval, "simulated {:?} must not exceed deadline+interval", simulated.get());
-            }
-            // Every sleep is bounded by interval and by remaining time (checked above for interval, and elapsed bound covers deadline).
-            for s in sleeps.borrow().iter() {
-                prop_assert!(*s <= interval);
-            }
-        }
-    }
-
+    /// The operation-lock sidecar is now the CRATE's
+    /// ([`storekit::transport::with_operation_lock_sidecar`]): the same
+    /// `layout::operation_lock_sidecar()` record, the same
+    /// blocking-with-deadline policy (2 s deadline, 5 ms retries), opened
+    /// read-only and never unlinked. This test holds that record's flock
+    /// directly and proves a lock mutation on the transport waits the full
+    /// deadline and then fails with the contention message — never hangs,
+    /// never silently proceeds — and that the SAME transport then succeeds on
+    /// the SAME record once the hold is released. The wait-loop arithmetic
+    /// itself (interval bounding, EINTR retry, non-contention immediate
+    /// failure) is pinned by the crate's own `wait_for_sidecar_flock` tests,
+    /// since the loop is now the crate's. The three deploy unit tests that
+    /// duplicated the clock-injected loop were replaced by these four
+    /// crate-backed behaviour tests, which pin the policy, the record, the
+    /// wait, and the stable inode from deploy's side.
+    #[cfg(unix)]
     #[test]
-    fn wait_for_sidecar_flock_non_contention_fails_immediately() {
-        let timeout = SIDECAR_WAIT_TIMEOUT;
-        let interval = SIDECAR_RETRY_INTERVAL;
-        let start = Instant::now();
-        let simulated = std::cell::Cell::new(start);
-        let try_count = std::cell::Cell::new(0usize);
-        let sleeps = std::cell::RefCell::new(Vec::<Duration>::new());
-        let path = Path::new("/tmp/sidecar.test");
-        let res = wait_for_sidecar_flock(
-            path,
-            timeout,
-            interval,
-            || {
-                try_count.set(try_count.get() + 1);
-                -1
-            },
-            || libc::EIO,
-            || simulated.get(),
-            |d| {
-                sleeps.borrow_mut().push(d);
-                simulated.set(simulated.get() + d);
-            },
-        );
-        assert!(res.is_err(), "EIO must fail");
+    fn crate_backed_sidecar_waits_the_deadline_then_fails_typed() {
+        use std::os::unix::io::AsRawFd;
+        use std::time::Instant;
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let base = dir.path().join("remote");
+        let transport = LocalTransport::new(&crate::testutil::fixture_env(), base.clone()).unwrap();
+
+        // The SAME record the crate's sidecar names.
+        let sidecar = base.join(crate::remote::layout::operation_lock_sidecar().as_path());
+        std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&sidecar)
+            .expect("create the sidecar record once");
+
+        // Hold the sidecar flock on a read-only descriptor, exactly as the
+        // crate's critical section does.
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&sidecar)
+            .unwrap();
         assert_eq!(
-            try_count.get(),
-            1,
-            "non-contention error must fail immediately (one try)"
+            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "the test must hold the sidecar flock"
         );
-        assert!(sleeps.borrow().is_empty(), "no sleeps on immediate failure");
+
+        let start = Instant::now();
+        let res = transport.try_write_new(&crate::remote::layout::operation_lock(), b"held\n");
+        let elapsed = start.elapsed();
+        let err = res.expect_err("a held sidecar must refuse the lock mutation");
         assert!(
-            !res.unwrap_err()
-                .to_string()
-                .contains("remained contended for")
+            err.to_string().contains("remained contended for"),
+            "the timeout must be the sidecar-wait refusal, got: {err}"
+        );
+        assert!(
+            elapsed >= Duration::from_secs(2),
+            "the wait must run to the 2 s deadline, elapsed {elapsed:?}"
+        );
+        assert!(
+            elapsed <= Duration::from_secs(4),
+            "the wait must not hang past the deadline: elapsed {elapsed:?}"
+        );
+
+        // Release, and the SAME transport now succeeds on the SAME record.
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_UN) }, 0);
+        let verdict = transport
+            .try_write_new(&crate::remote::layout::operation_lock(), b"held\n")
+            .unwrap();
+        assert!(matches!(
+            verdict,
+            CreateNewVerdict::Created | CreateNewVerdict::AlreadyPresent
+        ));
+    }
+
+    /// The sidecar policy `deploy` now relies on is the crate's, and its
+    /// values are pinned: a 2 s monotonic deadline with 5 ms retries. A drift
+    /// in either constant changes the observable wait, so it is asserted here
+    /// as well as in the crate.
+    #[test]
+    fn crate_sidecar_policy_is_the_2s_5ms_deadline() {
+        assert_eq!(
+            storekit::transport::SIDECAR_WAIT_TIMEOUT,
+            Duration::from_secs(2),
+            "the sidecar deadline is 2 s"
+        );
+        assert_eq!(
+            storekit::transport::SIDECAR_RETRY_INTERVAL,
+            Duration::from_millis(5),
+            "the sidecar retry interval is 5 ms"
         );
     }
 
+    /// A holder that RELEASES before the deadline is WAITED for and then
+    /// admitted: the crate-backed critical section is a blocking mutex, not an
+    /// immediate refusal. The call must return well inside the 2 s deadline.
+    #[cfg(unix)]
     #[test]
-    fn wait_for_sidecar_flock_eintr_retries_without_sleep() {
-        let timeout = SIDECAR_WAIT_TIMEOUT;
-        let interval = SIDECAR_RETRY_INTERVAL;
-        let start = Instant::now();
-        let simulated = std::cell::Cell::new(start);
-        let sleeps = std::cell::RefCell::new(Vec::<Duration>::new());
-        let calls = std::cell::Cell::new(0usize);
-        let path = Path::new("/tmp/sidecar.test");
-        let res = wait_for_sidecar_flock(
-            path,
-            timeout,
-            interval,
-            || {
-                calls.set(calls.get() + 1);
-                if calls.get() == 1 { -1 } else { 0 }
-            },
-            || if calls.get() == 1 { libc::EINTR } else { 0 },
-            || simulated.get(),
-            |d| {
-                sleeps.borrow_mut().push(d);
-                simulated.set(simulated.get() + d);
-            },
+    fn crate_backed_sidecar_admits_a_holder_released_before_the_deadline() {
+        use std::os::unix::io::AsRawFd;
+        use std::time::Instant;
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let base = dir.path().join("remote");
+        let transport = LocalTransport::new(&crate::testutil::fixture_env(), base.clone()).unwrap();
+        let sidecar = base.join(crate::remote::layout::operation_lock_sidecar().as_path());
+        std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&sidecar)
+            .expect("create the sidecar record once");
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&sidecar)
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
         );
-        assert!(res.is_ok(), "EINTR then success must retry and succeed");
-        assert_eq!(calls.get(), 2, "should have retried once after EINTR");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_UN) };
+        });
+        let start = Instant::now();
+        let verdict = transport
+            .try_write_new(&crate::remote::layout::operation_lock(), b"admitted\n")
+            .expect("a holder released before the deadline must be admitted");
+        let elapsed = start.elapsed();
+        releaser.join().unwrap();
+        assert!(matches!(
+            verdict,
+            CreateNewVerdict::Created | CreateNewVerdict::AlreadyPresent
+        ));
         assert!(
-            sleeps.borrow().is_empty(),
-            "EINTR must retry without sleeping"
+            elapsed >= Duration::from_millis(100),
+            "the call must actually have waited for the live holder: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the call must have been admitted by the release, not the deadline: {elapsed:?}"
+        );
+    }
+
+    /// The crate-owned sidecar record has a STABLE inode: created once, never
+    /// unlinked or recreated by a mutation, so every participant flocks the
+    /// same file. Pinned by (dev, ino) via `MetadataExt`.
+    #[cfg(unix)]
+    #[test]
+    fn crate_backed_sidecar_record_is_never_unlinked() {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let base = dir.path().join("remote");
+        let transport = LocalTransport::new(&crate::testutil::fixture_env(), base.clone()).unwrap();
+        let lock = crate::remote::layout::operation_lock();
+        transport.try_write_new(&lock, b"a\n").unwrap();
+        let sidecar = base.join(crate::remote::layout::operation_lock_sidecar().as_path());
+        let first = std::fs::metadata(&sidecar).unwrap();
+        transport.remove_file_if(&lock, b"a\n").unwrap();
+        transport.try_write_new(&lock, b"b\n").unwrap();
+        let second = std::fs::metadata(&sidecar).unwrap();
+        assert_eq!(
+            (first.dev(), first.ino()),
+            (second.dev(), second.ino()),
+            "the sidecar inode must be stable: never unlinked or recreated"
         );
     }
 }

@@ -587,8 +587,14 @@ impl<'a> RemoteHelper<'a> {
         // Local fallback: hold the sidecar flock for the entire
         // read→verify→remove→install sequence, so the compare-then-delete
         // plus the install becomes operation-atomic and a contender's
-        // create-if-absent cannot interleave.
-        crate::remote::transport::with_operation_lock_sidecar(self.remote.root(), || {
+        // create-if-absent cannot interleave. The critical section is the
+        // CRATE's ([`storekit::transport::with_operation_lock_sidecar`]) on
+        // the layout's own `lock_sidecar` record — the same file and policy
+        // the transport's own lock mutations use.
+        storekit::transport::with_operation_lock_sidecar(
+            self.remote.root(),
+            &layout::operation_lock_sidecar(),
+            || Ok((|| -> Result<HeldSlotLock<'_>> {
             // READ + VERIFY under the sidecar.
             let current = read_lock_record(self.remote, p)?;
             match &current {
@@ -631,7 +637,8 @@ impl<'a> RemoteHelper<'a> {
                     "recovery install contended (a concurrent acquire won the freed slot: {reason:?});                      re-read and re-confirm"
                 ))),
             }
-        })
+        })()))
+        .map_err(Error::from)?
     }
 
     /// Acquire the server mutation lock and return a guard that releases it
