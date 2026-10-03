@@ -14,40 +14,12 @@
 //! resolved ref), so a future agent can see exactly what a relative push
 //! did, in what order, and how long each step took — `grep '\[trace\]'`
 //! on the stderr of a `deploy push --verbose` run.
+//!
+//! The implementation lives in `storekit::trace` (its prior home was this
+//! file); this module re-exports it so every `crate::trace::Tracer` call site
+//! keeps compiling unchanged.
 
-use std::time::Instant;
-
-/// A verbose step tracer. `enabled` gates every emission; a disabled tracer
-/// records nothing and prints nothing.
-pub struct Tracer {
-    enabled: bool,
-    start: Instant,
-    last: Instant,
-}
-
-impl Tracer {
-    /// A tracer gated on `enabled` (the `--verbose` / `-v` flag).
-    pub fn new(enabled: bool) -> Self {
-        Self {
-            enabled,
-            start: Instant::now(),
-            last: Instant::now(),
-        }
-    }
-
-    /// Record a step: `[trace] +<since-last> (+<since-start>) <name>: <detail>`.
-    /// A no-op when verbose is off.
-    pub fn step(&mut self, name: &str, detail: impl std::fmt::Display) {
-        if !self.enabled {
-            return;
-        }
-        let now = Instant::now();
-        let since_last = now.duration_since(self.last);
-        let since_start = now.duration_since(self.start);
-        eprintln!("[trace] +{since_last:?} (+{since_start:?}) {name}: {detail}");
-        self.last = now;
-    }
-}
+pub(crate) use storekit::trace::Tracer;
 
 #[cfg(test)]
 mod tests {

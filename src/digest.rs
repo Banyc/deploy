@@ -1,49 +1,12 @@
 //! Cryptographic digest helpers (SHA-256).
+//!
+//! The implementation lives in `storekit::digest` (its prior home was this
+//! file, verbatim); this module re-exports it so every `crate::digest::…`
+//! call site keeps compiling unchanged. `deploy::digest` is public API, and a
+//! glob re-export preserves all of it (`sha256_bytes`, `sha256_reader`,
+//! `Hasher`).
 
-use sha2::{Digest, Sha256};
-use std::io::Read;
-
-/// Compute the lowercase hex SHA-256 of a byte slice.
-pub fn sha256_bytes(data: &[u8]) -> String {
-    let mut h = Sha256::new();
-    h.update(data);
-    hex::encode(h.finalize())
-}
-
-/// Compute the lowercase hex SHA-256 of a reader's contents.
-pub fn sha256_reader<R: Read>(mut r: R) -> std::io::Result<String> {
-    let mut h = Sha256::new();
-    let mut buf = [0u8; 65536];
-    loop {
-        let n = r.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        h.update(&buf[..n]);
-    }
-    Ok(hex::encode(h.finalize()))
-}
-
-/// Streaming SHA-256 hasher wrapper.
-pub struct Hasher(Sha256);
-
-impl Hasher {
-    pub fn new() -> Self {
-        Hasher(Sha256::new())
-    }
-    pub fn update(&mut self, data: &[u8]) {
-        self.0.update(data);
-    }
-    pub fn finish(self) -> String {
-        hex::encode(self.0.finalize())
-    }
-}
-
-impl Default for Hasher {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+pub use storekit::digest::*;
 
 #[cfg(test)]
 mod tests {
@@ -54,6 +17,29 @@ mod tests {
         assert_eq!(
             sha256_bytes(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    /// Byte-identity fixture: the expected digest is what `deploy`'s own
+    /// former `digest` implementation produced for this input (and what
+    /// `shasum -a 256` prints), so it pins the crate's SHA-256 to deploy's
+    /// historical output. The fixture (`bytes(0..=255)` repeated 300 times,
+    /// then the ASCII tag `deploy/storekit digest fixture v1`) is 76833 bytes
+    /// — larger than the 64 KiB streaming buffer, so `sha256_reader` takes
+    /// more than one read.
+    #[test]
+    fn sha256_fixture_digest_is_stable() {
+        const EXPECTED: &str = "d942679f8f33c20fa90e5af131f2819842770e798400024c6cc177e6374c3528";
+        let mut fixture = Vec::new();
+        for _ in 0..300 {
+            fixture.extend(0u8..=255);
+        }
+        fixture.extend_from_slice(b"deploy/storekit digest fixture v1");
+        assert_eq!(fixture.len(), 76833);
+        assert_eq!(sha256_bytes(&fixture), EXPECTED);
+        assert_eq!(
+            sha256_reader(std::io::Cursor::new(&fixture)).unwrap(),
+            EXPECTED
         );
     }
 }

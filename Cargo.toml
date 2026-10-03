@@ -17,10 +17,20 @@ edition = "2024"
 test-support = []
 
 [dependencies]
+# The store substrate (`atomic`, `root`, `lock`, `id`, `relpath`, `manifest`,
+# `sync`, `transport`) and the shared helpers (`env`, `digest`, `platform`,
+# `trace`) `deploy` is being migrated onto (see `storekit/MIGRATION.md`).
+#
+# PATH, not git/tag, for now: both repos are local siblings and `storekit` has
+# not cut a tag yet, so a path dependency is the only form that cannot drift
+# from the reviewed working copy under migration. THE ONE-LINE SWITCH once
+# `storekit` cuts a tag: replace the line below with
+#     storekit = { git = "https://github.com/Banyc/storekit", tag = "v0.1.0" }
+# (or the eventual release tag) and commit the regenerated `Cargo.lock`.
+storekit = { path = "../storekit" }
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 serde_json = "1"
-sha2 = "0.11"
 uuid = { version = "1", features = ["v7", "serde"] }
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
