@@ -1538,6 +1538,10 @@ pub(crate) mod tests_publish {
         fn is_local(&self) -> bool {
             true
         }
+        fn provision_layout(&self) -> Result<()> {
+            crate::remote::transport::provision_receiver_marker(self)?;
+            Ok(())
+        }
         fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
             if Self::is_staging(rel) && self.consume(|f| f == ReleasePublishFault::VerifyRead) {
                 return Err(Error::remote(
@@ -1648,6 +1652,10 @@ pub(crate) mod tests_publish {
         }
         fn is_local(&self) -> bool {
             self.is_local
+        }
+        fn provision_layout(&self) -> Result<()> {
+            crate::remote::transport::provision_receiver_marker(self)?;
+            Ok(())
         }
         fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
             self.inner.read(rel)
@@ -2220,6 +2228,10 @@ pub(crate) mod tests_publish {
         }
         fn is_local(&self) -> bool {
             true
+        }
+        fn provision_layout(&self) -> Result<()> {
+            crate::remote::transport::provision_receiver_marker(self)?;
+            Ok(())
         }
         fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
             self.inner.read(rel)

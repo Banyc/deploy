@@ -88,6 +88,10 @@ mod tests {
         fn is_local(&self) -> bool {
             true
         }
+        fn provision_layout(&self) -> Result<()> {
+            crate::remote::transport::provision_receiver_marker(self)?;
+            Ok(())
+        }
         fn read(&self, _rel: &RootedRelativePath) -> Result<Vec<u8>> {
             unreachable!("not used by run_verification")
         }

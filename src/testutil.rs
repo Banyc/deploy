@@ -1043,6 +1043,10 @@ pub(crate) mod test_remotes {
         fn is_local(&self) -> bool {
             true
         }
+        fn provision_layout(&self) -> Result<()> {
+            crate::remote::transport::provision_receiver_marker(self)?;
+            Ok(())
+        }
         fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
             self.inner.read(rel)
         }
@@ -1148,6 +1152,10 @@ pub(crate) mod test_remotes {
 
         fn is_local(&self) -> bool {
             true
+        }
+        fn provision_layout(&self) -> Result<()> {
+            crate::remote::transport::provision_receiver_marker(self)?;
+            Ok(())
         }
         fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
             self.inner.read(rel)
@@ -1467,6 +1475,10 @@ pub(crate) mod test_remotes {
 
         fn is_local(&self) -> bool {
             true
+        }
+        fn provision_layout(&self) -> Result<()> {
+            crate::remote::transport::provision_receiver_marker(self)?;
+            Ok(())
         }
         fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
             self.tick();

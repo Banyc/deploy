@@ -1126,6 +1126,10 @@ impl Remote for SpyRemote {
     fn is_local(&self) -> bool {
         true
     }
+    fn provision_layout(&self) -> Result<()> {
+        deploy::remote::transport::provision_receiver_marker(self)?;
+        Ok(())
+    }
     fn read(&self, rel: &RootedRelativePath) -> deploy::error::Result<Vec<u8>> {
         self.inner.read(rel)
     }
@@ -1291,6 +1295,10 @@ impl Remote for FaultRemote {
 
     fn is_local(&self) -> bool {
         true
+    }
+    fn provision_layout(&self) -> Result<()> {
+        deploy::remote::transport::provision_receiver_marker(self)?;
+        Ok(())
     }
     fn read(&self, rel: &RootedRelativePath) -> deploy::error::Result<Vec<u8>> {
         self.inner.read(rel)

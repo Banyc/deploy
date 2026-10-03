@@ -398,6 +398,22 @@ pub trait Remote {
     }
 }
 
+/// Provision the deploy_dir's IMMUTABLE receiver-UUID marker through
+/// `remote`'s OWN methods, so a wrapper that records or injects a fault on
+/// those calls still sees them. This is the marker-only provisioning a
+/// `Remote` implementor wants when it builds no layout of its own; the
+/// production transports ([`LocalTransport`], [`SshTransport`]) provision
+/// the full layout and then call this too.
+///
+/// PUBLIC because an out-of-crate `Remote` implementor — a test fixture
+/// built on the public fixture API — reaches provisioning only through a
+/// public entry point. It grants no capability the caller did not already
+/// have: every effect goes through the caller's own [`Remote`] methods.
+pub fn provision_receiver_marker<R: Remote + ?Sized>(remote: &R) -> Result<()> {
+    provision_receiver_uuid(remote)?;
+    Ok(())
+}
+
 fn join(root: &Path, rel: &RootedRelativePath) -> PathBuf {
     root.join(rel.as_path())
 }
@@ -1622,6 +1638,199 @@ mod tests {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::Path;
 
+    /// A delegating wrapper used to pin the provisioning contract. With
+    /// `provision == true` it carries the SAME explicit `provision_layout`
+    /// override every test wrapper in the transport subsystem carries; with
+    /// `provision == false` it mirrors the substrate trait's default (a
+    /// no-op), reproducing a wrapper that stopped provisioning.
+    struct ProvisionProbe {
+        inner: LocalTransport,
+        provision: bool,
+    }
+
+    impl Remote for ProvisionProbe {
+        fn root(&self) -> &Path {
+            self.inner.root()
+        }
+        fn is_local(&self) -> bool {
+            self.inner.is_local()
+        }
+        fn provision_layout(&self) -> Result<()> {
+            if self.provision {
+                provision_receiver_marker(self)
+            } else {
+                Ok(())
+            }
+        }
+        fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
+            self.inner.read(rel)
+        }
+        fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
+            self.inner.write(rel, data, mode)
+        }
+        fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict> {
+            self.inner.try_write_new(rel, data)
+        }
+        fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
+            self.inner.create_dir(rel)
+        }
+        fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+            self.inner.create_dir_all(rel)
+        }
+        fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
+            self.inner.set_mode(rel, mode)
+        }
+        fn list(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>> {
+            self.inner.list(rel)
+        }
+        fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
+            self.inner.rename(from, to)
+        }
+        fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
+            self.inner.symlink(target, link)
+        }
+        fn read_link(&self, rel: &RootedRelativePath) -> Result<PathBuf> {
+            self.inner.read_link(rel)
+        }
+        fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
+            self.inner.remove_file(rel)
+        }
+        fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+            self.inner.remove_dir_all(rel)
+        }
+        fn exists(&self, rel: &RootedRelativePath) -> bool {
+            self.inner.exists(rel)
+        }
+        fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta> {
+            self.inner.metadata(rel)
+        }
+        fn exec(&self, argv: &[String], timeout: Duration) -> Result<ExecOutcome> {
+            self.inner.exec(argv, timeout)
+        }
+        fn filesystem_bytes(&self) -> Result<FsBytes> {
+            self.inner.filesystem_bytes()
+        }
+    }
+
+    /// The marker-only provisioning path every wrapper override runs: it goes
+    /// through the wrapper's OWN `Remote` methods and leaves the deploy_dir's
+    /// immutable receiver marker behind.
+    #[test]
+    fn provision_receiver_marker_creates_the_marker_through_the_remote() {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let base = dir.path().join("explicit");
+        let probe = ProvisionProbe {
+            inner: LocalTransport::new(&SysEnv::from_process(), base).unwrap(),
+            provision: true,
+        };
+        let marker = crate::remote::layout::receiver_uuid();
+        assert!(
+            !probe.inner.exists(&marker),
+            "construction alone does not provision: the marker must be absent before"
+        );
+        probe.provision_layout().unwrap();
+        assert!(
+            probe.inner.exists(&marker),
+            "the explicit override provisions the receiver marker"
+        );
+    }
+
+    /// The control: a wrapper that falls through to the substrate default
+    /// provisions NOTHING. This is why every wrapper needs the explicit
+    /// override above — without it the marker is silently absent.
+    #[test]
+    fn a_wrapper_without_the_override_provisions_nothing() {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let base = dir.path().join("default");
+        let probe = ProvisionProbe {
+            inner: LocalTransport::new(&SysEnv::from_process(), base).unwrap(),
+            provision: false,
+        };
+        probe.provision_layout().unwrap();
+        assert!(
+            !probe.inner.exists(&crate::remote::layout::receiver_uuid()),
+            "the substrate `provision_layout` default is a no-op: a wrapper that does not \
+             override it leaves the receiver marker absent"
+        );
+    }
+
+    /// Every `impl ... Remote for` block in the crate's own sources and in the
+    /// integration tests must carry an explicit `provision_layout` that
+    /// provisions. The substrate trait's default is a no-op, so a wrapper that
+    /// relied on `deploy`'s marker-creating default would silently stop
+    /// provisioning when the trait is swapped. The wrappers are private test
+    /// types spread across a dozen modules with no runtime registry, so the
+    /// one check that can see all of them is a source-shape check.
+    #[test]
+    fn every_remote_impl_carries_an_explicit_provisioning_override() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut checked = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+        for sub in ["src", "tests"] {
+            for entry in walkdir::WalkDir::new(root.join(sub))
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                // `tests/ui/*` are trybuild compile-fail fixtures and
+                // `src-tmp-check.rs` is a stray, undeclared file — neither is
+                // compiled into the crate.
+                if path.components().any(|c| c.as_os_str() == "ui")
+                    || path.file_name().and_then(|n| n.to_str()) == Some("src-tmp-check.rs")
+                {
+                    continue;
+                }
+                let text = std::fs::read_to_string(path).expect("a source file reads");
+                for (header, body) in remote_impl_blocks(&text) {
+                    checked += 1;
+                    let provisioned = body.contains("provision_receiver_marker(")
+                        || body.contains("provision_receiver_uuid(")
+                        || body.contains("inner.provision_layout(");
+                    if !provisioned {
+                        offenders.push(format!("{}: {header}", path.display()));
+                    }
+                }
+            }
+        }
+        assert!(
+            checked >= 31,
+            "the scan should see every `Remote` impl, saw {checked}"
+        );
+        assert!(
+            offenders.is_empty(),
+            "these `Remote` impls do not provision the receiver marker and would fall \
+             through to the substrate no-op default: {offenders:#?}"
+        );
+    }
+
+    /// The `(header, body)` of every `impl ... Remote for ...` block in
+    /// `text`, found by INDENTATION: every impl body in this codebase closes
+    /// with a `}` at the impl's own indentation.
+    fn remote_impl_blocks(text: &str) -> Vec<(String, String)> {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut blocks = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim_start();
+            if !trimmed.starts_with("impl") || !trimmed.contains("Remote for") {
+                continue;
+            }
+            let indent = line.len() - trimmed.len();
+            let mut body = String::new();
+            for l in &lines[i + 1..] {
+                if l.trim() == "}" && (l.len() - l.trim_start().len()) == indent {
+                    break;
+                }
+                body.push_str(l);
+                body.push('\n');
+            }
+            blocks.push((trimmed.to_string(), body));
+        }
+        blocks
+    }
+
     /// The deploy_dir's IMMUTABLE receiver-UUID marker: `provision_layout`
     /// creates it ONCE, a re-provisioning adopts the SAME identity (never a
     /// new one), and `read_receiver_uuid` reads it back — the PHYSICAL
@@ -2260,6 +2469,11 @@ mod tests {
 
         fn is_local(&self) -> bool {
             true
+        }
+
+        fn provision_layout(&self) -> Result<()> {
+            crate::remote::transport::provision_receiver_marker(self)?;
+            Ok(())
         }
 
         fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {

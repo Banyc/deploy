@@ -1780,6 +1780,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         fn is_local(&self) -> bool {
             true
         }
+        fn provision_layout(&self) -> Result<()> {
+            crate::remote::transport::provision_receiver_marker(self)?;
+            Ok(())
+        }
         fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
             self.inner.read(rel)
         }
@@ -2197,6 +2201,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
         fn is_local(&self) -> bool {
             true
+        }
+        fn provision_layout(&self) -> Result<()> {
+            crate::remote::transport::provision_receiver_marker(self)?;
+            Ok(())
         }
         fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
             if let Some(id) = self.tracked_assignment(rel) {

@@ -1474,6 +1474,10 @@ mod nested_guard_proptest {
         fn is_local(&self) -> bool {
             true
         }
+        fn provision_layout(&self) -> RemoteResult<()> {
+            crate::remote::transport::provision_receiver_marker(self)?;
+            Ok(())
+        }
         fn read(&self, rel: &RootedRelativePath) -> RemoteResult<Vec<u8>> {
             self.inner.read(rel)
         }
@@ -2488,6 +2492,10 @@ mod barrier_proptest {
         fn is_local(&self) -> bool {
             true
         }
+        fn provision_layout(&self) -> RemoteResult<()> {
+            crate::remote::transport::provision_receiver_marker(self)?;
+            Ok(())
+        }
         fn read(&self, rel: &RootedRelativePath) -> RemoteResult<Vec<u8>> {
             self.inner.read(rel)
         }
@@ -2780,6 +2788,10 @@ mod guard_release_retry {
 
         fn is_local(&self) -> bool {
             true
+        }
+        fn provision_layout(&self) -> RemoteResult<()> {
+            crate::remote::transport::provision_receiver_marker(self)?;
+            Ok(())
         }
         fn read(&self, rel: &RootedRelativePath) -> RemoteResult<Vec<u8>> {
             self.inner.read(rel)

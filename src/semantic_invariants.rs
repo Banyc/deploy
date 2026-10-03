@@ -420,6 +420,10 @@ impl Remote for FailOnceRemote {
     fn is_local(&self) -> bool {
         true
     }
+    fn provision_layout(&self) -> Result<()> {
+        crate::remote::transport::provision_receiver_marker(self)?;
+        Ok(())
+    }
     fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
         self.inner.read(rel)
     }
@@ -7493,6 +7497,10 @@ impl Remote for CtrlFaultRemote {
 
     fn is_local(&self) -> bool {
         true
+    }
+    fn provision_layout(&self) -> crate::error::Result<()> {
+        crate::remote::transport::provision_receiver_marker(self)?;
+        Ok(())
     }
     fn read(&self, rel: &RootedRelativePath) -> crate::error::Result<Vec<u8>> {
         if Self::hits_lock(rel) && self.faults.lock().unwrap().fail_read {
