@@ -717,6 +717,33 @@ mod tests {
 
     const TARGET: &str = "t1";
 
+    /// A faithful, TEST-ONLY clone of a store base tree (directories, regular
+    /// files, symlinks). The crate's path-based `copy_dir_recursive` is
+    /// `#[cfg(test)]` inside the crate's OWN build (not visible across the
+    /// dependency boundary), and the crate's PUBLIC `copy_dir_recursive_fd`
+    /// deliberately REFUSES an unlandable name — including the
+    /// `operation.lock` record a real, previously-locked store base holds —
+    /// so a live base cannot be cloned through it. This mirrors the
+    /// pre-migration `deploy::store::atomic::copy_dir_recursive` for this
+    /// test's purpose (run the checkpoint on an identical tree).
+    fn clone_tree(src: &std::path::Path, dst: &std::path::Path) {
+        std::fs::create_dir_all(dst).unwrap();
+        for entry in std::fs::read_dir(src).unwrap() {
+            let entry = entry.unwrap();
+            let from = entry.path();
+            let to = dst.join(entry.file_name());
+            let file_type = entry.file_type().unwrap();
+            if file_type.is_dir() {
+                clone_tree(&from, &to);
+            } else if file_type.is_symlink() {
+                let target = std::fs::read_link(&from).unwrap();
+                crate::platform::symlink(&target, &to).unwrap();
+            } else {
+                std::fs::copy(&from, &to).unwrap();
+            }
+        }
+    }
+
     /// A single-slot (`p1`) VALID intent over the given release/tree, whose
     /// frozen snapshot entry (generation gen-1, artifact, binding s1
     /// /srv/deploy/p1) MATCHES the rollback `terminal_for` builds (the new
@@ -2381,8 +2408,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // CLONE the base (the preview touched nothing) and EXECUTE the same
         // checkpoint on the clone.
         let clone_base = dir.path().join("clone");
-        crate::store::atomic::copy_dir_recursive(store.base(), &clone_base)
-            .expect("the store base clones");
+        clone_tree(store.base(), &clone_base);
         let clone = LocalStore::with_base(clone_base).unwrap();
         let executed = run_checkpoint_unlocked(&clone, &cfg, "t1", &checkpoint_id)
             .expect("the real checkpoint on the cloned store succeeds");

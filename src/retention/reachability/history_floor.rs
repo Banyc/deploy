@@ -315,7 +315,7 @@ impl LocalStore {
         // [`write_atomic_replace`] call — the production path is exercised
         // in test builds too.
         let mut hook = self.ledger_replace_hook(target);
-        write_atomic_replace(&path, buf.as_bytes(), &mut hook)
+        Ok(write_atomic_replace(&path, buf.as_bytes(), &mut hook)?)
     }
 
     /// The per-stage fault hook for the ledger-suffix replacement
@@ -326,7 +326,10 @@ impl LocalStore {
     /// production path (no faults ever armed) and the test path share the
     /// SAME [`write_atomic_replace`] call.
     #[cfg(test)]
-    fn ledger_replace_hook(&self, target: &str) -> impl FnMut(ReplaceStage) -> Option<Error> + '_ {
+    fn ledger_replace_hook(
+        &self,
+        target: &str,
+    ) -> impl FnMut(ReplaceStage) -> Option<storekit::Error> + '_ {
         let reg = std::sync::Arc::clone(self.fault_registry());
         let key = target.to_string();
         move |stage| {
@@ -337,7 +340,7 @@ impl LocalStore {
                 ReplaceStage::DirSync => FaultKind::LedgerReplaceDirSync,
             };
             if reg.consume(kind, &key) {
-                Some(Error::store(format!(
+                Some(storekit::Error::store(format!(
                     "test fault: ledger suffix replacement faulted at the {stage:?} stage"
                 )))
             } else {
@@ -350,7 +353,10 @@ impl LocalStore {
     /// hook is a no-op — the SAME [`write_atomic_replace`] call the test
     /// path uses.
     #[cfg(not(test))]
-    fn ledger_replace_hook(&self, _target: &str) -> impl FnMut(ReplaceStage) -> Option<Error> + '_ {
+    fn ledger_replace_hook(
+        &self,
+        _target: &str,
+    ) -> impl FnMut(ReplaceStage) -> Option<storekit::Error> + '_ {
         |_stage| None
     }
 

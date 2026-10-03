@@ -101,7 +101,7 @@ use crate::config::ProjectConfig;
 use crate::error::{Error, Result};
 use crate::identity::{ReleaseId, TreeDigest};
 use crate::remote::layout;
-use crate::store::atomic::{path_state, sync_parent_dir};
+use crate::store::atomic::path_state;
 use crate::store::local::LocalStore;
 use std::path::Path;
 
@@ -251,6 +251,19 @@ fn enumerate_dirs(root: &Path, kind: EntryKind) -> Result<Vec<EnumeratedEntry>> 
     // unrecognized entry and would leave them in filesystem readdir order.
     out.sort_by(|a, b| a.name().cmp(b.name()));
     Ok(out)
+}
+
+/// The confined replacement for the crate-deleted path-based
+/// `sync_parent_dir`: fsync the directory that HOLDS `rel` under the store
+/// `base`. `sync_parent_dir(p)` used to fsync `p.parent()`; the crate's
+/// [`sync_parent_dir_fd`](crate::store::atomic::sync_parent_dir_fd) fsyncs
+/// `root.join(rel).parent()`, so resolving the store base as the
+/// [`RootDir`](crate::store::atomic::RootDir) and handing it the layout
+/// spelling of `p` preserves the EXACT directory synced.
+fn sync_parent_dir_of(base: &Path, rel: &Path) -> Result<()> {
+    let root = crate::store::atomic::RootDir::open(base).map_err(Error::from)?;
+    let rel = storekit::RootedRelativePath::parse(rel)?;
+    crate::store::atomic::sync_parent_dir_fd(&root, &rel).map_err(Error::from)
 }
 
 impl LocalStore {
@@ -419,7 +432,7 @@ impl LocalStore {
         // survive power loss and the space is not reclaimed. A failed fsync
         // leaves the stage incomplete (the unlinks are not yet durable) —
         // the counts still report exactly what was unlinked.
-        if sync_parent_dir(&root).is_err() {
+        if sync_parent_dir_of(self.base(), Path::new(layout::RELEASES)).is_err() {
             return Ok(SweepStageStats {
                 planned,
                 removed,
@@ -521,7 +534,7 @@ impl LocalStore {
             removed += 1;
         }
         // Durable unlink (see the release stage).
-        if sync_parent_dir(&root).is_err() {
+        if sync_parent_dir_of(self.base(), layout::objects().as_path()).is_err() {
             return Ok(SweepStageStats {
                 planned,
                 removed,

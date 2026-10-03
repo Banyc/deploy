@@ -438,7 +438,7 @@ impl LocalStore {
             return Ok(None);
         }
         let rel_targets = self.rel(&targets_dir)?;
-        for entry in crate::store::atomic::read_dir_fd(&self.root_fd, rel_targets)? {
+        for entry in crate::store::atomic::read_dir_fd(&self.root_fd, &rel_targets)? {
             let name = entry.name.to_string_lossy().into_owned();
             if !entry.is_dir {
                 continue;
@@ -507,7 +507,7 @@ impl LocalStore {
         // per-stage fault registry maps onto the replace's stage hook.
         let rel = self.rel(&p)?;
         #[cfg(test)]
-        let fault = &mut |stage: crate::store::atomic::ReplaceStage| -> Option<Error> {
+        let fault = &mut |stage: crate::store::atomic::ReplaceStage| -> Option<storekit::Error> {
             let kind = match stage {
                 crate::store::atomic::ReplaceStage::Write => FaultKind::AppendWrite,
                 crate::store::atomic::ReplaceStage::Sync => FaultKind::AppendSync,
@@ -515,7 +515,7 @@ impl LocalStore {
                 crate::store::atomic::ReplaceStage::DirSync => FaultKind::AppendDirSync,
             };
             if self.fault_registry.consume(kind, _deployment_id) {
-                Some(Error::store(format!(
+                Some(storekit::Error::store(format!(
                     "test fault: ledger append ({stage:?}) forced to fail once"
                 )))
             } else {
@@ -523,10 +523,11 @@ impl LocalStore {
             }
         };
         #[cfg(not(test))]
-        let fault = &mut |_stage: crate::store::atomic::ReplaceStage| -> Option<Error> { None };
+        let fault =
+            &mut |_stage: crate::store::atomic::ReplaceStage| -> Option<storekit::Error> { None };
         let outcome = crate::store::atomic::write_atomic_replace_fd(
             &self.root_fd,
-            rel,
+            &rel,
             buf.as_bytes(),
             fault,
         )?;
@@ -535,7 +536,9 @@ impl LocalStore {
         // [`FaultKind::LedgerReplaceDirSync`] models).
         match outcome {
             crate::store::atomic::ReplaceOutcome::ReplacedDurable => Ok(()),
-            crate::store::atomic::ReplaceOutcome::ReplacedDurabilityUnknown { error } => Err(error),
+            crate::store::atomic::ReplaceOutcome::ReplacedDurabilityUnknown { error } => {
+                Err(error.into())
+            }
         }
     }
 }

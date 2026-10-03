@@ -71,9 +71,53 @@ pub enum Error {
 
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// A TYPED reserved-spelling / residue refusal from the `storekit`
+    /// substrate's ONE guard gate. The variant mirrors
+    /// `storekit::Error::Reserved` so a caller can branch on the typed
+    /// [`storekit::ReservedKind`] instead of matching message text; the
+    /// `Display` text is the crate's, byte-for-byte.
+    #[error("reserved spelling: {reason:?}: {message}")]
+    Reserved {
+        reason: storekit::ReservedKind,
+        message: String,
+    },
+
+    /// A typed advisory-lock contention signal from the `storekit`
+    /// substrate, mirroring `storekit::Error::LockContended` (distinct from
+    /// a real open/flock failure, which stays [`Error::Preflight`]).
+    #[error("lock contended: {0}")]
+    LockContended(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// The migration bridge from the `storekit` substrate's error to this
+/// facade: the shared classes map onto the SAME variants (so every existing
+/// `matches!`/`match` arm keeps matching) and the crate-only conditions
+/// ([`storekit::ReservedKind`] refusals and lock contention) get their own
+/// typed variants above. The `Display` text of every class is identical on
+/// both sides, so message-matching callers and tests are unaffected.
+impl From<storekit::Error> for Error {
+    fn from(e: storekit::Error) -> Self {
+        use storekit::Error as S;
+        match e {
+            S::Io(e) => Error::Io(e),
+            S::Json(e) => Error::Json(e),
+            S::Path(message) => Error::Path(message),
+            S::Materialization { message, .. } => Error::Materialization(message),
+            S::Integrity(message) => Error::Integrity(message),
+            S::Store { message, .. } => Error::Store(message),
+            S::Transport { message, .. } => Error::Transport(message),
+            S::Preflight(message) => Error::Preflight(message),
+            S::NotFound(message) => Error::NotFound(message),
+            S::Ref(message) => Error::Ref(message),
+            S::Conflict(message) => Error::Conflict(message),
+            S::Reserved { reason, message } => Error::Reserved { reason, message },
+            S::LockContended(message) => Error::LockContended(message),
+        }
+    }
+}
 
 impl Error {
     pub fn config(msg: impl Into<String>) -> Self {

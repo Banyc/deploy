@@ -63,7 +63,7 @@ impl LocalStore {
             .map_err(|e| Error::store(format!("serialize pins: {e}")))?;
         match self.write_atomic_replace_at(&self.pins_path(), &bytes)? {
             ReplaceOutcome::ReplacedDurable => Ok(()),
-            ReplaceOutcome::ReplacedDurabilityUnknown { error } => Err(error),
+            ReplaceOutcome::ReplacedDurabilityUnknown { error } => Err(error.into()),
         }
     }
 

@@ -43,7 +43,7 @@ impl LocalStore {
     /// WITHOUT syncing their directory entries, so a power loss right after a
     /// reported-successful first append could lose the new directories
     /// entirely). The pure creation + syncs live in
-    /// [`ensure_private_dir_durable`](crate::store::atomic::ensure_private_dir_durable):
+    /// [`ensure_private_dir_durable_fd`](storekit::atomic::ensure_private_dir_durable_fd):
     /// every component this call created gets a parent-directory fsync — at
     /// minimum `targets/` (the new target dir's entry) and the store base
     /// (the `targets/` entry) — before the ledger write below. The helper's

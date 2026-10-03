@@ -34,9 +34,10 @@ use crate::env::SysEnv;
 use crate::error::{Error, Result};
 use crate::identity::ApplicationStoreKey;
 use crate::remote::layout as remote_layout;
-use crate::store::atomic::{ReplaceOutcome, ensure_private_dir, read_json_fd};
+use crate::store::atomic::{ReplaceOutcome, read_json_fd};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+use storekit::RootedRelativePath;
 
 #[cfg(test)]
 use crate::identity::DeploymentId;
@@ -75,7 +76,7 @@ pub mod releases;
 /// symlink injected into any path component is refused, never followed).
 pub(crate) fn read_keyed_json_fd<T>(
     root: &crate::store::atomic::RootDir,
-    rel: &Path,
+    rel: &RootedRelativePath,
     key: &str,
     extract: impl Fn(&T) -> &str,
 ) -> Result<T>
@@ -91,6 +92,45 @@ where
         )));
     }
     Ok(rec)
+}
+
+/// Create the store BASE (the directory a [`crate::store::atomic::RootDir`]
+/// will be opened on) with private permissions — the ONE store directory that
+/// is NOT under a root, so the crate's confined `ensure_private_dir_fd` cannot
+/// name it. The crate deleted the path-based `ensure_private_dir`, so the base
+/// is created with `create_dir_all` + a `0o700` mode (the same shape the
+/// deleted helper had: intermediates at the caller's umask, the final
+/// directory chmodded private — a no-op on Windows, whose ACLs are the
+/// privacy mechanism).
+fn ensure_private_base_dir(path: &Path) -> Result<()> {
+    std::fs::create_dir_all(path)
+        .map_err(|e| Error::store(format!("mkdir {}: {e}", path.display())))?;
+    crate::platform::chmod(path, 0o700)
+        .map_err(|e| Error::store(format!("chmod {}: {e}", path.display())))?;
+    Ok(())
+}
+
+/// Create every private directory UNDER the store base through the crate's
+/// CONFINED `ensure_private_dir_fd` (component-wise `mkdirat`/`openat` with
+/// `O_NOFOLLOW`, final directory chmodded `0o700`), so a symlink injected at
+/// any component is refused. The paths are validated ONCE here as
+/// [`RootedRelativePath`](storekit::RootedRelativePath)s — the store's own
+/// layout spellings, none caller-supplied.
+fn ensure_store_dirs(root_fd: &crate::store::atomic::RootDir) -> Result<()> {
+    let dirs = [
+        remote_layout::objects().as_path().to_path_buf(),
+        PathBuf::from(remote_layout::RELEASES),
+        PathBuf::from("targets"),
+        PathBuf::from("slots"),
+        PathBuf::from("servers"),
+        PathBuf::from("deployments"),
+        PathBuf::from("staging"),
+    ];
+    for dir in dirs {
+        let rel = RootedRelativePath::parse(&dir)?;
+        crate::store::atomic::ensure_private_dir_fd(root_fd, &rel).map_err(Error::from)?;
+    }
+    Ok(())
 }
 
 impl LocalStore {
@@ -109,7 +149,7 @@ impl LocalStore {
         key: &str,
         value: &T,
         extract: impl Fn(&T) -> &str,
-        #[cfg(test)] fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
+        #[cfg(test)] fault: &mut dyn FnMut(ReplaceStage) -> Option<storekit::Error>,
     ) -> Result<()>
     where
         T: Serialize,
@@ -150,7 +190,7 @@ impl LocalStore {
             .map_err(|e| Error::store(format!("serialize {}: {e}", path.display())))?;
         match self.write_atomic_replace_at(path, &bytes)? {
             ReplaceOutcome::ReplacedDurable => Ok(()),
-            ReplaceOutcome::ReplacedDurabilityUnknown { error } => Err(error),
+            ReplaceOutcome::ReplacedDurabilityUnknown { error } => Err(error.into()),
         }
     }
 
@@ -166,13 +206,13 @@ impl LocalStore {
         &self,
         path: &Path,
         value: &T,
-        fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
+        fault: &mut dyn FnMut(ReplaceStage) -> Option<storekit::Error>,
     ) -> Result<()> {
         let bytes = serde_json::to_vec_pretty(value)
             .map_err(|e| Error::store(format!("serialize {}: {e}", path.display())))?;
         match self.write_atomic_replace_seam_at(path, &bytes, fault)? {
             ReplaceOutcome::ReplacedDurable => Ok(()),
-            ReplaceOutcome::ReplacedDurabilityUnknown { error } => Err(error),
+            ReplaceOutcome::ReplacedDurabilityUnknown { error } => Err(error.into()),
         }
     }
 
@@ -193,7 +233,7 @@ impl LocalStore {
     /// symlink injected at the final component is refused, never followed).
     pub(crate) fn write_atomic_cas(&self, path: &Path, bytes: &[u8]) -> Result<()> {
         let rel = self.rel(path)?;
-        crate::store::atomic::write_atomic_cas_fd(&self.root_fd, rel, bytes)
+        crate::store::atomic::write_atomic_cas_fd(&self.root_fd, &rel, bytes).map_err(Into::into)
     }
 }
 
@@ -265,8 +305,13 @@ impl LocalStore {
         let base = default_base(env).join(application.as_str());
         // The ownership gate needs a real canonical directory: create the
         // base tree first (idempotent), then construct the owned root from
-        // the now-existing canonical directory.
-        ensure_private_dir(&base)?;
+        // the now-existing canonical directory. The BASE is not yet under a
+        // [`crate::store::atomic::RootDir`] (it is what the root will be
+        // opened on), so it is created with `create_dir_all` + a mode — the
+        // crate deleted the path-based `ensure_private_dir`; every entry UNDER
+        // the base uses the confined `ensure_private_dir_fd`
+        // ([`Self::ensure_store_dirs`]).
+        ensure_private_base_dir(&base)?;
         let root = OwnedRoot::parse(&OwnedRoot::local_endpoint()?, &base)?;
         Self::from_owned_root(root)
     }
@@ -281,13 +326,7 @@ impl LocalStore {
     pub fn from_owned_root(root: OwnedRoot) -> Result<LocalStore> {
         let base = root.canonical().to_path_buf();
         let root_fd = crate::store::atomic::RootDir::open(&base)?;
-        ensure_private_dir(&base.join(remote_layout::objects()))?;
-        ensure_private_dir(&base.join(remote_layout::RELEASES))?;
-        ensure_private_dir(&base.join("targets"))?;
-        ensure_private_dir(&base.join("slots"))?;
-        ensure_private_dir(&base.join("servers"))?;
-        ensure_private_dir(&base.join("deployments"))?;
-        ensure_private_dir(&base.join("staging"))?;
+        ensure_store_dirs(&root_fd)?;
         Ok(LocalStore {
             base,
             root: Some(root),
@@ -334,15 +373,9 @@ impl LocalStore {
     /// against the library without `#[cfg(test)]`).
     #[doc(hidden)]
     pub fn with_base(base: PathBuf) -> Result<LocalStore> {
-        ensure_private_dir(&base)?;
-        ensure_private_dir(&base.join(remote_layout::objects()))?;
-        ensure_private_dir(&base.join(remote_layout::RELEASES))?;
-        ensure_private_dir(&base.join("targets"))?;
-        ensure_private_dir(&base.join("slots"))?;
-        ensure_private_dir(&base.join("servers"))?;
-        ensure_private_dir(&base.join("deployments"))?;
-        ensure_private_dir(&base.join("staging"))?;
+        ensure_private_base_dir(&base)?;
         let root_fd = crate::store::atomic::RootDir::open(&base)?;
+        ensure_store_dirs(&root_fd)?;
         Ok(LocalStore {
             base,
             root: None,
@@ -354,24 +387,30 @@ impl LocalStore {
         })
     }
 
-    /// The path relative to the owned root (for descriptor-relative I/O).
-    /// Every store path is built from `self.base`, so the prefix strip is
-    /// exact; a path outside the root is a store error (fail closed).
-    fn rel<'a>(&self, path: &'a Path) -> Result<&'a Path> {
-        path.strip_prefix(&self.base).map_err(|_| {
+    /// The path relative to the owned root (for descriptor-relative I/O),
+    /// validated ONCE at this boundary into the crate's
+    /// [`RootedRelativePath`](storekit::RootedRelativePath) — the type every
+    /// `_fd` primitive now takes. Every store path is built from `self.base`,
+    /// so the prefix strip is exact; a path outside the root, an empty path,
+    /// or a `..`/`.`/absolute spelling is refused (fail closed). The `_fd`
+    /// callers below therefore never hand a raw `&Path` to a mutation.
+    fn rel(&self, path: &Path) -> Result<RootedRelativePath> {
+        let stripped = path.strip_prefix(&self.base).map_err(|_| {
             Error::store(format!(
                 "path {} is outside the owned root {}",
                 path.display(),
                 self.base.display()
             ))
-        })
+        })?;
+        Ok(RootedRelativePath::parse(stripped)?)
     }
 
     /// The descriptor-relative atomic replace (see
     /// [`crate::store::atomic::write_atomic_replace_fd`]).
     fn write_atomic_replace_at(&self, path: &Path, bytes: &[u8]) -> Result<ReplaceOutcome> {
         let rel = self.rel(path)?;
-        crate::store::atomic::write_atomic_replace_fd(&self.root_fd, rel, bytes, &mut |_| None)
+        crate::store::atomic::write_atomic_replace_fd(&self.root_fd, &rel, bytes, &mut |_| None)
+            .map_err(Into::into)
     }
 
     /// The descriptor-relative atomic replace with the per-stage fault hook
@@ -381,45 +420,46 @@ impl LocalStore {
         &self,
         path: &Path,
         bytes: &[u8],
-        fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
+        fault: &mut dyn FnMut(ReplaceStage) -> Option<storekit::Error>,
     ) -> Result<ReplaceOutcome> {
         let rel = self.rel(path)?;
-        crate::store::atomic::write_atomic_replace_fd(&self.root_fd, rel, bytes, fault)
+        crate::store::atomic::write_atomic_replace_fd(&self.root_fd, &rel, bytes, fault)
+            .map_err(Into::into)
     }
 
     /// The descriptor-relative private-directory creation (see
     /// [`crate::store::atomic::ensure_private_dir_fd`]).
     fn ensure_private_dir_at(&self, path: &Path) -> Result<()> {
         let rel = self.rel(path)?;
-        crate::store::atomic::ensure_private_dir_fd(&self.root_fd, rel)
+        crate::store::atomic::ensure_private_dir_fd(&self.root_fd, &rel).map_err(Into::into)
     }
 
     /// The descriptor-relative DURABLE private-directory creation (see
     /// [`crate::store::atomic::ensure_private_dir_durable_fd`]).
     fn ensure_private_dir_durable_at(&self, path: &Path) -> Result<bool> {
         let rel = self.rel(path)?;
-        crate::store::atomic::ensure_private_dir_durable_fd(&self.root_fd, rel)
+        crate::store::atomic::ensure_private_dir_durable_fd(&self.root_fd, &rel).map_err(Into::into)
     }
 
     /// The descriptor-relative parent-directory fsync (see
     /// [`crate::store::atomic::sync_parent_dir_fd`]).
     fn sync_parent_dir_at(&self, path: &Path) -> Result<()> {
         let rel = self.rel(path)?;
-        crate::store::atomic::sync_parent_dir_fd(&self.root_fd, rel)
+        crate::store::atomic::sync_parent_dir_fd(&self.root_fd, &rel).map_err(Into::into)
     }
 
     /// The descriptor-relative private chmod (see
     /// [`crate::store::atomic::set_private_fd`]).
     fn set_private_at(&self, path: &Path) -> Result<()> {
         let rel = self.rel(path)?;
-        crate::store::atomic::set_private_fd(&self.root_fd, rel)
+        crate::store::atomic::set_private_fd(&self.root_fd, &rel).map_err(Into::into)
     }
 
     /// The descriptor-relative remove of a single file (see
     /// [`crate::store::atomic::remove_file_fd`]).
     fn remove_file_at(&self, path: &Path) -> Result<()> {
         let rel = self.rel(path)?;
-        crate::store::atomic::remove_file_fd(&self.root_fd, rel)
+        crate::store::atomic::remove_file_fd(&self.root_fd, &rel).map_err(Into::into)
     }
 
     /// The descriptor-relative rename of a path under the root (see
@@ -427,56 +467,57 @@ impl LocalStore {
     fn rename_at(&self, from: &Path, to: &Path) -> Result<()> {
         let from_rel = self.rel(from)?;
         let to_rel = self.rel(to)?;
-        crate::store::atomic::renameat_paths(&self.root_fd, from_rel, to_rel)
+        crate::store::atomic::renameat_paths(&self.root_fd, &from_rel, &to_rel).map_err(Into::into)
     }
 
     /// The descriptor-relative recursive removal of a directory tree (see
     /// [`crate::store::atomic::remove_dir_all_fd`]).
     fn remove_dir_all_at(&self, path: &Path) -> Result<()> {
         let rel = self.rel(path)?;
-        crate::store::atomic::remove_dir_all_fd(&self.root_fd, rel)
+        crate::store::atomic::remove_dir_all_fd(&self.root_fd, &rel).map_err(Into::into)
     }
 
     /// The descriptor-relative recursive tree copy (see
     /// [`crate::store::atomic::copy_dir_recursive_fd`]).
     fn copy_dir_recursive_at(&self, src: &Path, dst: &Path) -> Result<()> {
         let dst_rel = self.rel(dst)?;
-        crate::store::atomic::copy_dir_recursive_fd(&self.root_fd, src, dst_rel)
+        crate::store::atomic::copy_dir_recursive_fd(&self.root_fd, src, &dst_rel)
+            .map_err(Into::into)
     }
 
     /// The descriptor-relative recursive tree fsync (see
     /// [`crate::store::atomic::fsync_tree_recursive_fd`]).
     fn fsync_tree_recursive_at(&self, path: &Path) -> Result<()> {
         let rel = self.rel(path)?;
-        crate::store::atomic::fsync_tree_recursive_fd(&self.root_fd, rel)
+        crate::store::atomic::fsync_tree_recursive_fd(&self.root_fd, &rel).map_err(Into::into)
     }
 
     /// The descriptor-relative plain file write (see
     /// [`crate::store::atomic::write_file_fd`]).
     fn write_file_at(&self, path: &Path, bytes: &[u8]) -> Result<()> {
         let rel = self.rel(path)?;
-        crate::store::atomic::write_file_fd(&self.root_fd, rel, bytes)
+        crate::store::atomic::write_file_fd(&self.root_fd, &rel, bytes).map_err(Into::into)
     }
 
     /// The descriptor-relative whole-file read (see
     /// [`crate::store::atomic::read_fd`]).
     fn read_fd_at(&self, path: &Path) -> Result<Vec<u8>> {
         let rel = self.rel(path)?;
-        crate::store::atomic::read_fd(&self.root_fd, rel)
+        crate::store::atomic::read_fd(&self.root_fd, &rel).map_err(Into::into)
     }
 
     /// The descriptor-relative JSON read (see
     /// [`crate::store::atomic::read_json_fd`]).
     fn read_json_at<T: serde::de::DeserializeOwned>(&self, path: &Path) -> Result<T> {
         let rel = self.rel(path)?;
-        crate::store::atomic::read_json_fd(&self.root_fd, rel)
+        crate::store::atomic::read_json_fd(&self.root_fd, &rel).map_err(Into::into)
     }
 
     /// The descriptor-relative tri-state existence check (see
     /// [`crate::store::atomic::path_state_fd`]).
     fn path_state_at(&self, path: &Path) -> Result<bool> {
         let rel = self.rel(path)?;
-        crate::store::atomic::path_state_fd(&self.root_fd, rel)
+        crate::store::atomic::path_state_fd(&self.root_fd, &rel).map_err(Into::into)
     }
 
     /// The descriptor-relative keyed JSON read (see
@@ -492,7 +533,7 @@ impl LocalStore {
         T: serde::de::DeserializeOwned,
     {
         let rel = self.rel(path)?;
-        read_keyed_json_fd(&self.root_fd, rel, key, extract)
+        read_keyed_json_fd(&self.root_fd, &rel, key, extract)
     }
 
     /// The fixture's per-fixture one-shot fault registry. A test arms faults
@@ -521,13 +562,13 @@ impl LocalStore {
         &self,
         key: &str,
         kind: fn(ReplaceStage) -> FaultKind,
-    ) -> impl FnMut(ReplaceStage) -> Option<Error> + '_ {
+    ) -> impl FnMut(ReplaceStage) -> Option<storekit::Error> + '_ {
         let reg = std::sync::Arc::clone(self.fault_registry());
         let key = key.to_string();
         move |stage| {
             let kind = kind(stage);
             if reg.consume(kind, &key) {
-                Some(Error::store(format!(
+                Some(storekit::Error::store(format!(
                     "test fault: atomic JSON record replacement faulted at the {stage:?} stage"
                 )))
             } else {
@@ -1143,7 +1184,8 @@ mod tests {
             StoreBoundary::Server(_) => {
                 let p = reopened.base.join("servers").join("s1.json");
                 if crate::store::atomic::path_state(&p).expect("stat must not fail") {
-                    let read: ServerState = crate::store::atomic::read_json(&p)
+                    let read: ServerState = reopened
+                        .read_json_at(&p)
                         .expect("the server record must parse after a crash (never a torn record)");
                     assert!(
                         read == server_old || read == server_new,
@@ -1210,8 +1252,9 @@ mod tests {
         if !matches!(boundary, StoreBoundary::Server(_)) {
             let p = reopened.base.join("servers").join("s1.json");
             if crate::store::atomic::path_state(&p).expect("stat must not fail") {
-                let read: ServerState =
-                    crate::store::atomic::read_json(&p).expect("the server record must parse");
+                let read: ServerState = reopened
+                    .read_json_at(&p)
+                    .expect("the server record must parse");
                 assert_eq!(
                     read, server_old,
                     "{boundary:?} must not touch the server record"
@@ -1290,7 +1333,8 @@ mod tests {
         }
         let server_path = reopened.base.join("servers").join("s1.json");
         if crate::store::atomic::path_state(&server_path).expect("stat must not fail") {
-            let read: ServerState = crate::store::atomic::read_json(&server_path)
+            let read: ServerState = reopened
+                .read_json_at(&server_path)
                 .expect("the server record must parse");
             if let Some(ObservedSlot {
                 slot: _,

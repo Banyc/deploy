@@ -153,7 +153,7 @@ impl LocalStore {
             return Ok(out);
         }
         let rel_root = self.rel(&root)?;
-        for entry in crate::store::atomic::read_dir_fd(&self.root_fd, rel_root)? {
+        for entry in crate::store::atomic::read_dir_fd(&self.root_fd, &rel_root)? {
             let rec = self
                 .base
                 .join("slots")

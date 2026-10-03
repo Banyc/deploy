@@ -69,11 +69,45 @@ pub(crate) struct FileLock {
     file: std::fs::File,
 }
 
+/// The confined replacement for the crate-deleted path-based
+/// `ensure_private_dir_durable`: resolve the deepest EXISTING ancestor of
+/// `dir` as the [`RootDir`](crate::store::atomic::RootDir) and hand the
+/// missing chain (a validated [`RootedRelativePath`](storekit::RootedRelativePath))
+/// to the crate's confined
+/// [`ensure_private_dir_durable_fd`](crate::store::atomic::ensure_private_dir_durable_fd),
+/// which creates each component at `0o700` and fsyncs every NEW directory
+/// entry. The durable creation itself is the crate's; this helper only
+/// resolves WHICH existing directory anchors it — the lock path may sit under
+/// a not-yet-created `targets/<target>/`, so the anchor is the deepest
+/// existing ancestor, never the base the caller does not pass.
+fn ensure_private_dir_durable_confined(dir: &Path) -> Result<()> {
+    let Some(anchor) = dir.ancestors().find(|a| a.exists()) else {
+        return Err(Error::preflight(format!(
+            "cannot create {} durably: no existing ancestor",
+            dir.display()
+        )));
+    };
+    if anchor == dir {
+        return Ok(());
+    }
+    let rel_path = dir.strip_prefix(anchor).map_err(|_| {
+        Error::preflight(format!(
+            "{} is not under {}",
+            dir.display(),
+            anchor.display()
+        ))
+    })?;
+    let root = crate::store::atomic::RootDir::open(anchor).map_err(Error::from)?;
+    let rel = storekit::RootedRelativePath::parse(rel_path)?;
+    crate::store::atomic::ensure_private_dir_durable_fd(&root, &rel).map_err(Error::from)?;
+    Ok(())
+}
+
 impl FileLock {
     /// Acquire the advisory lock at `path`: open (creating the file on the
     /// FIRST acquisition only — after that the persistent inode is reused),
     /// then `flock LOCK_EX|LOCK_NB`. The parent directory is durably created
-    /// by [`crate::store::atomic::ensure_private_dir_durable`] before the lock
+    /// by [`ensure_private_dir_durable_confined`] before the lock
     /// is taken (see the durable-first-append machinery the lock path must
     /// never bypass).
     ///
@@ -82,13 +116,13 @@ impl FileLock {
     /// SAME inode is opened, never a fresh one — the lock never swaps inodes.
     /// The persistent file does not disturb the durable-first-append
     /// machinery: directory creation is detected by the directory-entry
-    /// fsyncs in [`crate::store::atomic::ensure_private_dir_durable`] (which
+    /// fsyncs in [`ensure_private_dir_durable_confined`] (which
     /// reports what it CREATED), never by files inside the directory, so a
     /// surviving `operation.lock` changes nothing for a first append.
     pub(crate) fn acquire(path: &Path, op_id: &str) -> Result<Self> {
         // DURABLE parent creation: the lock file's parent directory is
         // created with EVERY newly created directory entry fsynced (see
-        // [`crate::store::atomic::ensure_private_dir_durable`]) BEFORE the
+        // [`ensure_private_dir_durable_confined`]) BEFORE the
         // lock is taken. A lock acquisition that creates a directory must
         // never do so with a plain unsynced mkdir — the engine's first
         // push used to let the lock path create `targets/<target>/` that
@@ -100,7 +134,7 @@ impl FileLock {
         // locking (see [`crate::deploy::push`]); this helper makes
         // the lock path itself durable for every caller.
         if let Some(parent) = path.parent() {
-            crate::store::atomic::ensure_private_dir_durable(parent)
+            ensure_private_dir_durable_confined(parent)
                 .map_err(|e| Error::preflight(format!("mkdir {}: {e}", parent.display())))?;
         }
         let mut file = std::fs::OpenOptions::new()
