@@ -25,6 +25,7 @@
 //!   runner (`ssh::runner`).
 
 pub(crate) mod receiver_marker;
+#[cfg(test)]
 mod rooted;
 mod runner;
 #[cfg(test)]
@@ -32,11 +33,22 @@ pub(crate) mod scripted;
 mod ssh;
 
 pub(crate) use receiver_marker::adopt_receiver_marker;
-pub use rooted::RootedRelativePath;
+// The validated root-relative path is now the crate's type — the ONE spelling
+// authority for a root-relative path. `deploy`'s own `rooted` module (266
+// lines, the source `storekit::relpath` was extracted from) is deleted: its
+// public API is byte-for-byte the crate's (`parse`/`as_path`/`join`/
+// `file_name`/`parent`/`with_file_name`/`display` + `AsRef<Path>`/`Display`),
+// so every `crate::remote::transport::RootedRelativePath` call site keeps
+// resolving without change. The crate's internal `from_validated` constructor
+// is `pub(crate)` (deliberately unspellable by a consumer), so `deploy`'s
+// layout builders construct through the fallible `parse` (see
+// [`crate::remote::layout`]). The adaptation is behaviour-identical on the
+// accepted set; where the crate is stricter is named in the layout module.
 #[cfg(unix)]
 pub use runner::kill_process_group;
 pub use runner::{ChildRunner, KillSeam, RealKill, RunError, RunOutcome, RunnerConfig};
 pub use ssh::SshTransport;
+pub use storekit::relpath::RootedRelativePath;
 
 use crate::env::SysEnv;
 use crate::error::{Error, Result};

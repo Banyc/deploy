@@ -19,6 +19,25 @@ use crate::remote::transport::RootedRelativePath;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
+/// Parse a COMPILE-TIME-CONSTANT layout literal into the crate's validated
+/// [`RootedRelativePath`].
+///
+/// `storekit`'s `RootedRelativePath::from_validated` — the infallible
+/// constructor `deploy` used to call here — is `pub(crate)`, so a consumer
+/// must construct through the validated [`RootedRelativePath::parse`] (the
+/// ONE spelling authority). Every literal in this module is a plain relative
+/// name (or a `/`-joined pair of plain names, all defined as constants
+/// above), so `parse` cannot fail; the `expect` records that proof once, here,
+/// instead of at each builder. A literal that is NOT a safe relative spelling
+/// (empty, absolute, `.`/`..`, or a multi-segment literal that introduces one)
+/// makes the builder panic at first use — the same fail-closed class the
+/// crate's private constructor prevented by construction, now enforced by the
+/// crate's validator rather than bypassed.
+fn layout_path(literal: &str) -> RootedRelativePath {
+    RootedRelativePath::parse(Path::new(literal))
+        .unwrap_or_else(|e| panic!("layout literal {literal:?} must be a safe relative path: {e}"))
+}
+
 // ---- path components -------------------------------------------------------
 // Each component of the on-server layout is named exactly once, here.
 
@@ -58,22 +77,25 @@ pub const QUARANTINE_SUFFIX: &str = ".quarantined";
 /// `SshTransport::provision_layout` mkdir -p's them remotely.
 pub fn bootstrap_dirs() -> Vec<RootedRelativePath> {
     vec![
-        RootedRelativePath::from_validated(Path::new(CONTROL).to_path_buf()),
-        RootedRelativePath::from_validated(Path::new("helpers").to_path_buf()),
+        layout_path(CONTROL),
+        layout_path("helpers"),
         objects().clone(),
-        RootedRelativePath::from_validated(Path::new(RELEASES).to_path_buf()),
+        layout_path(RELEASES),
         generations().clone(),
-        RootedRelativePath::from_validated(Path::new(INCOMING).to_path_buf()),
+        layout_path(INCOMING),
         state_dir(),
-        RootedRelativePath::from_validated(Path::new("adapters").to_path_buf()),
-        RootedRelativePath::from_validated(Path::new("transactions").to_path_buf()),
+        layout_path("adapters"),
+        layout_path("transactions"),
     ]
 }
 
 /// Root of the content-addressed object store.
 pub fn objects() -> &'static RootedRelativePath {
-    static OBJECTS_ROOT: LazyLock<RootedRelativePath> =
-        LazyLock::new(|| RootedRelativePath::from_validated(Path::new(OBJECTS).join(SHA256)));
+    static OBJECTS_ROOT: LazyLock<RootedRelativePath> = LazyLock::new(|| {
+        layout_path(OBJECTS)
+            .join(SHA256)
+            .expect("a constant object-store component is a safe path segment")
+    });
     &OBJECTS_ROOT
 }
 
@@ -90,9 +112,8 @@ pub fn tree_root(digest: &TreeDigest) -> RootedRelativePath {
 
 /// Directory holding every generation record.
 pub fn generations() -> &'static RootedRelativePath {
-    static GENERATIONS_ROOT: LazyLock<RootedRelativePath> = LazyLock::new(|| {
-        RootedRelativePath::from_validated(Path::new(GENERATIONS_COMPONENT).to_path_buf())
-    });
+    static GENERATIONS_ROOT: LazyLock<RootedRelativePath> =
+        LazyLock::new(|| layout_path(GENERATIONS_COMPONENT));
     &GENERATIONS_ROOT
 }
 
@@ -121,8 +142,7 @@ pub fn staged_generation(gen_id: &GenerationId, nonce: &str) -> RootedRelativePa
 
 /// The atomically swapped per-server commit pointer.
 pub fn current() -> &'static RootedRelativePath {
-    static CURRENT: LazyLock<RootedRelativePath> =
-        LazyLock::new(|| RootedRelativePath::from_validated(Path::new("current").to_path_buf()));
+    static CURRENT: LazyLock<RootedRelativePath> = LazyLock::new(|| layout_path("current"));
     &CURRENT
 }
 
@@ -130,17 +150,18 @@ pub fn current() -> &'static RootedRelativePath {
 /// deployment identity — a caller cannot name a staging area from an
 /// arbitrary string.
 pub fn incoming_dir(deployment_id: &DeploymentId) -> RootedRelativePath {
-    RootedRelativePath::from_validated(Path::new(INCOMING).join(deployment_id.as_str()))
+    layout_path(INCOMING)
+        .join(deployment_id.as_str())
+        .expect("a validated deployment id is a safe path component")
 }
 
 /// A staged (partial) tree upload inside a deployment's incoming area. Both
 /// identities are TYPED — a caller cannot stage an arbitrary name.
 pub fn staged_tree(deployment_id: &DeploymentId, digest: &TreeDigest) -> RootedRelativePath {
-    RootedRelativePath::from_validated(
-        Path::new(INCOMING)
-            .join(deployment_id.as_str())
-            .join(format!("{digest}{PARTIAL_SUFFIX}")),
-    )
+    layout_path(INCOMING)
+        .join(deployment_id.as_str())
+        .and_then(|p| p.join(format!("{digest}{PARTIAL_SUFFIX}")))
+        .expect("a validated deployment id and a validated tree digest are safe path components")
 }
 
 /// A deployment-independent staging path for a tree upload in flight (used by
@@ -149,9 +170,9 @@ pub fn staged_tree(deployment_id: &DeploymentId, digest: &TreeDigest) -> RootedR
 /// upload as not-yet-published; the digest is the TYPED tree identity — a
 /// caller cannot stage an arbitrary name.
 pub fn staged_tree_global(digest: &TreeDigest) -> RootedRelativePath {
-    RootedRelativePath::from_validated(
-        Path::new(INCOMING).join(format!("{digest}{PARTIAL_SUFFIX}")),
-    )
+    layout_path(INCOMING)
+        .join(format!("{digest}{PARTIAL_SUFFIX}"))
+        .expect("a validated tree digest is a safe path component")
 }
 
 /// Quarantine path for an invalid tree object: the invalid `root` is moved
@@ -168,8 +189,7 @@ pub fn quarantined_tree(digest: &TreeDigest) -> RootedRelativePath {
 
 /// Parent of all published release-side files.
 pub fn remote_releases() -> &'static RootedRelativePath {
-    static RELEASES_ROOT: LazyLock<RootedRelativePath> =
-        LazyLock::new(|| RootedRelativePath::from_validated(Path::new(RELEASES).to_path_buf()));
+    static RELEASES_ROOT: LazyLock<RootedRelativePath> = LazyLock::new(|| layout_path(RELEASES));
     &RELEASES_ROOT
 }
 
@@ -199,7 +219,7 @@ pub fn staged_release(release_id: &ReleaseId, nonce: &str) -> RootedRelativePath
 
 /// The server-side state directory.
 pub fn state_dir() -> RootedRelativePath {
-    RootedRelativePath::from_validated(Path::new(STATE).to_path_buf())
+    layout_path(STATE)
 }
 
 /// A file inside the `state/` directory. `name` is a CONSTANT file name
@@ -241,13 +261,14 @@ pub fn commit_marker(deployment_id: &DeploymentId) -> RootedRelativePath {
 
 /// Protocol negotiation marker (first-contact version record).
 pub fn protocol_marker() -> RootedRelativePath {
-    RootedRelativePath::from_validated(Path::new(CONTROL).join("protocol.json"))
+    layout_path(CONTROL)
+        .join("protocol.json")
+        .expect("a constant control-file name is a safe path component")
 }
 
 /// Parent of all per-deployment staging areas.
 pub fn incoming() -> &'static RootedRelativePath {
-    static INCOMING_ROOT: LazyLock<RootedRelativePath> =
-        LazyLock::new(|| RootedRelativePath::from_validated(Path::new(INCOMING).to_path_buf()));
+    static INCOMING_ROOT: LazyLock<RootedRelativePath> = LazyLock::new(|| layout_path(INCOMING));
     &INCOMING_ROOT
 }
 
@@ -265,7 +286,7 @@ pub fn inventory() -> RootedRelativePath {
 /// the ledger's [`crate::ledger::PhysicalBinding`]; exact rollback and
 /// duplicate-location detection compare it.
 pub fn receiver_uuid() -> RootedRelativePath {
-    RootedRelativePath::from_validated(Path::new("receiver-uuid").to_path_buf())
+    layout_path("receiver-uuid")
 }
 
 /// The CRATE-FORMAT receiver-id marker file at the deploy_dir root, BESIDE
@@ -279,7 +300,7 @@ pub fn receiver_uuid() -> RootedRelativePath {
 /// The eventual crate migration points `Layout::receiver_marker` at THIS
 /// path; nothing else in `deploy` reads it yet.
 pub fn receiver_id() -> RootedRelativePath {
-    RootedRelativePath::from_validated(Path::new("receiver-id").to_path_buf())
+    layout_path("receiver-id")
 }
 
 /// Relative link target (from inside a generation directory) to that
@@ -299,9 +320,9 @@ pub fn generation_root_link(tree: &TreeDigest) -> PathBuf {
 /// identity — a caller cannot name a transaction record from an arbitrary
 /// string.
 pub fn transaction_record(operation_id: &OperationId) -> RootedRelativePath {
-    RootedRelativePath::from_validated(
-        Path::new("transactions").join(format!("{operation_id}.json")),
-    )
+    layout_path("transactions")
+        .join(format!("{operation_id}.json"))
+        .expect("a validated operation id is a safe path component")
 }
 
 #[cfg(test)]
