@@ -1437,7 +1437,6 @@ mod tests {
 #[cfg(test)]
 mod nested_guard_proptest {
     use super::*;
-    use crate::error::Result as RemoteResult;
     use crate::remote::transport::ExecOutcome;
     use crate::remote::transport::{
         CreateNewVerdict, FsBytes, LocalTransport, Remote, RemoteEntry, RemoteMeta,
@@ -1448,6 +1447,7 @@ mod nested_guard_proptest {
     use proptest::test_runner::RngSeed;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
+    use storekit::error::Result as RemoteResult;
 
     /// Wrapper that reports a shared `fake_root` for `root()` but delegates
     /// all filesystem operations to a disjoint real `inner` transport.
@@ -2466,7 +2466,6 @@ mod owner_mismatch_proptest {
 #[cfg(test)]
 mod barrier_proptest {
     use super::*;
-    use crate::error::Result as RemoteResult;
     use crate::remote::transport::{
         CreateNewVerdict, ExecOutcome, FsBytes, LocalTransport, Remote, RemoteEntry, RemoteMeta,
     };
@@ -2477,6 +2476,7 @@ mod barrier_proptest {
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Barrier};
     use std::time::Duration;
+    use storekit::error::Result as RemoteResult;
 
     struct BarrierTryCreateRemote {
         inner: LocalTransport,
@@ -2750,7 +2750,6 @@ mod barrier_proptest {
 #[cfg(test)]
 mod guard_release_retry {
     use super::*;
-    use crate::error::Result as RemoteResult;
     use crate::remote::layout;
     use crate::remote::transport::{
         CreateNewVerdict, ExecOutcome, FsBytes, LocalTransport, Remote, RemoteEntry, RemoteMeta,
@@ -2766,6 +2765,7 @@ mod guard_release_retry {
         atomic::{AtomicUsize, Ordering},
     };
     use std::time::Duration;
+    use storekit::error::{Error as SubstrateError, Result as RemoteResult};
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum GuardFaultOutcome {
@@ -2849,13 +2849,11 @@ mod guard_release_retry {
                 if let Some(outcome) = guard.take() {
                     match outcome {
                         GuardFaultOutcome::ErrorBeforeDelete => {
-                            return Err(crate::error::Error::transport(
-                                "injected ErrorBeforeDelete",
-                            ));
+                            return Err(SubstrateError::transport("injected ErrorBeforeDelete"));
                         }
                         GuardFaultOutcome::ErrorAfterDelete => {
                             let _ = self.inner.remove_file_if(rel, expected)?;
-                            return Err(crate::error::Error::transport(
+                            return Err(SubstrateError::transport(
                                 "injected ErrorAfterDelete (response lost)",
                             ));
                         }

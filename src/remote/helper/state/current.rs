@@ -493,6 +493,7 @@ mod tests_current {
     use proptest::prelude::*;
     #[cfg(test)]
     use proptest::test_runner::RngSeed;
+    use storekit::error::Error as SubstrateError;
 
     fn assignment(gen_id: &str, tree: &str) -> GenerationAssignment {
         GenerationAssignment {
@@ -1630,23 +1631,30 @@ mod tests_current {
         fn metadata(
             &self,
             rel: &RootedRelativePath,
-        ) -> crate::error::Result<crate::remote::transport::RemoteMeta> {
+        ) -> crate::remote::transport::SubstrateResult<crate::remote::transport::RemoteMeta>
+        {
             if rel == crate::remote::layout::current() {
-                return Err(crate::error::Error::transport(
+                return Err(SubstrateError::transport(
                     "current read failed: injected transport fault",
                 ));
             }
             self.inner.metadata(rel)
         }
-        fn read_link(&self, rel: &RootedRelativePath) -> crate::error::Result<std::path::PathBuf> {
+        fn read_link(
+            &self,
+            rel: &RootedRelativePath,
+        ) -> crate::remote::transport::SubstrateResult<std::path::PathBuf> {
             if rel == crate::remote::layout::current() {
-                return Err(crate::error::Error::transport(
+                return Err(SubstrateError::transport(
                     "current read failed: injected transport fault",
                 ));
             }
             self.inner.read_link(rel)
         }
-        fn read(&self, rel: &RootedRelativePath) -> crate::error::Result<Vec<u8>> {
+        fn read(
+            &self,
+            rel: &RootedRelativePath,
+        ) -> crate::remote::transport::SubstrateResult<Vec<u8>> {
             self.inner.read(rel)
         }
         fn write(
@@ -1654,65 +1662,86 @@ mod tests_current {
             rel: &RootedRelativePath,
             data: &[u8],
             mode: u32,
-        ) -> crate::error::Result<()> {
+        ) -> crate::remote::transport::SubstrateResult<()> {
             self.inner.write(rel, data, mode)
         }
         fn try_write_new(
             &self,
             rel: &RootedRelativePath,
             data: &[u8],
-        ) -> crate::error::Result<crate::remote::transport::CreateNewVerdict> {
+        ) -> crate::remote::transport::SubstrateResult<crate::remote::transport::CreateNewVerdict>
+        {
             self.inner.try_write_new(rel, data)
         }
-        fn create_dir(&self, rel: &RootedRelativePath) -> crate::error::Result<()> {
+        fn create_dir(
+            &self,
+            rel: &RootedRelativePath,
+        ) -> crate::remote::transport::SubstrateResult<()> {
             self.inner.create_dir(rel)
         }
-        fn create_dir_all(&self, rel: &RootedRelativePath) -> crate::error::Result<()> {
+        fn create_dir_all(
+            &self,
+            rel: &RootedRelativePath,
+        ) -> crate::remote::transport::SubstrateResult<()> {
             self.inner.create_dir_all(rel)
         }
-        fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> crate::error::Result<()> {
+        fn set_mode(
+            &self,
+            rel: &RootedRelativePath,
+            mode: u32,
+        ) -> crate::remote::transport::SubstrateResult<()> {
             self.inner.set_mode(rel, mode)
         }
         fn list(
             &self,
             rel: &RootedRelativePath,
-        ) -> crate::error::Result<Vec<crate::remote::transport::RemoteEntry>> {
+        ) -> crate::remote::transport::SubstrateResult<Vec<crate::remote::transport::RemoteEntry>>
+        {
             self.inner.list(rel)
         }
         fn rename(
             &self,
             from: &RootedRelativePath,
             to: &RootedRelativePath,
-        ) -> crate::error::Result<()> {
+        ) -> crate::remote::transport::SubstrateResult<()> {
             self.inner.rename(from, to)
         }
         fn symlink(
             &self,
             target: &std::path::Path,
             link: &RootedRelativePath,
-        ) -> crate::error::Result<()> {
+        ) -> crate::remote::transport::SubstrateResult<()> {
             self.inner.symlink(target, link)
         }
-        fn remove_file(&self, rel: &RootedRelativePath) -> crate::error::Result<()> {
+        fn remove_file(
+            &self,
+            rel: &RootedRelativePath,
+        ) -> crate::remote::transport::SubstrateResult<()> {
             self.inner.remove_file(rel)
         }
-        fn remove_dir_all(&self, rel: &RootedRelativePath) -> crate::error::Result<()> {
+        fn remove_dir_all(
+            &self,
+            rel: &RootedRelativePath,
+        ) -> crate::remote::transport::SubstrateResult<()> {
             self.inner.remove_dir_all(rel)
         }
         fn exec(
             &self,
             argv: &[String],
             timeout: std::time::Duration,
-        ) -> crate::error::Result<crate::remote::transport::ExecOutcome> {
+        ) -> crate::remote::transport::SubstrateResult<crate::remote::transport::ExecOutcome>
+        {
             self.inner.exec(argv, timeout)
         }
-        fn filesystem_bytes(&self) -> crate::error::Result<crate::remote::transport::FsBytes> {
+        fn filesystem_bytes(
+            &self,
+        ) -> crate::remote::transport::SubstrateResult<crate::remote::transport::FsBytes> {
             self.inner.filesystem_bytes()
         }
-        fn prepare_identity(&self) -> crate::error::Result<()> {
+        fn prepare_identity(&self) -> crate::remote::transport::SubstrateResult<()> {
             self.inner.prepare_identity()
         }
-        fn provision_layout(&self) -> crate::error::Result<()> {
+        fn provision_layout(&self) -> crate::remote::transport::SubstrateResult<()> {
             self.inner.provision_layout()
         }
     }
@@ -1856,12 +1885,13 @@ mod tests_current {
         fn metadata_opt(
             &self,
             rel: &RootedRelativePath,
-        ) -> crate::error::Result<Option<crate::remote::transport::RemoteMeta>> {
+        ) -> crate::remote::transport::SubstrateResult<Option<crate::remote::transport::RemoteMeta>>
+        {
             if rel == crate::remote::layout::current() {
                 return match self.meta {
                     MetaOutcome::Present => self.inner.metadata_opt(rel),
                     MetaOutcome::Absent => Ok(None),
-                    MetaOutcome::Err => Err(crate::error::Error::transport(
+                    MetaOutcome::Err => Err(SubstrateError::transport(
                         "current metadata read failed: injected transport fault",
                     )),
                 };
@@ -1871,24 +1901,31 @@ mod tests_current {
         fn metadata(
             &self,
             rel: &RootedRelativePath,
-        ) -> crate::error::Result<crate::remote::transport::RemoteMeta> {
+        ) -> crate::remote::transport::SubstrateResult<crate::remote::transport::RemoteMeta>
+        {
             if rel == crate::remote::layout::current() {
                 return match self.meta {
                     MetaOutcome::Present => self.inner.metadata(rel),
                     MetaOutcome::Absent => {
-                        Err(crate::error::Error::transport("current stat: not found"))
+                        Err(SubstrateError::transport("current stat: not found"))
                     }
-                    MetaOutcome::Err => Err(crate::error::Error::transport(
+                    MetaOutcome::Err => Err(SubstrateError::transport(
                         "current metadata read failed: injected transport fault",
                     )),
                 };
             }
             self.inner.metadata(rel)
         }
-        fn read_link(&self, rel: &RootedRelativePath) -> crate::error::Result<std::path::PathBuf> {
+        fn read_link(
+            &self,
+            rel: &RootedRelativePath,
+        ) -> crate::remote::transport::SubstrateResult<std::path::PathBuf> {
             self.inner.read_link(rel)
         }
-        fn read(&self, rel: &RootedRelativePath) -> crate::error::Result<Vec<u8>> {
+        fn read(
+            &self,
+            rel: &RootedRelativePath,
+        ) -> crate::remote::transport::SubstrateResult<Vec<u8>> {
             self.inner.read(rel)
         }
         fn write(
@@ -1896,65 +1933,86 @@ mod tests_current {
             rel: &RootedRelativePath,
             data: &[u8],
             mode: u32,
-        ) -> crate::error::Result<()> {
+        ) -> crate::remote::transport::SubstrateResult<()> {
             self.inner.write(rel, data, mode)
         }
         fn try_write_new(
             &self,
             rel: &RootedRelativePath,
             data: &[u8],
-        ) -> crate::error::Result<crate::remote::transport::CreateNewVerdict> {
+        ) -> crate::remote::transport::SubstrateResult<crate::remote::transport::CreateNewVerdict>
+        {
             self.inner.try_write_new(rel, data)
         }
-        fn create_dir(&self, rel: &RootedRelativePath) -> crate::error::Result<()> {
+        fn create_dir(
+            &self,
+            rel: &RootedRelativePath,
+        ) -> crate::remote::transport::SubstrateResult<()> {
             self.inner.create_dir(rel)
         }
-        fn create_dir_all(&self, rel: &RootedRelativePath) -> crate::error::Result<()> {
+        fn create_dir_all(
+            &self,
+            rel: &RootedRelativePath,
+        ) -> crate::remote::transport::SubstrateResult<()> {
             self.inner.create_dir_all(rel)
         }
-        fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> crate::error::Result<()> {
+        fn set_mode(
+            &self,
+            rel: &RootedRelativePath,
+            mode: u32,
+        ) -> crate::remote::transport::SubstrateResult<()> {
             self.inner.set_mode(rel, mode)
         }
         fn list(
             &self,
             rel: &RootedRelativePath,
-        ) -> crate::error::Result<Vec<crate::remote::transport::RemoteEntry>> {
+        ) -> crate::remote::transport::SubstrateResult<Vec<crate::remote::transport::RemoteEntry>>
+        {
             self.inner.list(rel)
         }
         fn rename(
             &self,
             from: &RootedRelativePath,
             to: &RootedRelativePath,
-        ) -> crate::error::Result<()> {
+        ) -> crate::remote::transport::SubstrateResult<()> {
             self.inner.rename(from, to)
         }
         fn symlink(
             &self,
             target: &std::path::Path,
             link: &RootedRelativePath,
-        ) -> crate::error::Result<()> {
+        ) -> crate::remote::transport::SubstrateResult<()> {
             self.inner.symlink(target, link)
         }
-        fn remove_file(&self, rel: &RootedRelativePath) -> crate::error::Result<()> {
+        fn remove_file(
+            &self,
+            rel: &RootedRelativePath,
+        ) -> crate::remote::transport::SubstrateResult<()> {
             self.inner.remove_file(rel)
         }
-        fn remove_dir_all(&self, rel: &RootedRelativePath) -> crate::error::Result<()> {
+        fn remove_dir_all(
+            &self,
+            rel: &RootedRelativePath,
+        ) -> crate::remote::transport::SubstrateResult<()> {
             self.inner.remove_dir_all(rel)
         }
         fn exec(
             &self,
             argv: &[String],
             timeout: std::time::Duration,
-        ) -> crate::error::Result<crate::remote::transport::ExecOutcome> {
+        ) -> crate::remote::transport::SubstrateResult<crate::remote::transport::ExecOutcome>
+        {
             self.inner.exec(argv, timeout)
         }
-        fn filesystem_bytes(&self) -> crate::error::Result<crate::remote::transport::FsBytes> {
+        fn filesystem_bytes(
+            &self,
+        ) -> crate::remote::transport::SubstrateResult<crate::remote::transport::FsBytes> {
             self.inner.filesystem_bytes()
         }
-        fn prepare_identity(&self) -> crate::error::Result<()> {
+        fn prepare_identity(&self) -> crate::remote::transport::SubstrateResult<()> {
             self.inner.prepare_identity()
         }
-        fn provision_layout(&self) -> crate::error::Result<()> {
+        fn provision_layout(&self) -> crate::remote::transport::SubstrateResult<()> {
             self.inner.provision_layout()
         }
     }

@@ -34,9 +34,9 @@
 //! the adoption deliberately leaves the legacy file in place.
 
 use super::{CreateNewVerdict, Remote};
-use crate::error::{Error, Result};
 use crate::identity::ReceiverUuid;
 use crate::remote::layout;
+use storekit::error::{Error, Result};
 
 /// The exact number of lowercase hex characters in a crate-format receiver
 /// id. MUST match `storekit::transport::RECEIVER_ID_LEN` (40): it is not

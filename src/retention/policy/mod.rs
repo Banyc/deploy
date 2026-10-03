@@ -385,6 +385,7 @@ mod tests {
     #[cfg(test)]
     use proptest::test_runner::RngSeed;
     use std::path::{Path, PathBuf};
+    use storekit::error::{Error as SubstrateError, Result as SubstrateResult};
 
     fn cfg() -> ProjectConfig {
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
@@ -1780,62 +1781,70 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         fn is_local(&self) -> bool {
             true
         }
-        fn provision_layout(&self) -> Result<()> {
+        fn provision_layout(&self) -> SubstrateResult<()> {
             crate::remote::transport::provision_receiver_marker(self)?;
             Ok(())
         }
-        fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
+        fn read(&self, rel: &RootedRelativePath) -> SubstrateResult<Vec<u8>> {
             self.inner.read(rel)
         }
-        fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
+        fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> SubstrateResult<()> {
             self.inner.write(rel, data, mode)
         }
-        fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict> {
+        fn try_write_new(
+            &self,
+            rel: &RootedRelativePath,
+            data: &[u8],
+        ) -> SubstrateResult<CreateNewVerdict> {
             self.inner.try_write_new(rel, data)
         }
-        fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
+        fn create_dir(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
             self.inner.create_dir(rel)
         }
-        fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+        fn create_dir_all(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
             self.inner.create_dir_all(rel)
         }
-        fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
+        fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> SubstrateResult<()> {
             self.inner.set_mode(rel, mode)
         }
-        fn list(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>> {
+        fn list(&self, rel: &RootedRelativePath) -> SubstrateResult<Vec<RemoteEntry>> {
             if self.fail_root_list.get() && rel == layout::generations() {
                 self.fail_root_list.set(false);
-                return Err(Error::remote(
+                return Err(SubstrateError::transport(
                     "injected fault: generations listing failed once",
                 ));
             }
             self.inner.list(rel)
         }
-        fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
+        fn rename(
+            &self,
+            from: &RootedRelativePath,
+            to: &RootedRelativePath,
+        ) -> SubstrateResult<()> {
             self.inner.rename(from, to)
         }
-        fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
+        fn symlink(&self, target: &Path, link: &RootedRelativePath) -> SubstrateResult<()> {
             self.inner.symlink(target, link)
         }
-        fn read_link(&self, rel: &RootedRelativePath) -> Result<PathBuf> {
+        fn read_link(&self, rel: &RootedRelativePath) -> SubstrateResult<PathBuf> {
             self.inner.read_link(rel)
         }
-        fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
+        fn remove_file(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
             self.inner.remove_file(rel)
         }
-        fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+        fn remove_dir_all(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
             self.inner.remove_dir_all(rel)
         }
         fn exists(&self, rel: &RootedRelativePath) -> bool {
             self.inner.exists(rel)
         }
-        fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta> {
+        fn metadata(&self, rel: &RootedRelativePath) -> SubstrateResult<RemoteMeta> {
             self.inner.metadata(rel)
         }
-        fn metadata_opt(&self, rel: &RootedRelativePath) -> Result<Option<RemoteMeta>> {
+        fn metadata_opt(&self, rel: &RootedRelativePath) -> SubstrateResult<Option<RemoteMeta>> {
             if self.fail_root_metadata.get() && rel == layout::generations() {
                 self.fail_root_metadata.set(false);
-                return Err(Error::remote(
+                return Err(SubstrateError::transport(
                     "injected fault: generations metadata failed once",
                 ));
             }
@@ -1845,10 +1854,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &self,
             argv: &[String],
             timeout: std::time::Duration,
-        ) -> Result<crate::remote::transport::ExecOutcome> {
+        ) -> SubstrateResult<crate::remote::transport::ExecOutcome> {
             self.inner.exec(argv, timeout)
         }
-        fn filesystem_bytes(&self) -> Result<crate::remote::transport::FsBytes> {
+        fn filesystem_bytes(&self) -> SubstrateResult<crate::remote::transport::FsBytes> {
             self.inner.filesystem_bytes()
         }
     }
@@ -2202,11 +2211,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         fn is_local(&self) -> bool {
             true
         }
-        fn provision_layout(&self) -> Result<()> {
+        fn provision_layout(&self) -> SubstrateResult<()> {
             crate::remote::transport::provision_receiver_marker(self)?;
             Ok(())
         }
-        fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
+        fn read(&self, rel: &RootedRelativePath) -> SubstrateResult<Vec<u8>> {
             if let Some(id) = self.tracked_assignment(rel) {
                 let mut counts = self.counts.borrow_mut();
                 let n = counts.entry(id.clone()).or_insert(0);
@@ -2214,29 +2223,33 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 if let Some(legit) = self.legit.get(&id)
                     && *n > *legit
                 {
-                    return Err(Error::remote(format!(
+                    return Err(SubstrateError::transport(format!(
                         "injected fault: second read of assignment {id}"
                     )));
                 }
             }
             self.inner.read(rel)
         }
-        fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
+        fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> SubstrateResult<()> {
             self.inner.write(rel, data, mode)
         }
-        fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict> {
+        fn try_write_new(
+            &self,
+            rel: &RootedRelativePath,
+            data: &[u8],
+        ) -> SubstrateResult<CreateNewVerdict> {
             self.inner.try_write_new(rel, data)
         }
-        fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
+        fn create_dir(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
             self.inner.create_dir(rel)
         }
-        fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+        fn create_dir_all(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
             self.inner.create_dir_all(rel)
         }
-        fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
+        fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> SubstrateResult<()> {
             self.inner.set_mode(rel, mode)
         }
-        fn list(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>> {
+        fn list(&self, rel: &RootedRelativePath) -> SubstrateResult<Vec<RemoteEntry>> {
             let entries = self.inner.list(rel)?;
             if rel == layout::generations() && !self.hide_from_listing.is_empty() {
                 return Ok(entries
@@ -2246,35 +2259,39 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             }
             Ok(entries)
         }
-        fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
+        fn rename(
+            &self,
+            from: &RootedRelativePath,
+            to: &RootedRelativePath,
+        ) -> SubstrateResult<()> {
             self.inner.rename(from, to)
         }
-        fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
+        fn symlink(&self, target: &Path, link: &RootedRelativePath) -> SubstrateResult<()> {
             self.inner.symlink(target, link)
         }
-        fn read_link(&self, rel: &RootedRelativePath) -> Result<PathBuf> {
+        fn read_link(&self, rel: &RootedRelativePath) -> SubstrateResult<PathBuf> {
             self.inner.read_link(rel)
         }
-        fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
+        fn remove_file(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
             self.inner.remove_file(rel)
         }
-        fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+        fn remove_dir_all(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
             self.inner.remove_dir_all(rel)
         }
         fn exists(&self, rel: &RootedRelativePath) -> bool {
             self.inner.exists(rel)
         }
-        fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta> {
+        fn metadata(&self, rel: &RootedRelativePath) -> SubstrateResult<RemoteMeta> {
             self.inner.metadata(rel)
         }
         fn exec(
             &self,
             argv: &[String],
             timeout: std::time::Duration,
-        ) -> Result<crate::remote::transport::ExecOutcome> {
+        ) -> SubstrateResult<crate::remote::transport::ExecOutcome> {
             self.inner.exec(argv, timeout)
         }
-        fn filesystem_bytes(&self) -> Result<crate::remote::transport::FsBytes> {
+        fn filesystem_bytes(&self) -> SubstrateResult<crate::remote::transport::FsBytes> {
             self.inner.filesystem_bytes()
         }
     }

@@ -61,9 +61,9 @@ pub use ssh::SshTransport;
 pub use storekit::relpath::RootedRelativePath;
 
 use crate::env::SysEnv;
-use crate::error::{Error, Result};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use storekit::error::{Error, Result};
 use walkdir::WalkDir;
 
 /// The remote-state protocol version. Bumped 1 -> 2 when the remote
@@ -78,46 +78,26 @@ use walkdir::WalkDir;
 /// legacy/transplanted record is never read as a valid deployment).
 pub const PROTOCOL_VERSION: u32 = 2;
 
-// The shared transport vocabulary is now the crate's. Each type below is
+// The shared transport vocabulary is the crate's. Each type below is
 // byte-for-byte identical to `deploy`'s former definition (same derives, same
 // fields/variants), so re-exporting it is behaviour-identical and gives the
-// verdict/wire vocabulary ONE authority — the crate that the transport trait
-// comes from. `ExecOutcome` deliberately stays `deploy`'s here: the crate's
-// carries an extra `timeout_cause` dimension that the runner/transport swap (a
-// later stage) adopts together with the `Exec` trait.
+// verdict/wire vocabulary ONE authority — the crate the transport trait comes
+// from. `ExecOutcome` now carries the crate's typed `timeout_cause`, which the
+// crate's `Exec` trait already produces; `deploy`'s local runner maps its
+// `TimedOut` outcome to `TimeoutCause::CommandStillRunning` (its only timeout
+// cause — its post-exit drain reports a background descendant as an error, so
+// `OutputDrainGaveUp` is never produced).
 pub use storekit::transport::{
-    ContentEquivalence, CreateNewVerdict, FsBytes, NotRegularFileKind, RemoteEntry, RemoteMeta,
-    RemoveIfVerdict, VerifiedExisting,
+    ContentEquivalence, CreateNewVerdict, Exec, ExecOutcome, FarSideLockSession, FsBytes,
+    NotRegularFileKind, RemoteEntry, RemoteMeta, RemoveIfVerdict, TimeoutCause, VerifiedExisting,
 };
 
-#[derive(Clone, Debug)]
-pub struct ExecOutcome {
-    pub exit_code: i32,
-    pub stdout: String,
-    pub stderr: String,
-}
-
-impl ExecOutcome {
-    pub fn success(&self) -> bool {
-        self.exit_code == 0
-    }
-}
-
-/// THE command-execution seam behind [`LocalTransport::exec`]. Production
-/// uses [`ChildRunner`] (the bounded real runner: spawn into an own process
-/// group, bounded wait, group termination, mandatory reap before every
-/// outcome); the deterministic deployment/state-machine properties inject a
-/// scripted fake (`ScriptedExec`, test-only: scripted outcomes keyed by argv
-/// — no subprocess, no wall-clock). The seam is what makes the property
-/// suites parallel-safe: the deterministic tests exercise the SAME logic
-/// branches (verification success/failure, activation, compensation) without
-/// spawning real processes or contending for the pid space.
-pub trait Exec: Send + Sync {
-    /// Execute `argv` (no shell) bounded by `timeout`, returning the
-    /// outcome. A conforming implementation never leaves a live process
-    /// behind and never blocks past `timeout`.
-    fn exec(&self, argv: &[String], timeout: Duration) -> Result<ExecOutcome>;
-}
+/// The SUBSTRATE error type (and result alias) every [`Remote`] method returns.
+/// Re-exported so an out-of-crate `Remote` implementor can spell its method
+/// signatures; `deploy`'s own domain error stays [`crate::error::Error`], and
+/// domain code converts at the boundary with the existing
+/// `From<storekit::Error>` impl.
+pub use storekit::error::{Error as SubstrateError, Result as SubstrateResult};
 
 /// The REAL exec: [`ChildRunner`] through the outcome mapping the transport
 /// always applied (a timed-out child surfaces as `exit_code: -1` with the
@@ -133,270 +113,38 @@ impl Exec for ChildRunner {
                 exit_code,
                 stdout,
                 stderr,
+                timeout_cause: None,
             }),
             Ok(RunOutcome::TimedOut { stderr }) => Ok(ExecOutcome {
                 exit_code: -1,
                 stdout: String::new(),
                 stderr,
+                // The local runner's `TimedOut` is produced only when the
+                // child was still running at the deadline (a background
+                // descendant is reported as a `RunError::Background` error,
+                // never a `TimedOut`), so the cause is unambiguous.
+                timeout_cause: Some(TimeoutCause::CommandStillRunning),
             }),
             Err(e) => Err(Error::transport(e.to_string())),
         }
     }
 }
 
-/// Filesystem + execution surface for one server's remote root.
+/// Filesystem + execution surface for one server's remote root — the
+/// substrate's trait, re-exported as [`crate::remote::transport::Remote`].
 ///
 /// Every path a transport operation receives is a validated
 /// [`RootedRelativePath`]: relative to the deployment root, never absolute,
 /// never traversal-bearing — so `root.join(rel)` inside a transport is safe
 /// by construction and a caller can never escape the deployment root.
-pub trait Remote {
-    fn root(&self) -> &Path;
-    /// Whether `root()` names a path on THIS host (a [`LocalTransport`]) or
-    /// a path on a REMOTE host (an [`SshTransport`]). Callers that must
-    /// choose between direct local filesystem access and a remote exec (tree
-    /// verification) branch on this DECLARED nature — never on a local
-    /// filesystem probe of the root path, which is meaningless for a remote
-    /// root and would silently verify a same-named local directory in place
-    /// of the remote tree. Every transport MUST declare its nature (no
-    /// default): a new remote transport that forgets is a compile error, not
-    /// a silent local-verification bug.
-    fn is_local(&self) -> bool;
-    fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>>;
-    fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()>;
-    /// Atomically create `rel` with `data` only if it does not already exist,
-    /// and make the install DURABLE before returning: the create-new
-    /// primitive (`durable_create_new`) writes a unique temp inside the
-    /// destination directory, applies the FINAL MODE, fsyncs the file,
-    /// publishes WITHOUT replacement (a concurrent winner is never replaced),
-    /// removes the temp, and fsyncs the PARENT DIRECTORY — every failure
-    /// propagates. Returns the TYPED [`CreateNewVerdict`]: `Created` when the
-    /// record was durably installed by this call; `AlreadyPresent` ONLY when
-    /// the destination already existed and VERIFIED as an identical entry —
-    /// a DESCRIPTOR-BOUND verification (the entry is OPENED with `O_NOFOLLOW`
-    /// and fstat'd + read through the SAME descriptor): a REGULAR FILE with
-    /// the EXACT final mode and byte-identical
-    /// content, all from the ONE opened inode (the identical retry converges —
-    /// the parent directory is
-    /// synced here too, so the retry returns with a durable entry);
-    /// `Conflict` carrying the TYPED [`VerifiedExisting`] reason when it
-    /// existed but did NOT verify (different bytes, a MODE MISMATCH, a
-    /// directory/symlink/other entry — a symlink is never followed — or an
-    /// unreadable entry; the winner is NEVER replaced or modified, and the
-    /// caller receives the typed reason, never an undifferentiated conflict
-    /// it can reinterpret); or `Err` on every other failure (a pre-install
-    /// failure, a failed parent-dir sync, a transport fault — never a
-    /// verdict). This is
-    /// the non-racy primitive used for lock acquisition:
-    /// `exists`-then-`write` would let two controllers both observe "no lock"
-    /// and both proceed.
-    fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict>;
-    /// [`Remote::try_write_new`] with a CALLER-CHOSEN content equivalence for
-    /// the EEXIST verification: `Semantic` (JSON parse-equal, byte-exact
-    /// fallback) is used by the release-file publisher whose idempotent
-    /// re-publication legitimately re-serializes the same contract with
-    /// different key order/whitespace. Transports whose centralized
-    /// verification can apply the equivalence directly (LocalTransport,
-    /// SshTransport) override this; the default performs the byte-exact
-    /// [`Remote::try_write_new`] and, for `Semantic`, re-reads and
-    /// semantically compares a `ContentMismatch` conflict — the identical
-    /// outcome a direct application would produce.
-    fn try_write_new_with(
-        &self,
-        rel: &RootedRelativePath,
-        data: &[u8],
-        equivalence: ContentEquivalence,
-    ) -> Result<CreateNewVerdict> {
-        let verdict = self.try_write_new(rel, data)?;
-        if equivalence != ContentEquivalence::Semantic {
-            return Ok(verdict);
-        }
-        match verdict {
-            CreateNewVerdict::Conflict(VerifiedExisting::ContentMismatch) => {
-                // The transport's Exact verification reported a content
-                // mismatch; the caller's SEMANTIC equivalence may still
-                // accept the winner (JSON key order/whitespace are not part
-                // of the contract). Type and mode were already verified
-                // (that is why the reason is ContentMismatch, not
-                // NotRegularFile/ModeMismatch), so only the content needs
-                // re-comparing.
-                let existing = self.read(rel)?;
-                if content_equivalent(&existing, data, ContentEquivalence::Semantic) {
-                    Ok(CreateNewVerdict::AlreadyPresent)
-                } else {
-                    Ok(CreateNewVerdict::Conflict(
-                        VerifiedExisting::ContentMismatch,
-                    ))
-                }
-            }
-            v => Ok(v),
-        }
-    }
-    fn create_dir(&self, rel: &RootedRelativePath) -> Result<()>;
-    fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()>;
-    /// Apply a permission mode to an existing remote entry (file or directory).
-    /// Uploads must preserve the canonical tree's modes exactly, or the
-    /// post-upload integrity re-hash diverges on hosts with a permissive umask
-    /// (a bare `mkdir`/`cat` inherits the remote umask, so modes must be
-    /// applied explicitly).
-    fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()>;
-    fn list(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>>;
-    fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()>;
-    /// Create a symlink at `link` (a rooted relative path) pointing at
-    /// `target`. `target` is a LINK TARGET, relative to the link's own
-    /// directory — it legitimately traverses up to the object store
-    /// (`../../objects/...`), so it is a plain `&Path`, never a
-    /// [`RootedRelativePath`].
-    fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()>;
-    /// Read the target of the symlink at `rel`. The returned target is a
-    /// LINK TARGET (relative to the link's directory, legitimately
-    /// `../../...`), so it is a plain `PathBuf`, never a
-    /// [`RootedRelativePath`].
-    fn read_link(&self, rel: &RootedRelativePath) -> Result<PathBuf>;
-    fn remove_file(&self, rel: &RootedRelativePath) -> Result<()>;
-    fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()>;
-    /// Recursively copy the tree at `src` to `dest` — the per-file dedup's
-    /// staging base (the previous tree is copied into the staging dir, then
-    /// only the changed files are uploaded). `dest` must not already exist
-    /// (the caller removes a stale staging dir first); its parent is
-    /// created. The DEFAULT is a naive list/read/write walk — correct for
-    /// every transport, and for a [`LocalTransport`] it is a real local-disk
-    /// copy (the "download" is a local read); the [`SshTransport`] overrides
-    /// it with a same-filesystem `cp -a` on the remote so no bytes cross the
-    /// link. The walk is TWO-PHASE (directories are created owner-writable
-    /// and chmodded to their final mode deepest-first after every child is
-    /// copied), so a read-only source tree copies cleanly.
-    fn copy_tree(&self, src: &RootedRelativePath, dest: &RootedRelativePath) -> Result<()> {
-        if let Some(parent) = dest.parent() {
-            self.create_dir_all(&parent)?;
-        }
-        // (dest, final_mode, depth) collected during the walk for phase 2.
-        let mut dirs: Vec<(RootedRelativePath, u32, usize)> = Vec::new();
-        copy_tree_recursive(self, src, dest, 0, &mut dirs)?;
-        dirs.sort_by_key(|d| std::cmp::Reverse(d.2));
-        for (d, mode, _depth) in dirs {
-            self.set_mode(&d, mode)?;
-        }
-        Ok(())
-    }
-    /// Recursively fsync every file and directory under `rel` (the staged
-    /// release bundle), making the WHOLE tree durable before the atomic
-    /// install rename — a crash after the fsync but before the rename loses
-    /// at most the disposable staging dir, never a partial final release
-    /// directory. The DEFAULT is a no-op (test wrappers that delegate to an
-    /// inner transport inherit the inner's implementation); the production
-    /// transports ([`LocalTransport`], [`SshTransport`]) realize it for
-    /// real.
-    fn fsync_tree(&self, rel: &RootedRelativePath) -> Result<()> {
-        let _ = rel;
-        Ok(())
-    }
-    /// Fsync the PARENT DIRECTORY of `rel` so a rename/removal/creation
-    /// inside it survives power loss — the durability commit point of every
-    /// atomic mutation (the staged-publish renames, the `current` symlink
-    /// swap, the record replaces): a mutation's success is reported ONLY
-    /// after this succeeds. FAIL-CLOSED: a failed open OR a failed fsync is
-    /// a propagated `Err` (never a silent success — the directory entry's
-    /// durability is unconfirmed). The DEFAULT is a no-op (test wrappers
-    /// that delegate to an inner transport inherit the inner's
-    /// implementation); the production transports ([`LocalTransport`],
-    /// [`SshTransport`]) realize it for real.
-    fn fsync_parent(&self, rel: &RootedRelativePath) -> Result<()> {
-        let _ = rel;
-        Ok(())
-    }
-    /// Atomically remove `rel` ONLY IF its content is byte-identical to
-    /// `expected` — the compare-and-delete primitive that makes stale
-    /// releases and expired-lease breaks safe. Returns the TYPED verdict
-    /// ([`RemoveIfVerdict`]); every transport failure propagates as `Err`
-    /// (never a fabricated verdict, never a silent no-op). The production
-    /// transports ([`LocalTransport`], [`SshTransport`]) realize it
-    /// ATOMICALLY: the entry is CLAIMED by an atomic rename to a unique
-    /// same-directory temp (only one contender can win), verified against
-    /// `expected`, and either deleted (match) or RESTORED no-replace
-    /// (mismatch — a successor's lock is never removed, never replaced).
-    /// The DEFAULT implementation is the NON-ATOMIC read-compare-remove
-    /// fallback: adequate for single-process test wrappers that never race
-    /// the lock, and only those; production must override it.
-    fn remove_file_if(&self, rel: &RootedRelativePath, expected: &[u8]) -> Result<RemoveIfVerdict> {
-        // Typed absence probe first: a transport failure is an `Err`, never
-        // a silent `Absent`.
-        let Some(_) = self.metadata_opt(rel)? else {
-            return Ok(RemoveIfVerdict::Absent);
-        };
-        let cur = self.read(rel)?;
-        if cur == expected {
-            self.remove_file(rel)?;
-            Ok(RemoveIfVerdict::Removed)
-        } else {
-            Ok(RemoveIfVerdict::Mismatch)
-        }
-    }
-    fn exists(&self, rel: &RootedRelativePath) -> bool;
-    fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta>;
-    /// The TYPED replacement for the `exists`/`metadata` pair: `Ok(Some(meta))`
-    /// when the entry exists, `Ok(None)` ONLY for a CONFIRMED `NotFound`, and
-    /// `Err` for every other failure (permission, transport fault, ...). A
-    /// failed read is NEVER indistinguishable from absence — callers must
-    /// never consult `exists` (a `bool` that swallows errors) to disambiguate.
-    fn metadata_opt(&self, rel: &RootedRelativePath) -> Result<Option<RemoteMeta>> {
-        match self.metadata(rel) {
-            Ok(m) => Ok(Some(m)),
-            Err(crate::error::Error::NotFound(_)) => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
-    /// Execute a command vector (no shell). Returns the outcome.
-    fn exec(&self, argv: &[String], timeout: Duration) -> Result<ExecOutcome>;
-    /// Total and available bytes on the filesystem backing the remote root.
-    /// `total` is the filesystem's full size; `available` is the free space a
-    /// new upload can consume. Capacity preflight needs both: the percent
-    /// reserve is a percentage of the TOTAL size, while the fit check
-    /// compares against the AVAILABLE space.
-    fn filesystem_bytes(&self) -> Result<FsBytes>;
-
-    /// Atomic recover of the operation lock: remove `rel` iff it equals
-    /// `observed`, then install `new_data`, all while holding the sidecar
-    /// mutex exclusively. Returns `Ok(Some(()))` on success, `Ok(None)` if
-    /// not implemented (caller falls back to helper-layer flock), `Err` on
-    /// mismatch/absent/contended/transport failure. Object-safe so
-    /// `RemoteHelper` can call it via `&dyn Remote` without knowing the
-    /// transport.
-    fn atomic_recover(
-        &self,
-        rel: &RootedRelativePath,
-        observed: &[u8],
-        new_data: &[u8],
-    ) -> Result<Option<()>> {
-        let _ = (rel, observed, new_data);
-        Ok(None)
-    }
-
-    /// Prepare the host identity (verify/pin the host key) before ANY remote
-    /// request, including read-only status inspection in a dry run. A dry run
-    /// still connects over the transport to inspect status, so the identity
-    /// must be prepared first. Construction is side-effect-free; identity
-    /// preparation happens before the first request that needs to connect.
-    /// Default: no-op (transports without a host-identity concept, like
-    /// `LocalTransport`).
-    fn prepare_identity(&self) -> Result<()> {
-        let _ = self;
-        Ok(())
-    }
-
-    /// Create the deployment-directory layout before the first mutation.
-    /// Construction is side-effect-free; layout provisioning happens only after
-    /// the push engine's non-dry-run gate. The DEFAULT creates the deploy_dir's
-    /// IMMUTABLE receiver-UUID marker (the PHYSICAL identity of the deploy_dir,
-    /// created ONCE at provisioning and never changed) — the transports that
-    /// override this method ([`LocalTransport`], [`SshTransport`]) create the
-    /// full layout AND the marker; the default (test wrappers delegating to an
-    /// inner transport) creates the marker alone.
-    fn provision_layout(&self) -> Result<()> {
-        provision_receiver_uuid(self)?;
-        Ok(())
-    }
-}
+///
+/// The trait's vocabulary is the substrate's throughout: every method's
+/// failure is a [`SubstrateError`] (the deploy domain error stays
+/// [`crate::error::Error`], converted at the boundary by the
+/// `From<storekit::Error>` impl), the exec outcome carries the substrate's
+/// typed `timeout_cause`, and the layout-aware provisioning plus the
+/// residue/lock methods are the substrate's.
+pub use storekit::transport::Remote;
 
 /// Provision the deploy_dir's IMMUTABLE receiver-UUID marker through
 /// `remote`'s OWN methods, so a wrapper that records or injects a fault on
@@ -416,37 +164,6 @@ pub fn provision_receiver_marker<R: Remote + ?Sized>(remote: &R) -> Result<()> {
 
 fn join(root: &Path, rel: &RootedRelativePath) -> PathBuf {
     root.join(rel.as_path())
-}
-
-/// The naive recursive half of [`Remote::copy_tree`]'s default: walk `src`
-/// with [`Remote::list`], recreating every entry at `dest` (directories
-/// owner-writable during the walk, files/symlinks with their final modes),
-/// collecting `(dest, final_mode, depth)` for the caller's phase-2 finalize.
-fn copy_tree_recursive<R: Remote + ?Sized>(
-    remote: &R,
-    src: &RootedRelativePath,
-    dest: &RootedRelativePath,
-    depth: usize,
-    dirs: &mut Vec<(RootedRelativePath, u32, usize)>,
-) -> Result<()> {
-    remote.create_dir_all(dest)?;
-    for e in remote.list(src)? {
-        let s = src.join(&e.name)?;
-        let d = dest.join(&e.name)?;
-        if e.is_dir {
-            remote.create_dir_all(&d)?;
-            remote.set_mode(&d, (e.mode | 0o200) & 0o7777)?;
-            dirs.push((d.clone(), e.mode & 0o7777, depth));
-            copy_tree_recursive(remote, &s, &d, depth + 1, dirs)?;
-        } else if e.is_symlink {
-            let target = remote.read_link(&s)?;
-            remote.symlink(&target, &d)?;
-        } else {
-            let data = remote.read(&s)?;
-            remote.write(&d, &data, e.mode & 0o7777)?;
-        }
-    }
-    Ok(())
 }
 
 /// True when `p` has at least one NORMAL path component below the root —
@@ -506,8 +223,7 @@ fn with_observed_operation_lock<R>(base: &Path, f: impl FnOnce() -> Result<R>) -
         base,
         &crate::remote::layout::operation_lock_sidecar(),
         || Ok(f()),
-    )
-    .map_err(Error::from)?
+    )?
 }
 
 /// The RAII observer for [`with_observed_operation_lock`]: raises the

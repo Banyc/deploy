@@ -1095,6 +1095,7 @@ fn dry_run_reports_plan() -> Result<()> {
 
 use deploy::remote::create_remote;
 use deploy::remote::helper::{GenerationAssignment, RemoteHelper};
+use deploy::remote::transport::SubstrateResult;
 use deploy::remote::transport::{ExecOutcome, RemoteEntry, RemoteMeta};
 use deploy::verify::release;
 use std::sync::Arc;
@@ -1126,11 +1127,14 @@ impl Remote for SpyRemote {
     fn is_local(&self) -> bool {
         true
     }
-    fn provision_layout(&self) -> Result<()> {
+    fn provision_layout(&self) -> SubstrateResult<()> {
         deploy::remote::transport::provision_receiver_marker(self)?;
         Ok(())
     }
-    fn read(&self, rel: &RootedRelativePath) -> deploy::error::Result<Vec<u8>> {
+    fn read(
+        &self,
+        rel: &RootedRelativePath,
+    ) -> deploy::remote::transport::SubstrateResult<Vec<u8>> {
         self.inner.read(rel)
     }
     fn write(
@@ -1138,9 +1142,9 @@ impl Remote for SpyRemote {
         _rel: &RootedRelativePath,
         _data: &[u8],
         _mode: u32,
-    ) -> deploy::error::Result<()> {
+    ) -> deploy::remote::transport::SubstrateResult<()> {
         self.mutations.fetch_add(1, Ordering::SeqCst);
-        Err(deploy::error::Error::remote(
+        Err(deploy::remote::transport::SubstrateError::transport(
             "SpyRemote: write is forbidden",
         ))
     }
@@ -1148,75 +1152,111 @@ impl Remote for SpyRemote {
         &self,
         _rel: &RootedRelativePath,
         _data: &[u8],
-    ) -> deploy::error::Result<deploy::remote::transport::CreateNewVerdict> {
+    ) -> deploy::remote::transport::SubstrateResult<deploy::remote::transport::CreateNewVerdict>
+    {
         self.mutations.fetch_add(1, Ordering::SeqCst);
-        Err(deploy::error::Error::remote(
+        Err(deploy::remote::transport::SubstrateError::transport(
             "SpyRemote: write is forbidden",
         ))
     }
-    fn create_dir(&self, _rel: &RootedRelativePath) -> deploy::error::Result<()> {
+    fn create_dir(
+        &self,
+        _rel: &RootedRelativePath,
+    ) -> deploy::remote::transport::SubstrateResult<()> {
         self.mutations.fetch_add(1, Ordering::SeqCst);
-        Err(deploy::error::Error::remote(
+        Err(deploy::remote::transport::SubstrateError::transport(
             "SpyRemote: create_dir is forbidden",
         ))
     }
-    fn create_dir_all(&self, _rel: &RootedRelativePath) -> deploy::error::Result<()> {
+    fn create_dir_all(
+        &self,
+        _rel: &RootedRelativePath,
+    ) -> deploy::remote::transport::SubstrateResult<()> {
         self.mutations.fetch_add(1, Ordering::SeqCst);
-        Err(deploy::error::Error::remote(
+        Err(deploy::remote::transport::SubstrateError::transport(
             "SpyRemote: create_dir_all is forbidden",
         ))
     }
-    fn set_mode(&self, _rel: &RootedRelativePath, _mode: u32) -> deploy::error::Result<()> {
+    fn set_mode(
+        &self,
+        _rel: &RootedRelativePath,
+        _mode: u32,
+    ) -> deploy::remote::transport::SubstrateResult<()> {
         self.mutations.fetch_add(1, Ordering::SeqCst);
-        Err(deploy::error::Error::remote(
+        Err(deploy::remote::transport::SubstrateError::transport(
             "SpyRemote: set_mode is forbidden",
         ))
     }
-    fn list(&self, rel: &RootedRelativePath) -> deploy::error::Result<Vec<RemoteEntry>> {
+    fn list(
+        &self,
+        rel: &RootedRelativePath,
+    ) -> deploy::remote::transport::SubstrateResult<Vec<RemoteEntry>> {
         self.inner.list(rel)
     }
     fn rename(
         &self,
         _from: &RootedRelativePath,
         _to: &RootedRelativePath,
-    ) -> deploy::error::Result<()> {
+    ) -> deploy::remote::transport::SubstrateResult<()> {
         self.mutations.fetch_add(1, Ordering::SeqCst);
-        Err(deploy::error::Error::remote(
+        Err(deploy::remote::transport::SubstrateError::transport(
             "SpyRemote: rename is forbidden",
         ))
     }
-    fn symlink(&self, _target: &Path, _link: &RootedRelativePath) -> deploy::error::Result<()> {
+    fn symlink(
+        &self,
+        _target: &Path,
+        _link: &RootedRelativePath,
+    ) -> deploy::remote::transport::SubstrateResult<()> {
         self.mutations.fetch_add(1, Ordering::SeqCst);
-        Err(deploy::error::Error::remote(
+        Err(deploy::remote::transport::SubstrateError::transport(
             "SpyRemote: symlink is forbidden",
         ))
     }
-    fn read_link(&self, rel: &RootedRelativePath) -> deploy::error::Result<std::path::PathBuf> {
+    fn read_link(
+        &self,
+        rel: &RootedRelativePath,
+    ) -> deploy::remote::transport::SubstrateResult<std::path::PathBuf> {
         self.inner.read_link(rel)
     }
-    fn remove_file(&self, _rel: &RootedRelativePath) -> deploy::error::Result<()> {
+    fn remove_file(
+        &self,
+        _rel: &RootedRelativePath,
+    ) -> deploy::remote::transport::SubstrateResult<()> {
         self.mutations.fetch_add(1, Ordering::SeqCst);
-        Err(deploy::error::Error::remote(
+        Err(deploy::remote::transport::SubstrateError::transport(
             "SpyRemote: remove_file is forbidden",
         ))
     }
-    fn remove_dir_all(&self, _rel: &RootedRelativePath) -> deploy::error::Result<()> {
+    fn remove_dir_all(
+        &self,
+        _rel: &RootedRelativePath,
+    ) -> deploy::remote::transport::SubstrateResult<()> {
         self.mutations.fetch_add(1, Ordering::SeqCst);
-        Err(deploy::error::Error::remote(
+        Err(deploy::remote::transport::SubstrateError::transport(
             "SpyRemote: remove_dir_all is forbidden",
         ))
     }
     fn exists(&self, rel: &RootedRelativePath) -> bool {
         self.inner.exists(rel)
     }
-    fn metadata(&self, rel: &RootedRelativePath) -> deploy::error::Result<RemoteMeta> {
+    fn metadata(
+        &self,
+        rel: &RootedRelativePath,
+    ) -> deploy::remote::transport::SubstrateResult<RemoteMeta> {
         self.inner.metadata(rel)
     }
-    fn exec(&self, _argv: &[String], _timeout: Duration) -> deploy::error::Result<ExecOutcome> {
+    fn exec(
+        &self,
+        _argv: &[String],
+        _timeout: Duration,
+    ) -> deploy::remote::transport::SubstrateResult<ExecOutcome> {
         self.mutations.fetch_add(1, Ordering::SeqCst);
-        Err(deploy::error::Error::remote("SpyRemote: exec is forbidden"))
+        Err(deploy::remote::transport::SubstrateError::transport(
+            "SpyRemote: exec is forbidden",
+        ))
     }
-    fn filesystem_bytes(&self) -> deploy::error::Result<FsBytes> {
+    fn filesystem_bytes(&self) -> deploy::remote::transport::SubstrateResult<FsBytes> {
         self.inner.filesystem_bytes()
     }
 }
@@ -1296,23 +1336,31 @@ impl Remote for FaultRemote {
     fn is_local(&self) -> bool {
         true
     }
-    fn provision_layout(&self) -> Result<()> {
+    fn provision_layout(&self) -> SubstrateResult<()> {
         deploy::remote::transport::provision_receiver_marker(self)?;
         Ok(())
     }
-    fn read(&self, rel: &RootedRelativePath) -> deploy::error::Result<Vec<u8>> {
+    fn read(
+        &self,
+        rel: &RootedRelativePath,
+    ) -> deploy::remote::transport::SubstrateResult<Vec<u8>> {
         self.inner.read(rel)
     }
-    fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> deploy::error::Result<()> {
+    fn write(
+        &self,
+        rel: &RootedRelativePath,
+        data: &[u8],
+        mode: u32,
+    ) -> deploy::remote::transport::SubstrateResult<()> {
         self.attempted.fetch_add(1, Ordering::SeqCst);
         if self.fail_write {
-            return Err(deploy::error::Error::remote(
+            return Err(deploy::remote::transport::SubstrateError::transport(
                 "FaultRemote: write forced to fail",
             ));
         }
         // Targeted fault injection for finding 6's bookkeeping writes.
         if self.fail_committed_txn && String::from_utf8_lossy(data).contains("\"committed\"") {
-            return Err(deploy::error::Error::remote(
+            return Err(deploy::remote::transport::SubstrateError::transport(
                 "FaultRemote: committed transaction record write forced to fail",
             ));
         }
@@ -1322,7 +1370,7 @@ impl Remote for FaultRemote {
                 .to_string_lossy()
                 .starts_with("state/commits/")
         {
-            return Err(deploy::error::Error::remote(
+            return Err(deploy::remote::transport::SubstrateError::transport(
                 "FaultRemote: commit marker write forced to fail",
             ));
         }
@@ -1332,10 +1380,11 @@ impl Remote for FaultRemote {
         &self,
         rel: &RootedRelativePath,
         data: &[u8],
-    ) -> deploy::error::Result<deploy::remote::transport::CreateNewVerdict> {
+    ) -> deploy::remote::transport::SubstrateResult<deploy::remote::transport::CreateNewVerdict>
+    {
         self.attempted.fetch_add(1, Ordering::SeqCst);
         if self.fail_write {
-            return Err(deploy::error::Error::remote(
+            return Err(deploy::remote::transport::SubstrateError::transport(
                 "FaultRemote: write forced to fail",
             ));
         }
@@ -1347,65 +1396,98 @@ impl Remote for FaultRemote {
                 .to_string_lossy()
                 .starts_with("state/commits/")
         {
-            return Err(deploy::error::Error::remote(
+            return Err(deploy::remote::transport::SubstrateError::transport(
                 "FaultRemote: commit marker create forced to fail",
             ));
         }
         self.inner.try_write_new(rel, data)
     }
-    fn create_dir(&self, rel: &RootedRelativePath) -> deploy::error::Result<()> {
+    fn create_dir(
+        &self,
+        rel: &RootedRelativePath,
+    ) -> deploy::remote::transport::SubstrateResult<()> {
         self.inner.create_dir(rel)
     }
-    fn create_dir_all(&self, rel: &RootedRelativePath) -> deploy::error::Result<()> {
+    fn create_dir_all(
+        &self,
+        rel: &RootedRelativePath,
+    ) -> deploy::remote::transport::SubstrateResult<()> {
         self.inner.create_dir_all(rel)
     }
-    fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> deploy::error::Result<()> {
+    fn set_mode(
+        &self,
+        rel: &RootedRelativePath,
+        mode: u32,
+    ) -> deploy::remote::transport::SubstrateResult<()> {
         self.inner.set_mode(rel, mode)
     }
-    fn list(&self, rel: &RootedRelativePath) -> deploy::error::Result<Vec<RemoteEntry>> {
+    fn list(
+        &self,
+        rel: &RootedRelativePath,
+    ) -> deploy::remote::transport::SubstrateResult<Vec<RemoteEntry>> {
         self.inner.list(rel)
     }
     fn rename(
         &self,
         from: &RootedRelativePath,
         to: &RootedRelativePath,
-    ) -> deploy::error::Result<()> {
+    ) -> deploy::remote::transport::SubstrateResult<()> {
         self.attempted.fetch_add(1, Ordering::SeqCst);
         if self.fail_rename {
-            return Err(deploy::error::Error::remote(
+            return Err(deploy::remote::transport::SubstrateError::transport(
                 "FaultRemote: rename forced to fail",
             ));
         }
         self.inner.rename(from, to)
     }
-    fn symlink(&self, target: &Path, link: &RootedRelativePath) -> deploy::error::Result<()> {
+    fn symlink(
+        &self,
+        target: &Path,
+        link: &RootedRelativePath,
+    ) -> deploy::remote::transport::SubstrateResult<()> {
         self.inner.symlink(target, link)
     }
-    fn read_link(&self, rel: &RootedRelativePath) -> deploy::error::Result<std::path::PathBuf> {
+    fn read_link(
+        &self,
+        rel: &RootedRelativePath,
+    ) -> deploy::remote::transport::SubstrateResult<std::path::PathBuf> {
         self.inner.read_link(rel)
     }
-    fn remove_file(&self, rel: &RootedRelativePath) -> deploy::error::Result<()> {
+    fn remove_file(
+        &self,
+        rel: &RootedRelativePath,
+    ) -> deploy::remote::transport::SubstrateResult<()> {
         self.inner.remove_file(rel)
     }
-    fn remove_dir_all(&self, rel: &RootedRelativePath) -> deploy::error::Result<()> {
+    fn remove_dir_all(
+        &self,
+        rel: &RootedRelativePath,
+    ) -> deploy::remote::transport::SubstrateResult<()> {
         self.inner.remove_dir_all(rel)
     }
     fn exists(&self, rel: &RootedRelativePath) -> bool {
         self.inner.exists(rel)
     }
-    fn metadata(&self, rel: &RootedRelativePath) -> deploy::error::Result<RemoteMeta> {
+    fn metadata(
+        &self,
+        rel: &RootedRelativePath,
+    ) -> deploy::remote::transport::SubstrateResult<RemoteMeta> {
         self.inner.metadata(rel)
     }
-    fn exec(&self, argv: &[String], timeout: Duration) -> deploy::error::Result<ExecOutcome> {
+    fn exec(
+        &self,
+        argv: &[String],
+        timeout: Duration,
+    ) -> deploy::remote::transport::SubstrateResult<ExecOutcome> {
         self.attempted.fetch_add(1, Ordering::SeqCst);
         if self.fail_exec {
-            return Err(deploy::error::Error::remote(
+            return Err(deploy::remote::transport::SubstrateError::transport(
                 "FaultRemote: exec forced to fail",
             ));
         }
         self.inner.exec(argv, timeout)
     }
-    fn filesystem_bytes(&self) -> deploy::error::Result<FsBytes> {
+    fn filesystem_bytes(&self) -> deploy::remote::transport::SubstrateResult<FsBytes> {
         self.inner.filesystem_bytes()
     }
 }
@@ -1445,67 +1527,71 @@ impl Remote for FailOnceMarkerRemote {
     fn is_local(&self) -> bool {
         true
     }
-    fn provision_layout(&self) -> Result<()> {
+    fn provision_layout(&self) -> SubstrateResult<()> {
         self.inner.provision_layout()
     }
-    fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
+    fn read(&self, rel: &RootedRelativePath) -> SubstrateResult<Vec<u8>> {
         self.inner.read(rel)
     }
-    fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
+    fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> SubstrateResult<()> {
         if self.fail_marker(rel) {
             self.armed.store(false, Ordering::SeqCst);
-            return Err(deploy::error::Error::remote(
+            return Err(deploy::remote::transport::SubstrateError::transport(
                 "FailOnceMarkerRemote: commit marker write forced to fail (once)",
             ));
         }
         self.inner.write(rel, data, mode)
     }
-    fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict> {
+    fn try_write_new(
+        &self,
+        rel: &RootedRelativePath,
+        data: &[u8],
+    ) -> SubstrateResult<CreateNewVerdict> {
         if self.fail_marker(rel) {
             self.armed.store(false, Ordering::SeqCst);
-            return Err(deploy::error::Error::remote(
+            return Err(deploy::remote::transport::SubstrateError::transport(
                 "FailOnceMarkerRemote: commit marker create forced to fail (once)",
             ));
         }
         self.inner.try_write_new(rel, data)
     }
-    fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
+    fn create_dir(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
         self.inner.create_dir(rel)
     }
-    fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+    fn create_dir_all(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
         self.inner.create_dir_all(rel)
     }
-    fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
+    fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> SubstrateResult<()> {
         self.inner.set_mode(rel, mode)
     }
-    fn list(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>> {
+    fn list(&self, rel: &RootedRelativePath) -> SubstrateResult<Vec<RemoteEntry>> {
         self.inner.list(rel)
     }
-    fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
+    fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> SubstrateResult<()> {
         self.inner.rename(from, to)
     }
-    fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
+    fn symlink(&self, target: &Path, link: &RootedRelativePath) -> SubstrateResult<()> {
         self.inner.symlink(target, link)
     }
-    fn read_link(&self, rel: &RootedRelativePath) -> Result<std::path::PathBuf> {
+    fn read_link(&self, rel: &RootedRelativePath) -> SubstrateResult<std::path::PathBuf> {
         self.inner.read_link(rel)
     }
-    fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
+    fn remove_file(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
         self.inner.remove_file(rel)
     }
-    fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+    fn remove_dir_all(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
         self.inner.remove_dir_all(rel)
     }
     fn exists(&self, rel: &RootedRelativePath) -> bool {
         self.inner.exists(rel)
     }
-    fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta> {
+    fn metadata(&self, rel: &RootedRelativePath) -> SubstrateResult<RemoteMeta> {
         self.inner.metadata(rel)
     }
-    fn exec(&self, argv: &[String], timeout: Duration) -> Result<ExecOutcome> {
+    fn exec(&self, argv: &[String], timeout: Duration) -> SubstrateResult<ExecOutcome> {
         self.inner.exec(argv, timeout)
     }
-    fn filesystem_bytes(&self) -> Result<FsBytes> {
+    fn filesystem_bytes(&self) -> SubstrateResult<FsBytes> {
         self.inner.filesystem_bytes()
     }
 }
@@ -1579,69 +1665,77 @@ impl Remote for FailOnceRetentionRemote {
     fn is_local(&self) -> bool {
         true
     }
-    fn provision_layout(&self) -> Result<()> {
+    fn provision_layout(&self) -> SubstrateResult<()> {
         self.inner.provision_layout()
     }
-    fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
+    fn read(&self, rel: &RootedRelativePath) -> SubstrateResult<Vec<u8>> {
         self.inner.read(rel)
     }
-    fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
+    fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> SubstrateResult<()> {
         if self.fail_write && self.should_fail(rel) {
             self.armed.store(false, Ordering::SeqCst);
-            return Err(deploy::error::Error::remote(format!(
-                "FailOnceRetentionRemote: write of {} forced to fail (once)",
-                rel.display()
-            )));
+            return Err(deploy::remote::transport::SubstrateError::transport(
+                format!(
+                    "FailOnceRetentionRemote: write of {} forced to fail (once)",
+                    rel.display()
+                ),
+            ));
         }
         self.inner.write(rel, data, mode)
     }
-    fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict> {
+    fn try_write_new(
+        &self,
+        rel: &RootedRelativePath,
+        data: &[u8],
+    ) -> SubstrateResult<CreateNewVerdict> {
         self.inner.try_write_new(rel, data)
     }
-    fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
+    fn remove_file(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
         self.inner.remove_file(rel)
     }
-    fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
+    fn create_dir(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
         self.inner.create_dir(rel)
     }
-    fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+    fn create_dir_all(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
         self.inner.create_dir_all(rel)
     }
-    fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
+    fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> SubstrateResult<()> {
         self.inner.set_mode(rel, mode)
     }
-    fn list(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>> {
+    fn list(&self, rel: &RootedRelativePath) -> SubstrateResult<Vec<RemoteEntry>> {
         if self.fail_list && self.should_fail(rel) {
             self.armed.store(false, Ordering::SeqCst);
-            return Err(deploy::error::Error::remote(format!(
-                "FailOnceRetentionRemote: list of {} forced to fail (once)",
-                rel.display()
-            )));
+            return Err(deploy::remote::transport::SubstrateError::transport(
+                format!(
+                    "FailOnceRetentionRemote: list of {} forced to fail (once)",
+                    rel.display()
+                ),
+            ));
         }
         self.inner.list(rel)
     }
-    fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
+    fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> SubstrateResult<()> {
         self.inner.rename(from, to)
     }
-    fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
+    fn symlink(&self, target: &Path, link: &RootedRelativePath) -> SubstrateResult<()> {
         self.inner.symlink(target, link)
     }
-    fn read_link(&self, rel: &RootedRelativePath) -> Result<std::path::PathBuf> {
+    fn read_link(&self, rel: &RootedRelativePath) -> SubstrateResult<std::path::PathBuf> {
         self.inner.read_link(rel)
     }
-    fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+    fn remove_dir_all(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
         self.inner.remove_dir_all(rel)
     }
     fn exists(&self, rel: &RootedRelativePath) -> bool {
         self.inner.exists(rel)
     }
-    fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta> {
+    fn metadata(&self, rel: &RootedRelativePath) -> SubstrateResult<RemoteMeta> {
         self.inner.metadata(rel)
     }
-    fn exec(&self, argv: &[String], timeout: Duration) -> Result<ExecOutcome> {
+    fn exec(&self, argv: &[String], timeout: Duration) -> SubstrateResult<ExecOutcome> {
         self.inner.exec(argv, timeout)
     }
-    fn filesystem_bytes(&self) -> Result<FsBytes> {
+    fn filesystem_bytes(&self) -> SubstrateResult<FsBytes> {
         Ok(FsBytes {
             total: self.avail,
             available: self.avail,
@@ -1695,20 +1789,24 @@ impl Remote for ConflictingMarkerRemote {
     fn is_local(&self) -> bool {
         true
     }
-    fn provision_layout(&self) -> Result<()> {
+    fn provision_layout(&self) -> SubstrateResult<()> {
         self.inner.provision_layout()
     }
-    fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
+    fn read(&self, rel: &RootedRelativePath) -> SubstrateResult<Vec<u8>> {
         self.inner.read(rel)
     }
-    fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
+    fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> SubstrateResult<()> {
         if self.conflict_marker(rel) {
             let conflicting = Self::conflicting_payload();
             return self.inner.write(rel, &conflicting, mode);
         }
         self.inner.write(rel, data, mode)
     }
-    fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict> {
+    fn try_write_new(
+        &self,
+        rel: &RootedRelativePath,
+        data: &[u8],
+    ) -> SubstrateResult<CreateNewVerdict> {
         if self.conflict_marker(rel) {
             // Install the conflicting payload FIRST so the exclusive create
             // below reports "already exists" (`Ok(false)`), and
@@ -1719,43 +1817,43 @@ impl Remote for ConflictingMarkerRemote {
         }
         self.inner.try_write_new(rel, data)
     }
-    fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
+    fn create_dir(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
         self.inner.create_dir(rel)
     }
-    fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+    fn create_dir_all(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
         self.inner.create_dir_all(rel)
     }
-    fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
+    fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> SubstrateResult<()> {
         self.inner.set_mode(rel, mode)
     }
-    fn list(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>> {
+    fn list(&self, rel: &RootedRelativePath) -> SubstrateResult<Vec<RemoteEntry>> {
         self.inner.list(rel)
     }
-    fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
+    fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> SubstrateResult<()> {
         self.inner.rename(from, to)
     }
-    fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
+    fn symlink(&self, target: &Path, link: &RootedRelativePath) -> SubstrateResult<()> {
         self.inner.symlink(target, link)
     }
-    fn read_link(&self, rel: &RootedRelativePath) -> Result<std::path::PathBuf> {
+    fn read_link(&self, rel: &RootedRelativePath) -> SubstrateResult<std::path::PathBuf> {
         self.inner.read_link(rel)
     }
-    fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
+    fn remove_file(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
         self.inner.remove_file(rel)
     }
-    fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+    fn remove_dir_all(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
         self.inner.remove_dir_all(rel)
     }
     fn exists(&self, rel: &RootedRelativePath) -> bool {
         self.inner.exists(rel)
     }
-    fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta> {
+    fn metadata(&self, rel: &RootedRelativePath) -> SubstrateResult<RemoteMeta> {
         self.inner.metadata(rel)
     }
-    fn exec(&self, argv: &[String], timeout: Duration) -> Result<ExecOutcome> {
+    fn exec(&self, argv: &[String], timeout: Duration) -> SubstrateResult<ExecOutcome> {
         self.inner.exec(argv, timeout)
     }
-    fn filesystem_bytes(&self) -> Result<FsBytes> {
+    fn filesystem_bytes(&self) -> SubstrateResult<FsBytes> {
         self.inner.filesystem_bytes()
     }
 }

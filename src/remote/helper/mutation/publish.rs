@@ -135,7 +135,7 @@ impl<'a> RemoteHelper<'a> {
             Ok(())
         }
         restore_write(self.remote, rel)?;
-        self.remote.remove_dir_all(rel)
+        Ok(self.remote.remove_dir_all(rel)?)
     }
 
     /// Stage a tree into a deployment-specific incoming directory (invisible to
@@ -270,7 +270,7 @@ impl<'a> RemoteHelper<'a> {
     /// disk copy for the local transport. The destination must not already
     /// exist (the caller removes a stale staging dir before calling).
     fn copy_remote_tree(&self, src: &RootedRelativePath, dest: &RootedRelativePath) -> Result<()> {
-        self.remote.copy_tree(src, dest)
+        Ok(self.remote.copy_tree(src, dest)?)
     }
 }
 
@@ -929,6 +929,7 @@ pub(crate) mod tests_publish {
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
+    use storekit::error::{Error as SubstrateError, Result as SubstrateResult};
 
     /// A named (label, mutator) pair driving the publish-rejection mutation
     /// matrices: the label names the tamper in failure messages, the mutator
@@ -1538,32 +1539,32 @@ pub(crate) mod tests_publish {
         fn is_local(&self) -> bool {
             true
         }
-        fn provision_layout(&self) -> Result<()> {
+        fn provision_layout(&self) -> SubstrateResult<()> {
             crate::remote::transport::provision_receiver_marker(self)?;
             Ok(())
         }
-        fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
+        fn read(&self, rel: &RootedRelativePath) -> SubstrateResult<Vec<u8>> {
             if Self::is_staging(rel) && self.consume(|f| f == ReleasePublishFault::VerifyRead) {
-                return Err(Error::remote(
+                return Err(SubstrateError::transport(
                     "FaultOnceReleaseRemote: staged verify read forced to fail (once)",
                 ));
             }
             self.inner.read(rel)
         }
-        fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
+        fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> SubstrateResult<()> {
             if Self::is_staging(rel) {
                 let name = rel.as_path().to_string_lossy();
                 if name.ends_with("release.json")
                     && self.consume(|f| f == ReleasePublishFault::WriteReleaseJson)
                 {
-                    return Err(Error::remote(
+                    return Err(SubstrateError::transport(
                         "FaultOnceReleaseRemote: staged release.json write forced to fail (once)",
                     ));
                 }
                 if name.ends_with("behavior.json")
                     && self.consume(|f| f == ReleasePublishFault::WriteBehaviorJson)
                 {
-                    return Err(Error::remote(
+                    return Err(SubstrateError::transport(
                         "FaultOnceReleaseRemote: staged behavior.json write forced to fail (once)",
                     ));
                 }
@@ -1575,56 +1576,72 @@ pub(crate) mod tests_publish {
             }
             self.inner.write(rel, data, mode)
         }
-        fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict> {
+        fn try_write_new(
+            &self,
+            rel: &RootedRelativePath,
+            data: &[u8],
+        ) -> SubstrateResult<CreateNewVerdict> {
             self.inner.try_write_new(rel, data)
         }
-        fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
+        fn create_dir(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
             self.inner.create_dir(rel)
         }
-        fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+        fn create_dir_all(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
             self.inner.create_dir_all(rel)
         }
-        fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
+        fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> SubstrateResult<()> {
             self.inner.set_mode(rel, mode)
         }
-        fn list(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>> {
+        fn list(&self, rel: &RootedRelativePath) -> SubstrateResult<Vec<RemoteEntry>> {
             self.inner.list(rel)
         }
-        fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
+        fn rename(
+            &self,
+            from: &RootedRelativePath,
+            to: &RootedRelativePath,
+        ) -> SubstrateResult<()> {
             if Self::is_staging(from) && self.consume(|f| f == ReleasePublishFault::InstallRename) {
-                return Err(Error::remote(
+                return Err(SubstrateError::transport(
                     "FaultOnceReleaseRemote: atomic install rename forced to fail (once)",
                 ));
             }
             self.inner.rename(from, to)
         }
-        fn symlink(&self, target: &std::path::Path, link: &RootedRelativePath) -> Result<()> {
+        fn symlink(
+            &self,
+            target: &std::path::Path,
+            link: &RootedRelativePath,
+        ) -> SubstrateResult<()> {
             self.inner.symlink(target, link)
         }
-        fn read_link(&self, rel: &RootedRelativePath) -> Result<std::path::PathBuf> {
+        fn read_link(&self, rel: &RootedRelativePath) -> SubstrateResult<std::path::PathBuf> {
             self.inner.read_link(rel)
         }
-        fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
+        fn remove_file(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
             self.inner.remove_file(rel)
         }
-        fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+        fn remove_dir_all(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
             self.inner.remove_dir_all(rel)
         }
         fn exists(&self, rel: &RootedRelativePath) -> bool {
             self.inner.exists(rel)
         }
-        fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta> {
+        fn metadata(&self, rel: &RootedRelativePath) -> SubstrateResult<RemoteMeta> {
             self.inner.metadata(rel)
         }
-        fn exec(&self, argv: &[String], timeout: std::time::Duration) -> Result<ExecOutcome> {
+        fn exec(
+            &self,
+            argv: &[String],
+            timeout: std::time::Duration,
+        ) -> SubstrateResult<ExecOutcome> {
             self.inner.exec(argv, timeout)
         }
-        fn filesystem_bytes(&self) -> Result<FsBytes> {
+        fn filesystem_bytes(&self) -> SubstrateResult<FsBytes> {
             self.inner.filesystem_bytes()
         }
-        fn fsync_tree(&self, rel: &RootedRelativePath) -> Result<()> {
+        fn fsync_tree(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
             if Self::is_staging(rel) && self.consume(|f| f == ReleasePublishFault::StagingFsync) {
-                return Err(Error::remote(
+                return Err(SubstrateError::transport(
                     "FaultOnceReleaseRemote: staged fsync forced to fail (once)",
                 ));
             }
@@ -1653,58 +1670,70 @@ pub(crate) mod tests_publish {
         fn is_local(&self) -> bool {
             self.is_local
         }
-        fn provision_layout(&self) -> Result<()> {
+        fn provision_layout(&self) -> SubstrateResult<()> {
             crate::remote::transport::provision_receiver_marker(self)?;
             Ok(())
         }
-        fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
+        fn read(&self, rel: &RootedRelativePath) -> SubstrateResult<Vec<u8>> {
             self.inner.read(rel)
         }
-        fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
+        fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> SubstrateResult<()> {
             self.inner.write(rel, data, mode)
         }
-        fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict> {
+        fn try_write_new(
+            &self,
+            rel: &RootedRelativePath,
+            data: &[u8],
+        ) -> SubstrateResult<CreateNewVerdict> {
             self.inner.try_write_new(rel, data)
         }
-        fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
+        fn create_dir(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
             self.inner.create_dir(rel)
         }
-        fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+        fn create_dir_all(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
             self.inner.create_dir_all(rel)
         }
-        fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
+        fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> SubstrateResult<()> {
             self.inner.set_mode(rel, mode)
         }
-        fn list(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>> {
+        fn list(&self, rel: &RootedRelativePath) -> SubstrateResult<Vec<RemoteEntry>> {
             self.inner.list(rel)
         }
-        fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
+        fn rename(
+            &self,
+            from: &RootedRelativePath,
+            to: &RootedRelativePath,
+        ) -> SubstrateResult<()> {
             self.inner.rename(from, to)
         }
-        fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
+        fn symlink(&self, target: &Path, link: &RootedRelativePath) -> SubstrateResult<()> {
             self.inner.symlink(target, link)
         }
-        fn read_link(&self, rel: &RootedRelativePath) -> Result<std::path::PathBuf> {
+        fn read_link(&self, rel: &RootedRelativePath) -> SubstrateResult<std::path::PathBuf> {
             self.inner.read_link(rel)
         }
-        fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
+        fn remove_file(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
             self.inner.remove_file(rel)
         }
-        fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+        fn remove_dir_all(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
             self.inner.remove_dir_all(rel)
         }
         fn exists(&self, rel: &RootedRelativePath) -> bool {
             self.inner.exists(rel)
         }
-        fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta> {
+        fn metadata(&self, rel: &RootedRelativePath) -> SubstrateResult<RemoteMeta> {
             self.inner.metadata(rel)
         }
-        fn exec(&self, _argv: &[String], _timeout: std::time::Duration) -> Result<ExecOutcome> {
+        fn exec(
+            &self,
+            _argv: &[String],
+            _timeout: std::time::Duration,
+        ) -> SubstrateResult<ExecOutcome> {
             self.exec_outcome.lock().unwrap().take().ok_or_else(|| {
-                Error::remote("DeclaredRemote: exec called with no scripted outcome")
+                SubstrateError::transport("DeclaredRemote: exec called with no scripted outcome")
             })
         }
-        fn filesystem_bytes(&self) -> Result<FsBytes> {
+        fn filesystem_bytes(&self) -> SubstrateResult<FsBytes> {
             self.inner.filesystem_bytes()
         }
     }
@@ -2159,6 +2188,7 @@ pub(crate) mod tests_publish {
             exit_code: 0,
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
             stderr: String::new(),
+            timeout_cause: None,
         };
 
         let rel = RootedRelativePath::parse(std::path::Path::new("tree")).unwrap();
@@ -2229,63 +2259,79 @@ pub(crate) mod tests_publish {
         fn is_local(&self) -> bool {
             true
         }
-        fn provision_layout(&self) -> Result<()> {
+        fn provision_layout(&self) -> SubstrateResult<()> {
             crate::remote::transport::provision_receiver_marker(self)?;
             Ok(())
         }
-        fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
+        fn read(&self, rel: &RootedRelativePath) -> SubstrateResult<Vec<u8>> {
             self.inner.read(rel)
         }
-        fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
+        fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> SubstrateResult<()> {
             self.written
                 .lock()
                 .unwrap()
                 .push(rel.as_path().to_string_lossy().into_owned());
             self.inner.write(rel, data, mode)
         }
-        fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict> {
+        fn try_write_new(
+            &self,
+            rel: &RootedRelativePath,
+            data: &[u8],
+        ) -> SubstrateResult<CreateNewVerdict> {
             self.inner.try_write_new(rel, data)
         }
-        fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
+        fn create_dir(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
             self.inner.create_dir(rel)
         }
-        fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+        fn create_dir_all(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
             self.inner.create_dir_all(rel)
         }
-        fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
+        fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> SubstrateResult<()> {
             self.inner.set_mode(rel, mode)
         }
-        fn list(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>> {
+        fn list(&self, rel: &RootedRelativePath) -> SubstrateResult<Vec<RemoteEntry>> {
             self.inner.list(rel)
         }
-        fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
+        fn rename(
+            &self,
+            from: &RootedRelativePath,
+            to: &RootedRelativePath,
+        ) -> SubstrateResult<()> {
             self.inner.rename(from, to)
         }
-        fn symlink(&self, target: &std::path::Path, link: &RootedRelativePath) -> Result<()> {
+        fn symlink(
+            &self,
+            target: &std::path::Path,
+            link: &RootedRelativePath,
+        ) -> SubstrateResult<()> {
             self.inner.symlink(target, link)
         }
-        fn read_link(&self, rel: &RootedRelativePath) -> Result<std::path::PathBuf> {
+        fn read_link(&self, rel: &RootedRelativePath) -> SubstrateResult<std::path::PathBuf> {
             self.inner.read_link(rel)
         }
-        fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
+        fn remove_file(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
             self.inner.remove_file(rel)
         }
-        fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+        fn remove_dir_all(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
             self.inner.remove_dir_all(rel)
         }
         fn exists(&self, rel: &RootedRelativePath) -> bool {
             self.inner.exists(rel)
         }
-        fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta> {
+        fn metadata(&self, rel: &RootedRelativePath) -> SubstrateResult<RemoteMeta> {
             self.inner.metadata(rel)
         }
-        fn copy_tree(&self, src: &RootedRelativePath, dest: &RootedRelativePath) -> Result<()> {
+        fn copy_tree(
+            &self,
+            src: &RootedRelativePath,
+            dest: &RootedRelativePath,
+        ) -> SubstrateResult<()> {
             self.inner.copy_tree(src, dest)
         }
-        fn exec(&self, argv: &[String], timeout: Duration) -> Result<ExecOutcome> {
+        fn exec(&self, argv: &[String], timeout: Duration) -> SubstrateResult<ExecOutcome> {
             self.inner.exec(argv, timeout)
         }
-        fn filesystem_bytes(&self) -> Result<FsBytes> {
+        fn filesystem_bytes(&self) -> SubstrateResult<FsBytes> {
             self.inner.filesystem_bytes()
         }
     }

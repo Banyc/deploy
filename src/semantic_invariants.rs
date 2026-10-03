@@ -106,6 +106,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use storekit::error::{Error as SubstrateError, Result as SubstrateResult};
 
 // ---------------------------------------------------------------------------
 // Fixture project
@@ -420,25 +421,29 @@ impl Remote for FailOnceRemote {
     fn is_local(&self) -> bool {
         true
     }
-    fn provision_layout(&self) -> Result<()> {
+    fn provision_layout(&self) -> SubstrateResult<()> {
         crate::remote::transport::provision_receiver_marker(self)?;
         Ok(())
     }
-    fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
+    fn read(&self, rel: &RootedRelativePath) -> SubstrateResult<Vec<u8>> {
         self.inner.read(rel)
     }
-    fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
+    fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> SubstrateResult<()> {
         if self.should_fail(rel) {
-            return Err(crate::error::Error::transport(format!(
+            return Err(SubstrateError::transport(format!(
                 "injected write failure at {}",
                 rel.display()
             )));
         }
         self.inner.write(rel, data, mode)
     }
-    fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict> {
+    fn try_write_new(
+        &self,
+        rel: &RootedRelativePath,
+        data: &[u8],
+    ) -> SubstrateResult<CreateNewVerdict> {
         if self.should_fail(rel) {
-            return Err(crate::error::Error::transport(format!(
+            return Err(SubstrateError::transport(format!(
                 "injected write failure at {}",
                 rel.display()
             )));
@@ -452,49 +457,49 @@ impl Remote for FailOnceRemote {
         }
         self.inner.try_write_new(rel, data)
     }
-    fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
+    fn create_dir(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
         self.inner.create_dir(rel)
     }
-    fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+    fn create_dir_all(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
         self.inner.create_dir_all(rel)
     }
-    fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
+    fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> SubstrateResult<()> {
         self.inner.set_mode(rel, mode)
     }
-    fn list(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>> {
+    fn list(&self, rel: &RootedRelativePath) -> SubstrateResult<Vec<RemoteEntry>> {
         self.inner.list(rel)
     }
-    fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
+    fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> SubstrateResult<()> {
         self.inner.rename(from, to)
     }
-    fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
+    fn symlink(&self, target: &Path, link: &RootedRelativePath) -> SubstrateResult<()> {
         self.inner.symlink(target, link)
     }
-    fn read_link(&self, rel: &RootedRelativePath) -> Result<PathBuf> {
+    fn read_link(&self, rel: &RootedRelativePath) -> SubstrateResult<PathBuf> {
         if self.should_fail_status_read(rel) {
-            return Err(crate::error::Error::transport(format!(
+            return Err(SubstrateError::transport(format!(
                 "injected pre-swap status read failure at {}",
                 rel.display()
             )));
         }
         self.inner.read_link(rel)
     }
-    fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
+    fn remove_file(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
         self.inner.remove_file(rel)
     }
-    fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+    fn remove_dir_all(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
         self.inner.remove_dir_all(rel)
     }
     fn exists(&self, rel: &RootedRelativePath) -> bool {
         self.inner.exists(rel)
     }
-    fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta> {
+    fn metadata(&self, rel: &RootedRelativePath) -> SubstrateResult<RemoteMeta> {
         self.inner.metadata(rel)
     }
-    fn exec(&self, argv: &[String], timeout: std::time::Duration) -> Result<ExecOutcome> {
+    fn exec(&self, argv: &[String], timeout: std::time::Duration) -> SubstrateResult<ExecOutcome> {
         self.inner.exec(argv, timeout)
     }
-    fn filesystem_bytes(&self) -> Result<FsBytes> {
+    fn filesystem_bytes(&self) -> SubstrateResult<FsBytes> {
         self.inner.filesystem_bytes()
     }
 }
@@ -7498,23 +7503,28 @@ impl Remote for CtrlFaultRemote {
     fn is_local(&self) -> bool {
         true
     }
-    fn provision_layout(&self) -> crate::error::Result<()> {
+    fn provision_layout(&self) -> crate::remote::transport::SubstrateResult<()> {
         crate::remote::transport::provision_receiver_marker(self)?;
         Ok(())
     }
-    fn read(&self, rel: &RootedRelativePath) -> crate::error::Result<Vec<u8>> {
+    fn read(&self, rel: &RootedRelativePath) -> crate::remote::transport::SubstrateResult<Vec<u8>> {
         if Self::hits_lock(rel) && self.faults.lock().unwrap().fail_read {
             self.faults.lock().unwrap().fail_read = false;
-            return Err(crate::error::Error::transport(
+            return Err(SubstrateError::transport(
                 "injected lock read failure".to_string(),
             ));
         }
         self.inner.read(rel)
     }
-    fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> crate::error::Result<()> {
+    fn write(
+        &self,
+        rel: &RootedRelativePath,
+        data: &[u8],
+        mode: u32,
+    ) -> crate::remote::transport::SubstrateResult<()> {
         if rel.as_path() == mutation_probe().as_path() && self.faults.lock().unwrap().fail_mutate {
             self.faults.lock().unwrap().fail_mutate = false;
-            return Err(crate::error::Error::transport(
+            return Err(SubstrateError::transport(
                 "injected mutation write failure".to_string(),
             ));
         }
@@ -7524,76 +7534,108 @@ impl Remote for CtrlFaultRemote {
         &self,
         rel: &RootedRelativePath,
         data: &[u8],
-    ) -> crate::error::Result<CreateNewVerdict> {
+    ) -> crate::remote::transport::SubstrateResult<CreateNewVerdict> {
         if Self::hits_lock(rel) && self.faults.lock().unwrap().fail_claim {
             self.faults.lock().unwrap().fail_claim = false;
-            return Err(crate::error::Error::transport(
+            return Err(SubstrateError::transport(
                 "injected lock claim failure".to_string(),
             ));
         }
         self.inner.try_write_new(rel, data)
     }
-    fn create_dir(&self, rel: &RootedRelativePath) -> crate::error::Result<()> {
+    fn create_dir(
+        &self,
+        rel: &RootedRelativePath,
+    ) -> crate::remote::transport::SubstrateResult<()> {
         self.inner.create_dir(rel)
     }
-    fn create_dir_all(&self, rel: &RootedRelativePath) -> crate::error::Result<()> {
+    fn create_dir_all(
+        &self,
+        rel: &RootedRelativePath,
+    ) -> crate::remote::transport::SubstrateResult<()> {
         self.inner.create_dir_all(rel)
     }
-    fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> crate::error::Result<()> {
+    fn set_mode(
+        &self,
+        rel: &RootedRelativePath,
+        mode: u32,
+    ) -> crate::remote::transport::SubstrateResult<()> {
         self.inner.set_mode(rel, mode)
     }
-    fn list(&self, rel: &RootedRelativePath) -> crate::error::Result<Vec<RemoteEntry>> {
+    fn list(
+        &self,
+        rel: &RootedRelativePath,
+    ) -> crate::remote::transport::SubstrateResult<Vec<RemoteEntry>> {
         self.inner.list(rel)
     }
     fn rename(
         &self,
         from: &RootedRelativePath,
         to: &RootedRelativePath,
-    ) -> crate::error::Result<()> {
+    ) -> crate::remote::transport::SubstrateResult<()> {
         self.inner.rename(from, to)
     }
-    fn symlink(&self, target: &Path, link: &RootedRelativePath) -> crate::error::Result<()> {
+    fn symlink(
+        &self,
+        target: &Path,
+        link: &RootedRelativePath,
+    ) -> crate::remote::transport::SubstrateResult<()> {
         self.inner.symlink(target, link)
     }
-    fn read_link(&self, rel: &RootedRelativePath) -> crate::error::Result<PathBuf> {
+    fn read_link(
+        &self,
+        rel: &RootedRelativePath,
+    ) -> crate::remote::transport::SubstrateResult<PathBuf> {
         self.inner.read_link(rel)
     }
-    fn remove_file(&self, rel: &RootedRelativePath) -> crate::error::Result<()> {
+    fn remove_file(
+        &self,
+        rel: &RootedRelativePath,
+    ) -> crate::remote::transport::SubstrateResult<()> {
         self.inner.remove_file(rel)
     }
     fn remove_file_if(
         &self,
         rel: &RootedRelativePath,
         expected: &[u8],
-    ) -> crate::error::Result<crate::remote::transport::RemoveIfVerdict> {
+    ) -> crate::remote::transport::SubstrateResult<crate::remote::transport::RemoveIfVerdict> {
         if Self::hits_lock(rel) && self.faults.lock().unwrap().fail_remove {
             self.faults.lock().unwrap().fail_remove = false;
-            return Err(crate::error::Error::transport(
+            return Err(SubstrateError::transport(
                 "injected lock remove failure".to_string(),
             ));
         }
         self.inner.remove_file_if(rel, expected)
     }
-    fn remove_dir_all(&self, rel: &RootedRelativePath) -> crate::error::Result<()> {
+    fn remove_dir_all(
+        &self,
+        rel: &RootedRelativePath,
+    ) -> crate::remote::transport::SubstrateResult<()> {
         self.inner.remove_dir_all(rel)
     }
     fn exists(&self, rel: &RootedRelativePath) -> bool {
         self.inner.exists(rel)
     }
-    fn metadata(&self, rel: &RootedRelativePath) -> crate::error::Result<RemoteMeta> {
+    fn metadata(
+        &self,
+        rel: &RootedRelativePath,
+    ) -> crate::remote::transport::SubstrateResult<RemoteMeta> {
         self.inner.metadata(rel)
     }
-    fn metadata_opt(&self, rel: &RootedRelativePath) -> crate::error::Result<Option<RemoteMeta>> {
+    fn metadata_opt(
+        &self,
+        rel: &RootedRelativePath,
+    ) -> crate::remote::transport::SubstrateResult<Option<RemoteMeta>> {
         self.inner.metadata_opt(rel)
     }
     fn exec(
         &self,
         argv: &[String],
         timeout: std::time::Duration,
-    ) -> crate::error::Result<ExecOutcome> {
+    ) -> crate::remote::transport::SubstrateResult<ExecOutcome> {
         self.inner.exec(argv, timeout)
     }
-    fn filesystem_bytes(&self) -> crate::error::Result<FsBytes> {
+    fn filesystem_bytes(&self) -> crate::remote::transport::SubstrateResult<FsBytes> {
         self.inner.filesystem_bytes()
     }
 }

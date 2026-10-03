@@ -3,9 +3,9 @@
 //! never trust-on-first-use.
 
 use crate::env::SysEnv;
-use crate::error::{Error, Result};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use storekit::error::{Error, Result};
 
 use super::runner::{OpKind, RunError, SSH_CONNECT_TIMEOUT_SECS, SshRunner};
 

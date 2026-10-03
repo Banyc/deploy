@@ -62,6 +62,7 @@ mod tests {
     use crate::remote::transport::{CreateNewVerdict, RootedRelativePath};
     use std::cell::RefCell;
     use std::path::{Path, PathBuf};
+    use storekit::error::Result as SubstrateResult;
 
     /// A remote whose `exec` records the argv it was handed (and reports
     /// success), so a test can assert the RENDERED command vector — without
@@ -88,51 +89,60 @@ mod tests {
         fn is_local(&self) -> bool {
             true
         }
-        fn provision_layout(&self) -> Result<()> {
+        fn provision_layout(&self) -> SubstrateResult<()> {
             crate::remote::transport::provision_receiver_marker(self)?;
             Ok(())
         }
-        fn read(&self, _rel: &RootedRelativePath) -> Result<Vec<u8>> {
+        fn read(&self, _rel: &RootedRelativePath) -> SubstrateResult<Vec<u8>> {
             unreachable!("not used by run_verification")
         }
-        fn write(&self, _rel: &RootedRelativePath, _data: &[u8], _mode: u32) -> Result<()> {
+        fn write(
+            &self,
+            _rel: &RootedRelativePath,
+            _data: &[u8],
+            _mode: u32,
+        ) -> SubstrateResult<()> {
             unreachable!("not used by run_verification")
         }
         fn try_write_new(
             &self,
             _rel: &RootedRelativePath,
             _data: &[u8],
-        ) -> Result<CreateNewVerdict> {
+        ) -> SubstrateResult<CreateNewVerdict> {
             unreachable!("not used by run_verification")
         }
-        fn create_dir(&self, _rel: &RootedRelativePath) -> Result<()> {
+        fn create_dir(&self, _rel: &RootedRelativePath) -> SubstrateResult<()> {
             unreachable!("not used by run_verification")
         }
-        fn create_dir_all(&self, _rel: &RootedRelativePath) -> Result<()> {
+        fn create_dir_all(&self, _rel: &RootedRelativePath) -> SubstrateResult<()> {
             unreachable!("not used by run_verification")
         }
-        fn set_mode(&self, _rel: &RootedRelativePath, _mode: u32) -> Result<()> {
+        fn set_mode(&self, _rel: &RootedRelativePath, _mode: u32) -> SubstrateResult<()> {
             unreachable!("not used by run_verification")
         }
         fn list(
             &self,
             _rel: &RootedRelativePath,
-        ) -> Result<Vec<crate::remote::transport::RemoteEntry>> {
+        ) -> SubstrateResult<Vec<crate::remote::transport::RemoteEntry>> {
             unreachable!("not used by run_verification")
         }
-        fn rename(&self, _from: &RootedRelativePath, _to: &RootedRelativePath) -> Result<()> {
+        fn rename(
+            &self,
+            _from: &RootedRelativePath,
+            _to: &RootedRelativePath,
+        ) -> SubstrateResult<()> {
             unreachable!("not used by run_verification")
         }
-        fn symlink(&self, _target: &Path, _link: &RootedRelativePath) -> Result<()> {
+        fn symlink(&self, _target: &Path, _link: &RootedRelativePath) -> SubstrateResult<()> {
             unreachable!("not used by run_verification")
         }
-        fn read_link(&self, _rel: &RootedRelativePath) -> Result<PathBuf> {
+        fn read_link(&self, _rel: &RootedRelativePath) -> SubstrateResult<PathBuf> {
             unreachable!("not used by run_verification")
         }
-        fn remove_file(&self, _rel: &RootedRelativePath) -> Result<()> {
+        fn remove_file(&self, _rel: &RootedRelativePath) -> SubstrateResult<()> {
             unreachable!("not used by run_verification")
         }
-        fn remove_dir_all(&self, _rel: &RootedRelativePath) -> Result<()> {
+        fn remove_dir_all(&self, _rel: &RootedRelativePath) -> SubstrateResult<()> {
             unreachable!("not used by run_verification")
         }
         fn exists(&self, _rel: &RootedRelativePath) -> bool {
@@ -141,22 +151,23 @@ mod tests {
         fn metadata(
             &self,
             _rel: &RootedRelativePath,
-        ) -> Result<crate::remote::transport::RemoteMeta> {
+        ) -> SubstrateResult<crate::remote::transport::RemoteMeta> {
             unreachable!("not used by run_verification")
         }
         fn exec(
             &self,
             argv: &[String],
             _timeout: Duration,
-        ) -> Result<crate::remote::transport::ExecOutcome> {
+        ) -> SubstrateResult<crate::remote::transport::ExecOutcome> {
             self.executed.borrow_mut().push(argv.to_vec());
             Ok(crate::remote::transport::ExecOutcome {
                 exit_code: 0,
                 stdout: String::new(),
                 stderr: String::new(),
+                timeout_cause: None,
             })
         }
-        fn filesystem_bytes(&self) -> Result<crate::remote::transport::FsBytes> {
+        fn filesystem_bytes(&self) -> SubstrateResult<crate::remote::transport::FsBytes> {
             unreachable!("not used by run_verification")
         }
     }

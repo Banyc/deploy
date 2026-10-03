@@ -328,7 +328,6 @@ impl SshRunner {
 #[cfg(test)]
 mod runner_property_tests {
     use super::*;
-    use crate::error::Error;
     use crate::remote::transport::Remote;
     use crate::remote::transport::SshTransport;
     #[cfg(test)]
@@ -783,7 +782,12 @@ mod runner_property_tests {
         Ok,
         Remote(std::process::Output),
         Err(String),
-        Exec(std::result::Result<crate::remote::transport::ExecOutcome, Error>),
+        Exec(
+            std::result::Result<
+                crate::remote::transport::ExecOutcome,
+                crate::remote::transport::SubstrateError,
+            >,
+        ),
     }
 
     /// A real ed25519 host key (never a hardcoded fake), generated once per

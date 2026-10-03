@@ -174,6 +174,7 @@ mod capacity_tests {
     };
     use crate::store::local::LocalStore;
     use std::path::{Path, PathBuf};
+    use storekit::error::Result as SubstrateResult;
 
     /// A transport wrapper that reports FIXED total and available filesystem
     /// bytes, letting a test control the headroom the capacity check sees
@@ -202,56 +203,68 @@ mod capacity_tests {
         fn is_local(&self) -> bool {
             true
         }
-        fn provision_layout(&self) -> Result<()> {
+        fn provision_layout(&self) -> SubstrateResult<()> {
             crate::remote::transport::provision_receiver_marker(self)?;
             Ok(())
         }
-        fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
+        fn read(&self, rel: &RootedRelativePath) -> SubstrateResult<Vec<u8>> {
             self.inner.read(rel)
         }
-        fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
+        fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> SubstrateResult<()> {
             self.inner.write(rel, data, mode)
         }
-        fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict> {
+        fn try_write_new(
+            &self,
+            rel: &RootedRelativePath,
+            data: &[u8],
+        ) -> SubstrateResult<CreateNewVerdict> {
             self.inner.try_write_new(rel, data)
         }
-        fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
+        fn create_dir(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
             self.inner.create_dir(rel)
         }
-        fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+        fn create_dir_all(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
             self.inner.create_dir_all(rel)
         }
-        fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
+        fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> SubstrateResult<()> {
             self.inner.set_mode(rel, mode)
         }
-        fn list(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>> {
+        fn list(&self, rel: &RootedRelativePath) -> SubstrateResult<Vec<RemoteEntry>> {
             self.inner.list(rel)
         }
-        fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
+        fn rename(
+            &self,
+            from: &RootedRelativePath,
+            to: &RootedRelativePath,
+        ) -> SubstrateResult<()> {
             self.inner.rename(from, to)
         }
-        fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
+        fn symlink(&self, target: &Path, link: &RootedRelativePath) -> SubstrateResult<()> {
             self.inner.symlink(target, link)
         }
-        fn read_link(&self, rel: &RootedRelativePath) -> Result<PathBuf> {
+        fn read_link(&self, rel: &RootedRelativePath) -> SubstrateResult<PathBuf> {
             self.inner.read_link(rel)
         }
-        fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
+        fn remove_file(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
             self.inner.remove_file(rel)
         }
-        fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+        fn remove_dir_all(&self, rel: &RootedRelativePath) -> SubstrateResult<()> {
             self.inner.remove_dir_all(rel)
         }
         fn exists(&self, rel: &RootedRelativePath) -> bool {
             self.inner.exists(rel)
         }
-        fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta> {
+        fn metadata(&self, rel: &RootedRelativePath) -> SubstrateResult<RemoteMeta> {
             self.inner.metadata(rel)
         }
-        fn exec(&self, argv: &[String], timeout: std::time::Duration) -> Result<ExecOutcome> {
+        fn exec(
+            &self,
+            argv: &[String],
+            timeout: std::time::Duration,
+        ) -> SubstrateResult<ExecOutcome> {
             self.inner.exec(argv, timeout)
         }
-        fn filesystem_bytes(&self) -> Result<FsBytes> {
+        fn filesystem_bytes(&self) -> SubstrateResult<FsBytes> {
             Ok(FsBytes {
                 total: self.total,
                 available: self.avail,

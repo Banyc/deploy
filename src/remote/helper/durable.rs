@@ -21,7 +21,6 @@
 //! consume it; the operation then runs exactly once and the remote is
 //! re-opened and inspected.
 
-use crate::error::{Error, Result};
 use crate::identity::{
     ArtifactRef, TargetName, VariantName, test_deployment_id, test_generation_id,
     test_operation_id, test_release_id, test_tree_digest,
@@ -38,6 +37,7 @@ use crate::remote::transport::{
 use proptest::prelude::*;
 use proptest::test_runner::RngSeed;
 use std::path::Path;
+use storekit::error::{Error, Result};
 
 /// The durability boundary to fault: each write, each fsync, each rename,
 /// each parent-fsync — plus the symlink-swap's stage step (a symlink has no
@@ -114,7 +114,7 @@ impl Remote for DurableFaultRemote {
     }
     fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
         if self.consume(DurableFault::Write) {
-            return Err(Error::remote(
+            return Err(Error::transport(
                 "DurableFaultRemote: write forced to fail (once)",
             ));
         }
@@ -137,7 +137,7 @@ impl Remote for DurableFaultRemote {
     }
     fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
         if self.consume(DurableFault::Rename) {
-            return Err(Error::remote(
+            return Err(Error::transport(
                 "DurableFaultRemote: rename forced to fail (once)",
             ));
         }
@@ -145,7 +145,7 @@ impl Remote for DurableFaultRemote {
     }
     fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
         if self.consume(DurableFault::Symlink) {
-            return Err(Error::remote(
+            return Err(Error::transport(
                 "DurableFaultRemote: symlink forced to fail (once)",
             ));
         }
@@ -162,7 +162,7 @@ impl Remote for DurableFaultRemote {
     }
     fn fsync_tree(&self, rel: &RootedRelativePath) -> Result<()> {
         if self.consume(DurableFault::Fsync) {
-            return Err(Error::remote(
+            return Err(Error::transport(
                 "DurableFaultRemote: fsync forced to fail (once)",
             ));
         }
@@ -170,7 +170,7 @@ impl Remote for DurableFaultRemote {
     }
     fn fsync_parent(&self, rel: &RootedRelativePath) -> Result<()> {
         if self.consume(DurableFault::ParentFsync) {
-            return Err(Error::remote(
+            return Err(Error::transport(
                 "DurableFaultRemote: parent fsync forced to fail (once)",
             ));
         }

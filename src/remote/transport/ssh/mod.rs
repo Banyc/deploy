@@ -18,9 +18,9 @@ mod hostkey;
 mod runner;
 
 use crate::env::SysEnv;
-use crate::error::{Error, Result};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use storekit::error::{Error, Result};
 
 use super::{
     ContentEquivalence, CreateNewVerdict, FsBytes, IMMUTABLE_RECORD_MODE, OpenedEntry,
@@ -1635,6 +1635,7 @@ impl Remote for SshTransport {
                 exit_code: out.status.code().unwrap_or(-1),
                 stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
                 stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+                timeout_cause: None,
             }),
             Err(RunError::Spawn(m)) => Err(Error::transport(m)),
             Err(RunError::StdinWrite(m)) => Err(Error::transport(m)),
@@ -1643,6 +1644,10 @@ impl Remote for SshTransport {
                 exit_code: -1,
                 stdout: String::new(),
                 stderr: format!("timed out after {after:?}"),
+                // The ssh runner emits `Timeout` only when the deadline fired
+                // while the child was still running (it has no post-exit
+                // drain), so the cause is unambiguous.
+                timeout_cause: Some(crate::remote::transport::TimeoutCause::CommandStillRunning),
             }),
         }
     }

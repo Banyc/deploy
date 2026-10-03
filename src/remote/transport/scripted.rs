@@ -7,11 +7,11 @@
 //! real processes — the property suites stay parallel-safe, deterministic,
 //! and fast even under the in-process (`cargo test --lib`) harness.
 
-use crate::error::{Error, Result};
 use crate::remote::transport::{Exec, ExecOutcome};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::time::Duration;
+use storekit::error::{Error, Result};
 
 /// One scripted exec outcome (what a real command would have reported).
 #[derive(Clone, Debug)]
@@ -111,6 +111,7 @@ impl Exec for ScriptedExec {
             exit_code: out.exit_code,
             stdout: out.stdout.clone(),
             stderr: out.stderr.clone(),
+            timeout_cause: None,
         })
     }
 }
