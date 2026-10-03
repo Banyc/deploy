@@ -293,7 +293,7 @@ pub fn receiver_uuid() -> RootedRelativePath {
 /// the legacy [`receiver_uuid`] marker: exactly 40 lowercase hex characters
 /// followed by a newline — the form `storekit`'s `Layout::receiver_marker`
 /// reads and validates. It is written ONCE by the legacy-marker ADOPTION
-/// ([`crate::remote::transport::adopt_receiver_marker`]), which derives it
+/// ([`crate::remote::transport::receiver_marker::adopt_receiver_marker`]), which derives it
 /// from the legacy receiver UUID; the legacy file is never modified, so the
 /// deploy_dir's old identity survives and the adoption is reversible.
 ///

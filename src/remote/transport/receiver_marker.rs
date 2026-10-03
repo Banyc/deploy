@@ -177,6 +177,114 @@ pub(crate) fn adopt_receiver_marker<R: Remote + ?Sized>(
     }
 }
 
+/// Read the deploy_dir's IMMUTABLE receiver-UUID marker
+/// ([`crate::remote::layout::receiver_uuid`]) and parse it. Fails closed on
+/// a MISSING marker (the deploy_dir was never provisioned, or was
+/// provisioned before the receiver-UUID feature) and on a MALFORMED marker
+/// (a tampered/foreign marker is never accepted as a physical identity).
+pub(crate) fn read_receiver_uuid<R: Remote + ?Sized>(remote: &R) -> Result<ReceiverUuid> {
+    read_receiver_uuid_opt(remote)?.ok_or_else(|| {
+        Error::transport(format!(
+            "deploy_dir {}: no receiver-UUID marker (the deploy_dir was never provisioned, or was provisioned before the receiver-UUID feature)",
+            remote.root().display()
+        ))
+    })
+}
+
+/// READ-ONLY twin of [`read_receiver_uuid_opt`]: read and validate the
+/// deploy_dir's receiver identity WITHOUT adopting a legacy marker. Returns
+/// `Ok(None)` ONLY for a CONFIRMED absent marker; a read failure or a marker
+/// (legacy OR crate-format) that cannot be parsed is an `Err` (fail closed).
+///
+/// This is the read a DRY RUN uses: a dry run touches nothing, so it must not
+/// write the crate-format marker either.
+pub(crate) fn peek_receiver_uuid_opt<R: Remote + ?Sized>(
+    remote: &R,
+) -> Result<Option<ReceiverUuid>> {
+    let marker = layout::receiver_uuid();
+    if remote.metadata_opt(&marker)?.is_none() {
+        // No legacy identity in `deploy`'s terms (the deploy_dir was never
+        // provisioned). A crate-format marker that IS present must still
+        // VALIDATE: a corrupt one is refused here, never ignored, and an
+        // absent one is a confirmed absence.
+        read_receiver_id_opt(remote)?;
+        return Ok(None);
+    }
+    let data = remote.read(&marker)?;
+    let s = std::str::from_utf8(&data).map_err(|e| {
+        Error::transport(format!(
+            "deploy_dir {}: the receiver-UUID marker is not valid UTF-8: {e}",
+            remote.root().display()
+        ))
+    })?;
+    let uuid = ReceiverUuid::parse(s.trim()).map_err(|e| {
+        Error::transport(format!(
+            "deploy_dir {}: the receiver-UUID marker is malformed: {e}",
+            remote.root().display()
+        ))
+    })?;
+    // A crate-format marker that is present must be well-formed even on the
+    // read-only path — a corrupt one is refused, never ignored.
+    read_receiver_id_opt(remote)?;
+    Ok(Some(uuid))
+}
+
+/// Read the deploy_dir's receiver-UUID marker, returning `Ok(None)` ONLY for
+/// a CONFIRMED absent marker (a not-yet-provisioned deploy_dir — the marker
+/// is created by [`provision_receiver_uuid`] during provisioning). A read
+/// failure or a malformed marker is an `Err` (fail closed — a marker that
+/// exists but cannot be parsed is never silently treated as absent).
+///
+/// ADOPT-ON-READ: when the deploy_dir carries the LEGACY `recv-<uuid-v7>`
+/// marker but no crate-format marker BESIDE it, this read also writes the
+/// crate-format receiver id derived from that legacy identity (see
+/// [`adopt_receiver_marker`]), so an already-provisioned deploy_dir becomes
+/// acceptable to the store substrate the next time it is read. The write is
+/// idempotent and NEVER touches the legacy marker. A crate-format marker that
+/// is present but malformed is refused, exactly as the crate refuses it.
+/// Because this WRITES, a dry run uses [`peek_receiver_uuid_opt`] instead.
+pub(crate) fn read_receiver_uuid_opt<R: Remote + ?Sized>(
+    remote: &R,
+) -> Result<Option<ReceiverUuid>> {
+    let uuid = peek_receiver_uuid_opt(remote)?;
+    if let Some(uuid) = &uuid {
+        adopt_receiver_marker(remote, uuid)?;
+    }
+    Ok(uuid)
+}
+
+/// Provision the deploy_dir's IMMUTABLE receiver-UUID marker: create it ONCE
+/// (a fresh [`ReceiverUuid`]) and return the deploy_dir's physical identity.
+/// The marker is never replaced: a re-provisioning or a concurrent
+/// provisioner adopts the EXISTING marker (the first writer wins — the
+/// deploy_dir's physical identity is whatever was created first), and a
+/// marker with different content is adopted too (fail closed on a malformed
+/// marker, never on a differing-but-valid one: the physical identity is
+/// immutable, so the existing marker is the truth).
+pub(crate) fn provision_receiver_uuid<R: Remote + ?Sized>(remote: &R) -> Result<ReceiverUuid> {
+    let marker = layout::receiver_uuid();
+    // Fast path: the deploy_dir already carries its immutable identity.
+    if remote.metadata_opt(&marker)?.is_some() {
+        return read_receiver_uuid(remote);
+    }
+    let uuid = ReceiverUuid::generate();
+    match remote.try_write_new(&marker, uuid.as_str().as_bytes())? {
+        CreateNewVerdict::Created => {
+            // A FRESHLY provisioned deploy_dir also gains the crate-format
+            // marker derived from the identity just created, so it is
+            // acceptable to the store substrate without a second read.
+            adopt_receiver_marker(remote, &uuid)?;
+            Ok(uuid)
+        }
+        // A concurrent provisioner won the create-new race (or the marker
+        // exists with different content): the deploy_dir's identity is
+        // whatever was created FIRST — adopt it, never replace it.
+        CreateNewVerdict::AlreadyPresent | CreateNewVerdict::Conflict(_) => {
+            read_receiver_uuid(remote)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,5 +563,57 @@ mod tests {
             .unwrap();
         adopt_receiver_marker(&t, &legacy)
             .expect_err("a malformed marker is refused, not repaired");
+    }
+
+    /// THE MARKER-ORDERING RESOLUTION, pinned from `deploy`'s side: a
+    /// LEGACY-ONLY deploy_dir must keep its DERIVED identity, never the fresh
+    /// random id the crate's `provision_receiver_id` generates when it finds
+    /// no crate marker. Provisioning such a directory runs `deploy`'s
+    /// adopt-on-read FIRST, so `receiver-id` is EXACTLY
+    /// `derive_receiver_id(legacy)` — not merely "some 40 hex characters".
+    ///
+    /// The resolution the eventual `LocalTransport` swap must preserve: pass
+    /// `Layout::receiver_marker: None` so the crate leaves the marker alone
+    /// and `deploy` owns it (cost: the crate performs no receiver-marker
+    /// provisioning for a deploy_dir, so `deploy`'s adoption remains the only
+    /// writer — which it already is).
+    #[test]
+    fn provisioning_a_legacy_only_dir_keeps_the_derived_id_not_a_random_one() {
+        let (dir, t) = fixture();
+        let root = dir.path().join("deploy-dir");
+        let legacy = provision_legacy_only(&t, &root);
+        let expected = derive_receiver_id(&legacy);
+        assert!(
+            !root.join("receiver-id").exists(),
+            "the fixture carries only the legacy marker (non-vacuous)"
+        );
+
+        // Provisioning through `deploy`'s writer takes the fast path: the
+        // existing legacy identity is read (and adopted), never regenerated.
+        let recovered = crate::remote::transport::provision_receiver_uuid(&t).unwrap();
+        assert_eq!(
+            recovered, legacy,
+            "the deploy_dir's identity is the legacy UUID it already had"
+        );
+
+        let marker = std::fs::read(root.join("receiver-id"))
+            .expect("provisioning a legacy-only dir adopts a crate-format marker");
+        assert_eq!(
+            marker,
+            expected.wire_bytes(),
+            "the crate marker must be the DERIVED id, never a fresh random one"
+        );
+
+        // Idempotent: a second provisioning adopts the same identity and does
+        // not rewrite the marker.
+        let meta_before = std::fs::metadata(root.join("receiver-id")).unwrap();
+        let again = crate::remote::transport::provision_receiver_uuid(&t).unwrap();
+        let meta_after = std::fs::metadata(root.join("receiver-id")).unwrap();
+        assert_eq!(again, legacy);
+        assert_eq!(
+            meta_before.ino(),
+            meta_after.ino(),
+            "a second provisioning must not rewrite the derived marker"
+        );
     }
 }

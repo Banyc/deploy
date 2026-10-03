@@ -32,7 +32,17 @@ mod runner;
 pub(crate) mod scripted;
 mod ssh;
 
-pub(crate) use receiver_marker::adopt_receiver_marker;
+// `deploy`'s LEGACY receiver-identity reads and the provisioning writer are
+// DOMAIN code (they parse and create `recv-<uuid-v7>`, which the crate
+// deliberately does not know — see the [`receiver_marker`] module), so they
+// live there with the crate-format adoption path they drive. Re-exported here
+// so every existing cross-module spelling
+// (`crate::remote::transport::{read_receiver_uuid_opt, peek_receiver_uuid_opt,
+// provision_receiver_uuid}`) keeps resolving; `read_receiver_uuid` and the
+// adoption writer are reached through the module itself.
+pub(crate) use receiver_marker::{
+    peek_receiver_uuid_opt, provision_receiver_uuid, read_receiver_uuid_opt,
+};
 // The validated root-relative path is now the crate's type — the ONE spelling
 // authority for a root-relative path. `deploy`'s own `rooted` module (266
 // lines, the source `storekit::relpath` was extracted from) is deleted: its
@@ -421,119 +431,6 @@ fn copy_tree_recursive<R: Remote + ?Sized>(
         }
     }
     Ok(())
-}
-
-/// Read the deploy_dir's IMMUTABLE receiver-UUID marker
-/// ([`crate::remote::layout::receiver_uuid`]) and parse it. Fails closed on
-/// a MISSING marker (the deploy_dir was never provisioned, or was
-/// provisioned before the receiver-UUID feature) and on a MALFORMED marker
-/// (a tampered/foreign marker is never accepted as a physical identity).
-pub(crate) fn read_receiver_uuid<R: Remote + ?Sized>(
-    remote: &R,
-) -> Result<crate::identity::ReceiverUuid> {
-    read_receiver_uuid_opt(remote)?.ok_or_else(|| {
-        Error::transport(format!(
-            "deploy_dir {}: no receiver-UUID marker (the deploy_dir was never provisioned, or was provisioned before the receiver-UUID feature)",
-            remote.root().display()
-        ))
-    })
-}
-
-/// READ-ONLY twin of [`read_receiver_uuid_opt`]: read and validate the
-/// deploy_dir's receiver identity WITHOUT adopting a legacy marker. Returns
-/// `Ok(None)` ONLY for a CONFIRMED absent marker; a read failure or a marker
-/// (legacy OR crate-format) that cannot be parsed is an `Err` (fail closed).
-///
-/// This is the read a DRY RUN uses: a dry run touches nothing, so it must not
-/// write the crate-format marker either.
-pub(crate) fn peek_receiver_uuid_opt<R: Remote + ?Sized>(
-    remote: &R,
-) -> Result<Option<crate::identity::ReceiverUuid>> {
-    let marker = crate::remote::layout::receiver_uuid();
-    if remote.metadata_opt(&marker)?.is_none() {
-        // No legacy identity in `deploy`'s terms (the deploy_dir was never
-        // provisioned). A crate-format marker that IS present must still
-        // VALIDATE: a corrupt one is refused here, never ignored, and an
-        // absent one is a confirmed absence.
-        receiver_marker::read_receiver_id_opt(remote)?;
-        return Ok(None);
-    }
-    let data = remote.read(&marker)?;
-    let s = std::str::from_utf8(&data).map_err(|e| {
-        Error::transport(format!(
-            "deploy_dir {}: the receiver-UUID marker is not valid UTF-8: {e}",
-            remote.root().display()
-        ))
-    })?;
-    let uuid = crate::identity::ReceiverUuid::parse(s.trim()).map_err(|e| {
-        Error::transport(format!(
-            "deploy_dir {}: the receiver-UUID marker is malformed: {e}",
-            remote.root().display()
-        ))
-    })?;
-    // A crate-format marker that is present must be well-formed even on the
-    // read-only path — a corrupt one is refused, never ignored.
-    receiver_marker::read_receiver_id_opt(remote)?;
-    Ok(Some(uuid))
-}
-
-/// Read the deploy_dir's receiver-UUID marker, returning `Ok(None)` ONLY for
-/// a CONFIRMED absent marker (a not-yet-provisioned deploy_dir — the marker
-/// is created by [`provision_receiver_uuid`] during provisioning). A read
-/// failure or a malformed marker is an `Err` (fail closed — a marker that
-/// exists but cannot be parsed is never silently treated as absent).
-///
-/// ADOPT-ON-READ: when the deploy_dir carries the LEGACY `recv-<uuid-v7>`
-/// marker but no crate-format marker BESIDE it, this read also writes the
-/// crate-format receiver id derived from that legacy identity (see
-/// [`receiver_marker::adopt_receiver_marker`]), so an already-provisioned
-/// deploy_dir becomes acceptable to the store substrate the next time it is
-/// read. The write is idempotent and NEVER touches the legacy marker. A
-/// crate-format marker that is present but malformed is refused, exactly as
-/// the crate refuses it. Because this WRITES, a dry run uses
-/// [`peek_receiver_uuid_opt`] instead.
-pub(crate) fn read_receiver_uuid_opt<R: Remote + ?Sized>(
-    remote: &R,
-) -> Result<Option<crate::identity::ReceiverUuid>> {
-    let uuid = peek_receiver_uuid_opt(remote)?;
-    if let Some(uuid) = &uuid {
-        adopt_receiver_marker(remote, uuid)?;
-    }
-    Ok(uuid)
-}
-
-/// Provision the deploy_dir's IMMUTABLE receiver-UUID marker: create it ONCE
-/// (a fresh [`crate::identity::ReceiverUuid`]) and return the deploy_dir's
-/// physical identity. The marker is never replaced: a re-provisioning or a
-/// concurrent provisioner adopts the EXISTING marker (the first writer wins —
-/// the deploy_dir's physical identity is whatever was created first), and a
-/// marker with different content is adopted too (fail closed on a malformed
-/// marker, never on a differing-but-valid one: the physical identity is
-/// immutable, so the existing marker is the truth).
-pub(crate) fn provision_receiver_uuid<R: Remote + ?Sized>(
-    remote: &R,
-) -> Result<crate::identity::ReceiverUuid> {
-    let marker = crate::remote::layout::receiver_uuid();
-    // Fast path: the deploy_dir already carries its immutable identity.
-    if remote.metadata_opt(&marker)?.is_some() {
-        return read_receiver_uuid(remote);
-    }
-    let uuid = crate::identity::ReceiverUuid::generate();
-    match remote.try_write_new(&marker, uuid.as_str().as_bytes())? {
-        CreateNewVerdict::Created => {
-            // A FRESHLY provisioned deploy_dir also gains the crate-format
-            // marker derived from the identity just created, so it is
-            // acceptable to the store substrate without a second read.
-            adopt_receiver_marker(remote, &uuid)?;
-            Ok(uuid)
-        }
-        // A concurrent provisioner won the create-new race (or the marker
-        // exists with different content): the deploy_dir's identity is
-        // whatever was created FIRST — adopt it, never replace it.
-        CreateNewVerdict::AlreadyPresent | CreateNewVerdict::Conflict(_) => {
-            read_receiver_uuid(remote)
-        }
-    }
 }
 
 /// True when `p` has at least one NORMAL path component below the root —
@@ -1739,7 +1636,7 @@ mod tests {
             t.exists(&marker),
             "provisioning creates the receiver-UUID marker"
         );
-        let first = read_receiver_uuid(&t).expect("the marker reads back");
+        let first = receiver_marker::read_receiver_uuid(&t).expect("the marker reads back");
         assert!(
             first.as_str().starts_with("recv-"),
             "the marker carries a receiver UUID, got {:?}",
@@ -1748,7 +1645,7 @@ mod tests {
         // Re-provisioning (a second push to the same deploy_dir) adopts the
         // SAME immutable identity — never a new one.
         t.provision_layout().unwrap();
-        let second = read_receiver_uuid(&t).expect("the marker reads back");
+        let second = receiver_marker::read_receiver_uuid(&t).expect("the marker reads back");
         assert_eq!(
             first, second,
             "the receiver UUID is IMMUTABLE: re-provisioning adopts the existing marker"
@@ -1763,14 +1660,14 @@ mod tests {
             .unwrap();
         t2.provision_layout().unwrap();
         assert_eq!(
-            read_receiver_uuid(&t2).expect("the existing marker is adopted"),
+            receiver_marker::read_receiver_uuid(&t2).expect("the existing marker is adopted"),
             foreign,
             "a re-provisioning never replaces the existing marker"
         );
         let t3 = LocalTransport::new(&SysEnv::from_process(), dir.path().join("r3")).unwrap();
         t3.provision_layout().unwrap();
         t3.write(&marker, b"not-a-uuid", 0o644).unwrap();
-        read_receiver_uuid(&t3).expect_err("a malformed marker fails closed");
+        receiver_marker::read_receiver_uuid(&t3).expect_err("a malformed marker fails closed");
     }
 
     /// Concurrent readers must only ever observe the destination file fully
