@@ -4,17 +4,8 @@
 //! short, long, uppercase, non-hex, or prefixed — is rejected at the domain
 //! boundary.
 
-use super::id_newtype;
-use crate::error::{Error, Result};
-use serde::{Deserialize, Serialize};
-use std::fmt;
-
-/// A valid sha256 digest: exactly 64 lowercase hex characters (the exact form
-/// [`crate::digest::sha256_bytes`] produces). Any other string — empty, short,
-/// long, uppercase, non-hex, or prefixed — is rejected.
-pub(crate) fn valid_hex_digest(s: &str) -> bool {
-    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-}
+use storekit::id::valid_hex_digest;
+use storekit::id_newtype;
 
 id_newtype!(
     ReleaseDigest,

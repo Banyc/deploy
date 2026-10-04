@@ -47,8 +47,3 @@ pub use id::*;
 pub use physical::*;
 pub use release_id::*;
 pub use scalars::*;
-
-// The `id_newtype!` macro is defined at the AREA root (it is the shared
-// identity-newtype contract); it is re-exported down through this group so
-// the id-family modules can `use super::id_newtype` unchanged.
-pub(crate) use super::id_newtype;

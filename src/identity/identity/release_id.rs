@@ -7,10 +7,11 @@
 //! an input convenience via [`crate::cli::parse_release_input`], which
 //! converts it to the full form BEFORE the domain parse.
 
-use super::id::digests::{ReleaseDigest, valid_hex_digest};
+use super::id::digests::ReleaseDigest;
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use storekit::id::valid_hex_digest;
 
 /// Release identifier: EXACTLY `rel-sha256-<64 lowercase hex>` — the canonical
 /// form [`ReleaseId::from_digest`] produces. The loose bare-digest and `rel-`

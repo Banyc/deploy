@@ -10,7 +10,7 @@ use crate::config::ProjectConfig;
 use crate::deploy::{PushOptions, PushReport, push};
 use crate::env::SysEnv;
 use crate::error::{Error, Result};
-use crate::identity::{AcquisitionId, DeploymentId, ReleaseId, SlotId, valid_hex_digest};
+use crate::identity::{AcquisitionId, DeploymentId, ReleaseId, SlotId};
 use crate::init::{InitOptions, init_project};
 use crate::ledger::{ObservedAssignment, ObservedTarget};
 // The `deploy log` RENDERING lives in [`crate::ledger::log`]; cli.rs stays the
@@ -23,6 +23,7 @@ use crate::remote::transport::Remote;
 use crate::store::local::LocalStore;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use storekit::id::valid_hex_digest;
 
 #[derive(Parser)]
 #[command(

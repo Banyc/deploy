@@ -1,7 +1,7 @@
 //! The SEGMENT identities: [`SlotId`], [`ServerId`], [`TargetName`],
 //! [`VariantName`] — a single safe path segment (non-empty, no path
 //! separators or traversal components, no surrounding whitespace or control
-//! characters), the shared segment rule from `crate::identity::scalars::valid_name`.
+//! characters), the shared segment rule from `storekit::id::valid_name`.
 //!
 //! [`SlotId`] is the DEPLOYMENT-LOCATION identity — the key of every
 //! slot→assignment relationship (plans, attempts, observed state, snapshots,
@@ -14,11 +14,8 @@
 //! a target, but the model keys assignments by [`SlotId`] and addresses
 //! transports by [`ServerId`].
 
-use super::id_newtype;
-use crate::error::{Error, Result};
-use crate::identity::scalars::valid_name;
-use serde::{Deserialize, Serialize};
-use std::fmt;
+use storekit::id::valid_name;
+use storekit::id_newtype;
 
 id_newtype!(
     ServerId,
@@ -71,8 +68,31 @@ mod tests {
             assert!(VariantName::parse(ok).is_ok(), "{ok:?}");
         }
         for bad in [
-            "", "   ", " x", "x ", "\u{0}", "a\nb", "a/b", "a\\b", ".", "..", "../x", "x/..", "α",
-            "x y", "-lead",
+            "",
+            "   ",
+            " x",
+            "x ",
+            "\u{0}",
+            "a\nb",
+            "a/b",
+            "a\\b",
+            ".",
+            "..",
+            "../x",
+            "x/..",
+            "α",
+            "x y",
+            "-lead",
+            // NAMED TIGHTENING: the crate's shared name rule (which these
+            // segment ids now use) additionally refuses a spelling that
+            // NAMES or can ALIAS the crate's own bookkeeping, and a name
+            // beyond the component bound. The prior charset-only rule took
+            // every one of these.
+            ".sync-aside.1",
+            "operation.lock",
+            ".dest.operation.lock",
+            ".dest.operation.lock.",
+            ".foo.tmp.1.0",
         ] {
             ServerId::parse(bad).expect_err("invalid server id rejected");
             SlotId::parse(bad).expect_err("invalid slot id rejected");
@@ -80,5 +100,11 @@ mod tests {
             RolloutGroupName::parse(bad).expect_err("invalid group name rejected");
             VariantName::parse(bad).expect_err("invalid variant name rejected");
         }
+        let oversized = "a".repeat(storekit::atomic::NAME_MAX + 1);
+        ServerId::parse(&oversized).expect_err("oversize server id rejected");
+        SlotId::parse(&oversized).expect_err("oversize slot id rejected");
+        TargetName::parse(&oversized).expect_err("oversize target name rejected");
+        RolloutGroupName::parse(&oversized).expect_err("oversize group name rejected");
+        VariantName::parse(&oversized).expect_err("oversize variant name rejected");
     }
 }

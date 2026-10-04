@@ -237,7 +237,9 @@ fn enumerate_dirs(root: &Path, kind: EntryKind) -> Result<Vec<EnumeratedEntry>> 
                     let name = entry.file_name().to_string_lossy().into_owned();
                     let parsed = match kind {
                         EntryKind::Release => ReleaseId::parse(&name).map(EnumeratedEntry::Release),
-                        EntryKind::Tree => TreeDigest::parse(&name).map(EnumeratedEntry::Tree),
+                        EntryKind::Tree => TreeDigest::parse(&name)
+                            .map_err(Error::from)
+                            .map(EnumeratedEntry::Tree),
                     };
                     out.push(parsed.unwrap_or(EnumeratedEntry::Other(name)));
                 }

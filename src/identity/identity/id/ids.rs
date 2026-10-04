@@ -7,10 +7,7 @@
 //! only), so a hand-written v4 UUID or any other malformed suffix is
 //! rejected.
 
-use super::id_newtype;
-use crate::error::{Error, Result};
-use serde::{Deserialize, Serialize};
-use std::fmt;
+use storekit::id_newtype;
 use uuid::Uuid;
 
 fn new_uuid_v7() -> String {
@@ -261,6 +258,48 @@ mod tests {
         serde_json::from_str::<TreeDigest>("\"t1\"").expect_err("short digest wire rejected");
     }
 
+    /// The macro's wire form is the transparent STRING form — a single JSON
+    /// string, byte-for-byte the `#[serde(transparent)]` form the pre-swap
+    /// copy produced. Pins the exact bytes and a round trip for one id of
+    /// each family (event id, digest, segment).
+    #[test]
+    fn domain_ids_serialize_as_transparent_strings() {
+        let dep = test_deployment_id("wire-pin");
+        let dep_wire = format!("\"{}\"", dep.as_str());
+        assert_eq!(
+            serde_json::to_string(&dep).expect("event id serializes"),
+            dep_wire,
+            "an event id is a single JSON string"
+        );
+        assert_eq!(
+            serde_json::from_str::<DeploymentId>(&dep_wire).expect("event id round-trips"),
+            dep
+        );
+
+        let digest = test_tree_digest("wire-pin");
+        let digest_wire = format!("\"{}\"", digest.as_str());
+        assert_eq!(
+            serde_json::to_string(&digest).expect("digest serializes"),
+            digest_wire,
+            "a digest is a single JSON string"
+        );
+        assert_eq!(
+            serde_json::from_str::<TreeDigest>(&digest_wire).expect("digest round-trips"),
+            digest
+        );
+
+        let slot = SlotId::parse("p1").expect("valid slot");
+        assert_eq!(
+            serde_json::to_string(&slot).expect("slot serializes"),
+            "\"p1\"",
+            "a segment id is a single JSON string"
+        );
+        assert_eq!(
+            serde_json::from_str::<SlotId>("\"p1\"").expect("slot round-trips"),
+            slot
+        );
+    }
+
     // -------------------------------------------------------------------
     // THE IDENTITY PROPERTY: over ARBITRARY strings (empty, whitespace,
     // separators, wrong prefixes, wrong hex, unicode, control characters),
@@ -293,11 +332,19 @@ mod tests {
         s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
     }
 
+    /// The independent characterization of the crate's shared name rule: a
+    /// safe single segment is non-empty, at most
+    /// [`storekit::atomic::NAME_MAX`] bytes, uses only `[a-zA-Z0-9._-]`, is
+    /// not a `.`/`..` traversal component, never starts with `-`, and is not
+    /// one of the crate's unaddressable bookkeeping spellings
+    /// ([`storekit::reserved::is_unaddressable_name`]).
     fn is_safe_segment(s: &str) -> bool {
         !s.is_empty()
+            && s.len() <= storekit::atomic::NAME_MAX
             && !s.starts_with('-')
             && s != "."
             && s != ".."
+            && !storekit::reserved::is_unaddressable_name(s)
             && s.bytes().all(|b| {
                 matches!(
                     b,
@@ -347,6 +394,13 @@ mod tests {
                 "\u{0}".to_string(),
                 "a\nb".to_string(),
                 "α".to_string(),
+                // The crate's unaddressable bookkeeping spellings: the prior
+                // charset-only rule accepted these, the shared rule refuses
+                // them (named tightening, pinned for every segment id type).
+                ".sync-aside.1".to_string(),
+                "operation.lock".to_string(),
+                ".dest.operation.lock".to_string(),
+                ".foo.tmp.1.0".to_string(),
             ]),
             prop::collection::vec(prop::char::any(), 0..48).prop_map(|v| v.into_iter().collect()),
         ]

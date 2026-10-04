@@ -663,7 +663,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     /// A valid name in the filesystem-safe ASCII grammar
-    /// ([`crate::identity::valid_name`]): `[a-zA-Z0-9._-]`+ (non-empty, not
+    /// ([`storekit::id::valid_name`]): `[a-zA-Z0-9._-]`+ (non-empty, not
     /// `.`/`..`, never a leading dash).
     fn valid_segment() -> impl Strategy<Value = String> {
         prop::collection::vec(
@@ -687,7 +687,7 @@ mod tests {
     /// legal in ids), and an unsuffixed component named `..` would make
     /// `slots/..` resolve to the STORE ROOT. THE TRAVERSAL CLASS IS NOW
     /// UNCONSTRUCTIBLE AT THE TYPE LEVEL: the identity grammar
-    /// ([`crate::identity::valid_name`]) rejects `.`/`..`/separators before a
+    /// ([`storekit::id::valid_name`]) rejects `.`/`..`/separators before a
     /// value of the id type can exist, and the validated-ID store paths
     /// store the name VERBATIM — so the `sanitize` confinement shown here
     /// applies only to RAW string entry points (`target_dir`,

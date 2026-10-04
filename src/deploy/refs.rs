@@ -488,7 +488,7 @@ fn deployment_form(input: &mut &str, token: &str) -> ModalResult<RefExpr, RefErr
         ))));
     }
     let dep = match id.strip_prefix("deploy-") {
-        Some(tail) if !tail.is_empty() => DeploymentId::parse(id),
+        Some(tail) if !tail.is_empty() => DeploymentId::parse(id).map_err(Error::from),
         _ => Err(Error::config("unrecognized reference id")),
     }
     .map_err(|_| {

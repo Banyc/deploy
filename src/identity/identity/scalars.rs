@@ -37,35 +37,13 @@ use jiff::Timestamp as JiffTimestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use storekit::id::valid_name;
 
 /// A valid 64-lowercase-hex sha256 digest, shared by test fixtures that need
 /// a well-formed behavior digest.
 #[cfg(test)]
 pub(crate) const DIGEST_TEST_HEX_1: &str =
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-
-/// The name rule shared by the identifier-like scalars AND the identity
-/// newtypes in [`crate::identity::segments`] (ServerId, SlotId, TargetName,
-/// VariantName): a SINGLE FILESYSTEM-SAFE ASCII path segment — non-empty,
-/// only `[a-zA-Z0-9._-]`, not a `.`/`..` traversal component, and never a
-/// leading dash. A name becomes a directory/file component UNCHANGED
-/// (the store stores validated names VERBATIM), so the rule must make the
-/// valid set INJECTIVE into the filesystem: every excluded class is exactly
-/// a class that could collide under an encoding or escape the forced
-/// namespace — separators (`/`, `\`) would nest, whitespace/control/unicode
-/// would have to be re-encoded (two distinct names collapsing onto one
-/// encoded name), `.`/`..` escape the namespace, and a leading dash invites
-/// option-parser confusion. No re-encoding is needed: the valid set is
-/// already filesystem-safe, so two distinct valid names ALWAYS map to two
-/// distinct path components.
-pub(crate) fn valid_name(s: &str) -> bool {
-    !s.is_empty()
-        && !s.starts_with('-')
-        && s != "."
-        && s != ".."
-        && s.bytes()
-            .all(|b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.'))
-}
 
 macro_rules! name_scalar {
     ($name:ident, $doc:expr, $rule:expr) => {
@@ -728,6 +706,50 @@ mod tests {
         }
     }
 
+    /// NAMED TIGHTENING (storekit migration): every name scalar is now built
+    /// on the crate's shared [`storekit::id::valid_name`], which additionally
+    /// refuses a name that NAMES or can ALIAS the crate's own bookkeeping
+    /// ([`storekit::reserved::is_unaddressable_name`]) or exceeds
+    /// [`storekit::atomic::NAME_MAX`]. deploy's prior charset-only rule
+    /// accepted every spelling below; each is refused after the swap, through
+    /// every construction path. `Host`/`SshUser` are included because they
+    /// share the rule even though they are not filesystem ids.
+    #[test]
+    fn name_scalars_refuse_unaddressable_and_oversize_names() {
+        let oversized = "a".repeat(storekit::atomic::NAME_MAX + 1);
+        for bad in [
+            ".sync-aside.1",
+            ".SYNC-ASIDE.1",
+            "operation.lock",
+            "OPERATION.LOCK",
+            ".dest.operation.lock",
+            ".dest.operation.lock.",
+            ".foo.tmp.1.0",
+            ".FOO.TMP.1.0",
+            oversized.as_str(),
+        ] {
+            Identifier::parse(bad).expect_err("unaddressable/oversize identifier refused");
+            RolloutGroupName::parse(bad).expect_err("unaddressable/oversize group refused");
+            ApplicationStoreKey::parse(bad).expect_err("unaddressable/oversize store key refused");
+            Host::parse(bad).expect_err("unaddressable/oversize host refused");
+            SshUser::parse(bad).expect_err("unaddressable/oversize ssh user refused");
+            // The refusal is also observable through the wire (fail closed).
+            let json = format!("{bad:?}");
+            serde_json::from_str::<Identifier>(&json)
+                .expect_err("unaddressable identifier wire refused");
+            serde_json::from_str::<ApplicationStoreKey>(&json)
+                .expect_err("unaddressable store key wire refused");
+        }
+        // The crate's public authority agrees with the shared rule.
+        for bad in [".sync-aside.1", "operation.lock", ".foo.tmp.1.0"] {
+            assert!(!storekit::id::valid_name(bad), "{bad:?}");
+            assert!(storekit::reserved::is_unaddressable_name(bad), "{bad:?}");
+        }
+        // A name AT the bound is still accepted (the bound is not off by one).
+        let at_max = "a".repeat(storekit::atomic::NAME_MAX);
+        Identifier::parse(&at_max).expect("a name at NAME_MAX is legal");
+    }
+
     #[test]
     fn behavior_digest_requires_64_lowercase_hex() {
         let d = BehaviorDigest::parse(DIGEST).expect("64 lowercase hex parses");
@@ -909,15 +931,23 @@ mod tests {
     // Bounded 16 cases, fixed seed 0x5EED_5EED per house style.
     // -------------------------------------------------------------------
 
-    /// The independent characterization of the name rule: a value is a safe
-    /// filesystem ASCII single path segment iff it is non-empty, uses only
-    /// `[a-zA-Z0-9._-]`, is not a `.`/`..` traversal component, and never
-    /// starts with `-` (a leading dash invites option-parser confusion).
+    /// The independent characterization of the shared name rule: a value is
+    /// a safe filesystem ASCII single path segment iff it is non-empty, at
+    /// most [`storekit::atomic::NAME_MAX`] bytes, uses only
+    /// `[a-zA-Z0-9._-]`, is not a `.`/`..` traversal component, never starts
+    /// with `-` (a leading dash invites option-parser confusion), and is not
+    /// one of the crate's own unaddressable bookkeeping spellings
+    /// ([`storekit::reserved::is_unaddressable_name`] — the reserved
+    /// spellings, their case aliases, the application lock record and its
+    /// trailing-dot fold, and the crate temp shapes), which the crate's
+    /// shared name rule refuses.
     fn is_safe_segment(s: &str) -> bool {
         !s.is_empty()
+            && s.len() <= storekit::atomic::NAME_MAX
             && !s.starts_with('-')
             && s != "."
             && s != ".."
+            && !storekit::reserved::is_unaddressable_name(s)
             && s.bytes().all(|b| {
                 matches!(
                     b,
@@ -957,6 +987,20 @@ mod tests {
                 "a..b".to_string(),
                 "a.b".to_string(),
                 "a_b-c.d9".to_string(),
+                // The crate's unaddressable spellings: their own bookkeeping
+                // names (byte-exact, case aliases, trailing-dot folds) and
+                // temp shapes. The prior charset-only rule accepted these;
+                // the shared rule refuses them (named tightening).
+                ".sync-aside.1".to_string(),
+                ".SYNC-ASIDE.1".to_string(),
+                "operation.lock".to_string(),
+                "OPERATION.LOCK".to_string(),
+                ".dest.operation.lock".to_string(),
+                ".dest.operation.lock.".to_string(),
+                ".foo.tmp.1.0".to_string(),
+                ".FOO.TMP.1.0".to_string(),
+                "a".repeat(storekit::atomic::NAME_MAX),
+                "a".repeat(storekit::atomic::NAME_MAX + 1),
             ]),
             prop::collection::vec(prop::char::any(), 0..12).prop_map(|v| v.into_iter().collect()),
         ]

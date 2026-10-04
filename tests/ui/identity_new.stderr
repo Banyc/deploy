@@ -4,11 +4,11 @@ error[E0599]: no associated function or constant named `new` found for struct `S
 12 |     let _bad = SlotId::new("..");
    |                        ^^^ associated function or constant not found in `SlotId`
    |
-note: if you're trying to build a new `SlotId`, consider using `SlotId::parse` which returns `Result<SlotId, deploy::error::Error>`
-  --> src/identity/mod.rs
+note: if you're trying to build a new `SlotId`, consider using `SlotId::parse` which returns `Result<SlotId, SubstrateError>`
+  --> $STOREKIT/src/id.rs
    |
-   |               pub fn parse(s: &str) -> Result<$name> {
-   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |               pub fn parse(s: &str) -> $crate::error::Result<$name> {
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
    |
   ::: src/identity/identity/id/segments.rs
    |

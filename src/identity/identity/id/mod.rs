@@ -22,5 +22,3 @@ pub mod segments;
 pub use digests::*;
 pub use ids::*;
 pub use segments::*;
-
-pub(crate) use super::id_newtype;
