@@ -109,7 +109,7 @@ impl From<storekit::Error> for Error {
             S::Integrity(message) => Error::Integrity(message),
             S::Store { message, .. } => Error::Store(message),
             S::Transport { message, .. } => Error::Transport(message),
-            S::Preflight(message) => Error::Preflight(message),
+            S::Preflight { message, .. } => Error::Preflight(message),
             S::NotFound(message) => Error::NotFound(message),
             S::Ref(message) => Error::Ref(message),
             S::Conflict(message) => Error::Conflict(message),
