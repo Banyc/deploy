@@ -127,6 +127,7 @@ pub fn create_remote(
                 address.as_str(),
                 port.get(),
                 deploy_dir,
+                crate::remote::layout::substrate_layout(),
                 known_hosts,
                 host_key_fingerprint,
                 &known_hosts_cache_dir,

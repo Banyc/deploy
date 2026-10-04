@@ -303,6 +303,40 @@ pub fn receiver_id() -> RootedRelativePath {
     layout_path("receiver-id")
 }
 
+/// THE ONE adapter from `deploy`'s rich, semantic layout to the substrate's
+/// [`storekit::transport::Layout`] the re-exported `SshTransport`
+/// (and the substrate `Remote::provision_layout` default) consumes.
+///
+/// Every field is derived HERE, once, so no call site hand-builds a substrate
+/// layout and the two layouts cannot drift field-by-field:
+///
+/// * `bootstrap_dirs` — [`bootstrap_dirs`], the same list the local transport
+///   provisions;
+/// * `lock` / `lock_sidecar` — [`operation_lock`] / [`operation_lock_sidecar`],
+///   the in-root operation lock and its flock mutex;
+/// * `receiver_marker` — **`None`**, DELIBERATELY. `deploy`'s physical
+///   identity is the LEGACY `recv-<uuid-v7>` marker
+///   ([`receiver_uuid`]) with a DERIVED crate-format sibling the adoption
+///   writes ([`receiver_id`]); `storekit`'s `provision_receiver_id` MINTS A
+///   RANDOM id when its marker is `None`/absent, so pointing
+///   `Layout::receiver_marker` at `receiver-id` would let the substrate
+///   create — or, worse, refuse — an identity that must be
+///   `deploy`'s to write. `deploy`'s adoption
+///   ([`crate::remote::transport::provision_receiver_uuid`] and
+///   `adopt_receiver_marker`) is therefore the ONLY writer of the crate-format
+///   marker, and the substrate is told to have no receiver identity at all.
+///   The non-regression is pinned by
+///   `provisioning_a_legacy_only_dir_keeps_the_derived_id_not_a_random_one` in
+///   [`crate::remote::transport::receiver_marker`].
+pub fn substrate_layout() -> storekit::transport::Layout {
+    storekit::transport::Layout {
+        bootstrap_dirs: bootstrap_dirs(),
+        lock: operation_lock(),
+        lock_sidecar: operation_lock_sidecar(),
+        receiver_marker: None,
+    }
+}
+
 /// Relative link target (from inside a generation directory) to that
 /// generation's tree object. `tree` is the TYPED tree identity. The target
 /// is relative to the LINK's directory (it legitimately traverses up to the
@@ -334,6 +368,32 @@ mod tests {
     };
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
+
+    /// THE ADAPTER is the ONE place the two layouts meet, and it deliberately
+    /// leaves the substrate WITHOUT a receiver marker: `deploy`'s physical
+    /// identity is the legacy `receiver-uuid` PLUS the derived `receiver-id`,
+    /// while the substrate's `provision_receiver_id` MINTS A RANDOM id when
+    /// its `Layout::receiver_marker` is `None`/absent. A `Some(...)` here would
+    /// let the substrate create an identity that must be `deploy`'s to write
+    /// (or refuse the legacy one), so the marker is pinned absent — this is the
+    /// mechanism by which `remote::transport::receiver_marker` stays the ONLY
+    /// reader/writer of either deploy marker: the substrate is never handed a
+    /// path at all. The other three fields are pinned to their canonical
+    /// deploy paths so a future edit cannot drift the two layouts apart
+    /// field-by-field.
+    #[test]
+    fn substrate_layout_leaves_the_receiver_marker_to_deploy() {
+        let l = substrate_layout();
+        assert!(
+            l.receiver_marker.is_none(),
+            "the substrate layout must carry NO receiver marker: deploy's adoption is the only \
+             writer of receiver-uuid/receiver-id, and a `Some(...)` here would let storekit mint \
+             a random id (or fail closed on the legacy one)"
+        );
+        assert_eq!(l.lock, operation_lock());
+        assert_eq!(l.lock_sidecar, operation_lock_sidecar());
+        assert_eq!(l.bootstrap_dirs, bootstrap_dirs());
+    }
 
     proptest! {
         #![proptest_config(ProptestConfig {

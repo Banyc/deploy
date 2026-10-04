@@ -610,7 +610,16 @@ pub(crate) fn run_preflight(
             let helper = &helpers[&slot_id];
             let status = &statuses[&slot_id];
             helper.handshake()?;
-            remotes.get(&slot_id).unwrap().provision_layout()?;
+            // The substrate's `provision_layout` creates the ROOT and the
+            // bootstrap directories. The deploy_dir's IMMUTABLE physical
+            // identity is `deploy`'s to write: the substrate `SshTransport` is
+            // constructed with `Layout::receiver_marker = None`
+            // ([`crate::remote::layout::substrate_layout`]), so the LEGACY
+            // `recv-<uuid-v7>` marker and the crate-format marker it adopts are
+            // written HERE, by deploy's own writer, exactly as before.
+            let remote = remotes.get(&slot_id).unwrap();
+            remote.provision_layout()?;
+            crate::remote::transport::provision_receiver_uuid(remote.as_ref())?;
             crate::deploy::plan::cleanup_abandoned_incoming(
                 helper,
                 &status.pending_incoming,

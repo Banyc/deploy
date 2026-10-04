@@ -37,9 +37,7 @@
 //! kills the escapee by pid so the test leaks nothing.
 
 use deploy::env::SysEnv;
-use deploy::remote::transport::{
-    ChildRunner, KillSeam, RunOutcome, RunnerConfig, kill_process_group,
-};
+use deploy::remote::transport::{ChildRunner, KillSeam, RunOutcome, RunnerConfig};
 use proptest::prelude::*;
 use proptest::test_runner::RngSeed;
 use std::collections::BTreeMap;
@@ -179,7 +177,24 @@ impl KillSeam for FaultSeam {
     fn kill_group(&self, pgid: i32, sig: i32) -> std::io::Result<()> {
         self.group_kills.fetch_add(1, Ordering::SeqCst);
         match self.fault {
-            KillFault::Real => kill_process_group(pgid, sig),
+            // The REAL rung: signal the whole group with `killpg(2)` — the
+            // same syscall the substrate's `RealKill` issues. The substrate
+            // keeps its `kill_process_group` helper crate-internal (it is on
+            // the shimmed seam, not the consumer surface), so this
+            // integration target — the only out-of-crate driver of the real
+            // rung — issues the syscall directly rather than requiring the
+            // crate to widen its public surface for a test.
+            KillFault::Real => {
+                // SAFETY: `killpg` on a process group this test created (the
+                // child is its own group leader, `pgid == pid`), with a valid
+                // libc signal constant.
+                let rc = unsafe { libc::killpg(pgid, sig) };
+                if rc == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            }
             KillFault::Missing => Err(std::io::Error::from_raw_os_error(libc::ENOENT)),
             KillFault::Denied => Err(std::io::Error::from_raw_os_error(libc::EPERM)),
             KillFault::Esrch => Err(std::io::Error::from_raw_os_error(libc::ESRCH)),

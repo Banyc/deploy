@@ -27,10 +27,23 @@
 pub(crate) mod receiver_marker;
 #[cfg(test)]
 mod rooted;
-mod runner;
 #[cfg(test)]
 pub(crate) mod scripted;
-mod ssh;
+// The SSH transport group and the shared bounded child-runner are now the
+// SUBSTRATE's (`storekit::transport::{SshTransport, runner}`): `deploy`'s two
+// copies are deleted, and the substrate runner/crate tests carry their
+// coverage. The transport types are re-exported below so every existing
+// `crate::remote::transport::{...}` spelling keeps resolving.
+//
+// The source audit in `deploy`
+// (`every_remote_impl_carries_an_explicit_provisioning_override`) loses
+// exactly one counted `impl Remote for` block — the deleted
+// `impl Remote for SshTransport` — so its observed count falls 34 -> 33 and
+// its `checked >= 31` floor still holds with margin; the re-exported
+// substrate `SshTransport` provisions its receiver marker in the crate, where
+// that audit does not look.
+#[cfg(test)]
+mod ssh_fake_endpoint_tests;
 
 // `deploy`'s LEGACY receiver-identity reads and the provisioning writer are
 // DOMAIN code (they parse and create `recv-<uuid-v7>`, which the crate
@@ -54,11 +67,11 @@ pub(crate) use receiver_marker::{
 // layout builders construct through the fallible `parse` (see
 // [`crate::remote::layout`]). The adaptation is behaviour-identical on the
 // accepted set; where the crate is stricter is named in the layout module.
-#[cfg(unix)]
-pub use runner::kill_process_group;
-pub use runner::{ChildRunner, KillSeam, RealKill, RunError, RunOutcome, RunnerConfig};
-pub use ssh::SshTransport;
 pub use storekit::relpath::RootedRelativePath;
+pub use storekit::transport::SshTransport;
+pub use storekit::transport::{
+    ChildRunner, KillSeam, RealKill, RunError, RunOutcome, RunnerConfig,
+};
 
 use crate::env::SysEnv;
 use std::path::{Path, PathBuf};
@@ -99,36 +112,10 @@ pub use storekit::transport::{
 /// `From<storekit::Error>` impl.
 pub use storekit::error::{Error as SubstrateError, Result as SubstrateResult};
 
-/// The REAL exec: [`ChildRunner`] through the outcome mapping the transport
-/// always applied (a timed-out child surfaces as `exit_code: -1` with the
-/// runner's stderr; a kill/reap failure is an error, never a fake success).
-impl Exec for ChildRunner {
-    fn exec(&self, argv: &[String], timeout: Duration) -> Result<ExecOutcome> {
-        match ChildRunner::exec(self, argv, timeout) {
-            Ok(RunOutcome::Exited {
-                exit_code,
-                stdout,
-                stderr,
-            }) => Ok(ExecOutcome {
-                exit_code,
-                stdout,
-                stderr,
-                timeout_cause: None,
-            }),
-            Ok(RunOutcome::TimedOut { stderr }) => Ok(ExecOutcome {
-                exit_code: -1,
-                stdout: String::new(),
-                stderr,
-                // The local runner's `TimedOut` is produced only when the
-                // child was still running at the deadline (a background
-                // descendant is reported as a `RunError::Background` error,
-                // never a `TimedOut`), so the cause is unambiguous.
-                timeout_cause: Some(TimeoutCause::CommandStillRunning),
-            }),
-            Err(e) => Err(Error::transport(e.to_string())),
-        }
-    }
-}
+// The REAL exec mapping for [`ChildRunner`] (`RunOutcome::TimedOut` →
+// `exit_code: -1` + [`TimeoutCause::CommandStillRunning`]) is the SUBSTRATE's
+// `impl Exec for ChildRunner`; a local copy here would be a second, incoherent
+// impl of the crate's trait for the crate's type.
 
 /// Filesystem + execution surface for one server's remote root — the
 /// substrate's trait, re-exported as [`crate::remote::transport::Remote`].
@@ -700,14 +687,6 @@ pub(crate) struct VerifySwap {
 
 #[cfg(test)]
 impl VerifySwap {
-    pub(crate) fn boundary(&self) -> VerifySwapBoundary {
-        self.boundary
-    }
-
-    pub(crate) fn kind(&self) -> VerifySwapKind {
-        self.kind
-    }
-
     pub(crate) fn new(
         boundary: VerifySwapBoundary,
         kind: VerifySwapKind,

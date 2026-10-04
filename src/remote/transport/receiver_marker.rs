@@ -616,4 +616,181 @@ mod tests {
             "a second provisioning must not rewrite the derived marker"
         );
     }
+
+    /// STRUCTURAL CONFIRMATION of the second post-swap non-regression: the
+    /// deploy_dir's receiver markers (`receiver-uuid`, `receiver-id`) may be
+    /// READ or WRITTEN only through this module.
+    ///
+    /// The substrate cannot reach them by construction —
+    /// [`crate::remote::layout::substrate_layout`] hands the re-exported
+    /// `SshTransport` `receiver_marker: None`, so `storekit` never receives a
+    /// marker path at all (and its `provision_receiver_id`, which would MINT A
+    /// RANDOM id, is unreachable) — but a future edit could still call
+    /// `layout::receiver_uuid()` from another module. This source audit fails
+    /// if any PRODUCTION (non-`#[cfg(test)]`) code outside this file names
+    /// either marker path, so "one authority per resource" is enforced, not
+    /// merely documented.
+    #[test]
+    fn only_this_module_names_the_receiver_marker_paths() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let this = "src/remote/transport/receiver_marker.rs";
+        let mut offenders: Vec<String> = Vec::new();
+        for dir in ["src", "tests"] {
+            for entry in walkdir::WalkDir::new(root.join(dir))
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
+                let p = entry.path();
+                if p.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let rel = p
+                    .strip_prefix(root)
+                    .expect("a walked path is under the manifest dir")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if rel == this || rel.starts_with("tests/ui/") {
+                    continue;
+                }
+                let src = std::fs::read_to_string(p).expect("a source file reads");
+                let code = strip_cfg_test_items(&code_only(&src));
+                for needle in ["layout::receiver_uuid()", "layout::receiver_id()"] {
+                    if code.windows(needle.len()).any(|w| w == needle.as_bytes()) {
+                        offenders.push(format!("{rel}: {needle}"));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these files name a receiver-marker path outside the ONE module that owns it \
+             ({this}), so the marker would have more than one reader/writer: {offenders:#?}"
+        );
+    }
+
+    /// Remove comments and string/char literals (byte-level), so the
+    /// `#[cfg(test)]` brace tracker is not confused by a brace inside a string
+    /// (the crate's own audits strip code first for the same reason).
+    fn code_only(src: &str) -> Vec<u8> {
+        let b = src.as_bytes();
+        let mut out: Vec<u8> = Vec::with_capacity(b.len());
+        let mut i = 0usize;
+        while i < b.len() {
+            match b[i] {
+                b'/' if b.get(i + 1) == Some(&b'/') => {
+                    while i < b.len() && b[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                b'/' if b.get(i + 1) == Some(&b'*') => {
+                    i += 2;
+                    while i < b.len() && !(b[i] == b'*' && b.get(i + 1) == Some(&b'/')) {
+                        i += 1;
+                    }
+                    i = (i + 2).min(b.len());
+                }
+                b'"' => {
+                    i += 1;
+                    while i < b.len() {
+                        match b[i] {
+                            b'\\' => i += 2,
+                            b'"' => {
+                                i += 1;
+                                break;
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                }
+                // A char literal is `'X'` or `'\X'`; a lifetime (`'a`) is not
+                // a literal, so only consume the quoted forms.
+                b'\'' if b.get(i + 1) == Some(&b'\\') => {
+                    i += 2;
+                    while i < b.len() && b[i] != b'\'' {
+                        i += 1;
+                    }
+                    i = (i + 1).min(b.len());
+                }
+                b'\'' if b.get(i + 2) == Some(&b'\'') => i += 3,
+                _ => {
+                    out.push(b[i]);
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// Remove every `#[cfg(test)]`-gated item from `src`, so an audit sees
+    /// PRODUCTION code only. A byte scanner (the crate's own audits use the
+    /// same shape): skip the attribute(s), then the balanced `{…}` item or the
+    /// `;`-terminated form.
+    fn strip_cfg_test_items(bytes: &[u8]) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i..].starts_with(b"#[cfg(test)]") {
+                let mut j = i + b"#[cfg(test)]".len();
+                loop {
+                    let before = j;
+                    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if bytes.get(j) == Some(&b'#') && bytes.get(j + 1) == Some(&b'[') {
+                        let mut depth = 0i32;
+                        while j < bytes.len() {
+                            match bytes[j] {
+                                b'[' => depth += 1,
+                                b']' => {
+                                    depth -= 1;
+                                    j += 1;
+                                    if depth == 0 {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                            j += 1;
+                        }
+                    } else {
+                        j = before;
+                        break;
+                    }
+                }
+                let mut depth = 0i32;
+                let mut started = false;
+                while j < bytes.len() {
+                    match bytes[j] {
+                        b'{' => {
+                            depth += 1;
+                            started = true;
+                        }
+                        b'}' => {
+                            depth -= 1;
+                            if started && depth == 0 {
+                                j += 1;
+                                break;
+                            }
+                        }
+                        b';' if !started && depth == 0 => {
+                            j += 1;
+                            break;
+                        }
+                        b',' if !started && depth == 0 => {
+                            j += 1;
+                            break;
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                i = j;
+                continue;
+            }
+            out.push(bytes[i]);
+            i += 1;
+        }
+        out
+    }
 }
