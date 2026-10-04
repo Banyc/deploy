@@ -1222,7 +1222,7 @@ mod tests_materialize {
             &TemplateVars::mapping("app", "v1", "standard"),
             dest,
         )?;
-        canonicalize_tree(dest)
+        Ok(canonicalize_tree(dest)?)
     }
 
     /// Child runner, re-executed once per umask by

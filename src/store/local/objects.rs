@@ -273,7 +273,10 @@ impl LocalStore {
         // version: only `TREE_SCHEMA_VERSION` is accepted, any other version
         // is refused (a tree.json written by a different schema is never
         // interpreted).
-        crate::remote::canonical::verify_tree_metadata(&self.object_root(digest), &stored)
+        Ok(crate::remote::canonical::verify_tree_metadata(
+            &self.object_root(digest),
+            &stored,
+        )?)
     }
 }
 

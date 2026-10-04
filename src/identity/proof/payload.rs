@@ -73,33 +73,13 @@ impl BehaviorContract {
     }
 }
 
-/// One entry in a canonical tree object.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TreeEntry {
-    /// NFC-normalized, UTF-8 relative path within the artifact root.
-    pub path: String,
-    /// `file`, `dir`, or `symlink`.
-    #[serde(rename = "type")]
-    pub entry_type: String,
-    /// Octal mode string, e.g. `"0755"`.
-    pub mode: String,
-    /// For files: SHA-256 of contents. For symlinks: SHA-256 of the target.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub content_sha256: Option<String>,
-    /// For symlinks: the (relative, in-root) link target.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub symlink_target: Option<String>,
-}
-
-/// Canonical tree metadata (the `tree.json` payload). `tree_schema_version`
-/// is `TREE_SCHEMA_VERSION`; readers refuse any other value.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TreeMetadata {
-    pub tree_schema_version: u32,
-    pub hash_algorithm: String,
-    pub tree_sha256: String,
-    pub entries: Vec<TreeEntry>,
-}
+/// One entry in a canonical tree object — the substrate's canonical type
+/// ([`storekit::manifest::TreeEntry`]). The wire form is byte-identical to the
+/// type previously defined here (`"type": "file"|"dir"|"symlink"`, a
+/// four-digit octal `mode` string), but the FIELDS are now the validated
+/// values (`EntryKind`, `u32`) the substrate's readers and writers use, so a
+/// manifest produced by either side is the same value at every call site.
+pub use storekit::manifest::{EntryKind, TreeEntry, TreeMetadata};
 
 /// The unversioned but frozen mapping digest payload (canonical mapping form).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -32,7 +32,9 @@
 //! sibling).
 
 use crate::error::{Error, Result};
-use crate::identity::{DeploymentId, ReleaseRecord, TreeDigest, TreeEntry, TreeMetadata};
+use crate::identity::{
+    DeploymentId, EntryKind, ReleaseRecord, TreeDigest, TreeEntry, TreeMetadata,
+};
 use crate::remote::layout;
 use crate::remote::transport::{IMMUTABLE_RECORD_MODE, Remote, RootedRelativePath};
 use crate::verify::release::ValidatedReleaseBundle;
@@ -244,7 +246,7 @@ impl<'a> RemoteHelper<'a> {
     fn remote_tree_metadata(&self, rel: &RootedRelativePath) -> Result<TreeMetadata> {
         let root = self.remote.root().join(rel);
         if self.remote.is_local() {
-            return crate::remote::canonical::canonicalize_tree(&root);
+            return Ok(crate::remote::canonical::canonicalize_tree(&root)?);
         }
         let argv = vec![
             "perl".to_string(),
@@ -261,7 +263,13 @@ impl<'a> RemoteHelper<'a> {
                 out.exit_code, out.stderr
             )));
         }
-        crate::remote::canonical::canonicalize_remote_entries(&out.stdout, &root)
+        Ok(
+            crate::remote::canonical::canonicalize_remote_entries_checked(
+                &out.stdout,
+                &root,
+                out.success(),
+            )?,
+        )
     }
 
     /// Copy a remote tree into a staging path — the per-file dedup's staging
@@ -861,17 +869,13 @@ fn copy_host_tree_to_remote_impl(
 /// type, mode, and content hash). These entries are already present in the
 /// staging dir (copied from the previous tree) and must not be re-uploaded.
 fn build_skip_set(host_meta: &TreeMetadata, prev_meta: &TreeMetadata) -> HashSet<String> {
-    let prev: HashMap<&str, (&str, &str, Option<&str>)> = prev_meta
+    let prev: HashMap<&str, (EntryKind, u32, Option<&str>)> = prev_meta
         .entries
         .iter()
         .map(|e| {
             (
                 e.path.as_str(),
-                (
-                    e.entry_type.as_str(),
-                    e.mode.as_str(),
-                    e.content_sha256.as_deref(),
-                ),
+                (e.entry_type, e.mode, e.content_sha256.as_deref()),
             )
         })
         .collect();
@@ -904,7 +908,7 @@ fn remove_stale_entries(
             continue;
         }
         let p = dest.join(pe.path.as_str())?;
-        if pe.entry_type == "dir" {
+        if pe.entry_type == EntryKind::Dir {
             stale_dirs.push(pe);
         } else {
             remote.remove_file(&p)?;
