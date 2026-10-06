@@ -1,23 +1,23 @@
 error[E0599]: no associated function or constant named `new` found for struct `SlotId` in the current scope
-  --> tests/ui/identity_new.rs:12:24
+  --> $DIR/identity_new.rs:12:24
    |
 12 |     let _bad = SlotId::new("..");
    |                        ^^^ associated function or constant not found in `SlotId`
    |
 note: if you're trying to build a new `SlotId`, consider using `SlotId::parse` which returns `Result<SlotId, SubstrateError>`
-  --> $STOREKIT/src/id.rs
+  --> $DIR/id.rs:62:13
    |
-   |               pub fn parse(s: &str) -> $crate::error::Result<$name> {
+62 |               pub fn parse(s: &str) -> $crate::error::Result<$name> {
    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
    |
-  ::: src/identity/identity/id/segments.rs
+  ::: $DIR/src/identity/identity/id/segments.rs:27:1
    |
-   | / id_newtype!(
-   | |     SlotId,
-   | |     valid_name,
-   | |     "A slot identity: a single safe path segment (the shared \
-   | |      segment rule from [`crate::identity`])."
-   | | );
+27 | / id_newtype!(
+28 | |     SlotId,
+29 | |     valid_name,
+30 | |     "A slot identity: a single safe path segment (the shared \
+31 | |      segment rule from [`crate::identity`])."
+32 | | );
    | |_- in this macro invocation
    = note: this error originates in the macro `id_newtype` (in Nightly builds, run with -Z macro-backtrace for more info)
 help: there is a method `ne` with a similar name
