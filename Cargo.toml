@@ -21,13 +21,9 @@ test-support = []
 # `sync`, `transport`) and the shared helpers (`env`, `digest`, `platform`,
 # `trace`) `deploy` is being migrated onto (see `storekit/MIGRATION.md`).
 #
-# PATH, not git/tag, for now: both repos are local siblings and `storekit` has
-# not cut a tag yet, so a path dependency is the only form that cannot drift
-# from the reviewed working copy under migration. THE ONE-LINE SWITCH once
-# `storekit` cuts a tag: replace the line below with
-#     storekit = { git = "https://github.com/Banyc/storekit", tag = "v0.1.0" }
-# (or the eventual release tag) and commit the regenerated `Cargo.lock`.
-storekit = { path = "../storekit" }
+# Pinned to the `storekit` release tag: the tag names the published revision,
+# where a path dependency resolves whatever the sibling working copy holds.
+storekit = { git = "https://github.com/Banyc/storekit", tag = "v0.1.0" }
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 serde_json = "1"
