@@ -864,8 +864,8 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "storekit"
-version = "0.1.0"
-source = "git+https://github.com/Banyc/storekit?tag=v0.1.0#e3d9b9c91dfba75ac61f1e2706ac1d4af748096e"
+version = "0.2.0"
+source = "git+https://github.com/Banyc/storekit?tag=v0.2.0#59b2af8e5773fd67cf32144a6f8caa6efcc205ae"
 dependencies = [
  "getrandom 0.4.3",
  "hex",
@@ -920,7 +920,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
