@@ -449,10 +449,17 @@ proptest! {
         // Inject the outcome BEFORE the first remote metadata read.
         match outcome {
             LstatOutcome::SignalKilled => {
-                // The remote command is killed by a signal: the runner's
+                // The LSTAT remote command is killed by a signal: the runner's
                 // direct child dies by SIGTERM, so its exit status carries
-                // no code (never a success).
-                write_fake_bin(&fake.bin, "ssh", "#!/bin/sh\nkill -TERM $$\n");
+                // no code (never a success). The CLI probe that now precedes
+                // lstat must still run normally (it finds no `storekit-remote`
+                // and the transport falls back to the script), so kill only
+                // the command that carries the lstat helper.
+                write_fake_bin(
+                    &fake.bin,
+                    "ssh",
+                    "#!/bin/sh\nfor last; do :; done\ncase \"$last\" in\n  *lstat*) kill -TERM $$ ;;\n  *) exec /bin/sh -c \"$last\" ;;\nesac\n",
+                );
             }
             LstatOutcome::TransportSpawnFailure => {
                 // The transport cannot even spawn the remote command (a
