@@ -3,8 +3,8 @@
 //!
 //! The canonical tree objects ([`canonicalize_tree`], [`compute_tree_digest`],
 //! [`entry_paths`]) and the remote verification wire
-//! ([`remote_tree_verify_script`], [`canonicalize_remote_entries_checked`],
-//! [`verify_tree_metadata`]) are now the SUBSTRATE's (`storekit::manifest`):
+//! ([`canonicalize_remote_entries_checked`], [`verify_tree_metadata`]) are now
+//! the SUBSTRATE's (`storekit::manifest`):
 //! `deploy`'s copies are deleted, and the substrate names are re-exported below
 //! so every existing `crate::remote::canonical::{...}` spelling keeps
 //! resolving. Mapping/template materialization ([`materialize_variant`],
@@ -69,5 +69,5 @@ pub use materialize::{
 
 pub use storekit::manifest::{
     EntryKind, TreeEntry, TreeMetadata, canonicalize_remote_entries_checked, canonicalize_tree,
-    compute_tree_digest, entry_paths, remote_tree_verify_script, verify_tree_metadata,
+    compute_tree_digest, entry_paths, verify_tree_metadata,
 };

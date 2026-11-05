@@ -69,6 +69,7 @@ pub(crate) use policies::{
 
 mod domain;
 mod policies;
+pub(crate) mod user;
 
 pub use activation::{
     Activation, ActivationConfig, ActivationScope, UnitDef, UnitName, ValidatedSystemd,

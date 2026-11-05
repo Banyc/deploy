@@ -50,7 +50,8 @@ failed attempts never advance the rollback ref. Run `deploy push <target>
 --dry-run` first."
 )]
 struct Cli {
-    /// Path to deploy.toml (defaults to ./deploy.toml).
+    /// Path to deploy.toml (defaults to ./deploy.toml). Server connections may
+    /// be overlaid from the per-user `<config dir>/deploy/servers.toml`.
     #[arg(long, global = true)]
     config: Option<PathBuf>,
     /// Verbose step tracing for the RELATIVE reference operations
@@ -359,9 +360,12 @@ recovered and released; the slot ends free. The operation is idempotent\n\
 /// boundary ([`SysEnv::from_process`]) and thread it down through
 /// [`cli::run_with`](`crate::cli::run_with`) — the house pattern (mirroring
 /// `run_with(std::env::args())` for argv): subsystem code never reads the
-/// live process env.
+/// live process env. The per-user `servers.toml` path is resolved here with
+/// `etcetera`, for the same reason.
 pub fn run() -> Result<()> {
-    run_with(std::env::args(), &SysEnv::from_process())
+    let env = SysEnv::from_process();
+    let servers = crate::config::user::path();
+    run_with_servers(std::env::args(), &env, servers.as_deref())
 }
 
 /// Parse `args` (argv, including the program name) and run the command
@@ -369,6 +373,20 @@ pub fn run() -> Result<()> {
 /// store base and any child-process environment come from it, never from a
 /// live process read).
 pub fn run_with<I, T>(args: I, env: &SysEnv) -> Result<()>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    run_with_servers(args, env, None)
+}
+
+/// The body shared by [`run`] and [`run_with`]: `user_servers` is the
+/// already-resolved per-user `servers.toml` overlay, or `None`.
+fn run_with_servers<I, T>(
+    args: I,
+    env: &SysEnv,
+    user_servers: Option<&std::path::Path>,
+) -> Result<()>
 where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone,
@@ -435,7 +453,7 @@ where
             config_path.display()
         )));
     }
-    let config = ProjectConfig::load(&config_path)?;
+    let config = ProjectConfig::load_with_servers(&config_path, user_servers)?;
     // The config's `application` IS the store key (one safe application
     // identifier for display and storage): the load already validated it as
     // a single safe path segment, so the store is constructed DIRECTLY from
@@ -654,6 +672,7 @@ fn render_manual() -> Vec<String> {
         "  target      a rollout group of slots; owns rollout policy (batch size, failure policy)".to_string(),
         "  group       a per-slot tag selecting slots for `deploy push <target> --group <name>`".to_string(),
         "  release     a named project snapshot (releases/<name>/); the active one is set in deploy.toml".to_string(),
+        "  servers     declared in deploy.toml; a per-user servers.toml under the config dir overlays connections by id".to_string(),
         "  generation  a deployed instance of a tree on a slot; `current` points at the live one".to_string(),
         "  tree        the content-addressed artifact tree (sha256 of the canonicalized content)".to_string(),
         "  receiver    the deploy_dir's immutable UUID; the physical identity of a slot".to_string(),

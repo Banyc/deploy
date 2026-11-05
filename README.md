@@ -314,6 +314,15 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                             # are derived from the slots' `target` fields
 ```
 
+Server connections can also be supplied per user, so host details need not be
+committed: `deploy` reads `<config dir>/deploy/servers.toml`
+(`$XDG_CONFIG_HOME/deploy/servers.toml`, else `~/.config/deploy/servers.toml`;
+resolved with `etcetera`) and overlays its `[[servers]]` entries by `id`. A
+matching id replaces the project entry's connection (address, user, port, host
+identity); its `capacity` overrides only when declared. An id the project does
+not declare is appended, so a slot can reference a server whose connection
+exists only in the user file. A duplicate id in the user file is refused.
+
 A variant file (`releases/<release>/<name>.toml`) is a mapping plus policy —
 plus the variant's deployment slots and its slot-owned retention policy:
 

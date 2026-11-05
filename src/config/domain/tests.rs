@@ -4410,3 +4410,155 @@ proptest! {
         }
     }
 }
+
+/// The per-user `servers.toml` overlay: a matching id replaces the project's
+/// connection fields, a user-only id is appended, and the project load alone
+/// is unchanged.
+#[test]
+fn load_with_servers_overlays_connections_and_appends_user_only_servers() {
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+    let project = dir.path().join("proj");
+    let release = project.join("releases").join("v1");
+    std::fs::create_dir_all(&release).unwrap();
+    let manifest = project.join("deploy.toml");
+    std::fs::write(
+        &manifest,
+        r#"
+schema_version = 2
+application = "proj"
+release = "v1"
+
+[[servers]]
+id = "s1"
+address = "project-host"
+user = "project-user"
+host_key_fingerprint = "SHA256:project"
+
+[targets.t1]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        release.join("v.toml"),
+        r#"
+[[slots]]
+id = "p1"
+server = "s1"
+target = "t1"
+deploy_dir = "/srv/proj"
+
+[[artifact.mappings]]
+from = "a/"
+to = "app/"
+recursive = true
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["true"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+"#,
+    )
+    .unwrap();
+    let servers = dir.path().join("servers.toml");
+    std::fs::write(
+        &servers,
+        r#"
+[[servers]]
+id = "s1"
+address = "user-host"
+user = "user"
+host_key_fingerprint = "SHA256:user"
+
+[[servers]]
+id = "s2"
+address = "user-only-host"
+user = "user"
+known_hosts = "/etc/ssh/known_hosts"
+"#,
+    )
+    .unwrap();
+
+    let plain = ProjectConfig::load(&manifest).unwrap();
+    assert_eq!(plain.server("s1").unwrap().address(), "project-host");
+    assert!(plain.server("s2").is_none());
+
+    let overlaid = ProjectConfig::load_with_servers(&manifest, Some(&servers)).unwrap();
+    let s1 = overlaid.server("s1").unwrap();
+    assert_eq!(s1.address(), "user-host");
+    assert_eq!(s1.user(), "user");
+    assert_eq!(overlaid.server("s2").unwrap().address(), "user-only-host");
+}
+
+/// A project may omit `[[servers]]` entirely when the per-user overlay
+/// supplies every server its slots reference; the same project without the
+/// overlay fails the one validator (the slot's server does not resolve).
+#[test]
+fn a_project_without_servers_loads_only_with_the_user_overlay() {
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+    let project = dir.path().join("proj");
+    let release = project.join("releases").join("v1");
+    std::fs::create_dir_all(&release).unwrap();
+    let manifest = project.join("deploy.toml");
+    std::fs::write(
+        &manifest,
+        r#"
+schema_version = 2
+application = "proj"
+release = "v1"
+
+[targets.t1]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        release.join("v.toml"),
+        r#"
+[[slots]]
+id = "p1"
+server = "s1"
+target = "t1"
+deploy_dir = "/srv/proj"
+
+[[artifact.mappings]]
+from = "a/"
+to = "app/"
+recursive = true
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["true"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+"#,
+    )
+    .unwrap();
+    let servers = dir.path().join("servers.toml");
+    std::fs::write(
+        &servers,
+        r#"
+[[servers]]
+id = "s1"
+address = "user-host"
+user = "user"
+host_key_fingerprint = "SHA256:user"
+"#,
+    )
+    .unwrap();
+
+    let error = ProjectConfig::load(&manifest).unwrap_err();
+    assert!(error.to_string().contains("s1"), "{error}");
+
+    let loaded = ProjectConfig::load_with_servers(&manifest, Some(&servers)).unwrap();
+    assert_eq!(loaded.server("s1").unwrap().address(), "user-host");
+}

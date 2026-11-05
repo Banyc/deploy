@@ -40,6 +40,10 @@ pub(crate) struct RawConfig {
     pub release: ReleaseName,
     #[serde(default)]
     pub pins: Vec<RawPin>,
+    /// Servers may be omitted entirely when every one is supplied by the
+    /// per-user `servers.toml` overlay (see [`crate::config::user`]); the
+    /// merged list is what the validator sees.
+    #[serde(default)]
     pub servers: Vec<RawServer>,
     pub targets: BTreeMap<String, RawTargetConfig>,
 }

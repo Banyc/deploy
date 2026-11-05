@@ -193,7 +193,20 @@ impl ProjectConfig {
     /// whole raw input is converted into the validated domain — any invalid
     /// identifier, reference, or option combination fails the load.
     pub fn load(path: &Path) -> Result<ProjectConfig> {
-        let manifest = Self::read_manifest(path)?;
+        Self::load_with_servers(path, None)
+    }
+
+    /// [`ProjectConfig::load`] with the per-user server overlay applied first:
+    /// `user_servers` names the `servers.toml` read from the user-scope config
+    /// directory (see [`crate::config::user`]). The overlay runs on the RAW
+    /// server list, before the one validator, so a user-supplied connection is
+    /// held to exactly the project file's rules. `None` (the library default)
+    /// leaves the project untouched.
+    pub fn load_with_servers(path: &Path, user_servers: Option<&Path>) -> Result<ProjectConfig> {
+        let mut manifest = Self::read_manifest(path)?;
+        if let Some(servers) = user_servers {
+            crate::config::user::apply(&mut manifest.servers, servers)?;
+        }
         let variants = manifest.load_variant_files(path)?;
         ProjectConfig::from_raw_parts(manifest, variants)
     }

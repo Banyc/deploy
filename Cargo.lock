@@ -272,6 +272,7 @@ dependencies = [
  "assert_fs",
  "clap",
  "deploy",
+ "etcetera",
  "hex",
  "jiff",
  "libc",
@@ -320,6 +321,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "etcetera"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de48cc4d1c1d97a20fd819def54b890cadde72ed3ad0c614822a0a433361be96"
+dependencies = [
+ "cfg-if",
  "windows-sys 0.61.2",
 ]
 
@@ -864,8 +875,8 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "storekit"
-version = "0.3.0"
-source = "git+https://github.com/Banyc/storekit?tag=v0.3.0#b580605496c0745e52984d226aae65eac7612516"
+version = "0.4.0"
+source = "git+https://github.com/Banyc/storekit?tag=v0.4.0#c8e8d32ba5dce9f5d9675c5cdf5424425b706882"
 dependencies = [
  "getrandom 0.4.3",
  "hex",

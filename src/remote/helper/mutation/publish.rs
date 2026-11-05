@@ -241,19 +241,16 @@ impl<'a> RemoteHelper<'a> {
     /// The canonical metadata of a remote tree (per-file type/mode/content
     /// hash), WITHOUT transferring the tree content: a local transport
     /// canonicalizes the tree directly; a remote transport runs the
-    /// verification script, which prints per-entry metadata. Used by the
-    /// per-file dedup to compare the previous tree against the new one.
+    /// transport's manifest command — `storekit-remote manifest` when the
+    /// compatible CLI is installed on the far side, else the perl verification
+    /// script — which prints per-entry metadata. Used by the per-file dedup to
+    /// compare the previous tree against the new one.
     fn remote_tree_metadata(&self, rel: &RootedRelativePath) -> Result<TreeMetadata> {
         let root = self.remote.root().join(rel);
         if self.remote.is_local() {
             return Ok(crate::remote::canonical::canonicalize_tree(&root)?);
         }
-        let argv = vec![
-            "perl".to_string(),
-            "-e".to_string(),
-            crate::remote::canonical::remote_tree_verify_script().to_string(),
-            root.to_string_lossy().into_owned(),
-        ];
+        let argv = self.remote.manifest_argv(&root)?;
         let out = self
             .remote
             .exec(&argv, Duration::from_secs(VERIFY_TREE_EXEC_TIMEOUT_SECS))?;
@@ -2181,16 +2178,20 @@ pub(crate) mod tests_publish {
         std::fs::create_dir_all(base.join("tree")).unwrap();
         std::fs::write(base.join("tree").join("file.txt"), b"decoy content").unwrap();
 
-        // Scripted exec output: the remote script run on the REMOTE tree.
-        let out = std::process::Command::new("perl")
-            .args(["-e", crate::remote::canonical::remote_tree_verify_script()])
-            .arg(&remote_tree)
-            .output()
-            .expect("perl must run");
-        assert!(out.status.success());
+        // Scripted exec output: the wire frame the far-side walk prints for
+        // the REMOTE tree (one regular file). Built directly: the raw script
+        // is no longer public API, and this test is about the transport
+        // branch, not the script text.
+        let content = b"remote content";
+        let mode = crate::platform::metadata_mode(
+            &std::fs::metadata(remote_tree.join("file.txt")).unwrap(),
+        ) & 0o7777;
         let scripted = ExecOutcome {
             exit_code: 0,
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stdout: format!(
+                "file.txt\tf\t{mode:x}\t1\t{}\t\n",
+                storekit::digest::sha256_bytes(content)
+            ),
             stderr: String::new(),
             timeout_cause: None,
         };
