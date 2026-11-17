@@ -249,6 +249,12 @@ fn fake_env_with(
         .map(|p| std::env::split_paths(&p).collect())
         .unwrap_or_default();
     paths.insert(0, bin.to_path_buf());
+    // The far side is a LOCAL emulation (the fake ssh runs the command with
+    // `sh -c`), so this host's PATH would decide the far-side form: a real
+    // `storekit-remote` installed here answers the probe as the CLI and the
+    // injected script frames never run. Pin the far side to the script form
+    // unless a test writes its own CLI into `bin` (which shadows this one).
+    write_fake_bin(bin, "storekit-remote", "#!/bin/sh\nexit 127\n");
     let joined = std::env::join_paths(paths).unwrap();
     vars.insert(OsString::from("PATH"), joined);
     vars.extend(std::collections::BTreeMap::from([
