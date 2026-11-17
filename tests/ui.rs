@@ -50,6 +50,10 @@
 //!   them — the ONLY public mutation path is `deploy::rollout::commit` with
 //!   a `PreparedSlotMutation`.
 //!
+//! * `process_group_requires_capability.rs` — a spawned child's group is a
+//!   `ProcessGroup` CAPABILITY: `KillSeam::kill_group` takes `&ProcessGroup`
+//!   rather than a pid, and no constructor mints a group from one, so a caller
+//!   cannot turn a remembered pgid into a signal.
 //! * `unlocked_store_writer.rs` — the store's RAW writers (`write_plan`,
 //!   `store_object`, `write_pins`, `write_slot_observed`, `write_server`,
 //!   the debt writers, `write_release`, `recover_if_missing`) and the
@@ -75,5 +79,6 @@ fn sealed_ledger_writes_are_compile_enforced() {
     t.compile_fail("tests/ui/unguarded_create_generation.rs");
     t.compile_fail("tests/ui/guard_primitives_are_crate_private.rs");
     t.compile_fail("tests/ui/unlocked_store_writer.rs");
+    t.compile_fail("tests/ui/process_group_requires_capability.rs");
     t.pass("tests/ui/non_successful_terminal_ok.rs");
 }

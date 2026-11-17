@@ -1,0 +1,21 @@
+error[E0308]: mismatched types
+  --> tests/ui/process_group_requires_capability.rs:18:20
+   |
+18 |     requires_group(pgid);
+   |     -------------- ^^^^ expected `&ProcessGroup`, found `i32`
+   |     |
+   |     arguments to this function are incorrect
+   |
+note: function defined here
+  --> tests/ui/process_group_requires_capability.rs:13:4
+   |
+13 | fn requires_group(_group: &ProcessGroup) {}
+   |    ^^^^^^^^^^^^^^ ---------------------
+
+error[E0308]: mismatched types
+  --> tests/ui/process_group_requires_capability.rs:20:32
+   |
+20 |     let _group: ProcessGroup = pgid;
+   |                 ------------   ^^^^ expected `ProcessGroup`, found `i32`
+   |                 |
+   |                 expected due to this
