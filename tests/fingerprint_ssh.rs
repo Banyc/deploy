@@ -187,8 +187,17 @@ exec /bin/mv "$@"
     )
     .unwrap();
 
+    // The far side is a LOCAL emulation (the fake ssh runs the remote command
+    // with `sh -c`), so the ambient PATH would decide the far-side form: a
+    // `storekit-remote` installed on this host answers the `protocol` probe as
+    // the CLI, and the emulated remote is then driven by that binary instead
+    // of the scripts above. Exit 127 is the substrate's documented "absent"
+    // classification (`FAR_SIDE_ABSENT_EXITS`), so the far side is pinned to
+    // the script form here.
+    std::fs::write(bin.join("storekit-remote"), "#!/bin/sh\nexit 127\n").unwrap();
+
     use std::os::unix::fs::PermissionsExt;
-    for name in ["ssh", "ssh-keyscan", "stat", "mv"] {
+    for name in ["ssh", "ssh-keyscan", "stat", "mv", "storekit-remote"] {
         let p = bin.join(name);
         let mut perms = std::fs::metadata(&p).unwrap().permissions();
         perms.set_mode(0o755);
