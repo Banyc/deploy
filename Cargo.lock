@@ -875,8 +875,8 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "storekit"
-version = "0.5.0"
-source = "git+https://github.com/Banyc/storekit?tag=v0.5.0#d5305b8bd40ccd6e580f8b986e3156b27dd31e1e"
+version = "0.5.1"
+source = "git+https://github.com/Banyc/storekit?tag=v0.5.1#bcfa8146027a63aab28c64466dc7e637aed8954b"
 dependencies = [
  "getrandom 0.4.3",
  "hex",
