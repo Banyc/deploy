@@ -38,7 +38,7 @@
 
 use deploy::env::SysEnv;
 use deploy::remote::transport::{
-    ChildRunner, GroupSignal, KillSeam, ProcessGroup, RealKill, RunOutcome, RunnerConfig,
+    ChildRunner, GroupSignal, KillSeam, ProcessGroup, RealKill, RunError, RunOutcome, RunnerConfig,
 };
 use proptest::prelude::*;
 use proptest::test_runner::RngSeed;
@@ -167,6 +167,21 @@ enum KillFault {
     Inert,
 }
 
+impl KillFault {
+    /// The errno this fault's GROUP kill is REFUSED with, or `None` when the
+    /// kill is not refused at all. The ONE mapping: [`FaultSeam::kill_group`]
+    /// builds its error from it and the property reads the expected failure
+    /// from it, so no second spelling of a fault's identity can drift.
+    fn group_errno(self) -> Option<i32> {
+        match self {
+            KillFault::Real | KillFault::Inert => None,
+            KillFault::Missing => Some(libc::ENOENT),
+            KillFault::Denied => Some(libc::EPERM),
+            KillFault::Esrch => Some(libc::ESRCH),
+        }
+    }
+}
+
 /// The injectable kill seam: records every group-kill attempt (for the
 /// escalation assertion) and applies the injected fault.
 struct FaultSeam {
@@ -177,13 +192,14 @@ struct FaultSeam {
 impl KillSeam for FaultSeam {
     fn kill_group(&self, group: &ProcessGroup, sig: GroupSignal) -> std::io::Result<()> {
         self.group_kills.fetch_add(1, Ordering::SeqCst);
+        if let Some(errno) = self.fault.group_errno() {
+            return Err(std::io::Error::from_raw_os_error(errno));
+        }
         match self.fault {
             // The REAL rung is the substrate's own syscall path, not a copy.
             KillFault::Real => RealKill.kill_group(group, sig),
-            KillFault::Missing => Err(std::io::Error::from_raw_os_error(libc::ENOENT)),
-            KillFault::Denied => Err(std::io::Error::from_raw_os_error(libc::EPERM)),
-            KillFault::Esrch => Err(std::io::Error::from_raw_os_error(libc::ESRCH)),
-            KillFault::Inert => Ok(()),
+            // Nothing is signalled: the refusing faults returned above.
+            KillFault::Inert | KillFault::Missing | KillFault::Denied | KillFault::Esrch => Ok(()),
         }
     }
     fn kill_owned(&self, group: &mut ProcessGroup) -> std::io::Result<()> {
@@ -483,12 +499,31 @@ fn run_one_case(kind: ChildKind, fault: KillFault) {
                 "{kind:?} × {fault:?}: a kill failure must be an error, never a successful timeout outcome"
             );
         }
-        (
-            Err(_),
-            true,
-            KillFault::Missing | KillFault::Denied | KillFault::Esrch | KillFault::Inert,
-        ) => {
-            // Kill/reap failure surfaces as an error (the spec's contract).
+        (Err(e), true, fault @ (KillFault::Missing | KillFault::Denied | KillFault::Esrch)) => {
+            // A REFUSED group kill surfaces as a KILL failure naming the errno
+            // the fault injects — never the reap failure a kill that reports
+            // success produces.
+            let errno = fault
+                .group_errno()
+                .expect("the refusing faults carry their errno");
+            assert!(
+                matches!(e, RunError::Kill(_)),
+                "{kind:?} × {fault:?}: a refused group kill must be a kill failure, got {e}"
+            );
+            let injected = std::io::Error::from_raw_os_error(errno).to_string();
+            assert!(
+                e.to_string().contains(&injected),
+                "{kind:?} × {fault:?}: the kill failure must name `{injected}`, got {e}"
+            );
+        }
+        (Err(e), true, KillFault::Inert) => {
+            // The inert kill IS the kill not working: no signal was refused, so
+            // the failure is the REAP bound firing — never a kill failure and
+            // never a successful timeout.
+            assert!(
+                matches!(e, RunError::Reap(_)),
+                "{kind:?} × {fault:?}: an inert kill must reach the reap bound, got {e}"
+            );
         }
         (Err(e), true, KillFault::Real) => {
             panic!("{kind:?} × {fault:?}: a real kill must never fail, got {e}")
