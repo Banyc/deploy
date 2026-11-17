@@ -172,7 +172,7 @@ impl KillFault {
     /// kill is not refused at all. The ONE mapping: [`FaultSeam::kill_group`]
     /// builds its error from it and the property reads the expected failure
     /// from it, so no second spelling of a fault's identity can drift.
-    fn group_errno(self) -> Option<i32> {
+    fn refusing_errno(self) -> Option<i32> {
         match self {
             KillFault::Real | KillFault::Inert => None,
             KillFault::Missing => Some(libc::ENOENT),
@@ -192,14 +192,17 @@ struct FaultSeam {
 impl KillSeam for FaultSeam {
     fn kill_group(&self, group: &ProcessGroup, sig: GroupSignal) -> std::io::Result<()> {
         self.group_kills.fetch_add(1, Ordering::SeqCst);
-        if let Some(errno) = self.fault.group_errno() {
-            return Err(std::io::Error::from_raw_os_error(errno));
-        }
         match self.fault {
             // The REAL rung is the substrate's own syscall path, not a copy.
             KillFault::Real => RealKill.kill_group(group, sig),
-            // Nothing is signalled: the refusing faults returned above.
-            KillFault::Inert | KillFault::Missing | KillFault::Denied | KillFault::Esrch => Ok(()),
+            // Nothing is signalled, and the call reports success.
+            KillFault::Inert => Ok(()),
+            // Every remaining fault REFUSES the kill with its own errno.
+            refusing => Err(std::io::Error::from_raw_os_error(
+                refusing
+                    .refusing_errno()
+                    .expect("a refusing fault carries its errno"),
+            )),
         }
     }
     fn kill_owned(&self, group: &mut ProcessGroup) -> std::io::Result<()> {
@@ -504,7 +507,7 @@ fn run_one_case(kind: ChildKind, fault: KillFault) {
             // the fault injects — never the reap failure a kill that reports
             // success produces.
             let errno = fault
-                .group_errno()
+                .refusing_errno()
                 .expect("the refusing faults carry their errno");
             assert!(
                 matches!(e, RunError::Kill(_)),
