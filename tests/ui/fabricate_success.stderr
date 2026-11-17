@@ -9,7 +9,5 @@ error[E0308]: mismatched types
 note: associated function defined here
   --> src/kernel/terminal.rs
    |
-   | impl LedgerTerminal {
-...
    |     pub fn new(
    |            ^^^
