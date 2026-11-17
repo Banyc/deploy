@@ -30,9 +30,11 @@
 //! * `rebinding_proof.rs` — the `VerifiedReleaseRebinding` proof is sealed
 //!   (private invariant-bearing fields + a private `_sealed` marker): no
 //!   struct literal can be written;
-//! * `rebinding_deserialize.rs` — the proof is serde-free: a wire string
-//!   can deserialize into the CLAIM `RebindingPlan`, never into a "verified"
-//!   proof — only the verification (`TryFrom`) mints it.
+//! * `rebinding_deserialize.rs` — the proof is serde-free: it implements
+//!   NEITHER `Serialize` NOR `Deserialize`, so no serializer of any format can
+//!   write it and no deserializer can mint it; a wire string can deserialize
+//!   into the CLAIM `RebindingPlan` — only the verification (`TryFrom`) mints
+//!   the proof.
 //! * `unguarded_rotate.rs` — `RemoteHelper` has no `rotate` method: rotation
 //!   is a destructive operation and therefore a `HeldSlotLock` method (a
 //!   caller must HOLD the slot's mutation lock to sweep it).
