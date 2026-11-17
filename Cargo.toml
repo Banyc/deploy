@@ -23,7 +23,7 @@ test-support = []
 #
 # Pinned to the `storekit` release tag: the tag names the published revision,
 # where a path dependency resolves whatever the sibling working copy holds.
-storekit = { git = "https://github.com/Banyc/storekit", tag = "v0.4.0" }
+storekit = { git = "https://github.com/Banyc/storekit", tag = "v0.5.0" }
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 serde_json = "1"

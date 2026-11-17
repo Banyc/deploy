@@ -70,7 +70,7 @@ pub(crate) use receiver_marker::{
 pub use storekit::relpath::RootedRelativePath;
 pub use storekit::transport::SshTransport;
 pub use storekit::transport::{
-    ChildRunner, KillSeam, RealKill, RunError, RunOutcome, RunnerConfig,
+    ChildRunner, GroupSignal, KillSeam, ProcessGroup, RealKill, RunError, RunOutcome, RunnerConfig,
 };
 
 use crate::env::SysEnv;

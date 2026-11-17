@@ -37,13 +37,14 @@
 //! kills the escapee by pid so the test leaks nothing.
 
 use deploy::env::SysEnv;
-use deploy::remote::transport::{ChildRunner, KillSeam, RunOutcome, RunnerConfig};
+use deploy::remote::transport::{
+    ChildRunner, GroupSignal, KillSeam, ProcessGroup, RealKill, RunOutcome, RunnerConfig,
+};
 use proptest::prelude::*;
 use proptest::test_runner::RngSeed;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::Path;
-use std::process::Child;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -153,7 +154,7 @@ impl ChildKind {
 /// "succeeds" but signals nothing — the only way to force the reap bound.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum KillFault {
-    /// Real `killpg`/`Child::kill`.
+    /// Real `killpg(2)` / owned-handle `SIGKILL`.
     Real,
     /// Every group kill fails with ENOENT (the kill binary unavailable).
     Missing,
@@ -174,39 +175,23 @@ struct FaultSeam {
 }
 
 impl KillSeam for FaultSeam {
-    fn kill_group(&self, pgid: i32, sig: i32) -> std::io::Result<()> {
+    fn kill_group(&self, group: &ProcessGroup, sig: GroupSignal) -> std::io::Result<()> {
         self.group_kills.fetch_add(1, Ordering::SeqCst);
         match self.fault {
-            // The REAL rung: signal the whole group with `killpg(2)` — the
-            // same syscall the substrate's `RealKill` issues. The substrate
-            // keeps its `kill_process_group` helper crate-internal (it is on
-            // the shimmed seam, not the consumer surface), so this
-            // integration target — the only out-of-crate driver of the real
-            // rung — issues the syscall directly rather than requiring the
-            // crate to widen its public surface for a test.
-            KillFault::Real => {
-                // SAFETY: `killpg` on a process group this test created (the
-                // child is its own group leader, `pgid == pid`), with a valid
-                // libc signal constant.
-                let rc = unsafe { libc::killpg(pgid, sig) };
-                if rc == 0 {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::last_os_error())
-                }
-            }
+            // The REAL rung is the substrate's own syscall path, not a copy.
+            KillFault::Real => RealKill.kill_group(group, sig),
             KillFault::Missing => Err(std::io::Error::from_raw_os_error(libc::ENOENT)),
             KillFault::Denied => Err(std::io::Error::from_raw_os_error(libc::EPERM)),
             KillFault::Esrch => Err(std::io::Error::from_raw_os_error(libc::ESRCH)),
             KillFault::Inert => Ok(()),
         }
     }
-    fn kill_owned(&self, child: &mut Child) -> std::io::Result<()> {
+    fn kill_owned(&self, group: &mut ProcessGroup) -> std::io::Result<()> {
         match self.fault {
             // The Inert fault makes even the owned-handle kill a no-op:
             // only then can the child survive to the reap bound.
             KillFault::Inert => Ok(()),
-            _ => child.kill(),
+            _ => RealKill.kill_owned(group),
         }
     }
 }
